@@ -424,11 +424,11 @@ class Graph {
     return { x: node.x * this.view.k + this.view.x, y: node.y * this.view.k + this.view.y };
   }
 
-  nodeAt(px, py) {
+  nodeAt(px, py, slop = 9) {
     const point = this.toWorld(px, py);
     let best = null, bestDistance = Infinity;
     for (const node of this.nodes) {
-      const reach = Math.max(node.radius * 1.9, 9 / this.view.k);
+      const reach = Math.max(node.radius * 1.9, slop / this.view.k);
       const d = Math.hypot(node.x - point.x, node.y - point.y);
       if (d < reach && d < bestDistance) { best = node; bestDistance = d; }
     }
@@ -454,15 +454,46 @@ class Graph {
 
   bind() {
     const canvas = this.canvas, pointer = this.pointer;
+    // Fingers on the canvas: one drags (a node or the view), two pinch.
+    const touches = new Map();
+    let pinch = null;
+    const startPinch = () => {
+      const [a, b] = [...touches.values()];
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      pinch = { distance: Math.max(Math.hypot(a.x - b.x, a.y - b.y), 1), k: this.view.k, world: this.toWorld(mid.x, mid.y) };
+      if (pointer.node) pointer.node.fixed = false;
+      pointer.node = null;
+      pointer.moved = true; // a pinch is never a tap
+    };
     canvas.addEventListener("pointerdown", (event) => {
       canvas.setPointerCapture(event.pointerId);
+      if (event.pointerType === "touch") {
+        touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        if (touches.size === 2) { startPinch(); return; }
+        if (touches.size > 2) return;
+      }
       pointer.down = true; pointer.moved = false;
       pointer.x = event.clientX; pointer.y = event.clientY;
-      pointer.node = this.nodeAt(event.clientX, event.clientY);
+      pointer.node = this.nodeAt(event.clientX, event.clientY, event.pointerType === "touch" ? 18 : 9);
       if (pointer.node) pointer.node.fixed = true;
       canvas.classList.add("dragging");
     });
     canvas.addEventListener("pointermove", (event) => {
+      if (touches.has(event.pointerId)) {
+        touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        if (pinch && touches.size >= 2) {
+          const [a, b] = [...touches.values()];
+          const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+          const distance = Math.max(Math.hypot(a.x - b.x, a.y - b.y), 1);
+          const k = Math.min(Math.max(pinch.k * distance / pinch.distance, 0.15), 6);
+          // Keep the point that started under the fingers under them.
+          this.view.k = k;
+          this.view.x = mid.x - pinch.world.x * k;
+          this.view.y = mid.y - pinch.world.y * k;
+          this.touched = true;
+          return;
+        }
+      }
       if (pointer.down) {
         const dx = event.clientX - pointer.x, dy = event.clientY - pointer.y;
         if (Math.abs(dx) + Math.abs(dy) > 3) pointer.moved = true;
@@ -476,6 +507,7 @@ class Graph {
         }
         return;
       }
+      if (event.pointerType === "touch") return;
       const node = this.nodeAt(event.clientX, event.clientY);
       if (node !== this.hover) {
         this.hover = node;
@@ -484,6 +516,16 @@ class Graph {
       this.onHover(node, event.clientX, event.clientY);
     });
     const release = (event) => {
+      if (touches.delete(event.pointerId) && pinch) {
+        if (touches.size >= 2) { startPinch(); return; }
+        pinch = null;
+        if (touches.size === 1) {
+          // The finger left on the glass carries on panning from where it is.
+          const [rest] = [...touches.values()];
+          pointer.down = true; pointer.x = rest.x; pointer.y = rest.y;
+          return;
+        }
+      }
       if (!pointer.down) return;
       pointer.down = false;
       canvas.classList.remove("dragging");
@@ -700,6 +742,11 @@ function showLogin() {
   Object.assign(board, { data: null, tab: "tasks", filter: "open", project: "" });
   closeFiles();
   resetFiles();
+  closeDetail();
+  $("side").classList.remove("open");
+  $("feed").classList.remove("open");
+  closeMore();
+  closeSearch();
   $("app").hidden = true;
   $("login").hidden = false;
   if (!state.decorative) {
@@ -772,7 +819,9 @@ function applyRole(role) {
   state.role = role === "admin" ? "admin" : "viewer";
   const admin = state.role === "admin";
   $("backup-toggle").hidden = !admin;
+  $("more-backup").hidden = !admin;
   $("role").hidden = admin;
+  $("more-role").hidden = admin;
   // The board forms write as the administrator; a viewer never sees them.
   $("task-form").hidden = !admin;
   $("message-form").hidden = !admin;
@@ -2448,6 +2497,190 @@ async function openDetail(node) {
     box.append(el("h4", "", "Related memories"), list);
   }
 }
+
+/* ---------- Phone layout: top bar, tab bar and the More sheet ----------
+
+   At 760px and below the page shows one destination at a time, picked from
+   the bottom tab bar. The destinations are the existing panels, opened and
+   closed through their own toggles, so every other code path (Escape, the
+   panels closing each other, a row opening a drawer) keeps working; the tab
+   bar only reads the panels' state back. */
+
+const PHONE = window.matchMedia("(max-width: 760px)");
+const isPhone = () => PHONE.matches;
+
+/* Each destination: whether it is showing, and how to show or hide it. */
+const DESTINATIONS = {
+  side: {
+    shown: () => $("side").classList.contains("open"),
+    open: () => { $("side").classList.add("open"); $("side-toggle").setAttribute("aria-expanded", "true"); },
+    close: () => { $("side").classList.remove("open"); $("side-toggle").setAttribute("aria-expanded", "false"); },
+  },
+  feed: {
+    shown: () => $("feed").classList.contains("open"),
+    open: () => { $("feed").classList.add("open"); $("feed-toggle").setAttribute("aria-expanded", "true"); },
+    close: () => { $("feed").classList.remove("open"); $("feed-toggle").setAttribute("aria-expanded", "false"); },
+  },
+  board: {
+    shown: () => !$("board").hidden,
+    open: () => $("board-toggle").click(),
+    close: () => closeBoard(),
+  },
+  files: {
+    shown: () => !$("files").hidden,
+    open: () => $("files-toggle").click(),
+    close: () => closeFiles(),
+  },
+  profile: {
+    shown: () => !$("profile").hidden,
+    open: () => $("profile-toggle").click(),
+    close: () => { $("profile").hidden = true; $("profile-toggle").setAttribute("aria-expanded", "false"); },
+  },
+  backup: {
+    shown: () => !$("backup").hidden,
+    open: () => $("backup-toggle").click(),
+    close: () => { $("backup").hidden = true; $("backup-toggle").setAttribute("aria-expanded", "false"); },
+  },
+};
+/* Profile and Backup live behind the More tab. */
+const TAB_OF = { side: "side", feed: "feed", board: "board", files: "files", profile: "more", backup: "more" };
+
+function moreOpen() { return !$("more").hidden; }
+
+function openMore() {
+  $("more").hidden = false;
+  $("more-scrim").hidden = false;
+  syncTabs();
+}
+
+function closeMore() {
+  $("more").hidden = true;
+  $("more-scrim").hidden = true;
+  syncTabs();
+}
+
+function currentDestination() {
+  for (const name of ["profile", "backup", "board", "files", "side", "feed"]) {
+    if (DESTINATIONS[name].shown()) return name;
+  }
+  return "graph";
+}
+
+function syncTabs() {
+  const active = moreOpen() ? "more" : TAB_OF[currentDestination()] || "graph";
+  for (const tab of document.querySelectorAll("#tabbar .tab")) {
+    const on = tab.dataset.tab === active;
+    tab.classList.toggle("active", on);
+    if (on) tab.setAttribute("aria-current", "page"); else tab.removeAttribute("aria-current");
+  }
+  document.querySelector('#tabbar [data-tab="more"]').setAttribute("aria-expanded", String(moreOpen()));
+}
+
+/* Shows one destination ("graph" for none) and closes every other one. */
+function showDestination(name) {
+  closeMore();
+  closeDetail();
+  for (const [other, destination] of Object.entries(DESTINATIONS)) {
+    if (other !== name && destination.shown()) destination.close();
+  }
+  if (name !== "graph" && !DESTINATIONS[name].shown()) DESTINATIONS[name].open();
+  for (const sheet of [$("side"), $("feed"), $("board"), $("files"), $("profile"), $("backup")]) sheet.scrollTop = 0;
+  syncTabs();
+}
+
+for (const tab of document.querySelectorAll("#tabbar .tab")) {
+  tab.addEventListener("click", () => {
+    const name = tab.dataset.tab;
+    if (name === "more") { if (moreOpen()) closeMore(); else openMore(); return; }
+    // The tab of the destination on screen takes it back to its start.
+    if (name === "files" && DESTINATIONS.files.shown() && filesState.openId !== null && $("detail").hidden) {
+      backToFiles();
+      return;
+    }
+    showDestination(name);
+  });
+}
+$("more-scrim").addEventListener("click", closeMore);
+$("more-profile").addEventListener("click", () => showDestination("profile"));
+$("more-backup").addEventListener("click", () => showDestination("backup"));
+$("more-logout").addEventListener("click", () => { closeMore(); $("logout").click(); });
+
+/* On a phone only one panel shows at a time: whichever opened last wins,
+   whatever code path opened it. */
+{
+  const panels = { side: $("side"), feed: $("feed"), board: $("board"), files: $("files"), profile: $("profile"), backup: $("backup") };
+  const observer = new MutationObserver((records) => {
+    if (isPhone()) {
+      // The last record is the newest change; the panel it opened stays.
+      for (const record of [...records].reverse()) {
+        const name = Object.keys(panels).find((key) => panels[key] === record.target);
+        if (!name || !DESTINATIONS[name].shown()) continue;
+        for (const [other, destination] of Object.entries(DESTINATIONS)) {
+          if (other !== name && destination.shown()) destination.close();
+        }
+        break;
+      }
+    }
+    syncTabs();
+  });
+  for (const panel of Object.values(panels)) {
+    observer.observe(panel, { attributes: true, attributeFilter: ["hidden", "class"] });
+  }
+}
+
+/* The search field folds into a button on a phone and opens across the bar. */
+function openSearch() {
+  document.querySelector(".top").classList.add("searching");
+  $("search-open").setAttribute("aria-expanded", "true");
+  // Searching dims the graph, so the graph is what to look at.
+  if (isPhone()) showDestination("graph");
+  $("search").focus();
+}
+
+function closeSearch() {
+  document.querySelector(".top").classList.remove("searching");
+  $("search-open").setAttribute("aria-expanded", "false");
+  $("search-open").classList.toggle("active", state.query.trim() !== "");
+}
+
+$("search-open").addEventListener("click", openSearch);
+$("search-close").addEventListener("click", () => {
+  // Closing an empty field just folds it; closing a filled one clears it.
+  if (state.query) {
+    $("search").value = "";
+    state.query = "";
+    applyFocus();
+  }
+  closeSearch();
+});
+$("search").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && isPhone()) $("search").blur();
+});
+
+/* Escape closes the More sheet or the search before anything underneath. */
+window.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (moreOpen()) { closeMore(); event.stopPropagation(); return; }
+  if (document.querySelector(".top").classList.contains("searching") && document.activeElement === $("search")) {
+    closeSearch();
+    $("search-open").focus();
+    event.stopPropagation();
+  }
+}, true);
+
+PHONE.addEventListener("change", () => {
+  closeMore();
+  if (!isPhone()) closeSearch();
+  else {
+    // Arriving at phone width with several panels open: keep the top one.
+    const keep = currentDestination();
+    for (const [other, destination] of Object.entries(DESTINATIONS)) {
+      if (other !== keep && destination.shown()) destination.close();
+    }
+    syncTabs();
+  }
+});
+syncTabs();
 
 /* ---------- Boot ---------- */
 
