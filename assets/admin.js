@@ -55,6 +55,7 @@ class Graph {
     this.hover = null;
     this.selected = null;
     this.focus = null; // Set of node keys to keep bright, or null for all
+    this.onCamera = () => {};
     this.onHover = () => {};
     this.onSelect = () => {};
     this.pointer = { down: false, moved: false, node: null, x: 0, y: 0 };
@@ -238,6 +239,7 @@ class Graph {
     if (this.alpha > 0.02) this.tick();
 
     const ctx = this.ctx, { x, y, k } = this.view;
+    this.onCamera(x, y, k);
     ctx.setTransform(this.ratio, 0, 0, this.ratio, 0, 0);
     ctx.clearRect(0, 0, this.width, this.height);
     if (!this.nodes.length) return;
@@ -590,9 +592,63 @@ function decorativeGraph() {
   return { nodes, links };
 }
 
+/* ---------- Scene ---------- */
+
+/* Stars are drawn once; CSS moves and twinkles the layer. */
+function drawStars() {
+  const canvas = $("stars");
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  const width = window.innerWidth * 1.08, height = window.innerHeight * 1.08;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  const tints = ["#ffffff", "#cfe2ff", "#b9c8ff", "#ffe9c4", "#d9c2ff"];
+  // A fixed seed keeps the sky the same on every visit.
+  let seed = 1337;
+  const random = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+  const count = Math.round((width * height) / 5200);
+  for (let i = 0; i < count; i++) {
+    const depth = random();
+    const radius = depth > 0.97 ? 1.5 + random() * 0.9 : 0.35 + depth * 0.75;
+    const px = random() * width, py = random() * height;
+    ctx.globalAlpha = 0.25 + depth * 0.6;
+    ctx.fillStyle = tints[Math.floor(random() * tints.length)];
+    ctx.beginPath(); ctx.arc(px, py, radius, 0, Math.PI * 2); ctx.fill();
+    if (radius > 1.5) {
+      const halo = ctx.createRadialGradient(px, py, 0, px, py, radius * 6);
+      halo.addColorStop(0, "rgba(190, 215, 255, 0.35)");
+      halo.addColorStop(1, "rgba(190, 215, 255, 0)");
+      ctx.globalAlpha = 0.6; ctx.fillStyle = halo;
+      ctx.beginPath(); ctx.arc(px, py, radius * 6, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+drawStars();
+window.addEventListener("resize", drawStars);
+
 /* ---------- App ---------- */
 
 const graph = new Graph($("graph"));
+
+/* The scene follows the camera: far layers move less than near ones. */
+{
+  const scene = document.querySelector(".scene");
+  let last = "";
+  graph.onCamera = (x, y, k) => {
+    if (REDUCED_MOTION) return;
+    const clamp = (v, limit) => Math.max(-limit, Math.min(limit, v));
+    const panX = clamp((x - window.innerWidth / 2) * 0.06, 46);
+    const panY = clamp((y - window.innerHeight / 2) * 0.06, 34);
+    const zoom = 1 + clamp(Math.log(k) * 0.03, 0.05);
+    const key = `${panX.toFixed(1)}|${panY.toFixed(1)}|${zoom.toFixed(3)}`;
+    if (key === last) return;
+    last = key;
+    scene.style.setProperty("--pan-x", panX.toFixed(1) + "px");
+    scene.style.setProperty("--pan-y", panY.toFixed(1) + "px");
+    scene.style.setProperty("--zoom", zoom.toFixed(3));
+  };
+}
 const state = {
   version: null, brain: null, colors: new Map(), counts: [], agents: [],
   agentColors: new Map(), lastAction: new Map(), feed: [], seen: new Set(),

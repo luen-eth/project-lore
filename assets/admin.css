@@ -31,18 +31,60 @@ html, body {
 
 [hidden] { display: none !important; }
 
+/* The scene behind the graph: image, light clouds, stars, vignette. Each
+   layer follows the camera at its own speed (--pan-x/--pan-y, set from the
+   graph), which is what gives the page depth. */
+.scene { position: fixed; inset: 0; overflow: hidden; background: var(--bg); --pan-x: 0px; --pan-y: 0px; --zoom: 1; }
+.scene > * { position: absolute; }
 .backdrop {
-  position: fixed;
-  inset: 0;
-  background:
-    radial-gradient(ellipse 70% 60% at 58% 45%, rgba(4, 6, 12, 0) 0%, rgba(4, 6, 12, 0.55) 70%, rgba(4, 6, 12, 0.92) 100%),
-    url("/admin/backdrop.jpg") 58% 45% / cover no-repeat,
-    var(--bg);
-  animation: breathe 14s ease-in-out infinite alternate;
+  inset: -6%;
+  background: url("/admin/backdrop.jpg") 56% 46% / cover no-repeat;
+  transform: translate(calc(var(--pan-x) * 0.35), calc(var(--pan-y) * 0.35)) scale(var(--zoom));
+  animation: breathe 16s ease-in-out infinite alternate;
+  will-change: transform, filter;
 }
 @keyframes breathe {
-  from { filter: brightness(0.9) saturate(1); }
-  to { filter: brightness(1.12) saturate(1.2); }
+  from { filter: brightness(0.36) saturate(1.05); }
+  to { filter: brightness(0.5) saturate(1.25); }
+}
+.aurora {
+  width: 60vmax; height: 60vmax; border-radius: 50%;
+  filter: blur(90px); mix-blend-mode: screen; opacity: 0.5;
+  will-change: transform;
+}
+.aurora.one {
+  left: 34%; top: -22%;
+  background: radial-gradient(circle, rgba(64, 120, 255, 0.34), rgba(64, 120, 255, 0) 62%);
+  animation: drift-one 38s ease-in-out infinite alternate;
+}
+.aurora.two {
+  left: 48%; top: 34%;
+  background: radial-gradient(circle, rgba(170, 90, 255, 0.26), rgba(170, 90, 255, 0) 60%);
+  animation: drift-two 46s ease-in-out infinite alternate;
+}
+@keyframes drift-one {
+  from { transform: translate(-6%, 0) scale(1); }
+  to { transform: translate(10%, 12%) scale(1.18); }
+}
+@keyframes drift-two {
+  from { transform: translate(4%, 6%) scale(1.1); }
+  to { transform: translate(-12%, -8%) scale(0.92); }
+}
+.stars {
+  inset: -4%; width: 108%; height: 108%;
+  transform: translate(calc(var(--pan-x) * 0.8), calc(var(--pan-y) * 0.8));
+  animation: twinkle 7s ease-in-out infinite alternate;
+  will-change: transform, opacity;
+}
+@keyframes twinkle {
+  from { opacity: 0.55; }
+  to { opacity: 1; }
+}
+.vignette {
+  inset: 0;
+  background:
+    radial-gradient(ellipse 62% 58% at 56% 47%, rgba(3, 5, 11, 0) 0%, rgba(3, 5, 11, 0.5) 68%, rgba(3, 5, 11, 0.93) 100%),
+    linear-gradient(90deg, rgba(3, 5, 11, 0.72) 0%, rgba(3, 5, 11, 0) 26%, rgba(3, 5, 11, 0) 78%, rgba(3, 5, 11, 0.6) 100%);
 }
 
 #graph {
@@ -419,5 +461,5 @@ input:focus-visible, button:focus-visible, [tabindex]:focus-visible {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .backdrop, .live i, .avatar.online::after, .feed-list li.fresh, .agents li.flash, .stat.bump b { animation: none; }
+  .backdrop, .aurora, .stars, .live i, .avatar.online::after, .feed-list li.fresh, .agents li.flash, .stat.bump b { animation: none; }
 }
