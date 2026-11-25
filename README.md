@@ -63,7 +63,7 @@ Queries take a few tens of milliseconds because everything happens in one proces
 
 | Tool | Purpose |
 |---|---|
-| `hello` | Open the session for this chat, once, at the very start. Returns the briefing: how to address the user, the reply language, the user's rules, other open sessions and where the project was left off |
+| `hello` | Open the session for this chat, once, at the very start. Returns the briefing: how to address the user, the reply language, the user's rules, handoff notes left for this project, unread messages, open tasks, other open sessions and where the project was left off |
 | `recall` | Search past work, decisions, bugs and notes by topic |
 | `log` | Record an update, decision, bug, note or todo, with the directory, repo and commit it was made at |
 | `recent` | Newest entries, to see where a project was left off |
@@ -73,6 +73,12 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `forget` | Delete an entry |
 | `checkin` | Record what happened in this chat since the last check-in |
 | `bye` | Close the session with a short summary of the chat |
+| `tasks` | The shared to-do list: open and claimed tasks by default, or done, cancelled or all of them |
+| `task_add` | Add a task to a project's to-do list, optionally meant for one agent |
+| `task_update` | Claim, release, finish (with the commit), cancel or reopen a task |
+| `send` | Send a message to one agent, or to every agent |
+| `handoff` | Leave a note for whoever works on the project next |
+| `inbox` | Read the messages sent to you, and mark them read |
 
 Every tool except `hello` takes the `session_id` that `hello` returned and
 refuses to work without a live session.
@@ -113,6 +119,8 @@ chat is call `hello`, which opens a session and returns the **briefing**:
   default one — and **which language to reply in**.
 - **The rules the user wants followed**: global rules first, then rules for that
   agent, then rules for that project.
+- **Notes left for whoever works on the project next**, **unread messages** and
+  the project's **open tasks** (see the board, below).
 - **Other open sessions** on the same project, and **where the project was left
   off** (the five most recent entries).
 
@@ -132,13 +140,51 @@ known agent, and the rule list (global, per agent or per project). A viewer can
 read the dialog but not change it. Open admin pages refresh the moment a profile,
 a rule or a session changes.
 
-Backups are version 3: they include the sessions with their check-in timelines,
-the profile and the rules. Older backup files still import and restore; restoring one
-replaces the entries but keeps the sessions, profile and rules, which it does not carry.
+Backups are version 4: they include the sessions with their check-in timelines,
+the profile, the rules and the board. Older backup files still import and restore;
+restoring one replaces the entries but keeps whatever the file does not carry: a
+version 3 file keeps the board, and older ones also keep the sessions, profile and
+rules.
 
 The server also sends instructions on connect that tell the agent to open the
-session with `hello` and when to call `recall` and `log`, so most clients use it
-without extra prompting.
+session with `hello`, when to call `recall` and `log`, and how to use the board, so
+most clients use it without extra prompting.
+
+### The board: tasks, messages, handoff notes
+
+Agents also talk to each other through lore. The board has three parts.
+
+**Tasks** are a shared to-do list per project. Any agent adds one with `task_add`,
+optionally meant for one agent, and sees the list with `tasks`. Before starting
+work that may already be on the list, an agent claims the task so nobody else picks
+it up, and marks it done with the commit when it finishes. `task_update` moves a
+task through its life cycle:
+
+| Action | From | To | Notes |
+|---|---|---|---|
+| `claim` | open | claimed | refused when another agent already holds it |
+| `release` | claimed | open | only by the agent that claimed it, or the admin |
+| `done` | open or claimed | done | records who finished it, when, and the commit |
+| `cancel` | open or claimed | cancelled | the task is no longer needed |
+| `reopen` | done or cancelled | open | clears the claim and the done fields |
+
+Every action can carry a short note; the latest one shows with the task. A refused
+action says what state the task is in.
+
+**Messages** go to one agent (`send` with `to`) or to every agent (`send` without
+it). A message counts as unread for an agent until that agent has seen it; an
+agent never gets its own messages. `hello` lists up to ten unread messages and
+marks them read, `checkin` mentions how many are waiting, and `inbox` lists them
+(up to 30, newest first) and marks them read. `inbox` with `include_read` also
+shows the latest ones already read.
+
+**Handoff notes** are for whoever works on a project next: an agent that stops in
+the middle of something leaves one with `handoff`. The note is delivered exactly
+once, in the `hello` briefing of the next session opened on that project (never to
+the session that wrote it), and the admin page shows who received it.
+
+The administrator sees all of it on the admin page and can add tasks, move them
+along, and write messages and handoff notes too (see below).
 
 ## The admin view
 
@@ -160,7 +206,8 @@ nothing needs a reload:
 - **Sessions** lists the open chats first and then the latest closed ones: agent,
   project, what the chat is about, and how long ago it was last active. Click one
   to read its fields and its check-in timeline;
-- **Open sessions** in the stats row counts the chats live right now.
+- **Open sessions** and **Open tasks** in the stats row count the chats live
+  right now and the tasks nobody has claimed yet.
 
 Click a neuron to read the entry, with the commit it was logged at and its related
 memories. Click a project, an agent or a kind (decision, bug, todo…) to isolate that
@@ -170,6 +217,16 @@ The **Profile** button opens the dialog where the form of address, the reply
 language, per-agent addresses and the rule list are edited; a signed-in viewer
 sees it read-only.
 
+The **Board** button opens the shared board in two tabs. **Tasks** lists the tasks
+with their status, project, who added, claimed and finished them, the body and the
+latest note; filter them by Open, Done or All, and by project. **Messages** lists
+messages and handoff notes, newest first, with who has read each message and who
+received each handoff note (or that it is still waiting). The admin can add a task,
+mark one done, cancel, release or reopen it, and write a message to one agent or to
+everyone, or a handoff note for a project; these appear as written by `admin`. A
+viewer sees the board read-only. The board refreshes while it is open, as agents
+work.
+
 ![An open entry with its commit, tags and related memories](docs/memory.jpg)
 
 ### Backup and restore
@@ -178,8 +235,8 @@ The **Backup** menu covers moving and protecting the whole store:
 
 | Action | What it does |
 |---|---|
-| **Export backup** | Downloads the whole store as one JSON file (version 3): every entry, its embedding vector, the activity log, the agent records, the sessions with their check-ins, the profile and the rules. |
-| **Import and merge** | Adds the entries, sessions and rules of a backup that are not present yet. Nothing is removed. |
+| **Export backup** | Downloads the whole store as one JSON file (version 4): every entry, its embedding vector, the activity log, the agent records, the sessions with their check-ins, the profile, the rules, and the tasks, messages and handoff notes. |
+| **Import and merge** | Adds the entries, sessions, rules, tasks and messages of a backup that are not present yet. Nothing is removed. |
 | **Restore from backup** | Replaces everything with the backup, after a confirmation. All or nothing: a file that fails validation changes nothing. |
 
 ![The backup menu](docs/backup.jpg)
@@ -196,11 +253,11 @@ password you type decides what you get:
 
 | Password | Role | Can do |
 |---|---|---|
-| `LORE_ADMIN_PASSWORD` | admin | everything, including backup export, import and restore, and editing the profile and rules |
-| `LORE_VIEWER_PASSWORD` | viewer | watch the graph, the sessions and the live activity, open entries, read the profile |
+| `LORE_ADMIN_PASSWORD` | admin | everything, including backup export, import and restore, editing the profile and rules, and adding tasks and messages on the board |
+| `LORE_VIEWER_PASSWORD` | viewer | watch the graph, the sessions and the live activity, open entries, read the profile and the board |
 
 A viewer never sees the Backup menu, and the server refuses the backup endpoints
-and every profile or rule edit for a viewer session, so hiding the buttons is not
+and every profile, rule or board edit for a viewer session, so hiding the buttons is not
 what keeps the data in. Share the viewer password with someone who should watch
 but not take a copy.
 
@@ -323,7 +380,8 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
   and with reCAPTCHA configured, refuses requests Google scores as automated. If
   Google cannot be reached the sign-in fails closed.
 - **The admin view** cannot edit individual entries. Its only write actions are
-  backup import and restore, which need the signed-in session (a `SameSite=Strict`
+  backup import and restore, the profile and rules, and the board, all of which
+  need a signed-in admin session (a `SameSite=Strict`
   cookie). It is served with a strict Content-Security-Policy and uses no third-party
   scripts apart from reCAPTCHA on the sign-in form.
 - **Activity is recorded.** Every tool call is stored with the agent that made it,

@@ -27,8 +27,17 @@ const TOOLS = {
   import: { verb: "imported a backup", tone: "write" },
   restore: { verb: "restored a backup", tone: "remove" },
   reindex: { verb: "re-indexed memories", tone: "write" },
+  task_add: { verb: "added a task", tone: "write" },
+  task_update: { verb: "updated a task", tone: "write" },
+  tasks: { verb: "looked at the tasks", tone: "read" },
+  send: { verb: "sent a message", tone: "write" },
+  handoff: { verb: "left a handoff note", tone: "write" },
+  inbox: { verb: "read the inbox", tone: "read" },
 };
-const WRITES = new Set(["hello", "checkin", "bye", "log", "amend", "forget", "profile", "rules", "import", "restore", "reindex"]);
+const WRITES = new Set([
+  "hello", "checkin", "bye", "log", "amend", "forget", "profile", "rules", "import", "restore", "reindex",
+  "task_add", "task_update", "send", "handoff",
+]);
 const FALLBACK_POLL_MS = 30000;
 const FEED_MAX = 120;
 const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -660,7 +669,7 @@ const state = {
   filter: null, // { type: 'project' | 'agent' | 'kind', value }
   query: "", timer: null, clock: null, source: null, refreshing: null,
   siteKey: null, decorative: false, role: "viewer",
-  sessions: [], openSessions: 0,
+  sessions: [], openSessions: 0, openTasks: 0,
 };
 
 async function api(path, options) {
@@ -683,6 +692,8 @@ function showLogin() {
   $("backup-toggle").setAttribute("aria-expanded", "false");
   $("profile").hidden = true;
   $("profile-toggle").setAttribute("aria-expanded", "false");
+  closeBoard();
+  Object.assign(board, { data: null, tab: "tasks", filter: "open", project: "" });
   $("app").hidden = true;
   $("login").hidden = false;
   if (!state.decorative) {
@@ -756,6 +767,9 @@ function applyRole(role) {
   const admin = state.role === "admin";
   $("backup-toggle").hidden = !admin;
   $("role").hidden = admin;
+  // The board forms write as the administrator; a viewer never sees them.
+  $("task-form").hidden = !admin;
+  $("message-form").hidden = !admin;
   if (!admin) {
     $("backup").hidden = true;
     $("backup-toggle").setAttribute("aria-expanded", "false");
@@ -819,6 +833,11 @@ async function fallbackPoll() {
       renderStats();
       loadSessions();
     }
+    if (pulse.open_tasks !== state.openTasks) {
+      state.openTasks = pulse.open_tasks;
+      renderStats();
+      boardActivity();
+    }
     if (pulse.version !== state.version) await refresh(false);
   } catch (_) { /* signed out or offline; the next poll retries */ }
 }
@@ -864,6 +883,7 @@ async function load(first) {
       state.agents = payload.agents;
       state.model = payload.embedding_model;
       state.openSessions = payload.open_sessions;
+      state.openTasks = payload.open_tasks;
       const { counts, colors } = projectColors(payload.brain.neurons);
       state.counts = counts; state.colors = colors;
       for (const agent of payload.agents) agentColor(agent.name);
@@ -992,6 +1012,7 @@ const activityKey = (activity) => `${activity.id}|${activity.at}|${activity.tool
 async function onActivity(activity) {
   if (state.seen.has(activityKey(activity))) return;
   addToFeed(activity, true);
+  boardActivity();
 
   const agent = state.agents.find((a) => a.name === activity.agent);
   if (agent) {
@@ -1077,6 +1098,7 @@ function renderStats() {
   setStat("stat-links", state.brain.synapses.length);
   setStat("stat-projects", state.counts.length);
   setStat("stat-online", state.agents.filter((a) => a.seconds_since_seen !== null && a.seconds_since_seen < 300).length);
+  setStat("stat-tasks", state.openTasks);
   setStat("stat-sessions", state.openSessions);
 }
 
@@ -1247,9 +1269,10 @@ $("backup-toggle").addEventListener("click", () => {
   $("backup-toggle").setAttribute("aria-expanded", String(!panel.hidden));
   if (!panel.hidden) {
     backupStatus("");
-    // The two menus share a corner; only one is open at a time.
+    // The menus share a corner; only one is open at a time.
     $("profile").hidden = true;
     $("profile-toggle").setAttribute("aria-expanded", "false");
+    closeBoard();
   }
 });
 
@@ -1328,6 +1351,7 @@ $("profile-toggle").addEventListener("click", () => {
   if (open) {
     $("backup").hidden = true;
     $("backup-toggle").setAttribute("aria-expanded", "false");
+    closeBoard();
     profileStatus("");
     loadProfile();
   }
@@ -1509,6 +1533,360 @@ $("profile-save").addEventListener("click", async () => {
   }
 });
 
+/* ---------- Board: tasks, messages and handoff notes ---------- */
+
+/* The forms are static markup and are never rebuilt, so a refresh while the
+   admin is typing only replaces the lists and the select options. */
+const board = {
+  tab: "tasks", filter: "open", project: "",
+  data: null, loading: null, again: false, timer: null,
+};
+const TASK_FILTERS = [["open", "Open"], ["done", "Done"], ["all", "All"]];
+const TASK_ACTIONS = {
+  open: ["done", "cancel"],
+  claimed: ["done", "release", "cancel"],
+  done: ["reopen"],
+  cancelled: ["reopen"],
+};
+const ACTION_LABEL = { done: "Done", cancel: "Cancel", release: "Release", reopen: "Reopen" };
+const ACTION_DONE = { done: "marked done", cancel: "cancelled", release: "released", reopen: "reopened" };
+
+function ago(iso) {
+  const text = relative(secondsSince(iso));
+  return text === "now" || text === "never" ? text : text + " ago";
+}
+
+function boardStatus(text, tone) {
+  const node = $("board-status");
+  node.textContent = text;
+  node.className = "small-text" + (tone ? " " + tone : "");
+}
+
+function closeBoard() {
+  $("board").hidden = true;
+  $("board-toggle").setAttribute("aria-expanded", "false");
+  clearTimeout(board.timer);
+}
+
+$("board-toggle").addEventListener("click", () => {
+  const panel = $("board");
+  const open = panel.hidden;
+  if (!open) { closeBoard(); return; }
+  panel.hidden = false;
+  $("board-toggle").setAttribute("aria-expanded", "true");
+  $("backup").hidden = true;
+  $("backup-toggle").setAttribute("aria-expanded", "false");
+  $("profile").hidden = true;
+  $("profile-toggle").setAttribute("aria-expanded", "false");
+  boardStatus("");
+  renderBoard();
+  loadBoard();
+});
+
+/* Collapses bursts the same way `refresh` does: one load at a time, and at
+   most one more queued behind it. */
+function loadBoard() {
+  if (board.loading) {
+    board.again = true;
+    return board.loading;
+  }
+  board.loading = (async () => {
+    try {
+      do {
+        board.again = false;
+        const response = await api("/admin/api/board?limit=300");
+        if (!response.ok) throw new Error("failed");
+        board.data = await response.json();
+        state.openTasks = board.data.counts.open_tasks;
+        renderStats();
+        if (!$("board").hidden) renderBoard();
+      } while (board.again);
+    } catch (_) {
+      if (!$("board").hidden) boardStatus("The board could not be loaded.", "bad");
+    } finally {
+      board.loading = null;
+    }
+  })();
+  return board.loading;
+}
+
+/* Live events reload the board only while it is open. */
+function boardActivity() {
+  if ($("board").hidden) return;
+  clearTimeout(board.timer);
+  board.timer = setTimeout(loadBoard, 250);
+}
+
+function boardAgents() {
+  const names = new Set(state.agents.map((agent) => agent.name));
+  if (board.data) {
+    for (const task of board.data.tasks) {
+      for (const name of [task.created_by, task.assignee, task.claimed_by, task.done_by]) names.add(name);
+    }
+    for (const message of board.data.messages) {
+      for (const name of [message.from_agent, message.to_agent, message.delivered_to]) names.add(name);
+    }
+  }
+  names.delete("");
+  names.delete("admin");
+  return [...names].filter(Boolean).sort();
+}
+
+function boardProjects() {
+  const names = new Set(state.counts.map(([project]) => project));
+  if (board.data) {
+    for (const task of board.data.tasks) names.add(task.project);
+    for (const message of board.data.messages) names.add(message.project);
+  }
+  names.delete("");
+  return [...names].sort();
+}
+
+/* Replaces a select's options and keeps the current choice when it still exists. */
+function fillSelect(select, options) {
+  const keep = select.value;
+  select.replaceChildren();
+  for (const [value, label] of options) {
+    const option = el("option", "", label);
+    option.value = value;
+    select.append(option);
+  }
+  select.value = options.some(([value]) => value === keep) ? keep : options.length ? options[0][0] : "";
+}
+
+function renderBoard() {
+  const admin = state.role === "admin";
+  const tasksTab = board.tab === "tasks";
+  $("board-tab-tasks").classList.toggle("active", tasksTab);
+  $("board-tab-tasks").setAttribute("aria-selected", String(tasksTab));
+  $("board-tab-messages").classList.toggle("active", !tasksTab);
+  $("board-tab-messages").setAttribute("aria-selected", String(!tasksTab));
+  $("board-tasks").hidden = !tasksTab;
+  $("board-messages").hidden = tasksTab;
+  $("board-chips").hidden = !tasksTab;
+  $("task-form").hidden = !admin;
+  $("message-form").hidden = !admin;
+
+  const projects = boardProjects();
+  if (board.project && !projects.includes(board.project)) projects.push(board.project);
+  fillSelect($("board-project"), [["", "All projects"], ...projects.map((p) => [p, p])]);
+  board.project = $("board-project").value;
+  const datalist = $("board-projects");
+  datalist.replaceChildren();
+  for (const project of projects) {
+    const option = el("option");
+    option.value = project;
+    datalist.append(option);
+  }
+  const agents = boardAgents();
+  fillSelect($("task-assignee"), [["", "anyone"], ...agents.map((a) => [a, a])]);
+  fillSelect($("message-to"), [["", "everyone"], ...agents.map((a) => [a, a])]);
+
+  if (!board.data) {
+    $("task-list").replaceChildren(el("li", "none", "Loading…"));
+    $("message-list").replaceChildren(el("li", "none", "Loading…"));
+    $("board-chips").replaceChildren();
+    return;
+  }
+  renderTasks(admin);
+  renderMessages();
+}
+
+function renderTasks(admin) {
+  const inProject = board.data.tasks.filter((task) => !board.project || task.project === board.project);
+  const matches = {
+    open: (task) => task.status === "open" || task.status === "claimed",
+    done: (task) => task.status === "done",
+    all: () => true,
+  };
+  const chips = $("board-chips");
+  chips.replaceChildren();
+  for (const [value, label] of TASK_FILTERS) {
+    const chip = el("button", board.filter === value ? "active" : "", label);
+    chip.type = "button";
+    chip.setAttribute("aria-pressed", String(board.filter === value));
+    chip.append(el("b", "", String(inProject.filter(matches[value]).length)));
+    chip.addEventListener("click", () => { board.filter = value; renderBoard(); });
+    chips.append(chip);
+  }
+
+  const list = $("task-list");
+  list.replaceChildren();
+  const tasks = inProject.filter(matches[board.filter]);
+  if (!tasks.length) {
+    const what = board.filter === "all" ? "No tasks" : `No ${board.filter} tasks`;
+    list.append(el("li", "none", what + (board.project ? ` on ${board.project}.` : " yet.")));
+    return;
+  }
+  for (const task of tasks) list.append(taskItem(task, admin));
+}
+
+function taskItem(task, admin) {
+  const item = el("li", "board-item " + task.status);
+  const head = el("div", "board-item-head");
+  head.append(el("span", "pill " + task.status, task.status),
+    el("span", "board-title", task.title), el("span", "board-id", "#" + task.id));
+  const meta = [task.project, `added by ${task.created_by}`];
+  if (task.assignee) meta.push(`for ${task.assignee}`);
+  if (task.claimed_by && task.status !== "open") meta.push(`claimed by ${task.claimed_by}`);
+  if (task.done_by) {
+    meta.push(`done by ${task.done_by}` + (task.done_commit ? ` at ${task.done_commit.slice(0, 10)}` : ""));
+  }
+  meta.push(ago(task.updated_at));
+  const metaLine = el("div", "board-meta", meta.join(" · "));
+  metaLine.title = `added ${shortDate(task.created_at)} · updated ${shortDate(task.updated_at)}`;
+  item.append(head, metaLine);
+  if (task.body) item.append(el("p", "board-body", task.body));
+  if (task.note) item.append(el("p", "board-note", "Note: " + task.note));
+  if (admin) {
+    const actions = TASK_ACTIONS[task.status] || [];
+    if (actions.length) {
+      const row = el("div", "board-actions");
+      for (const action of actions) {
+        const button = el("button", "ghost small" + (action === "cancel" ? " danger" : ""), ACTION_LABEL[action]);
+        button.type = "button";
+        button.addEventListener("click", () => updateTask(task, action, row));
+        row.append(button);
+      }
+      item.append(row);
+    }
+  }
+  return item;
+}
+
+async function updateTask(task, action, row) {
+  for (const button of row.querySelectorAll("button")) button.disabled = true;
+  try {
+    const response = await api("/admin/api/tasks/" + task.id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, note: "" }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      boardStatus(result.error || (response.status === 404
+        ? `Task #${task.id} no longer exists.` : "The task could not be updated."), "bad");
+    } else {
+      boardStatus(`Task #${task.id} ${ACTION_DONE[action]}.`, "ok");
+    }
+  } catch (_) {
+    boardStatus("The task could not be updated.", "bad");
+  }
+  await loadBoard();
+}
+
+function renderMessages() {
+  const list = $("message-list");
+  list.replaceChildren();
+  const messages = board.data.messages.filter((m) => !board.project || m.project === board.project);
+  if (!messages.length) {
+    list.append(el("li", "none", board.project
+      ? `No messages or handoff notes about ${board.project}.`
+      : "No messages or handoff notes yet."));
+    return;
+  }
+  for (const message of messages) list.append(messageItem(message));
+}
+
+function messageItem(message) {
+  const handoff = message.kind === "handoff";
+  const item = el("li", "board-item " + message.kind);
+  const head = el("div", "board-item-head");
+  const to = handoff ? `next agent on ${message.project}` : message.to_agent || "everyone";
+  const when = el("span", "board-id", ago(message.created_at));
+  when.title = shortDate(message.created_at);
+  head.append(el("span", "pill " + message.kind, handoff ? "handoff" : "message"),
+    el("span", "board-title", `${message.from_agent} → ${to}`), when);
+  item.append(head);
+  const meta = [`#${message.id}`];
+  if (message.project && !handoff) meta.push(message.project);
+  item.append(el("div", "board-meta", meta.join(" · ")), el("p", "board-body", message.body));
+  let foot;
+  if (handoff) {
+    foot = message.delivered_at
+      ? el("div", "board-foot", `delivered to ${message.delivered_to || "an agent"} · ${ago(message.delivered_at)}`)
+      : el("div", "board-foot waiting", "waiting for the next session on " + message.project);
+  } else {
+    foot = message.read_by.length
+      ? el("div", "board-foot", "read by: " + message.read_by.join(", "))
+      : el("div", "board-foot waiting", "not read yet");
+  }
+  item.append(foot);
+  return item;
+}
+
+$("board-tab-tasks").addEventListener("click", () => { board.tab = "tasks"; renderBoard(); });
+$("board-tab-messages").addEventListener("click", () => { board.tab = "messages"; renderBoard(); });
+$("board-project").addEventListener("change", (event) => { board.project = event.target.value; renderBoard(); });
+
+function syncMessageKind() {
+  const handoff = $("message-kind").value === "handoff";
+  $("message-to-field").hidden = handoff;
+  $("message-project").required = handoff;
+  $("message-project-label").textContent = handoff ? "Project" : "Project (optional)";
+  $("message-body").placeholder = handoff
+    ? "Where the work stands and what is left, for whoever continues"
+    : "What the agents must know";
+  $("message-submit").textContent = handoff ? "Leave note" : "Send";
+}
+$("message-kind").addEventListener("change", syncMessageKind);
+syncMessageKind();
+
+async function postBoard(path, payload, button) {
+  button.disabled = true;
+  try {
+    const response = await api(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      boardStatus(result.error || "That could not be saved.", "bad");
+      return null;
+    }
+    return result;
+  } catch (_) {
+    boardStatus("That could not be saved.", "bad");
+    return null;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("task-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const task = await postBoard("/admin/api/tasks", {
+    project: $("task-project").value.trim(),
+    title: $("task-title").value.trim(),
+    body: $("task-body").value.trim(),
+    assignee: $("task-assignee").value,
+  }, $("task-submit"));
+  if (!task) return;
+  // The project and the assignee stay for the next task.
+  $("task-title").value = "";
+  $("task-body").value = "";
+  boardStatus(`Task #${task.id} added to ${task.project}.`, "ok");
+  await loadBoard();
+});
+
+$("message-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const handoff = $("message-kind").value === "handoff";
+  const message = await postBoard("/admin/api/messages", {
+    kind: handoff ? "handoff" : "message",
+    project: $("message-project").value.trim(),
+    to: handoff ? "" : $("message-to").value,
+    body: $("message-body").value.trim(),
+  }, $("message-submit"));
+  if (!message) return;
+  $("message-body").value = "";
+  boardStatus(handoff
+    ? `Handoff note #${message.id} left for the next session on ${message.project}.`
+    : `Message #${message.id} sent to ${message.to_agent || "everyone"}.`, "ok");
+  await loadBoard();
+});
+
 /* ---------- Tooltip and entry drawer ---------- */
 
 graph.onHover = (node, x, y) => {
@@ -1550,7 +1928,9 @@ function closeDetail() {
 $("detail-close").addEventListener("click", closeDetail);
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (!$("backup").hidden) {
+  if (!$("board").hidden) {
+    closeBoard();
+  } else if (!$("backup").hidden) {
     $("backup").hidden = true;
     $("backup-toggle").setAttribute("aria-expanded", "false");
   } else if (!$("profile").hidden) {

@@ -11,7 +11,10 @@ use serde::Deserialize;
 
 use crate::{
     auth::{Agent, SHARED_AGENT},
-    db::{Db, Entry, KINDS, NewEntry, NewSession, Patch, Rule, Session},
+    db::{
+        BODY_MAX_CHARS, Db, Entry, KINDS, Message, NOTE_MAX_CHARS, NewEntry, NewMessage,
+        NewSession, NewTask, Patch, Rule, Session, TASK_ACTIONS, TASK_TITLE_MAX_CHARS, Task,
+    },
     embed::Embedder,
     events::Events,
 };
@@ -44,7 +47,13 @@ logged per project, so compare it with your own HEAD before building on someone'
 
 `project` is the repository or folder name in lowercase (for example `project-lore`). \
 If an earlier entry is wrong or outdated, fix it with `amend` rather than adding a \
-contradicting one.";
+contradicting one.
+
+The board is how agents work together. Before starting on something that may already \
+be on the list, check it with `tasks`, and use `task_update` to claim a task before \
+working on it and to mark it `done` (with the commit) when you finish it. Leave a `handoff` note \
+when you stop in the middle of something, and use `send` for anything another agent \
+must know.";
 
 /// Longest body returned inline by `recall` and `recent`; `get` returns everything.
 const PREVIEW_CHARS: usize = 700;
@@ -196,6 +205,79 @@ pub struct ByeArgs {
     pub session_id: String,
     /// A short summary of what this chat accomplished.
     pub summary: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaskAddArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Repository or folder name in lowercase, e.g. `project-lore`.
+    pub project: String,
+    /// One line that says what needs doing.
+    pub title: String,
+    /// The details: what exactly the task involves, links, constraints.
+    pub body: Option<String>,
+    /// The agent the task is meant for. Omit for anyone.
+    pub assignee: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaskUpdateArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Id of the task, as shown by `tasks`.
+    pub id: i64,
+    /// One of: claim (take the task), release (give it back), done
+    /// (finished), cancel (no longer needed), reopen.
+    pub action: String,
+    /// Short status note: what changed, or why the task was closed.
+    pub note: Option<String>,
+    /// The HEAD commit the work was finished at, with `done`.
+    pub commit: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TasksArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Restrict to one project. Omit for every project.
+    pub project: Option<String>,
+    /// One of: open (open + claimed, the default), done, cancelled, all.
+    pub status: Option<String>,
+    /// Maximum number of tasks to return (default 20, max 100).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// What the other agent must know.
+    pub body: String,
+    /// One agent, or omit to tell every agent.
+    pub to: Option<String>,
+    /// The project the message is about, when it is about one.
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HandoffArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// The repository or folder name the note is about, in lowercase.
+    pub project: String,
+    /// Where the work stands and what is left, for whoever continues.
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InboxArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Restrict to one project. Omit for every project.
+    pub project: Option<String>,
+    /// Also list the 20 latest messages you have already read.
+    pub include_read: Option<bool>,
 }
 
 #[tool_router]
@@ -590,7 +672,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Open the session for this chat and get the briefing: how to address the user, the language to reply in, the rules the user wants followed, other open sessions, and where the project was left off. Call this once at the very start of every new chat, before any other lore tool."
+        description = "Open the session for this chat and get the briefing: how to address the user, the language to reply in, the rules the user wants followed, notes left for whoever works on the project next, your unread messages, the open tasks, other open sessions, and where the project was left off. Call this once at the very start of every new chat, before any other lore tool."
     )]
     async fn hello(
         &self,
@@ -645,6 +727,39 @@ impl Lore {
             } else {
                 &session.agent
             };
+            // The open tasks show what is waiting; tasks meant for this
+            // agent come first.
+            let mut open_tasks = this
+                .db
+                .tasks(Some(&session.project), &["open", "claimed"], 100)
+                .map_err(internal)?;
+            open_tasks.sort_by_key(|task| task.assignee.as_str() != feed_agent);
+            open_tasks.truncate(10);
+            // Up to ten unread messages are listed and marked read, and
+            // handoff notes for whoever works on this project next arrive
+            // here, exactly once. Only what this call marked or delivered
+            // is shown, so a session opening at the same moment cannot show
+            // it too. Handoffs go last, with nothing that can fail after
+            // them: a delivered note cannot be fetched again, while a
+            // message marked read still shows in `inbox` with include_read.
+            let mut unread = this
+                .db
+                .unread_messages(feed_agent, None, 10)
+                .map_err(internal)?;
+            let ids: Vec<i64> = unread.iter().map(|message| message.id).collect();
+            let marked = this.db.mark_read(feed_agent, &ids).map_err(internal)?;
+            unread.retain(|message| marked.contains(&message.id));
+            let unread_more = this.db.unread_message_count(feed_agent).map_err(internal)?;
+            let mut handoffs = this
+                .db
+                .pending_handoffs(&session.project, &session.id)
+                .map_err(internal)?;
+            let ids: Vec<i64> = handoffs.iter().map(|message| message.id).collect();
+            let delivered = this
+                .db
+                .deliver_handoffs(&ids, feed_agent, &session.id)
+                .map_err(internal)?;
+            handoffs.retain(|message| delivered.contains(&message.id));
             this.note(
                 feed_agent,
                 "hello",
@@ -659,6 +774,13 @@ impl Lore {
                 &address,
                 &language,
                 &rules,
+                &BriefingBoard {
+                    handoffs: &handoffs,
+                    unread: &unread,
+                    unread_more: unread_more.max(0) as usize,
+                    agent: feed_agent,
+                    open_tasks: &open_tasks,
+                },
                 &other_rows,
                 &entries,
             ))
@@ -715,7 +837,17 @@ impl Lore {
                 &[],
                 &clipped,
             );
-            Ok(format!("Checked in on {}: {}", update.session_id, clipped))
+            let mut out = format!("Checked in on {}: {}", update.session_id, clipped);
+            // Only a hint, so the agent knows to look: reading them is what
+            // `inbox` is for.
+            let actor = session_agent(&agent, &session);
+            let unread = this.db.unread_message_count(actor).map_err(internal)?;
+            if unread > 0 {
+                out.push_str(&format!(
+                    "\nYou have {unread} unread message(s): call `inbox`."
+                ));
+            }
+            Ok(out)
         })
         .await
     }
@@ -750,6 +882,352 @@ impl Lore {
                 &clipped,
             );
             Ok(format!("Session {} closed: {}", closed.id, clipped))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Add a task to the shared to-do list of a project: work that should not be forgotten, or that another agent could pick up. Say exactly what needs doing."
+    )]
+    async fn task_add(
+        &self,
+        Parameters(args): Parameters<TaskAddArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let new = NewTask {
+                project: normalize_project(&args.project)?,
+                title: short_line("title", &args.title, TASK_TITLE_MAX_CHARS)?,
+                body: capped("body", args.body.as_deref(), BODY_MAX_CHARS)?,
+                assignee: args
+                    .assignee
+                    .as_deref()
+                    .map(|a| a.trim().to_lowercase())
+                    .unwrap_or_default(),
+                created_by: actor.to_string(),
+                session_id: Some(session.id.clone()),
+            };
+            let task = this.db.add_task(&new).map_err(internal)?;
+            this.note(
+                actor,
+                "task_add",
+                &task.project,
+                Some(&session.id),
+                None,
+                &[],
+                &format!("task #{}: {}", task.id, task.title),
+            );
+            Ok(format!(
+                "Task #{} added to `{}`: {}",
+                task.id, task.project, task.title
+            ))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Update a task on the shared to-do list. Call `tasks` to see the ids. Claim a task with `claim` before you start working on it, and mark it `done` (with the commit) when you finish. Also: `release` a task you are giving up, `cancel` one that is no longer needed, `reopen` one that was closed by mistake."
+    )]
+    async fn task_update(
+        &self,
+        Parameters(args): Parameters<TaskUpdateArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let action = args.action.trim().to_lowercase();
+            if !TASK_ACTIONS.contains(&action.as_str()) {
+                return Err(format!(
+                    "action must be one of: {}",
+                    TASK_ACTIONS.join(", ")
+                ));
+            }
+            let note = args
+                .note
+                .as_deref()
+                .map(|note| capped("note", Some(note), NOTE_MAX_CHARS))
+                .transpose()?
+                .filter(|note| !note.is_empty());
+            let commit = match args.commit.as_deref() {
+                None => None,
+                Some(commit) => Some(normalize_commit(commit)?),
+            };
+            let task = match this.db.update_task(
+                args.id,
+                &action,
+                actor,
+                note.as_deref(),
+                commit.as_deref(),
+            ) {
+                Ok(Some(task)) => task,
+                Ok(None) => return Err(format!("No task with id {}.", args.id)),
+                // A refused transition is an answer to the agent, not a
+                // server fault: it names the task's current status.
+                Err(error) => {
+                    tracing::warn!(%error, id = args.id, "task update refused");
+                    return Err(error.to_string());
+                }
+            };
+            let effect = match action.as_str() {
+                "claim" => "claimed".to_string(),
+                "release" => "released".to_string(),
+                "done" => {
+                    if task.done_commit.is_empty() {
+                        "marked done".to_string()
+                    } else {
+                        format!("marked done at {}", short(&task.done_commit))
+                    }
+                }
+                "cancel" => "cancelled".to_string(),
+                _ => "reopened".to_string(),
+            };
+            this.note(
+                actor,
+                "task_update",
+                &task.project,
+                Some(&session.id),
+                None,
+                &[],
+                &format!("task #{} {effect}", task.id),
+            );
+            Ok(format!("Task #{} {effect}.", task.id))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "List the tasks on the shared to-do list: open and claimed ones by default, or done, cancelled or all of them. Check this before starting work that may already be on the list."
+    )]
+    async fn tasks(
+        &self,
+        Parameters(args): Parameters<TasksArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let status = args.status.as_deref().map(|s| s.trim().to_lowercase());
+            let statuses: &[&str] = match status.as_deref() {
+                None | Some("") | Some("open") => &["open", "claimed"],
+                Some("done") => &["done"],
+                Some("cancelled") => &["cancelled"],
+                Some("all") => &[],
+                Some(other) => {
+                    return Err(format!(
+                        "status must be open, done, cancelled or all, not \"{other}\""
+                    ));
+                }
+            };
+            let word = match statuses {
+                ["open", "claimed"] => " open",
+                ["done"] => " done",
+                ["cancelled"] => " cancelled",
+                _ => "",
+            };
+            let limit = args.limit.unwrap_or(20).clamp(1, 100) as usize;
+            let project = normalize_project_filter(args.project);
+            let list = this
+                .db
+                .tasks(project.as_deref(), statuses, limit)
+                .map_err(internal)?;
+            this.note(
+                actor,
+                "tasks",
+                project.as_deref().unwrap_or(""),
+                Some(&session.id),
+                None,
+                &[],
+                &format!("{} tasks", list.len()),
+            );
+            if list.is_empty() {
+                let scope = project.map(|p| format!(" on `{p}`")).unwrap_or_default();
+                return Ok(format!("No{word} tasks{scope}."));
+            }
+            let scope = project.map(|p| format!(" on `{p}`")).unwrap_or_default();
+            let mut out = format!("{}{} tasks{scope}:\n", list.len(), word);
+            for task in &list {
+                out.push('\n');
+                out.push_str(&render_task(task));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Send a message to one other agent, or to every agent when `to` is omitted. Use it for anything another agent must know, even in a later session: they read their unread messages in `hello` and `inbox`."
+    )]
+    async fn send(
+        &self,
+        Parameters(args): Parameters<SendArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let to = args
+                .to
+                .as_deref()
+                .map(|to| to.trim().to_lowercase())
+                .filter(|to| !to.is_empty());
+            let project = normalize_project_filter(args.project);
+            let message = this
+                .db
+                .add_message(&NewMessage {
+                    kind: "message".to_string(),
+                    project: project.clone().unwrap_or_default(),
+                    from_agent: actor.to_string(),
+                    to_agent: to.clone().unwrap_or_default(),
+                    body: long_text("body", &args.body, BODY_MAX_CHARS)?,
+                    session_id: Some(session.id.clone()),
+                })
+                .map_err(internal)?;
+            this.note(
+                actor,
+                "send",
+                &message.project,
+                Some(&session.id),
+                None,
+                &[],
+                &format!("message #{}: {}", message.id, clip(&message.body, 90)),
+            );
+            Ok(match to {
+                Some(to) => format!("Message #{} sent to {}.", message.id, to),
+                None => format!("Message #{} sent to everyone.", message.id),
+            })
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Leave a handoff note for whoever works on this project next: where the work stands, what is done, what is left. It is delivered exactly once, to the next session on the project that is not this one."
+    )]
+    async fn handoff(
+        &self,
+        Parameters(args): Parameters<HandoffArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let project = normalize_project(&args.project)?;
+            let message = this
+                .db
+                .add_message(&NewMessage {
+                    kind: "handoff".to_string(),
+                    project: project.clone(),
+                    from_agent: actor.to_string(),
+                    to_agent: String::new(),
+                    body: long_text("body", &args.body, BODY_MAX_CHARS)?,
+                    session_id: Some(session.id.clone()),
+                })
+                .map_err(internal)?;
+            this.note(
+                actor,
+                "handoff",
+                &message.project,
+                Some(&session.id),
+                None,
+                &[],
+                &clip(&message.body, 90),
+            );
+            Ok(format!(
+                "Handoff note #{} left for the next session on `{}`.",
+                message.id, message.project
+            ))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Read the messages other agents sent you: the ones addressed to you and the ones sent to everyone. Returns up to 30 unread messages, newest first, and marks them read. With include_read it also lists the 20 latest ones you have already read."
+    )]
+    async fn inbox(
+        &self,
+        Parameters(args): Parameters<InboxArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let project = normalize_project_filter(args.project);
+            // The already-read list is taken before this call marks
+            // anything, so it holds only what was read earlier.
+            let mut read = Vec::new();
+            if args.include_read.unwrap_or(false) {
+                read = this
+                    .db
+                    .read_messages(actor, project.as_deref(), 20)
+                    .map_err(internal)?;
+            }
+            let mut unread = this
+                .db
+                .unread_messages(actor, project.as_deref(), 30)
+                .map_err(internal)?;
+            // Only what this call marked is shown as unread, so another
+            // session of the same agent reading at the same moment does not
+            // get the same messages as new too.
+            let ids: Vec<i64> = unread.iter().map(|message| message.id).collect();
+            let marked = this.db.mark_read(actor, &ids).map_err(internal)?;
+            unread.retain(|message| marked.contains(&message.id));
+            let scope = project
+                .as_deref()
+                .map(|p| format!(" about `{p}`"))
+                .unwrap_or_default();
+            let mut out = if unread.is_empty() {
+                format!("No unread messages{scope}.")
+            } else {
+                let mut out = format!("{} unread messages{scope}:\n", unread.len());
+                for message in &unread {
+                    out.push('\n');
+                    out.push_str(&render_message(message, BODY_MAX_CHARS));
+                }
+                out
+            };
+            if !read.is_empty() {
+                out.push_str("\n\nAlready read, newest first:\n");
+                for message in &read {
+                    out.push('\n');
+                    out.push_str(&render_message(message, BODY_MAX_CHARS));
+                }
+            }
+            this.note(
+                actor,
+                "inbox",
+                project.as_deref().unwrap_or(""),
+                Some(&session.id),
+                None,
+                &[],
+                &format!("{} unread, {} read", unread.len(), read.len()),
+            );
+            Ok(out)
         })
         .await
     }
@@ -852,14 +1330,115 @@ fn one_line(name: &str, value: &str) -> Result<String, String> {
     required(name, &flat)
 }
 
-/// The text `hello` returns: the session, the profile, the rules, the other
-/// open sessions and where the project was left off. A section that has
-/// nothing to say is left out entirely.
+/// The agent a session acts as: the one that opened it, or the token's
+/// agent when the session carries no name.
+fn session_agent<'a>(token_agent: &'a str, session: &'a Session) -> &'a str {
+    if session.agent.is_empty() {
+        token_agent
+    } else {
+        &session.agent
+    }
+}
+
+/// Required text with a length cap, flattened to a single line.
+fn short_line(name: &str, value: &str, max: usize) -> Result<String, String> {
+    let flat = one_line(name, value)?;
+    if flat.chars().count() > max {
+        return Err(format!("{name} must be at most {max} characters"));
+    }
+    Ok(flat)
+}
+
+/// Required text with a length cap, trimmed but otherwise as written.
+fn long_text(name: &str, value: &str, max: usize) -> Result<String, String> {
+    let value = required(name, value)?;
+    if value.chars().count() > max {
+        return Err(format!("{name} must be at most {max} characters"));
+    }
+    Ok(value)
+}
+
+/// Optional text with a length cap, trimmed; empty stays empty.
+fn capped(name: &str, value: Option<&str>, max: usize) -> Result<String, String> {
+    let value = value.unwrap_or("").trim();
+    if value.chars().count() > max {
+        return Err(format!("{name} must be at most {max} characters"));
+    }
+    Ok(value.to_string())
+}
+
+/// One task as `tasks` lists it: the id, the status, the title, the project
+/// and the creator, who holds or finished it where that applies, then the
+/// body and the latest note.
+fn render_task(task: &Task) -> String {
+    let mut out = format!(
+        "#{} [{}] {} · {} · by {}",
+        task.id, task.status, task.title, task.project, task.created_by
+    );
+    if !task.claimed_by.is_empty() {
+        out.push_str(&format!(" → claimed by {}", task.claimed_by));
+    }
+    if !task.assignee.is_empty() {
+        out.push_str(&format!(" → for {}", task.assignee));
+    }
+    if !task.done_by.is_empty() {
+        out.push_str(&format!(" → done by {}", task.done_by));
+        if !task.done_commit.is_empty() {
+            out.push_str(&format!(" at {}", short(&task.done_commit)));
+        }
+    }
+    out.push('\n');
+    if !task.body.is_empty() {
+        out.push_str(&clip(&task.body, 300));
+        out.push('\n');
+    }
+    if !task.note.is_empty() {
+        out.push_str(&format!("note: {}", task.note));
+        out.push('\n');
+    }
+    out
+}
+
+/// One message as `inbox` lists it. `body_clip` caps the body.
+fn render_message(message: &Message, body_clip: usize) -> String {
+    let addressed = if message.to_agent.is_empty() {
+        "to everyone"
+    } else {
+        "to you"
+    };
+    let mut line = format!("#{} from {} [{addressed}]", message.id, message.from_agent);
+    if !message.project.is_empty() {
+        line.push_str(&format!(" · {}", message.project));
+    }
+    line.push_str(&format!(" · {}:", message.created_at));
+    let mut out = line;
+    out.push('\n');
+    out.push_str(&clip(&message.body, body_clip));
+    out.push('\n');
+    out
+}
+
+/// The board sections of the `hello` briefing: the handoff notes delivered
+/// with it, the messages it marks read, and the open tasks of the project.
+struct BriefingBoard<'a> {
+    handoffs: &'a [Message],
+    unread: &'a [Message],
+    /// Unread messages beyond the ten listed.
+    unread_more: usize,
+    /// The agent the briefing is for, to mark the tasks meant for it.
+    agent: &'a str,
+    open_tasks: &'a [Task],
+}
+
+/// The text `hello` returns: the session, the profile, the rules, the board,
+/// the other open sessions and where the project was left off. A section
+/// that has nothing to say is left out entirely.
 fn briefing(
     session: &Session,
     address: &str,
     language: &str,
     rules: &[Rule],
+    board: &BriefingBoard<'_>,
     others: &[(Session, Option<String>)],
     entries: &[Entry],
 ) -> String {
@@ -887,6 +1466,65 @@ fn briefing(
         let mut lines = vec!["Rules the user wants followed:".to_string()];
         for (index, rule) in rules.iter().enumerate() {
             lines.push(format!("{}. {}", index + 1, rule.body));
+        }
+        sections.push(lines.join("\n"));
+    }
+    if !board.handoffs.is_empty() {
+        let mut lines = vec![format!(
+            "Notes left for whoever works on {} next:",
+            session.project
+        )];
+        for note in board.handoffs {
+            lines.push(format!(
+                "- from {} · {}: {}",
+                note.from_agent, note.created_at, note.body
+            ));
+        }
+        sections.push(lines.join("\n"));
+    }
+    if !board.unread.is_empty() {
+        let mut lines = vec!["Unread messages:".to_string()];
+        for message in board.unread {
+            let addressed = if message.to_agent.is_empty() {
+                "to everyone"
+            } else {
+                "to you"
+            };
+            let mut line = format!(
+                "- #{} from {} [{addressed}]",
+                message.id, message.from_agent
+            );
+            if !message.project.is_empty() {
+                line.push_str(&format!(" · {}", message.project));
+            }
+            line.push_str(&format!(
+                " · {}: {}",
+                message.created_at,
+                clip(&message.body, 400)
+            ));
+            lines.push(line);
+        }
+        if board.unread_more > 0 {
+            lines.push(format!(
+                "  (… and {} more: call `inbox`)",
+                board.unread_more
+            ));
+        }
+        sections.push(lines.join("\n"));
+    }
+    if !board.open_tasks.is_empty() {
+        let mut lines = vec![format!("Open tasks on {}:", session.project)];
+        for task in board.open_tasks {
+            let status = if task.status == "claimed" {
+                format!("claimed by {}", task.claimed_by)
+            } else {
+                "open".to_string()
+            };
+            let mut line = format!("- #{} [{}] {}", task.id, status, task.title);
+            if !board.agent.is_empty() && task.assignee == board.agent {
+                line.push_str(" (for you)");
+            }
+            lines.push(line);
         }
         sections.push(lines.join("\n"));
     }
@@ -926,8 +1564,9 @@ fn briefing(
     }
     sections.push(
         "Keep this session current: call `checkin` when you finish a meaningful step, and \
-         `bye` with a short summary before the chat ends. This briefing is given once per \
-         chat; it is not repeated on later calls."
+         `bye` with a short summary before the chat ends. Use `tasks`/`task_update` for the \
+         shared to-do list, `send` to talk to other agents, and `handoff` to leave a note for \
+         the next one. This briefing is given once per chat; it is not repeated on later calls."
             .to_string(),
     );
     sections.join("\n\n")

@@ -491,6 +491,101 @@ button:focus-visible, [tabindex]:focus-visible {
 }
 .profile button.danger:hover { background: rgba(255, 122, 144, 0.2); }
 
+/* The Board panel: tasks, messages and handoff notes. The head and the
+   filters stay put; the forms and the lists scroll inside the panel. */
+.board {
+  position: fixed; right: 16px; top: 60px; z-index: 6;
+  width: min(640px, calc(100vw - 32px));
+  max-height: calc(100vh - 76px);
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 16px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--panel-solid), var(--panel-solid)) padding-box,
+    linear-gradient(140deg, rgba(111, 182, 255, 0.5), rgba(199, 155, 255, 0.16) 38%, rgba(255, 255, 255, 0.05) 70%) border-box;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.65);
+}
+.board-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.board-tabs { display: inline-flex; gap: 2px; padding: 3px; border-radius: 11px; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--line); }
+.board-tab {
+  background: transparent; border: 0; color: var(--muted); font-weight: 500;
+  padding: 5px 14px; border-radius: 8px; font-size: 13px;
+}
+.board-tab:hover { color: var(--text); }
+.board-tab.active { background: rgba(111, 182, 255, 0.16); color: var(--text); }
+.board-filters { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.board-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.board-chips button {
+  background: rgba(255, 255, 255, 0.05); color: var(--text); font-weight: 500; font-size: 12px;
+  padding: 3px 11px; border-radius: 999px;
+}
+.board-chips button b { color: var(--muted); font-weight: 500; font-family: var(--mono); margin-left: 6px; }
+.board-chips button.active { background: rgba(111, 182, 255, 0.16); border-color: rgba(111, 182, 255, 0.45); }
+#board-project { padding: 5px 9px; font-size: 13px; margin-left: auto; max-width: 220px; }
+#board-status { margin: 0; min-height: 1.4em; color: var(--muted); }
+#board-status:empty { display: none; }
+#board-status.ok { color: var(--ok); }
+#board-status.bad { color: var(--danger); }
+.board-scroll {
+  min-height: 0; overflow-y: auto; margin: 0 -6px; padding: 0 6px 2px;
+  scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+.board-scroll section { display: grid; gap: 12px; }
+
+.board-form { display: grid; gap: 8px; padding: 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.04); }
+.board-form h4 {
+  margin: 0; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.1em; color: var(--muted); font-weight: 600;
+}
+.board-form-row { display: grid; grid-template-columns: 1fr 180px; gap: 8px; }
+.board-form-row.three { grid-template-columns: 150px 160px 1fr; }
+.board-form-row.three:has(#message-to-field[hidden]) { grid-template-columns: 150px 1fr; }
+.board-field { display: grid; gap: 4px; font-size: 12px; color: var(--muted); min-width: 0; }
+.board-field input[type="text"], .board-field select { width: 100%; padding: 7px 9px; font-size: 13px; color: var(--text); }
+.board-field textarea { padding: 8px 10px; font-size: 13px; color: var(--text); min-height: 58px; }
+.board-form-actions { display: flex; justify-content: flex-end; }
+
+.board-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.board-list .none { color: var(--muted); font-size: 13px; padding: 6px 2px; }
+.board-item {
+  display: grid; gap: 4px; padding: 10px 12px; border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04); border: 1px solid transparent;
+  overflow-wrap: anywhere;
+}
+.board-item.claimed { border-color: rgba(230, 193, 90, 0.22); }
+.board-item.done, .board-item.cancelled { opacity: 0.74; }
+.board-item.handoff { border-color: rgba(199, 155, 255, 0.2); }
+.board-item-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.board-item-head .pill { margin-left: 0; flex: none; }
+.board-title { font-weight: 600; min-width: 0; flex: 1; }
+.board-item.cancelled .board-title { text-decoration: line-through; text-decoration-color: rgba(138, 148, 173, 0.7); }
+.board-id { font-family: var(--mono); font-size: 11px; color: var(--muted); flex: none; }
+.board-meta { font-size: 12px; color: var(--muted); }
+.board-body { margin: 2px 0 0; white-space: pre-wrap; font-size: 13px; line-height: 1.55; color: #cfd8ec; }
+.board-note { margin: 0; font-size: 12px; color: var(--warn); white-space: pre-wrap; }
+.board-foot { font-size: 12px; color: var(--ok); }
+.board-foot.waiting { color: var(--muted); font-style: italic; }
+.board-actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; margin-top: 2px; }
+.board button.danger {
+  background: rgba(255, 122, 144, 0.12);
+  border-color: rgba(255, 122, 144, 0.4);
+  color: var(--danger);
+}
+.board button.danger:hover { background: rgba(255, 122, 144, 0.2); }
+
+/* Board status pills, next to the open/closed ones of the sessions */
+.pill.claimed { color: var(--warn); }
+.pill.done { color: var(--accent); }
+.pill.cancelled { color: var(--muted); }
+.pill.message { color: var(--accent); }
+.pill.handoff { color: var(--violet); }
+
+@media (max-width: 760px) {
+  .board-form-row, .board-form-row.three, .board-form-row.three:has(#message-to-field[hidden]) { grid-template-columns: 1fr; }
+  #board-project { margin-left: 0; max-width: none; }
+}
+
 .tooltip {
   position: fixed; z-index: 5; pointer-events: none;
   max-width: 300px; padding: 8px 11px;

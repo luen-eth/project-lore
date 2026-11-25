@@ -28,7 +28,7 @@ use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
 use crate::{
     auth::{RateLimiter, client_ip, too_many_requests},
-    db::{Backup, Db, ProfileInput, Rule, RuleInput, Session},
+    db::{Backup, Db, Message, NewMessage, NewTask, ProfileInput, Rule, RuleInput, Session, Task},
     embed::Embedder,
     events::Events,
 };
@@ -162,12 +162,14 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/admin/api/profile", get(profile))
         .route("/admin/api/sessions", get(sessions))
         .route("/admin/api/sessions/{id}", get(session_detail))
+        .route("/admin/api/board", get(board))
         .layer(middleware::from_fn_with_state(
             admin.clone(),
             require_session,
         ));
-    // Backups carry the whole store and profile edits change what every
-    // agent is told, so only the admin role reaches them.
+    // Backups carry the whole store, profile edits change what every
+    // agent is told, and board writes speak for the administrator, so only
+    // the admin role reaches them.
     let admin_only = Router::new()
         .route("/admin/api/export", get(export))
         .route(
@@ -187,6 +189,18 @@ pub fn router(admin: Arc<Admin>) -> Router {
             put(save_rule)
                 .layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
                 .delete(delete_rule),
+        )
+        .route(
+            "/admin/api/tasks",
+            post(add_task).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/tasks/{id}",
+            put(update_task).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/messages",
+            post(add_message).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
         )
         .layer(middleware::from_fn_with_state(admin.clone(), require_admin));
 
@@ -402,6 +416,7 @@ async fn brain(State(admin): State<Arc<Admin>>) -> Response {
             "agents": state.db.agents(&state.configured_agents)?,
             "activity": state.db.activity(FEED_LENGTH)?,
             "open_sessions": state.db.open_session_count()?,
+            "open_tasks": state.db.board_counts()?.open_tasks,
             "brain": brain,
         }))
     })
@@ -418,6 +433,7 @@ async fn pulse(State(admin): State<Arc<Admin>>) -> Response {
             "version": state.db.version()?,
             "agents": state.db.agents(&state.configured_agents)?,
             "open_sessions": state.db.open_session_count()?,
+            "open_tasks": state.db.board_counts()?.open_tasks,
         }))
     })
     .await;
@@ -735,6 +751,201 @@ async fn session_detail(State(admin): State<Arc<Admin>>, Path(id): Path<String>)
 }
 
 #[derive(Deserialize)]
+struct BoardQuery {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// The shared board: every task, the latest messages and the totals, for
+/// the Board panel. Any signed-in role can read it.
+async fn board(State(admin): State<Arc<Admin>>, Query(query): Query<BoardQuery>) -> Response {
+    let project = query
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|project| !project.is_empty())
+        .map(str::to_lowercase);
+    let limit = query.limit.unwrap_or(100).clamp(1, 300) as usize;
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let project = project.as_deref();
+        let tasks = state.db.tasks(project, &[], limit)?;
+        let messages = state.db.messages(project, 100)?;
+        let counts = state.db.board_counts()?;
+        Ok(json!({ "tasks": tasks, "messages": messages, "counts": counts }))
+    })
+    .await;
+    respond(result)
+}
+
+#[derive(Deserialize)]
+struct TaskForm {
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    assignee: String,
+}
+
+/// Adds a task as the admin. The created task is returned.
+async fn add_task(State(admin): State<Arc<Admin>>, Json(form): Json<TaskForm>) -> Response {
+    let input = NewTask {
+        project: form.project,
+        title: form.title,
+        body: form.body,
+        assignee: form.assignee,
+        created_by: ADMIN_ACTOR.into(),
+        session_id: None,
+    };
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Task> {
+        let task = state.db.add_task(&input)?;
+        let summary = format!("task #{}: {}", task.id, task.title);
+        if let Ok(activity) = state.db.record_activity(
+            ADMIN_ACTOR,
+            "task_add",
+            &task.project,
+            None,
+            None,
+            &[],
+            &summary,
+        ) {
+            state.events.publish(activity);
+        }
+        Ok(task)
+    })
+    .await;
+    match result {
+        Ok(Ok(task)) => Json(task).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "adding a task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TaskUpdateForm {
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// Moves one task along its life cycle as the admin, who may release or
+/// reopen any task.
+async fn update_task(
+    State(admin): State<Arc<Admin>>,
+    Path(id): Path<i64>,
+    Json(form): Json<TaskUpdateForm>,
+) -> Response {
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Task>> {
+        let note = form.note.trim();
+        let note = (!note.is_empty()).then(|| note.to_string());
+        let Some(task) =
+            state
+                .db
+                .update_task(id, &form.action, ADMIN_ACTOR, note.as_deref(), None)?
+        else {
+            return Ok(None);
+        };
+        let summary = format!("task #{} {}", task.id, form.action);
+        if let Ok(activity) = state.db.record_activity(
+            ADMIN_ACTOR,
+            "task_update",
+            &task.project,
+            None,
+            None,
+            &[],
+            &summary,
+        ) {
+            state.events.publish(activity);
+        }
+        Ok(Some(task))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(task))) => Json(task).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "updating a task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MessageForm {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    body: String,
+}
+
+/// Adds a message or a handoff note as the admin. The message that was
+/// written is returned.
+async fn add_message(State(admin): State<Arc<Admin>>, Json(form): Json<MessageForm>) -> Response {
+    let input = NewMessage {
+        kind: form.kind,
+        project: form.project,
+        from_agent: ADMIN_ACTOR.into(),
+        to_agent: form.to,
+        body: form.body,
+        session_id: None,
+    };
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Message> {
+        let message = state.db.add_message(&input)?;
+        let (tool, summary) = if message.kind == "handoff" {
+            (
+                "handoff",
+                format!("handoff note #{} for {}", message.id, message.project),
+            )
+        } else {
+            let to = if message.to_agent.is_empty() {
+                "everyone"
+            } else {
+                &message.to_agent
+            };
+            ("send", format!("message #{} to {}", message.id, to))
+        };
+        if let Ok(activity) = state.db.record_activity(
+            ADMIN_ACTOR,
+            tool,
+            &message.project,
+            None,
+            None,
+            &[],
+            &summary,
+        ) {
+            state.events.publish(activity);
+        }
+        Ok(message)
+    })
+    .await;
+    match result {
+        Ok(Ok(message)) => Json(message).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "adding a message failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct RuleForm {
     #[serde(default)]
     scope: String,
@@ -939,7 +1150,12 @@ mod tests {
     /// Serves the admin router on a free local port with one admin and one
     /// viewer session already signed in.
     async fn serve() -> (String, Arc<Admin>) {
-        let dir = std::env::temp_dir().join(format!("lore-admin-test-{}", std::process::id()));
+        // The thread id keeps parallel tests off each other's database.
+        let dir = std::env::temp_dir().join(format!(
+            "lore-admin-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         let db = Db::open(&dir.join("lore.db")).unwrap();
         let admin = Arc::new(Admin::new(
@@ -1084,5 +1300,199 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), 413);
+    }
+
+    #[tokio::test]
+    async fn board_reads_and_writes_follow_the_roles() {
+        let (base, _admin) = serve().await;
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: String, token: Option<&str>| {
+            let mut request = client.request(method, format!("{base}{path}"));
+            if let Some(token) = token {
+                request = request.header(header::COOKIE, format!("{COOKIE}={token}"));
+            }
+            request
+        };
+        let task =
+            json!({ "project": "Shop", "title": "Fix checkout", "body": "b", "assignee": "" });
+        let message = json!({ "kind": "message", "project": "shop", "to": "", "body": "hello" });
+        let handoff = json!({ "kind": "handoff", "project": "shop", "body": "half done" });
+
+        // Reads: any signed-in role, nobody else.
+        let status = call(reqwest::Method::GET, "/admin/api/board".into(), None)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 401);
+        let response = call(
+            reqwest::Method::GET,
+            "/admin/api/board".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let board: serde_json::Value = response.json().await.unwrap();
+        assert!(board["tasks"].as_array().unwrap().is_empty());
+        assert!(board["messages"].as_array().unwrap().is_empty());
+        assert_eq!(board["counts"]["open_tasks"], 0);
+
+        // Writes: the viewer is refused, nobody else is not even signed in.
+        for token in [None, Some("viewer-token")] {
+            let expected = if token.is_some() { 403 } else { 401 };
+            for request in [
+                call(reqwest::Method::POST, "/admin/api/tasks".into(), token).json(&task),
+                call(reqwest::Method::PUT, "/admin/api/tasks/1".into(), token)
+                    .json(&json!({ "action": "done", "note": "" })),
+                call(reqwest::Method::POST, "/admin/api/messages".into(), token).json(&message),
+            ] {
+                assert_eq!(request.send().await.unwrap().status(), expected);
+            }
+        }
+
+        // The admin writes a task, and every write lands in the activity
+        // feed under the admin's name.
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/tasks".into(),
+            Some("admin-token"),
+        )
+        .json(&task)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let created: serde_json::Value = response.json().await.unwrap();
+        let id = created["id"].as_i64().unwrap();
+        assert_eq!(created["status"], "open");
+        assert_eq!(created["created_by"], "admin");
+        assert_eq!(created["project"], "shop");
+
+        // The admin moves the task along; ids that do not exist and
+        // actions that do not apply are refused.
+        let response = call(
+            reqwest::Method::PUT,
+            format!("/admin/api/tasks/{id}"),
+            Some("admin-token"),
+        )
+        .json(&json!({ "action": "done", "note": "shipped" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let done: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(done["status"], "done");
+        assert_eq!(done["done_by"], "admin");
+        assert_eq!(done["note"], "shipped");
+        let response = call(
+            reqwest::Method::PUT,
+            format!("/admin/api/tasks/{id}"),
+            Some("admin-token"),
+        )
+        .json(&json!({ "action": "done", "note": "" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        let response = call(
+            reqwest::Method::PUT,
+            format!("/admin/api/tasks/{id}"),
+            Some("admin-token"),
+        )
+        .json(&json!({ "action": "reopen", "note": "" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let response = call(
+            reqwest::Method::PUT,
+            format!("/admin/api/tasks/{id}"),
+            Some("admin-token"),
+        )
+        .json(&json!({ "action": "fly", "note": "" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/tasks/999".into(),
+            Some("admin-token"),
+        )
+        .json(&json!({ "action": "done", "note": "" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 404);
+
+        // Messages: a handoff without a project is refused.
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/messages".into(),
+            Some("admin-token"),
+        )
+        .json(&message)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let sent: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(sent["from_agent"], "admin");
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/messages".into(),
+            Some("admin-token"),
+        )
+        .json(&json!({ "kind": "handoff", "project": "", "body": "x" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/messages".into(),
+            Some("admin-token"),
+        )
+        .json(&handoff)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // The viewer reads what the admin wrote, with the readers of each
+        // message and the task totals.
+        let response = call(
+            reqwest::Method::GET,
+            "/admin/api/board?project=shop".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let board: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(board["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(board["counts"]["open_tasks"], 1);
+        let messages = board["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["read_by"].as_array().is_some())
+        );
+
+        // The pulse payload carries the open task count too.
+        let response = call(
+            reqwest::Method::GET,
+            "/admin/api/pulse".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        let pulse: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(pulse["open_tasks"], 1);
     }
 }

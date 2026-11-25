@@ -50,6 +50,7 @@
       <input id="search" type="search" placeholder="Search memories" aria-label="Search memories" spellcheck="false">
       <button id="side-toggle" class="ghost only-narrow" type="button" aria-expanded="false">Overview</button>
       <button id="feed-toggle" class="ghost only-medium" type="button" aria-expanded="false">Activity</button>
+      <button id="board-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="board">Board</button>
       <button id="profile-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="profile">Profile</button>
       <button id="backup-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="backup">Backup</button>
       <button id="logout" class="ghost" type="button">Sign out</button>
@@ -62,7 +63,8 @@
       <div class="stat"><b id="stat-links">0</b><span>Links</span></div>
       <div class="stat"><b id="stat-projects">0</b><span>Projects</span></div>
       <div class="stat"><b id="stat-online">0</b><span>Agents active</span></div>
-      <div class="stat span"><b id="stat-sessions">0</b><span>Open sessions</span></div>
+      <div class="stat"><b id="stat-tasks">0</b><span>Open tasks</span></div>
+      <div class="stat"><b id="stat-sessions">0</b><span>Open sessions</span></div>
     </section>
     <section class="panel">
       <h2>Connected models</h2>
@@ -121,6 +123,73 @@
     <h4>Rules the agents must follow</h4>
     <div id="profile-rules" class="profile-rules"></div>
     <button id="profile-add-rule" class="ghost" type="button">Add rule</button>
+  </div>
+
+  <div id="board" class="board" hidden>
+    <div class="board-head">
+      <h2>Board</h2>
+      <div class="board-tabs" role="tablist" aria-label="Board sections">
+        <button id="board-tab-tasks" class="board-tab active" type="button" role="tab" aria-selected="true" aria-controls="board-tasks">Tasks</button>
+        <button id="board-tab-messages" class="board-tab" type="button" role="tab" aria-selected="false" aria-controls="board-messages">Messages</button>
+      </div>
+    </div>
+    <div class="board-filters">
+      <div id="board-chips" class="board-chips" aria-label="Task status"></div>
+      <select id="board-project" aria-label="Project"></select>
+    </div>
+    <p id="board-status" class="small-text" role="status"></p>
+    <div class="board-scroll">
+      <section id="board-tasks" role="tabpanel" aria-labelledby="board-tab-tasks">
+        <form id="task-form" class="board-form" autocomplete="off" hidden>
+          <h4>New task</h4>
+          <div class="board-form-row">
+            <label class="board-field"><span>Project</span>
+              <input id="task-project" type="text" maxlength="100" list="board-projects" placeholder="project-lore" required spellcheck="false">
+            </label>
+            <label class="board-field"><span>For</span>
+              <select id="task-assignee"></select>
+            </label>
+          </div>
+          <label class="board-field"><span>Title</span>
+            <input id="task-title" type="text" maxlength="200" placeholder="What needs doing, in one line" required>
+          </label>
+          <label class="board-field"><span>Details</span>
+            <textarea id="task-body" maxlength="4000" placeholder="Optional: what exactly the task involves"></textarea>
+          </label>
+          <div class="board-form-actions">
+            <button id="task-submit" class="ghost small" type="submit">Add task</button>
+          </div>
+        </form>
+        <ul id="task-list" class="board-list"></ul>
+      </section>
+      <section id="board-messages" role="tabpanel" aria-labelledby="board-tab-messages" hidden>
+        <form id="message-form" class="board-form" autocomplete="off" hidden>
+          <h4>New message</h4>
+          <div class="board-form-row three">
+            <label class="board-field"><span>Kind</span>
+              <select id="message-kind">
+                <option value="message">Message</option>
+                <option value="handoff">Handoff note</option>
+              </select>
+            </label>
+            <label id="message-to-field" class="board-field"><span>To</span>
+              <select id="message-to"></select>
+            </label>
+            <label class="board-field"><span id="message-project-label">Project (optional)</span>
+              <input id="message-project" type="text" maxlength="100" list="board-projects" spellcheck="false">
+            </label>
+          </div>
+          <label class="board-field"><span>Message</span>
+            <textarea id="message-body" maxlength="4000" placeholder="What the agents must know" required></textarea>
+          </label>
+          <div class="board-form-actions">
+            <button id="message-submit" class="ghost small" type="submit">Send</button>
+          </div>
+        </form>
+        <ul id="message-list" class="board-list"></ul>
+      </section>
+    </div>
+    <datalist id="board-projects"></datalist>
   </div>
 
   <aside id="detail" class="detail" hidden>

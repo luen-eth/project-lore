@@ -1,5 +1,6 @@
 //! SQLite storage: entries, chat sessions, the user profile and rules, the
-//! full-text index, and embedding blobs.
+//! shared board of tasks and messages, the full-text index, and embedding
+//! blobs.
 
 use std::{
     collections::HashMap,
@@ -98,6 +99,45 @@ CREATE TABLE IF NOT EXISTS rules (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project     TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'open',
+    assignee    TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL,
+    claimed_by  TEXT NOT NULL DEFAULT '',
+    done_by     TEXT NOT NULL DEFAULT '',
+    done_commit TEXT NOT NULL DEFAULT '',
+    note        TEXT NOT NULL DEFAULT '',
+    session_id  TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    done_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS tasks_project_status ON tasks (project, status);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT NOT NULL,
+    project      TEXT NOT NULL DEFAULT '',
+    from_agent   TEXT NOT NULL,
+    to_agent     TEXT NOT NULL DEFAULT '',
+    body         TEXT NOT NULL,
+    session_id   TEXT,
+    created_at   TEXT NOT NULL,
+    delivered_to TEXT NOT NULL DEFAULT '',
+    delivered_session TEXT,
+    delivered_at TEXT
+);
+CREATE TABLE IF NOT EXISTS message_reads (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    agent      TEXT NOT NULL,
+    read_at    TEXT NOT NULL,
+    PRIMARY KEY (message_id, agent)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5 (
     title, body, tags, files,
     content = 'entries', content_rowid = 'id',
@@ -136,6 +176,31 @@ const RULE_ORDER: &str =
 
 /// Longest rule body accepted.
 const RULE_BODY_MAX_CHARS: usize = 2000;
+
+/// The columns of a task row, in the order `Task::from_row` reads them.
+const TASK_COLUMNS: &str = "id, project, title, body, status, assignee, created_by, \
+                            claimed_by, done_by, done_commit, note, session_id, \
+                            created_at, updated_at, done_at";
+
+/// The columns of a message row, in the order `Message::from_row` reads them.
+const MESSAGE_COLUMNS: &str = "id, kind, project, from_agent, to_agent, body, session_id, \
+                               created_at, delivered_to, delivered_session, delivered_at";
+
+/// Task statuses: open, claimed, done or cancelled.
+pub const TASK_STATUSES: &[&str] = &["open", "claimed", "done", "cancelled"];
+
+/// The actions a task update can take.
+pub const TASK_ACTIONS: &[&str] = &["claim", "release", "done", "cancel", "reopen"];
+
+/// Message kinds: a message to agents, or a handoff note for a project.
+pub const MESSAGE_KINDS: &[&str] = &["message", "handoff"];
+
+/// Longest task title accepted.
+pub const TASK_TITLE_MAX_CHARS: usize = 200;
+/// Longest task or message body accepted.
+pub const BODY_MAX_CHARS: usize = 4000;
+/// Longest task status note accepted.
+pub const NOTE_MAX_CHARS: usize = 1000;
 
 /// Columns added after the first release, as (table, name, definition).
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
@@ -449,6 +514,163 @@ pub struct RuleInput {
     pub position: i64,
 }
 
+/// One task on the shared to-do list of a project.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Task {
+    pub id: i64,
+    pub project: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    /// One of: open, claimed, done, cancelled.
+    pub status: String,
+    /// The agent the task is meant for; empty for anyone.
+    #[serde(default)]
+    pub assignee: String,
+    /// The agent that added it, or "admin".
+    pub created_by: String,
+    #[serde(default)]
+    pub claimed_by: String,
+    #[serde(default)]
+    pub done_by: String,
+    /// The commit the work was finished at, when there was one.
+    #[serde(default)]
+    pub done_commit: String,
+    /// The latest status note.
+    #[serde(default)]
+    pub note: String,
+    /// The session that created it, when there was one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Set when the task was marked done.
+    #[serde(default)]
+    pub done_at: Option<String>,
+}
+
+impl Task {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            project: row.get(1)?,
+            title: row.get(2)?,
+            body: row.get(3)?,
+            status: row.get(4)?,
+            assignee: row.get(5)?,
+            created_by: row.get(6)?,
+            claimed_by: row.get(7)?,
+            done_by: row.get(8)?,
+            done_commit: row.get(9)?,
+            note: row.get(10)?,
+            session_id: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
+            done_at: row.get(14)?,
+        })
+    }
+}
+
+/// A task as it is created; the id and the times are assigned here.
+#[derive(Debug, Default)]
+pub struct NewTask {
+    pub project: String,
+    pub title: String,
+    pub body: String,
+    /// The agent the task is meant for; empty for anyone.
+    pub assignee: String,
+    /// The agent that adds it, or "admin".
+    pub created_by: String,
+    /// The chat session it was added in, when there is one.
+    pub session_id: Option<String>,
+}
+
+/// One message between agents, or one handoff note for a project.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Message {
+    pub id: i64,
+    /// One of: message, handoff.
+    pub kind: String,
+    /// Required for a handoff; optional for a message.
+    #[serde(default)]
+    pub project: String,
+    /// The agent that wrote it, or "admin".
+    pub from_agent: String,
+    /// Empty for a message to everyone; always empty for a handoff.
+    #[serde(default)]
+    pub to_agent: String,
+    pub body: String,
+    /// The session that wrote it, when there was one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub created_at: String,
+    /// Handoff only: the agent that received it.
+    #[serde(default)]
+    pub delivered_to: String,
+    /// Handoff only: the session that received it.
+    #[serde(default)]
+    pub delivered_session: Option<String>,
+    /// Handoff only: when it was delivered.
+    #[serde(default)]
+    pub delivered_at: Option<String>,
+}
+
+impl Message {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            project: row.get(2)?,
+            from_agent: row.get(3)?,
+            to_agent: row.get(4)?,
+            body: row.get(5)?,
+            session_id: row.get(6)?,
+            created_at: row.get(7)?,
+            delivered_to: row.get(8)?,
+            delivered_session: row.get(9)?,
+            delivered_at: row.get(10)?,
+        })
+    }
+}
+
+/// A message as it is written; the id and the time are assigned here.
+#[derive(Debug, Default)]
+pub struct NewMessage {
+    /// One of: message, handoff.
+    pub kind: String,
+    pub project: String,
+    pub from_agent: String,
+    /// Empty for a message to everyone; always empty for a handoff.
+    pub to_agent: String,
+    pub body: String,
+    /// The chat session it was written in, when there is one.
+    pub session_id: Option<String>,
+}
+
+/// Who has read one message.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MessageRead {
+    pub message_id: i64,
+    pub agent: String,
+    pub read_at: String,
+}
+
+/// A message as the admin board draws it: the row and its readers.
+#[derive(Debug, serde::Serialize)]
+pub struct BoardMessage {
+    #[serde(flatten)]
+    pub message: Message,
+    /// The agents that have read it; empty for a handoff.
+    pub read_by: Vec<String>,
+}
+
+/// The board totals the admin stats show.
+#[derive(Debug, serde::Serialize)]
+pub struct BoardCounts {
+    pub open_tasks: i64,
+    pub claimed_tasks: i64,
+}
+
 /// Everything in the store: entries, their embedding vectors, the activity
 /// log and the agent records. Restoring it reproduces the store exactly.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -480,11 +702,20 @@ pub struct Backup {
     /// The rules the user wants followed.
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// The shared to-do list.
+    #[serde(default)]
+    pub tasks: Vec<Task>,
+    /// The messages and handoff notes.
+    #[serde(default)]
+    pub messages: Vec<Message>,
+    /// Who has read which message.
+    #[serde(default)]
+    pub message_reads: Vec<MessageRead>,
 }
 
 /// Backup versions this build can read. Version 1 had no embeddings; version
-/// 2 had no sessions, profile or rules.
-const BACKUP_VERSIONS: std::ops::RangeInclusive<u32> = 1..=3;
+/// 2 had no sessions, profile or rules; version 3 had no board.
+const BACKUP_VERSIONS: std::ops::RangeInclusive<u32> = 1..=4;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BackupAgent {
@@ -777,9 +1008,38 @@ impl Db {
         };
         let profile = self.profile()?;
         let rules = self.rules()?;
+        let tasks = {
+            let conn = self.lock();
+            let sql = format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY id");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], Task::from_row)?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        // Messages and their read marks are read under one lock: a mark for
+        // a message written in between would make the backup fail its own
+        // validation on restore.
+        let (messages, message_reads) = {
+            let conn = self.lock();
+            let sql = format!("SELECT {MESSAGE_COLUMNS} FROM messages ORDER BY id");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], Message::from_row)?;
+            let messages: Vec<Message> = rows.collect::<rusqlite::Result<_>>()?;
+            let mut stmt = conn.prepare(
+                "SELECT message_id, agent, read_at FROM message_reads ORDER BY message_id, agent",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(MessageRead {
+                    message_id: row.get(0)?,
+                    agent: row.get(1)?,
+                    read_at: row.get(2)?,
+                })
+            })?;
+            let message_reads: Vec<MessageRead> = rows.collect::<rusqlite::Result<_>>()?;
+            (messages, message_reads)
+        };
         Ok(Backup {
             format: BACKUP_FORMAT.to_string(),
-            version: 3,
+            version: 4,
             exported_at,
             entries,
             activity,
@@ -790,13 +1050,17 @@ impl Db {
             session_updates,
             profile,
             rules,
+            tasks,
+            messages,
+            message_reads,
         })
     }
 
     /// Replaces the whole store with a backup, keeping entry ids. All or
     /// nothing: on any error the previous contents stay in place. A backup
     /// older than version 3 leaves the sessions, the profile and the rules
-    /// as they are, since it has none to put in their place.
+    /// as they are; one older than version 4 also leaves the tasks, the
+    /// messages and the read marks, since it has none to put in their place.
     pub fn restore(&self, backup: &Backup) -> Result<usize> {
         validate_backup(backup)?;
         let mut conn = self.lock();
@@ -807,14 +1071,22 @@ impl Db {
              DELETE FROM sqlite_sequence WHERE name IN ('entries', 'activity');",
         )?;
         // Backups older than version 3 know nothing of sessions, the profile
-        // or rules. Restoring one must not wipe what was set up since, so
-        // those tables are only replaced by a backup that carries them.
+        // or rules, and ones older than version 4 know nothing of the board.
+        // Restoring one must not wipe what was set up since, so those tables
+        // are only replaced by a backup that carries them.
         let replaces_sessions = backup.version >= 3;
         if replaces_sessions {
             tx.execute_batch(
                 "DELETE FROM sessions; DELETE FROM session_updates;
                  DELETE FROM agent_profiles; DELETE FROM rules;
                  DELETE FROM sqlite_sequence WHERE name IN ('session_updates', 'rules');",
+            )?;
+        }
+        let replaces_board = backup.version >= 4;
+        if replaces_board {
+            tx.execute_batch(
+                "DELETE FROM message_reads; DELETE FROM messages; DELETE FROM tasks;
+                 DELETE FROM sqlite_sequence WHERE name IN ('tasks', 'messages');",
             )?;
         }
         for entry in &backup.entries {
@@ -955,6 +1227,63 @@ impl Db {
                 ],
             )?;
         }
+        if !replaces_board {
+            tx.commit()?;
+            return Ok(backup.entries.len());
+        }
+        for task in &backup.tasks {
+            tx.execute(
+                "INSERT INTO tasks (id, project, title, body, status, assignee, created_by,
+                                      claimed_by, done_by, done_commit, note, session_id,
+                                      created_at, updated_at, done_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    task.id,
+                    task.project,
+                    task.title,
+                    task.body,
+                    task.status,
+                    task.assignee,
+                    task.created_by,
+                    task.claimed_by,
+                    task.done_by,
+                    task.done_commit,
+                    task.note,
+                    task.session_id,
+                    task.created_at,
+                    task.updated_at,
+                    task.done_at
+                ],
+            )?;
+        }
+        for message in &backup.messages {
+            tx.execute(
+                "INSERT INTO messages (id, kind, project, from_agent, to_agent, body,
+                                         session_id, created_at, delivered_to,
+                                         delivered_session, delivered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    message.id,
+                    message.kind,
+                    message.project,
+                    message.from_agent,
+                    message.to_agent,
+                    message.body,
+                    message.session_id,
+                    message.created_at,
+                    message.delivered_to,
+                    message.delivered_session,
+                    message.delivered_at
+                ],
+            )?;
+        }
+        for read in &backup.message_reads {
+            tx.execute(
+                "INSERT OR IGNORE INTO message_reads (message_id, agent, read_at)
+                 VALUES (?1, ?2, ?3)",
+                params![read.message_id, read.agent, read.read_at],
+            )?;
+        }
         tx.commit()?;
         Ok(backup.entries.len())
     }
@@ -1084,6 +1413,89 @@ impl Db {
                     rule.created_at,
                     rule.updated_at
                 ],
+            )?;
+        }
+        // The board comes along the same way: a task counts as present when
+        // the same writer added the same title at the same time, and a
+        // message when the same body arrived from the same agent at the same
+        // time. Read marks are carried over to the new message ids.
+        for task in &backup.tasks {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM tasks
+                 WHERE project = ?1 AND title = ?2 AND created_by = ?3 AND created_at = ?4)",
+                params![task.project, task.title, task.created_by, task.created_at],
+                |row| row.get(0),
+            )?;
+            if exists {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO tasks (project, title, body, status, assignee, created_by,
+                                      claimed_by, done_by, done_commit, note, session_id,
+                                      created_at, updated_at, done_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    task.project,
+                    task.title,
+                    task.body,
+                    task.status,
+                    task.assignee,
+                    task.created_by,
+                    task.claimed_by,
+                    task.done_by,
+                    task.done_commit,
+                    task.note,
+                    task.session_id,
+                    task.created_at,
+                    task.updated_at,
+                    task.done_at
+                ],
+            )?;
+        }
+        let mut arrived_messages: HashMap<i64, i64> = HashMap::new();
+        for message in &backup.messages {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM messages
+                 WHERE kind = ?1 AND from_agent = ?2 AND body = ?3 AND created_at = ?4)",
+                params![
+                    message.kind,
+                    message.from_agent,
+                    message.body,
+                    message.created_at
+                ],
+                |row| row.get(0),
+            )?;
+            if exists {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO messages (kind, project, from_agent, to_agent, body,
+                                         session_id, created_at, delivered_to,
+                                         delivered_session, delivered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    message.kind,
+                    message.project,
+                    message.from_agent,
+                    message.to_agent,
+                    message.body,
+                    message.session_id,
+                    message.created_at,
+                    message.delivered_to,
+                    message.delivered_session,
+                    message.delivered_at
+                ],
+            )?;
+            arrived_messages.insert(message.id, tx.last_insert_rowid());
+        }
+        for read in &backup.message_reads {
+            let Some(new_id) = arrived_messages.get(&read.message_id) else {
+                continue;
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO message_reads (message_id, agent, read_at)
+                 VALUES (?1, ?2, ?3)",
+                params![new_id, read.agent, read.read_at],
             )?;
         }
         tx.commit()?;
@@ -1391,6 +1803,443 @@ impl Db {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    /// Adds a task to a project's shared to-do list.
+    pub fn add_task(&self, new: &NewTask) -> Result<Task> {
+        let (project, title, body) = normalize_task(&new.project, &new.title, &new.body)?;
+        let assignee = new.assignee.trim().to_lowercase();
+        let created_by = new.created_by.trim().to_lowercase();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO tasks (project, title, body, assignee, created_by, session_id,
+                                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            params![project, title, body, assignee, created_by, new.session_id],
+        )?;
+        let id = conn.last_insert_rowid();
+        get_task(&conn, id)?.context("task vanished after insert")
+    }
+
+    /// One task by its id.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "part of the board API; no single-task route reads it yet"
+        )
+    )]
+    pub fn task(&self, id: i64) -> Result<Option<Task>> {
+        get_task(&self.lock(), id)
+    }
+
+    /// Applies one task transition. `actor` is an agent name or "admin".
+    /// A `None` note keeps the task's latest note. `None` when the id does
+    /// not exist; an error, naming the task's current status, when the
+    /// action does not apply to it.
+    pub fn update_task(
+        &self,
+        id: i64,
+        action: &str,
+        actor: &str,
+        note: Option<&str>,
+        commit: Option<&str>,
+    ) -> Result<Option<Task>> {
+        let action = action.trim().to_lowercase();
+        if !TASK_ACTIONS.contains(&action.as_str()) {
+            anyhow::bail!("action must be one of: {}", TASK_ACTIONS.join(", "));
+        }
+        let actor = actor.trim().to_lowercase();
+        let note = match note {
+            None => None,
+            Some(note) => {
+                let note = note.trim();
+                if note.chars().count() > NOTE_MAX_CHARS {
+                    anyhow::bail!("the note must be at most {NOTE_MAX_CHARS} characters");
+                }
+                Some(note.to_string()).filter(|note| !note.is_empty())
+            }
+        };
+        let commit = commit.unwrap_or("").trim().to_lowercase();
+        let conn = self.lock();
+        let Some(task) = get_task(&conn, id)? else {
+            return Ok(None);
+        };
+        // The new value of every column the action touches; anything the
+        // action leaves alone keeps its current value.
+        let (status, claimed_by, done_by, done_commit, done) = match action.as_str() {
+            "claim" => {
+                if task.status == "claimed" {
+                    if task.claimed_by != actor {
+                        anyhow::bail!(
+                            "task #{} is already claimed by {}",
+                            task.id,
+                            if task.claimed_by.is_empty() {
+                                "someone else"
+                            } else {
+                                &task.claimed_by
+                            }
+                        );
+                    }
+                    // The claimer claiming again changes nothing.
+                    (
+                        task.status.clone(),
+                        task.claimed_by.clone(),
+                        String::new(),
+                        String::new(),
+                        false,
+                    )
+                } else if task.status != "open" {
+                    anyhow::bail!("task #{} is {} and cannot be claimed", task.id, task.status);
+                } else {
+                    (
+                        "claimed".into(),
+                        actor.clone(),
+                        String::new(),
+                        String::new(),
+                        false,
+                    )
+                }
+            }
+            "release" => {
+                if task.status != "claimed" {
+                    anyhow::bail!(
+                        "task #{} is {} and cannot be released",
+                        task.id,
+                        task.status
+                    );
+                }
+                if task.claimed_by != actor && actor != "admin" {
+                    anyhow::bail!(
+                        "task #{} is claimed by {}, and only they (or the admin) may release it",
+                        task.id,
+                        if task.claimed_by.is_empty() {
+                            "someone else"
+                        } else {
+                            &task.claimed_by
+                        }
+                    );
+                }
+                (
+                    "open".into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    false,
+                )
+            }
+            "done" => {
+                if task.status != "open" && task.status != "claimed" {
+                    anyhow::bail!(
+                        "task #{} is {} and cannot be marked done",
+                        task.id,
+                        task.status
+                    );
+                }
+                (
+                    "done".into(),
+                    task.claimed_by.clone(),
+                    actor.clone(),
+                    commit,
+                    true,
+                )
+            }
+            "cancel" => {
+                if task.status != "open" && task.status != "claimed" {
+                    anyhow::bail!(
+                        "task #{} is {} and cannot be cancelled",
+                        task.id,
+                        task.status
+                    );
+                }
+                (
+                    "cancelled".into(),
+                    task.claimed_by.clone(),
+                    String::new(),
+                    String::new(),
+                    false,
+                )
+            }
+            _ => {
+                // reopen
+                if task.status != "done" && task.status != "cancelled" {
+                    anyhow::bail!(
+                        "task #{} is {} and cannot be reopened",
+                        task.id,
+                        task.status
+                    );
+                }
+                // Reopening clears the claim and the done fields.
+                (
+                    "open".into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    false,
+                )
+            }
+        };
+        conn.execute(
+            "UPDATE tasks SET status = ?2, claimed_by = ?3, done_by = ?4, done_commit = ?5,
+                     note = COALESCE(?6, note),
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                     done_at = CASE WHEN ?7 THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') ELSE NULL END
+             WHERE id = ?1",
+            params![id, status, claimed_by, done_by, done_commit, note, done],
+        )?;
+        get_task(&conn, id)
+    }
+
+    /// Tasks on the board, claimed ones first, then open ones, then the
+    /// rest, newest first within each status. An empty `statuses` list
+    /// means every status.
+    pub fn tasks(
+        &self,
+        project: Option<&str>,
+        statuses: &[&str],
+        limit: usize,
+    ) -> Result<Vec<Task>> {
+        let conn = self.lock();
+        let mut sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE 1=1");
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(project) = project {
+            sql.push_str(" AND project = ?");
+            args.push(Value::Text(project.to_string()));
+        }
+        if !statuses.is_empty() {
+            sql.push_str(&format!(
+                " AND status IN ({})",
+                placeholders(statuses.len())
+            ));
+            args.extend(
+                statuses
+                    .iter()
+                    .map(|status| Value::Text(status.to_string())),
+            );
+        }
+        sql.push_str(
+            " ORDER BY CASE status WHEN 'claimed' THEN 0 WHEN 'open' THEN 1 ELSE 2 END, \
+              created_at DESC, id DESC LIMIT ?",
+        );
+        args.push(Value::Integer(limit as i64));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), Task::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Adds a message between agents, or a handoff note for a project. A
+    /// handoff needs its project and is never addressed to one agent.
+    pub fn add_message(&self, new: &NewMessage) -> Result<Message> {
+        let (kind, project, body) = normalize_message(&new.kind, &new.project, &new.body)?;
+        let from_agent = new.from_agent.trim().to_lowercase();
+        if from_agent.is_empty() {
+            anyhow::bail!("from_agent must not be empty");
+        }
+        let to_agent = if kind == "handoff" {
+            String::new()
+        } else {
+            new.to_agent.trim().to_lowercase()
+        };
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO messages (kind, project, from_agent, to_agent, body, session_id,
+                                     created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            params![kind, project, from_agent, to_agent, body, new.session_id],
+        )?;
+        let id = conn.last_insert_rowid();
+        get_message(&conn, id)?.context("message vanished after insert")
+    }
+
+    /// Messages agent X has not read yet, newest first: addressed to X or to
+    /// everyone, and not written by X.
+    pub fn unread_messages(
+        &self,
+        agent: &str,
+        project: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        self.messages_for(agent, project, limit, false)
+    }
+
+    /// The messages agent X has already read, newest first.
+    pub fn read_messages(
+        &self,
+        agent: &str,
+        project: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        self.messages_for(agent, project, limit, true)
+    }
+
+    /// How many messages agent X has not read yet, across every project.
+    pub fn unread_message_count(&self, agent: &str) -> Result<i64> {
+        Ok(self.lock().query_row(
+            "SELECT COUNT(*) FROM messages m
+             WHERE m.kind = 'message' AND m.from_agent != ?1
+               AND (m.to_agent = '' OR m.to_agent = ?1)
+               AND NOT EXISTS (SELECT 1 FROM message_reads r
+                               WHERE r.message_id = m.id AND r.agent = ?1)",
+            params![agent],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The read or the unread messages of one agent, newest first.
+    fn messages_for(
+        &self,
+        agent: &str,
+        project: Option<&str>,
+        limit: usize,
+        read: bool,
+    ) -> Result<Vec<Message>> {
+        let conn = self.lock();
+        let reads = if read { "EXISTS" } else { "NOT EXISTS" };
+        let mut sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages m
+             WHERE m.kind = 'message' AND m.from_agent != ?1
+               AND (m.to_agent = '' OR m.to_agent = ?1)
+               AND {reads} (SELECT 1 FROM message_reads r
+                            WHERE r.message_id = m.id AND r.agent = ?1)"
+        );
+        let mut args: Vec<Value> = vec![Value::Text(agent.to_string())];
+        if let Some(project) = project {
+            sql.push_str(" AND m.project = ?");
+            args.push(Value::Text(project.to_string()));
+        }
+        sql.push_str(" ORDER BY m.created_at DESC, m.id DESC LIMIT ?");
+        args.push(Value::Integer(limit as i64));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), Message::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Marks messages read for one agent, and returns the ids this call
+    /// marked. Ids that are gone, or already read, are skipped, so two
+    /// sessions of the same agent never both get to show one message as new.
+    pub fn mark_read(&self, agent: &str, ids: &[i64]) -> Result<Vec<i64>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        // Inserting from the messages table itself leaves out ids that do
+        // not exist, instead of tripping over their foreign key.
+        let sql = format!(
+            "INSERT OR IGNORE INTO message_reads (message_id, agent, read_at)
+             SELECT id, ?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now') FROM messages
+             WHERE id IN ({})
+             RETURNING message_id",
+            placeholders(ids.len())
+        );
+        let mut args: Vec<Value> = vec![Value::Text(agent.to_string())];
+        args.extend(ids.iter().map(|id| Value::Integer(*id)));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The handoff notes of one project waiting for its next session:
+    /// undelivered, and not written by that session, oldest first.
+    pub fn pending_handoffs(&self, project: &str, session_id: &str) -> Result<Vec<Message>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE kind = 'handoff' AND project = ?1 AND delivered_at IS NULL
+               AND (session_id IS NULL OR session_id != ?2)
+             ORDER BY id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![project, session_id], Message::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Delivers handoff notes to one agent's session, and returns the ids
+    /// this call delivered; only those may be shown. A note is delivered
+    /// exactly once and never to the session that wrote it: ids already
+    /// delivered, or written by `session_id`, are left alone. The check and
+    /// the update are one statement, so two sessions opening at the same
+    /// moment cannot both receive the same note.
+    pub fn deliver_handoffs(&self, ids: &[i64], agent: &str, session_id: &str) -> Result<Vec<i64>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let sql = format!(
+            "UPDATE messages SET delivered_to = ?1, delivered_session = ?2,
+                     delivered_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE kind = 'handoff' AND delivered_at IS NULL
+               AND (session_id IS NULL OR session_id != ?2)
+               AND id IN ({})
+             RETURNING id",
+            placeholders(ids.len())
+        );
+        let mut args: Vec<Value> = vec![
+            Value::Text(agent.to_string()),
+            Value::Text(session_id.to_string()),
+        ];
+        args.extend(ids.iter().map(|id| Value::Integer(*id)));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every message and handoff note on the board, newest first, each with
+    /// the agents that have read it.
+    pub fn messages(&self, project: Option<&str>, limit: usize) -> Result<Vec<BoardMessage>> {
+        let conn = self.lock();
+        let mut sql = format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE 1=1");
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(project) = project {
+            sql.push_str(" AND project = ?");
+            args.push(Value::Text(project.to_string()));
+        }
+        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+        args.push(Value::Integer(limit as i64));
+        let list: Vec<Message> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(args), Message::from_row)?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut reads: HashMap<i64, Vec<String>> = HashMap::new();
+        if !list.is_empty() {
+            let ids: Vec<i64> = list.iter().map(|message| message.id).collect();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT message_id, agent FROM message_reads
+                 WHERE message_id IN ({}) ORDER BY message_id, agent",
+                placeholders(ids.len())
+            ))?;
+            let rows = stmt.query_map(params_from_iter(ids), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (message_id, agent) = row?;
+                reads.entry(message_id).or_default().push(agent);
+            }
+        }
+        Ok(list
+            .into_iter()
+            .map(|message| BoardMessage {
+                read_by: reads.remove(&message.id).unwrap_or_default(),
+                message,
+            })
+            .collect())
+    }
+
+    /// How many tasks are open and claimed right now.
+    pub fn board_counts(&self) -> Result<BoardCounts> {
+        let conn = self.lock();
+        let (open_tasks, claimed_tasks): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*) FILTER (WHERE status = 'open'),
+                    COUNT(*) FILTER (WHERE status = 'claimed') FROM tasks",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(BoardCounts {
+            open_tasks,
+            claimed_tasks,
+        })
     }
 
     /// The user's profile: the default form of address, the reply language
@@ -1878,6 +2727,43 @@ fn validate_backup(backup: &Backup) -> Result<()> {
         normalize_rule(&rule.scope, &rule.target, &rule.body)
             .with_context(|| format!("rule #{} is not valid", rule.id))?;
     }
+    for task in &backup.tasks {
+        if task.project.trim().is_empty() || task.title.trim().is_empty() {
+            anyhow::bail!("task #{} has no project or title", task.id);
+        }
+        if !TASK_STATUSES.contains(&task.status.as_str()) {
+            anyhow::bail!(
+                "task #{} has an unknown status \"{}\"",
+                task.id,
+                task.status
+            );
+        }
+    }
+    for message in &backup.messages {
+        if !MESSAGE_KINDS.contains(&message.kind.as_str()) {
+            anyhow::bail!(
+                "message #{} has an unknown kind \"{}\"",
+                message.id,
+                message.kind
+            );
+        }
+        if message.kind == "handoff" && message.project.trim().is_empty() {
+            anyhow::bail!("handoff note #{} has no project", message.id);
+        }
+        if message.body.trim().is_empty() {
+            anyhow::bail!("message #{} has an empty body", message.id);
+        }
+    }
+    let message_ids: std::collections::HashSet<i64> =
+        backup.messages.iter().map(|message| message.id).collect();
+    for read in &backup.message_reads {
+        if !message_ids.contains(&read.message_id) {
+            anyhow::bail!(
+                "a read mark refers to message #{}, which is not in the backup",
+                read.message_id
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1951,6 +2837,66 @@ fn get_rule(conn: &Connection, id: i64) -> Result<Option<Rule>> {
     Ok(conn
         .query_row(&sql, params![id], Rule::from_row)
         .optional()?)
+}
+
+fn get_task(conn: &Connection, id: i64) -> Result<Option<Task>> {
+    let sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1");
+    Ok(conn
+        .query_row(&sql, params![id], Task::from_row)
+        .optional()?)
+}
+
+fn get_message(conn: &Connection, id: i64) -> Result<Option<Message>> {
+    let sql = format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE id = ?1");
+    Ok(conn
+        .query_row(&sql, params![id], Message::from_row)
+        .optional()?)
+}
+
+/// `?, ?, ?` for an IN list of `count` values.
+fn placeholders(count: usize) -> String {
+    vec!["?"; count].join(", ")
+}
+
+/// Checks and normalises a task's project, title and body. Agent and
+/// project names are lowercase everywhere else, so they are here too.
+fn normalize_task(project: &str, title: &str, body: &str) -> Result<(String, String, String)> {
+    let project = project.trim().to_lowercase();
+    if project.is_empty() {
+        anyhow::bail!("project must not be empty");
+    }
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!("the task title must not be empty");
+    }
+    if title.chars().count() > TASK_TITLE_MAX_CHARS {
+        anyhow::bail!("the task title must be at most {TASK_TITLE_MAX_CHARS} characters");
+    }
+    let body = body.trim();
+    if body.chars().count() > BODY_MAX_CHARS {
+        anyhow::bail!("the task body must be at most {BODY_MAX_CHARS} characters");
+    }
+    Ok((project, title.to_string(), body.to_string()))
+}
+
+/// Checks and normalises a message: its kind, its project and its body.
+fn normalize_message(kind: &str, project: &str, body: &str) -> Result<(String, String, String)> {
+    let kind = kind.trim().to_lowercase();
+    if !MESSAGE_KINDS.contains(&kind.as_str()) {
+        anyhow::bail!("kind must be one of: {}", MESSAGE_KINDS.join(", "));
+    }
+    let project = project.trim().to_lowercase();
+    if kind == "handoff" && project.is_empty() {
+        anyhow::bail!("a handoff note must name its project");
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        anyhow::bail!("the message body must not be empty");
+    }
+    if body.chars().count() > BODY_MAX_CHARS {
+        anyhow::bail!("the message body must be at most {BODY_MAX_CHARS} characters");
+    }
+    Ok((kind, project, body.to_string()))
 }
 
 /// "s_" plus 24 random hex characters.
@@ -2508,7 +3454,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_v3_round_trips_and_a_v2_file_still_restores() {
+    fn backup_v4_round_trips_and_a_v2_file_still_restores() {
         let db = temp_db();
         let opened = db
             .open_session(&session("claude", "shop", "Refactor payments"))
@@ -2546,7 +3492,7 @@ mod tests {
 
         let json = serde_json::to_string(&db.export().unwrap()).unwrap();
         let backup: Backup = serde_json::from_str(&json).unwrap();
-        assert_eq!(backup.version, 3);
+        assert_eq!(backup.version, 4);
         assert_eq!(backup.sessions.len(), 1);
         assert_eq!(backup.session_updates.len(), 1);
         assert_eq!(backup.rules.len(), 1);
@@ -2726,5 +3672,575 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entry.id, b.id);
         assert_eq!(hits[0].matched, "semantic");
+    }
+
+    fn task(project: &str, title: &str) -> NewTask {
+        NewTask {
+            project: project.into(),
+            title: title.into(),
+            created_by: "claude".into(),
+            ..Default::default()
+        }
+    }
+
+    fn message(kind: &str, from: &str, to: &str, body: &str) -> NewMessage {
+        NewMessage {
+            kind: kind.into(),
+            from_agent: from.into(),
+            to_agent: to.into(),
+            body: body.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tasks_move_through_their_states() {
+        let db = temp_db();
+        let added = db
+            .add_task(&NewTask {
+                assignee: "Codex".into(),
+                ..task("Shop", "Fix the checkout flow")
+            })
+            .unwrap();
+        // Project and agent names are trimmed and lowercased.
+        assert_eq!(
+            (
+                added.project.as_str(),
+                added.assignee.as_str(),
+                added.status.as_str()
+            ),
+            ("shop", "codex", "open")
+        );
+        assert!(
+            db.add_task(&NewTask {
+                title: "x".repeat(201),
+                ..task("p", "t")
+            })
+            .is_err()
+        );
+        assert!(
+            db.add_task(&NewTask {
+                body: "x".repeat(4001),
+                ..task("p", "t")
+            })
+            .is_err()
+        );
+        assert!(db.add_task(&task("", "t")).is_err());
+        assert!(db.add_task(&task("p", "  ")).is_err());
+
+        // A task is claimed, and only the claimer may release it.
+        let claimed = db
+            .update_task(added.id, "claim", "codex", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (claimed.status.as_str(), claimed.claimed_by.as_str()),
+            ("claimed", "codex")
+        );
+        let error = db
+            .update_task(added.id, "claim", "claude", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("already claimed"),
+            "unexpected error: {error}"
+        );
+        // The claimer claiming again changes nothing.
+        assert!(
+            db.update_task(added.id, "claim", "codex", None, None)
+                .unwrap()
+                .is_some()
+        );
+        let error = db
+            .update_task(added.id, "release", "claude", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("may release"), "unexpected error: {error}");
+        let released = db
+            .update_task(added.id, "release", "codex", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (released.status.as_str(), released.claimed_by.as_str()),
+            ("open", "")
+        );
+        // The admin may release any task.
+        db.update_task(added.id, "claim", "codex", None, None)
+            .unwrap();
+        assert!(
+            db.update_task(added.id, "release", "admin", None, None)
+                .unwrap()
+                .is_some()
+        );
+
+        // Done, with a commit and a note.
+        let done = db
+            .update_task(added.id, "done", "claude", Some("shipped"), Some("abc1234"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, "done");
+        assert_eq!(done.done_by, "claude");
+        assert!(done.done_at.is_some());
+        assert_eq!(done.done_commit, "abc1234");
+        assert_eq!(done.note, "shipped");
+        // A done task refuses everything but reopening.
+        for action in ["claim", "release", "done", "cancel"] {
+            let error = db
+                .update_task(added.id, action, "claude", None, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("is done"), "unexpected error: {error}");
+        }
+        // Reopening clears the claim and the done fields, keeps the note.
+        let reopened = db
+            .update_task(added.id, "reopen", "admin", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.status, "open");
+        assert_eq!(
+            (
+                reopened.claimed_by.as_str(),
+                reopened.done_by.as_str(),
+                reopened.done_commit.as_str()
+            ),
+            ("", "", "")
+        );
+        assert!(reopened.done_at.is_none());
+        assert_eq!(reopened.note, "shipped");
+
+        // Cancel from open, then reopen from cancelled.
+        let cancelled = db
+            .update_task(added.id, "cancel", "claude", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        let error = db
+            .update_task(added.id, "cancel", "claude", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is cancelled"), "unexpected error: {error}");
+        assert_eq!(
+            db.update_task(added.id, "reopen", "claude", None, None)
+                .unwrap()
+                .unwrap()
+                .status,
+            "open"
+        );
+
+        // Unknown ids and actions, and a note that is too long.
+        assert!(
+            db.update_task(999, "claim", "claude", None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.update_task(added.id, "ship", "claude", None, None)
+                .is_err()
+        );
+        assert!(
+            db.update_task(added.id, "done", "claude", Some(&"x".repeat(1001)), None)
+                .is_err()
+        );
+        assert_eq!(
+            db.task(added.id).unwrap().unwrap().title,
+            "Fix the checkout flow"
+        );
+    }
+
+    #[test]
+    fn tasks_list_claimed_first_then_open_then_the_rest() {
+        let db = temp_db();
+        let first = db.add_task(&task("shop", "first")).unwrap();
+        let second = db.add_task(&task("shop", "second")).unwrap();
+        let third = db.add_task(&task("shop", "third")).unwrap();
+        db.add_task(&task("blog", "other project")).unwrap();
+        db.update_task(second.id, "claim", "codex", None, None)
+            .unwrap();
+        db.update_task(third.id, "done", "codex", None, None)
+            .unwrap();
+
+        // Newest first within a status; claimed before open before the rest.
+        let listed = db
+            .tasks(Some("shop"), &["open", "claimed", "done"], 10)
+            .unwrap();
+        let ids: Vec<i64> = listed.iter().map(|task| task.id).collect();
+        assert_eq!(ids, [second.id, first.id, third.id]);
+        assert_eq!(db.tasks(Some("shop"), &["open"], 10).unwrap().len(), 1);
+        assert_eq!(db.tasks(None, &[], 10).unwrap().len(), 4);
+        let counts = db.board_counts().unwrap();
+        assert_eq!((counts.open_tasks, counts.claimed_tasks), (2, 1));
+    }
+
+    #[test]
+    fn messages_reach_their_reader_once() {
+        let db = temp_db();
+        let direct = db
+            .add_message(&NewMessage {
+                project: "shop".into(),
+                to_agent: "codex".into(),
+                ..message("message", "claude", "", "look at the webhook")
+            })
+            .unwrap();
+        let broadcast = db
+            .add_message(&message("message", "admin", "", "standup at ten"))
+            .unwrap();
+        // The author never sees their own message as unread.
+        db.add_message(&NewMessage {
+            to_agent: "codex".into(),
+            ..message("message", "codex", "", "note to self")
+        })
+        .unwrap();
+        // A handoff is never in an inbox, and needs its project.
+        let handoff = db
+            .add_message(&NewMessage {
+                project: "shop".into(),
+                ..message("handoff", "claude", "", "the migration is half done")
+            })
+            .unwrap();
+        assert!(
+            db.add_message(&message("handoff", "claude", "", "no project"))
+                .is_err()
+        );
+        assert!(
+            db.add_message(&message("letter", "claude", "", "no such kind"))
+                .is_err()
+        );
+
+        // Codex sees the direct message and the broadcast, newest first.
+        let ids: Vec<i64> = db
+            .unread_messages("codex", None, 10)
+            .unwrap()
+            .iter()
+            .map(|message| message.id)
+            .collect();
+        assert_eq!(ids, [broadcast.id, direct.id]);
+        assert_eq!(db.unread_message_count("codex").unwrap(), 2);
+        // Claude sees only the broadcast.
+        let ids: Vec<i64> = db
+            .unread_messages("claude", None, 10)
+            .unwrap()
+            .iter()
+            .map(|message| message.id)
+            .collect();
+        assert_eq!(ids, [broadcast.id]);
+        // The project filter only matches messages that carry it.
+        assert!(
+            db.unread_messages("codex", Some("blog"), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.unread_messages("codex", Some("shop"), 10).unwrap().len(),
+            1
+        );
+
+        // Reading marks exactly the given ids, once.
+        assert_eq!(
+            db.mark_read("codex", &[direct.id, 999]).unwrap(),
+            [direct.id]
+        );
+        let ids: Vec<i64> = db
+            .unread_messages("codex", None, 10)
+            .unwrap()
+            .iter()
+            .map(|message| message.id)
+            .collect();
+        assert_eq!(ids, [broadcast.id]);
+        assert_eq!(db.unread_message_count("codex").unwrap(), 1);
+        let ids: Vec<i64> = db
+            .read_messages("codex", None, 20)
+            .unwrap()
+            .iter()
+            .map(|message| message.id)
+            .collect();
+        assert_eq!(ids, [direct.id]);
+        // A second marking (another session of the same agent) gets nothing
+        // back, so it has nothing to show as new.
+        assert!(db.mark_read("codex", &[direct.id]).unwrap().is_empty());
+        assert_eq!(db.read_messages("codex", None, 20).unwrap().len(), 1);
+
+        // The board lists newest first, with the readers of each message.
+        let board = db.messages(None, 10).unwrap();
+        assert_eq!(board.len(), 4);
+        assert_eq!(board[0].message.id, handoff.id);
+        assert_eq!(
+            board
+                .iter()
+                .find(|row| row.message.id == direct.id)
+                .unwrap()
+                .read_by,
+            ["codex"]
+        );
+        assert!(
+            board
+                .iter()
+                .find(|row| row.message.kind == "handoff")
+                .unwrap()
+                .read_by
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn handoffs_are_delivered_once_and_not_to_their_writer() {
+        let db = temp_db();
+        let writer = db
+            .open_session(&session("claude", "shop", "writing"))
+            .unwrap();
+        let note = db
+            .add_message(&NewMessage {
+                project: "shop".into(),
+                session_id: Some(writer.id.clone()),
+                ..message("handoff", "claude", "", "the migration is half done")
+            })
+            .unwrap();
+
+        // The session that wrote it is not handed its own note, and other
+        // projects see nothing of it.
+        assert!(db.pending_handoffs("shop", &writer.id).unwrap().is_empty());
+        assert!(db.pending_handoffs("blog", &writer.id).unwrap().is_empty());
+
+        // The next session on the project gets it, exactly once.
+        let reader = db
+            .open_session(&session("codex", "shop", "reading"))
+            .unwrap();
+        let pending = db.pending_handoffs("shop", &reader.id).unwrap();
+        let ids: Vec<i64> = pending.iter().map(|message| message.id).collect();
+        assert_eq!(ids, [note.id]);
+        // Delivering to the writing session itself is refused even when the
+        // caller passes its id.
+        assert!(
+            db.deliver_handoffs(&ids, "claude", &writer.id)
+                .unwrap()
+                .is_empty()
+        );
+        // Two sessions that both saw it pending: only the first receives it.
+        let racer = db
+            .open_session(&session("gemini", "shop", "racing"))
+            .unwrap();
+        assert_eq!(db.pending_handoffs("shop", &racer.id).unwrap().len(), 1);
+        assert_eq!(
+            db.deliver_handoffs(&ids, "codex", &reader.id).unwrap(),
+            [note.id]
+        );
+        assert!(
+            db.deliver_handoffs(&ids, "gemini", &racer.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.pending_handoffs("shop", &reader.id).unwrap().is_empty());
+        let third = db
+            .open_session(&session("claude", "shop", "third"))
+            .unwrap();
+        assert!(db.pending_handoffs("shop", &third.id).unwrap().is_empty());
+        assert!(
+            db.deliver_handoffs(&ids, "codex", &reader.id)
+                .unwrap()
+                .is_empty()
+        );
+
+        let delivered = &db.messages(Some("shop"), 10).unwrap()[0];
+        assert_eq!(delivered.message.delivered_to, "codex");
+        assert_eq!(
+            delivered.message.delivered_session.as_deref(),
+            Some(reader.id.as_str())
+        );
+        assert!(delivered.message.delivered_at.is_some());
+        assert!(delivered.read_by.is_empty());
+    }
+
+    #[test]
+    fn backup_v4_round_trips_the_board() {
+        let db = temp_db();
+        let task = db
+            .add_task(&NewTask {
+                project: "shop".into(),
+                title: "Fix the checkout flow".into(),
+                body: "see the failing tests".into(),
+                assignee: "codex".into(),
+                created_by: "claude".into(),
+                session_id: Some("s_1".into()),
+            })
+            .unwrap();
+        db.update_task(task.id, "claim", "codex", Some("on it"), None)
+            .unwrap();
+        let direct = db
+            .add_message(&NewMessage {
+                project: "shop".into(),
+                to_agent: "codex".into(),
+                ..message("message", "admin", "", "check the claims")
+            })
+            .unwrap();
+        db.mark_read("codex", &[direct.id]).unwrap();
+        let note = db
+            .add_message(&NewMessage {
+                project: "shop".into(),
+                ..message("handoff", "claude", "", "the migration is half done")
+            })
+            .unwrap();
+        db.deliver_handoffs(&[note.id], "codex", "s_9").unwrap();
+
+        let json = serde_json::to_string(&db.export().unwrap()).unwrap();
+        let backup: Backup = serde_json::from_str(&json).unwrap();
+        assert_eq!(backup.version, 4);
+        assert_eq!(backup.tasks.len(), 1);
+        assert_eq!(backup.messages.len(), 2);
+        assert_eq!(backup.message_reads.len(), 1);
+
+        // Diverge, then restore: the board is exactly the backup again.
+        db.add_task(&NewTask {
+            project: "blog".into(),
+            title: "Discarded".into(),
+            created_by: "admin".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(db.restore(&backup).unwrap(), 0);
+        let tasks = db.tasks(None, &[], 10).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, task.id);
+        assert_eq!(
+            (
+                tasks[0].status.as_str(),
+                tasks[0].claimed_by.as_str(),
+                tasks[0].note.as_str()
+            ),
+            ("claimed", "codex", "on it")
+        );
+        assert_eq!(tasks[0].session_id.as_deref(), Some("s_1"));
+        let board = db.messages(Some("shop"), 10).unwrap();
+        assert_eq!(board.len(), 2);
+        assert_eq!(
+            board
+                .iter()
+                .find(|row| row.message.kind == "handoff")
+                .unwrap()
+                .message
+                .delivered_to,
+            "codex"
+        );
+        assert_eq!(
+            board
+                .iter()
+                .find(|row| row.message.id == direct.id)
+                .unwrap()
+                .read_by,
+            ["codex"]
+        );
+        assert_eq!(db.unread_message_count("codex").unwrap(), 0);
+
+        // Merging the same backup adds nothing; a changed copy adds only
+        // what is new, with its read marks under the new ids.
+        assert_eq!(db.merge(&backup).unwrap(), (0, 0));
+        let mut diverged: Backup = serde_json::from_str(&json).unwrap();
+        diverged.tasks[0].title = "A different title".into();
+        diverged.messages.push(Message {
+            id: 999,
+            kind: "message".into(),
+            project: String::new(),
+            from_agent: "claude".into(),
+            to_agent: String::new(),
+            body: "extra".into(),
+            session_id: None,
+            created_at: "2026-11-25T12:00:00Z".into(),
+            delivered_to: String::new(),
+            delivered_session: None,
+            delivered_at: None,
+        });
+        diverged.message_reads.push(MessageRead {
+            message_id: 999,
+            agent: "codex".into(),
+            read_at: "2026-11-25T12:01:00Z".into(),
+        });
+        db.merge(&diverged).unwrap();
+        assert_eq!(db.tasks(None, &[], 10).unwrap().len(), 2);
+        assert_eq!(db.messages(None, 100).unwrap().len(), 3);
+        let read = db.read_messages("codex", None, 20).unwrap();
+        assert!(read.iter().any(|message| message.body == "extra"));
+    }
+
+    #[test]
+    fn a_v3_backup_leaves_the_board_in_place() {
+        let db = temp_db();
+        let kept = db.add_task(&task("shop", "kept")).unwrap();
+        let sent = db
+            .add_message(&message("message", "claude", "", "kept too"))
+            .unwrap();
+
+        // A version 3 file: the same store without the board sections.
+        let mut value = serde_json::to_value(db.export().unwrap()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in ["tasks", "messages", "message_reads"] {
+            object.remove(key);
+        }
+        object.insert("version".into(), serde_json::json!(3));
+        let v3: Backup = serde_json::from_value(value).unwrap();
+        assert!(v3.tasks.is_empty() && v3.messages.is_empty());
+
+        // The board moves on after the export; restoring the older file
+        // replaces the entries but leaves the board alone.
+        db.add_task(&task("shop", "added later")).unwrap();
+        db.update_task(kept.id, "done", "claude", None, None)
+            .unwrap();
+        db.mark_read("codex", &[sent.id]).unwrap();
+        db.restore(&v3).unwrap();
+        let tasks = db.tasks(None, &[], 10).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(
+            tasks
+                .iter()
+                .any(|task| task.id == kept.id && task.status == "done")
+        );
+        let board = db.messages(None, 10).unwrap();
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].read_by, ["codex"]);
+    }
+
+    #[test]
+    fn an_old_database_gains_the_board_tables() {
+        let dir = std::env::temp_dir().join(format!("lore-board-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lore.db");
+        {
+            // A Phase 1 database: sessions and entries, no board tables.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,
+                 kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+                 tags TEXT NOT NULL DEFAULT '', files TEXT NOT NULL DEFAULT '',
+                 agent TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT 'x',
+                 updated_at TEXT, embedding BLOB);
+                 INSERT INTO entries (project, kind, title, body) VALUES ('p', 'note', 'old', 'entry');
+                 CREATE TABLE sessions (id TEXT PRIMARY KEY, agent TEXT NOT NULL,
+                 project TEXT NOT NULL, path TEXT NOT NULL DEFAULT '', repo TEXT NOT NULL DEFAULT '',
+                 commit_hash TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
+                 title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+                 summary TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                 ended_at TEXT);
+                 INSERT INTO sessions (id, agent, project, title, started_at, last_seen_at)
+                 VALUES ('s_old', 'claude', 'shop', 'old chat', 'x', 'x');
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('embedding_model', 'kept-model');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        // Nothing was lost, and the board works right away.
+        assert_eq!(db.get(1).unwrap().unwrap().title, "old");
+        assert_eq!(db.session("s_old").unwrap().unwrap().agent, "claude");
+        db.add_task(&task("shop", "fresh")).unwrap();
+        let sent = db
+            .add_message(&message("message", "claude", "", "fresh too"))
+            .unwrap();
+        db.mark_read("codex", &[sent.id]).unwrap();
+        assert_eq!(db.tasks(Some("shop"), &["open"], 10).unwrap().len(), 1);
+        assert_eq!(db.unread_messages("codex", None, 10).unwrap().len(), 0);
+        assert_eq!(db.board_counts().unwrap().open_tasks, 1);
+        // Opening it again changes nothing.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.tasks(None, &[], 10).unwrap().len(), 1);
+        assert_eq!(db.get(1).unwrap().unwrap().title, "old");
     }
 }
