@@ -6,9 +6,11 @@
 <meta name="robots" content="noindex, nofollow">
 <meta name="color-scheme" content="dark">
 <title>project-lore</title>
+<link rel="icon" type="image/svg+xml" href="/admin/icon.svg">
 <link rel="stylesheet" href="/admin/app.css">
 </head>
 <body>
+<div class="backdrop" aria-hidden="true"></div>
 <canvas id="graph" aria-label="Memory graph"></canvas>
 
 <section id="login" class="login" hidden>
@@ -32,33 +34,60 @@
   <header class="top">
     <div class="brand">
       <div class="mark small" aria-hidden="true"><span></span><span></span><span></span></div>
-      <div>
+      <div class="brand-text">
         <strong>project-lore</strong>
-        <div id="summary" class="muted small-text"></div>
+        <span id="live" class="live off"><i></i><span id="live-text">Connecting</span></span>
       </div>
     </div>
     <div class="actions">
       <input id="search" type="search" placeholder="Search memories" aria-label="Search memories" spellcheck="false">
-      <button id="panel-toggle" class="ghost only-narrow" type="button" aria-expanded="false">Panels</button>
+      <button id="side-toggle" class="ghost only-narrow" type="button" aria-expanded="false">Overview</button>
+      <button id="feed-toggle" class="ghost only-medium" type="button" aria-expanded="false">Activity</button>
+      <button id="backup-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="backup">Backup</button>
       <button id="logout" class="ghost" type="button">Sign out</button>
     </div>
   </header>
 
   <aside id="side" class="side">
+    <section class="stats" aria-label="Totals">
+      <div class="stat"><b id="stat-memories">0</b><span>Memories</span></div>
+      <div class="stat"><b id="stat-links">0</b><span>Links</span></div>
+      <div class="stat"><b id="stat-projects">0</b><span>Projects</span></div>
+      <div class="stat"><b id="stat-online">0</b><span>Agents active</span></div>
+    </section>
     <section class="panel">
       <h2>Connected models</h2>
-      <ul id="agents" class="list"></ul>
+      <ul id="agents" class="list agents"></ul>
     </section>
     <section class="panel">
       <h2>Projects</h2>
-      <ul id="projects" class="list"></ul>
+      <ul id="projects" class="list projects"></ul>
+      <div id="kinds" class="kinds" aria-label="Entry kinds"></div>
     </section>
     <section class="panel">
       <h2>Last 30 days</h2>
-      <div id="activity" class="activity" role="img" aria-label="Entries logged per day"></div>
+      <div id="activity-bars" class="bars" role="img" aria-label="Entries logged per day"></div>
       <div id="activity-note" class="muted small-text"></div>
     </section>
   </aside>
+
+  <aside id="feed" class="feed">
+    <div class="feed-head">
+      <h2>Live activity</h2>
+      <span id="feed-count" class="muted small-text"></span>
+    </div>
+    <ol id="feed-list" class="feed-list"></ol>
+    <p id="feed-empty" class="muted small-text feed-empty" hidden>Nothing yet. Actions appear here the moment an agent searches or writes.</p>
+  </aside>
+
+  <div id="backup" class="backup" hidden>
+    <h2>Backup and restore</h2>
+    <button id="backup-export" class="ghost" type="button"><b>Export backup</b><span>Download every memory, the activity log and agent records as one JSON file.</span></button>
+    <button id="backup-import" class="ghost" type="button"><b>Import and merge</b><span>Add the entries from a backup that are not here yet. Nothing is removed.</span></button>
+    <button id="backup-restore" class="ghost danger" type="button"><b>Restore from backup</b><span>Replace everything here with the contents of a backup file.</span></button>
+    <p id="backup-status" class="small-text" role="status"></p>
+    <input id="backup-file" type="file" accept="application/json,.json" hidden>
+  </div>
 
   <aside id="detail" class="detail" hidden>
     <button id="detail-close" class="ghost close" type="button" aria-label="Close">Close</button>
@@ -71,7 +100,10 @@
     <p class="muted">Connect an agent to the MCP endpoint and let it log its first entry.</p>
   </div>
   <div id="legend" class="legend muted small-text">
-    Neurons are entries, colour is the project, lines join related memories. Scroll to zoom, drag to move.
+    <span><i class="key dot"></i>memory</span>
+    <span><i class="key ring"></i>project</span>
+    <span><i class="key agent"></i>agent</span>
+    <span>scroll to zoom · drag to move</span>
   </div>
 </div>
 

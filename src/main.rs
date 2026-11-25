@@ -4,6 +4,7 @@ mod admin;
 mod auth;
 mod db;
 mod embed;
+mod events;
 mod server;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -19,6 +20,7 @@ use crate::{
     auth::{McpAuth, RateLimiter, SHARED_AGENT},
     db::Db,
     embed::{Embedder, Model},
+    events::Events,
     server::Lore,
 };
 
@@ -94,10 +96,18 @@ async fn main() -> Result<()> {
         requests: RateLimiter::new(600, Duration::from_secs(60)),
     });
 
+    let events = Events::new();
     let mcp = {
-        let (db, embedder) = (db.clone(), embedder.clone());
+        let (db, embedder, events) = (db.clone(), embedder.clone(), events.clone());
         StreamableHttpService::new(
-            move || Ok(Lore::new(db.clone(), embedder.clone(), min_similarity)),
+            move || {
+                Ok(Lore::new(
+                    db.clone(),
+                    embedder.clone(),
+                    min_similarity,
+                    events.clone(),
+                ))
+            },
             Arc::new(LocalSessionManager::default()),
             config,
         )
@@ -125,6 +135,8 @@ async fn main() -> Result<()> {
                 configured_agents,
                 semantic.then(|| model.name()),
                 model.link_similarity(),
+                events.clone(),
+                embedder.clone(),
             );
             app = app.merge(admin::router(Arc::new(admin)));
             tracing::info!("admin view enabled at /admin");

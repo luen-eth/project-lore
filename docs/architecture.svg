@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" role="img" aria-labelledby="t d" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
   <title id="t">project-lore architecture</title>
-  <desc id="d">Coding agents connect over MCP with a bearer token to a single Rust binary that authenticates them, serves seven tools, searches with keywords and embeddings, and stores everything in one SQLite file. A password-protected admin view reads the same data.</desc>
+  <desc id="d">Coding agents connect over MCP with a bearer token to a single Rust binary that authenticates them, serves seven tools, searches with keywords and embeddings, and stores everything in one SQLite file. A password-protected admin view shows the same data live and can back it up or restore it.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b1222"/>
@@ -105,7 +105,7 @@
   <text x="932" y="58" fill="#8791a8" font-size="12" font-weight="600" letter-spacing="1.4">YOU</text>
   <rect x="924" y="80" width="236" height="230" rx="14" fill="#0e1524" stroke="#94aadc" stroke-opacity=".28"/>
   <text x="944" y="110" fill="#e7ecf7" font-size="16" font-weight="600">Admin view</text>
-  <text x="944" y="131" fill="#8791a8" font-size="12.5">read-only, in the browser</text>
+  <text x="944" y="131" fill="#8791a8" font-size="12.5">live graph, activity and backups</text>
   <g stroke-width="1.1" fill="none">
     <path d="M990 232 L1040 190 L1096 222 L1062 268 Z" stroke="#6fb6ff" stroke-opacity=".5"/>
     <path d="M1040 190 L1062 268" stroke="#c79bff" stroke-opacity=".5"/>
@@ -127,5 +127,5 @@
 
   <path d="M924 450 H884" stroke="#8791a8" stroke-width="1.4" fill="none" marker-end="url(#arrow)"/>
   <path d="M1042 394 V450 H924" stroke="#8791a8" stroke-width="1.4" fill="none"/>
-  <text x="1052" y="472" fill="#8791a8" font-size="12" text-anchor="middle">session cookie, read only</text>
+  <text x="1052" y="472" fill="#8791a8" font-size="12" text-anchor="middle">session cookie · live events</text>
 </svg>

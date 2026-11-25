@@ -8,21 +8,29 @@ use std::{
     time::{Duration, Instant},
 };
 
+use std::convert::Infallible;
+
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::json;
 use subtle::ConstantTimeEq;
+use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
 use crate::{
     auth::{RateLimiter, client_ip, too_many_requests},
-    db::Db,
+    db::{Backup, Db},
+    embed::Embedder,
+    events::Events,
 };
 
 const COOKIE: &str = "lore_session";
@@ -31,6 +39,14 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_NEURONS: usize = 1200;
 const NEIGHBOURS: usize = 3;
 const RECAPTCHA_ACTION: &str = "login";
+/// Actions shown in the feed when the page opens.
+const FEED_LENGTH: usize = 60;
+/// Largest backup file accepted for import.
+const MAX_BACKUP_BYTES: usize = 512 * 1024 * 1024;
+/// Name the feed shows for actions taken from this page.
+const ADMIN_ACTOR: &str = "admin";
+const ICON: &str = include_str!("../assets/icon.svg");
+const BACKDROP: &[u8] = include_bytes!("../assets/backdrop.jpg");
 
 const PAGE: &str = include_str!("../assets/admin.html");
 const SCRIPT: &str = include_str!("../assets/admin.js");
@@ -56,6 +72,8 @@ pub struct Admin {
     pub configured_agents: Vec<String>,
     pub embedding_model: Option<&'static str>,
     pub link_similarity: f32,
+    pub events: Events,
+    pub embedder: Embedder,
     sessions: Mutex<HashMap<String, Instant>>,
     logins: RateLimiter,
     http: reqwest::Client,
@@ -70,6 +88,8 @@ impl Admin {
         configured_agents: Vec<String>,
         embedding_model: Option<&'static str>,
         link_similarity: f32,
+        events: Events,
+        embedder: Embedder,
     ) -> Self {
         Self {
             db,
@@ -79,6 +99,8 @@ impl Admin {
             configured_agents,
             embedding_model,
             link_similarity,
+            events,
+            embedder,
             sessions: Mutex::new(HashMap::new()),
             // Five wrong attempts lock the address out for fifteen minutes.
             logins: RateLimiter::new(5, Duration::from_secs(15 * 60)),
@@ -103,6 +125,12 @@ pub fn router(admin: Arc<Admin>) -> Router {
     let private = Router::new()
         .route("/admin/api/brain", get(brain))
         .route("/admin/api/pulse", get(pulse))
+        .route("/admin/api/events", get(events))
+        .route("/admin/api/export", get(export))
+        .route(
+            "/admin/api/import",
+            post(import).layer(DefaultBodyLimit::max(MAX_BACKUP_BYTES)),
+        )
         .route("/admin/api/entries/{id}", get(entry))
         .layer(middleware::from_fn_with_state(
             admin.clone(),
@@ -121,6 +149,14 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route(
             "/admin/app.css",
             get(|| async { asset("text/css; charset=utf-8", STYLE) }),
+        )
+        .route(
+            "/admin/icon.svg",
+            get(|| async { asset("image/svg+xml", ICON) }),
+        )
+        .route(
+            "/admin/backdrop.jpg",
+            get(|| async { ([(header::CONTENT_TYPE, "image/jpeg")], BACKDROP) }),
         )
         .route("/admin/api/session", get(session))
         .route("/admin/api/login", post(login))
@@ -264,6 +300,7 @@ async fn brain(State(admin): State<Arc<Admin>>) -> Response {
             "version": state.db.version()?,
             "embedding_model": state.embedding_model,
             "agents": state.db.agents(&state.configured_agents)?,
+            "activity": state.db.activity(FEED_LENGTH)?,
             "brain": brain,
         }))
     })
@@ -282,6 +319,139 @@ async fn pulse(State(admin): State<Arc<Admin>>) -> Response {
     })
     .await;
     respond(result)
+}
+
+/// Server-sent events: one `activity` event per agent action, as it happens.
+async fn events(
+    State(admin): State<Arc<Admin>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = BroadcastStream::new(admin.events.subscribe()).filter_map(|message| {
+        // A listener that fell behind skips what it missed; the page's
+        // periodic refresh catches up.
+        let activity = message.ok()?;
+        let event = Event::default()
+            .event("activity")
+            .json_data(&activity)
+            .ok()?;
+        Some(Ok(event))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
+}
+
+/// Downloads the whole store as one JSON file.
+async fn export(State(admin): State<Arc<Admin>>) -> Response {
+    let db = admin.db.clone();
+    match tokio::task::spawn_blocking(move || db.export()).await {
+        Ok(Ok(backup)) => {
+            let stamp: String = backup
+                .exported_at
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            let name = format!("attachment; filename=\"project-lore-backup-{stamp}.json\"");
+            match serde_json::to_vec(&backup) {
+                Ok(body) => (
+                    [
+                        (header::CONTENT_TYPE, "application/json".to_string()),
+                        (header::CONTENT_DISPOSITION, name),
+                    ],
+                    body,
+                )
+                    .into_response(),
+                Err(error) => {
+                    tracing::error!(%error, "serialising the backup failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+        other => {
+            tracing::error!(?other, "export failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ImportOptions {
+    /// `merge` adds missing entries; `replace` restores the backup exactly.
+    mode: String,
+}
+
+/// Loads a backup: either merged into what is here or replacing it.
+async fn import(
+    State(admin): State<Arc<Admin>>,
+    Query(options): Query<ImportOptions>,
+    Json(backup): Json<Backup>,
+) -> Response {
+    let replace = match options.mode.as_str() {
+        "replace" => true,
+        "merge" => false,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "mode must be merge or replace" })),
+            )
+                .into_response();
+        }
+    };
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let (added, present) = if replace {
+            (state.db.restore(&backup)?, 0)
+        } else {
+            state.db.merge(&backup)?
+        };
+        let (tool, summary) = if replace {
+            ("restore", format!("{added} entries restored"))
+        } else {
+            (
+                "import",
+                format!("{added} added, {present} already present"),
+            )
+        };
+        tracing::info!(tool, added, present, "backup loaded from the admin view");
+        if let Ok(activity) = state
+            .db
+            .record_activity(ADMIN_ACTOR, tool, "", None, &[], &summary)
+        {
+            state.events.publish(activity);
+        }
+        // Imported entries have no vectors yet; compute them in the background.
+        let (db, embedder, events) = (
+            state.db.clone(),
+            state.embedder.clone(),
+            state.events.clone(),
+        );
+        std::thread::spawn(move || {
+            match embedder.backfill(&db) {
+                // Tell open pages the links are back, so they redraw.
+                Ok(count) if count > 0 => {
+                    let summary = format!("{count} entries searchable by meaning again");
+                    if let Ok(activity) =
+                        db.record_activity(ADMIN_ACTOR, "reindex", "", None, &[], &summary)
+                    {
+                        events.publish(activity);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "embedding imported entries failed"),
+            }
+        });
+        Ok(json!({ "added": added, "present": present, "replaced": replace }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "import task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn entry(State(admin): State<Arc<Admin>>, Path(id): Path<i64>) -> Response {

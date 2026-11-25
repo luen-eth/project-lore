@@ -6,7 +6,7 @@ Claude Code, Codex, OpenCode and any other MCP client connect to one server. Bef
 they start work they ask it what was already done; after they finish they write down
 what changed. Whatever one agent learns, every other agent knows in its next session.
 
-![The memory graph: every entry is a neuron, coloured by project and linked to related entries](docs/brain.jpg)
+![The memory graph: entries are neurons coloured by project, agents are diamonds, and the right column shows what each agent is doing live](docs/brain.jpg)
 
 ## Why
 
@@ -103,15 +103,41 @@ The server also sends instructions on connect that tell the agent when to call
 
 ## The admin view
 
-`/admin` is a read-only window into the brain. It shows which agents are connected
-and draws every entry as a neuron: colour is the project, lines join entries that are
-about related things, and new entries light up as agents log them.
+`/admin` is a live window into the brain. Every entry is a neuron: colour is the
+project, lines join entries that are about related things. Agents sit around the
+graph as diamonds.
 
-![An open entry with its tags and related memories](docs/memory.jpg)
+![An agent searching: beams run from the agent to the entries it found](docs/live.jpg)
 
-Click a neuron to read the entry and jump to related ones. Click a project or an
-agent to isolate its part of the graph, or type in the search box to highlight
-matches.
+**It updates as it happens.** The page holds a server-sent event stream open, so
+nothing needs a reload:
+
+- when an agent searches, beams run from that agent to the entries it found;
+- when an agent logs something, the new neuron appears and lights up;
+- the **Live activity** column lists every action: which agent, what it did
+  (searched, logged, amended, read, deleted), on which project, and when;
+- **Connected models** shows who is active right now and each agent's last action.
+
+Click a neuron to read the entry, with the commit it was logged at and its related
+memories. Click a project, an agent or a kind (decision, bug, todo…) to isolate that
+part of the graph, or type in the search box to highlight matches.
+
+![An open entry with its commit, tags and related memories](docs/memory.jpg)
+
+### Backup and restore
+
+The **Backup** menu covers moving and protecting the whole store:
+
+| Action | What it does |
+|---|---|
+| **Export backup** | Downloads every entry, the activity log and the agent records as one JSON file. |
+| **Import and merge** | Adds the entries of a backup that are not present yet. Nothing is removed. |
+| **Restore from backup** | Replaces everything with the backup, after a confirmation. All or nothing: a file that fails validation changes nothing. |
+
+![The backup menu](docs/backup.jpg)
+
+Embeddings are not part of a backup; they are recomputed in the background after an
+import, and the page redraws the links when that finishes.
 
 Sign-in asks for one password and is protected by invisible reCAPTCHA v3.
 
@@ -227,8 +253,12 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
 - **Admin sign-in** locks an address out for 15 minutes after five wrong passwords,
   and with reCAPTCHA configured, refuses requests Google scores as automated. If
   Google cannot be reached the sign-in fails closed.
-- **The admin view** is read-only. It is served with a strict Content-Security-Policy
-  and uses no third-party scripts apart from reCAPTCHA on the sign-in form.
+- **The admin view** cannot edit individual entries. Its only write actions are
+  backup import and restore, which need the signed-in session (a `SameSite=Strict`
+  cookie). It is served with a strict Content-Security-Policy and uses no third-party
+  scripts apart from reCAPTCHA on the sign-in form.
+- **Activity is recorded.** Every tool call is stored with the agent that made it,
+  including search queries, so the admin view can show who did what.
 - **The container** runs as an unprivileged user.
 
 Agents are told not to log secrets, but the store is only as private as its tokens:
@@ -236,9 +266,12 @@ treat them like passwords.
 
 ## Backups
 
-All state is in the data volume. `lore.db` holds the entries; `models/` is a cache
-that is downloaded again if missing. Stop the container so the database file is
-complete on disk, copy it out, and start again:
+The simplest backup is **Backup → Export backup** in the admin view: one JSON file
+that **Restore from backup** loads into any project-lore instance.
+
+All state also lives in the data volume. `lore.db` holds the entries; `models/` is a
+cache that is downloaded again if missing. To copy the database file itself, stop
+the container so the file is complete on disk, copy it out, and start again:
 
 ```bash
 docker compose stop lore
@@ -262,7 +295,8 @@ Rust 1.85 or newer. The source is small:
 | `src/server.rs` | The MCP tools |
 | `src/db.rs` | SQLite schema, full-text and hybrid search |
 | `src/embed.rs` | Local embedding models |
-| `src/admin.rs` | Admin sign-in and the graph API |
+| `src/admin.rs` | Admin sign-in, the graph API, live events, backup and restore |
+| `src/events.rs` | Fan-out of agent activity to open admin pages |
 | `assets/` | The admin page (plain HTML, CSS and canvas JavaScript, no build step) |
 
 ## License

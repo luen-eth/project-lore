@@ -13,6 +13,7 @@ use crate::{
     auth::{Agent, SHARED_AGENT},
     db::{Db, Entry, KINDS, NewEntry, Patch},
     embed::Embedder,
+    events::Events,
 };
 
 const INSTRUCTIONS: &str = "\
@@ -44,6 +45,7 @@ pub struct Lore {
     db: Db,
     embedder: Embedder,
     min_similarity: f32,
+    events: Events,
     #[expect(dead_code, reason = "read by the tool_handler macro")]
     tool_router: ToolRouter<Self>,
 }
@@ -127,11 +129,12 @@ pub struct AmendArgs {
 
 #[tool_router]
 impl Lore {
-    pub fn new(db: Db, embedder: Embedder, min_similarity: f32) -> Self {
+    pub fn new(db: Db, embedder: Embedder, min_similarity: f32, events: Events) -> Self {
         Self {
             db,
             embedder,
             min_similarity,
+            events,
             tool_router: Self::tool_router(),
         }
     }
@@ -139,7 +142,12 @@ impl Lore {
     #[tool(
         description = "Search the shared memory for past work, decisions, bugs and notes related to a topic. Call this before starting work to learn what was already done. Combines keyword and semantic search."
     )]
-    async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> Result<String, String> {
+    async fn recall(
+        &self,
+        Parameters(args): Parameters<RecallArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
         let query = args.query.trim().to_string();
         if query.is_empty() {
             return Err("query must not be empty".into());
@@ -164,6 +172,15 @@ impl Lore {
                     this.min_similarity,
                 )
                 .map_err(internal)?;
+            let found: Vec<i64> = hits.iter().map(|hit| hit.entry.id).collect();
+            this.note(
+                &agent,
+                "recall",
+                project.as_deref().unwrap_or(""),
+                None,
+                &found,
+                &format!("\"{}\" → {} found", clip(&query, 90), found.len()),
+            );
             if hits.is_empty() {
                 let scope = project
                     .map(|p| format!(" in project `{p}`"))
@@ -199,6 +216,7 @@ impl Lore {
     ) -> Result<String, String> {
         // A per-agent token identifies the writer; only the shared token
         // falls back to what the model says it is.
+        let actor = agent_of(&parts);
         let agent = match parts.extensions.get::<Agent>() {
             Some(Agent(name)) if name != SHARED_AGENT => name.clone(),
             _ => args.agent.unwrap_or_default().trim().to_lowercase(),
@@ -221,6 +239,19 @@ impl Lore {
         blocking(move || {
             let entry = this.db.insert(&new).map_err(internal)?;
             this.embed_entry(&entry);
+            let actor = if entry.agent.is_empty() {
+                &actor
+            } else {
+                &entry.agent
+            };
+            this.note(
+                actor,
+                "log",
+                &entry.project,
+                Some(entry.id),
+                &[],
+                &format!("[{}] {}", entry.kind, entry.title),
+            );
             let at = if entry.commit.is_empty() {
                 " (no commit recorded)".to_string()
             } else {
@@ -237,15 +268,30 @@ impl Lore {
     #[tool(
         description = "List the most recent entries, newest first. Use it to see where a project was left off."
     )]
-    async fn recent(&self, Parameters(args): Parameters<RecentArgs>) -> Result<String, String> {
+    async fn recent(
+        &self,
+        Parameters(args): Parameters<RecentArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
         let project = normalize_project_filter(args.project);
         let kind = normalize_kind_filter(args.kind)?;
         let limit = args.limit.unwrap_or(10).clamp(1, 50) as usize;
-        let db = self.db.clone();
+        let this = self.clone();
         blocking(move || {
-            let entries = db
+            let entries = this
+                .db
                 .recent(project.as_deref(), kind.as_deref(), limit)
                 .map_err(internal)?;
+            let seen: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+            this.note(
+                &agent,
+                "recent",
+                project.as_deref().unwrap_or(""),
+                None,
+                &seen,
+                &format!("{} newest entries", seen.len()),
+            );
             if entries.is_empty() {
                 return Ok("No entries yet.".to_string());
             }
@@ -262,10 +308,19 @@ impl Lore {
     #[tool(
         description = "List every project in the shared memory with its entry count, last activity, and the commit each agent last logged at. Compare those commits with your own HEAD to see who is ahead or behind."
     )]
-    async fn projects(&self) -> Result<String, String> {
-        let db = self.db.clone();
+    async fn projects(&self, Extension(parts): Extension<Parts>) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let this = self.clone();
         blocking(move || {
-            let projects = db.projects().map_err(internal)?;
+            let projects = this.db.projects().map_err(internal)?;
+            this.note(
+                &agent,
+                "projects",
+                "",
+                None,
+                &[],
+                &format!("{} projects", projects.len()),
+            );
             if projects.is_empty() {
                 return Ok("No projects yet.".to_string());
             }
@@ -307,10 +362,25 @@ impl Lore {
     #[tool(
         description = "Fetch one entry in full by id. Use it when a recall result was truncated."
     )]
-    async fn get(&self, Parameters(args): Parameters<IdArgs>) -> Result<String, String> {
-        let db = self.db.clone();
-        blocking(move || match db.get(args.id).map_err(internal)? {
-            Some(entry) => Ok(render(&entry, None, false)),
+    async fn get(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let this = self.clone();
+        blocking(move || match this.db.get(args.id).map_err(internal)? {
+            Some(entry) => {
+                this.note(
+                    &agent,
+                    "get",
+                    &entry.project,
+                    Some(entry.id),
+                    &[],
+                    &entry.title,
+                );
+                Ok(render(&entry, None, false))
+            }
             None => Err(format!("No entry with id {}.", args.id)),
         })
         .await
@@ -319,7 +389,12 @@ impl Lore {
     #[tool(
         description = "Correct or update an existing entry. Only the fields you pass are changed. Prefer this over logging a contradicting entry."
     )]
-    async fn amend(&self, Parameters(args): Parameters<AmendArgs>) -> Result<String, String> {
+    async fn amend(
+        &self,
+        Parameters(args): Parameters<AmendArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
         let patch = Patch {
             kind: args.kind.as_deref().map(normalize_kind).transpose()?,
             title: args
@@ -340,6 +415,14 @@ impl Lore {
             move || match this.db.amend(args.id, &patch).map_err(internal)? {
                 Some(entry) => {
                     this.embed_entry(&entry);
+                    this.note(
+                        &agent,
+                        "amend",
+                        &entry.project,
+                        Some(entry.id),
+                        &[],
+                        &entry.title,
+                    );
                     Ok(format!("Updated #{}: {}", entry.id, entry.title))
                 }
                 None => Err(format!("No entry with id {}.", args.id)),
@@ -351,16 +434,46 @@ impl Lore {
     #[tool(
         description = "Permanently delete an entry by id. Use only for entries that are wrong or were logged by mistake."
     )]
-    async fn forget(&self, Parameters(args): Parameters<IdArgs>) -> Result<String, String> {
-        let db = self.db.clone();
+    async fn forget(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let this = self.clone();
         blocking(move || {
-            if db.delete(args.id).map_err(internal)? {
+            let existing = this.db.get(args.id).map_err(internal)?;
+            if this.db.delete(args.id).map_err(internal)? {
+                let (project, title) = existing
+                    .map(|entry| (entry.project, entry.title))
+                    .unwrap_or_default();
+                this.note(&agent, "forget", &project, Some(args.id), &[], &title);
                 Ok(format!("Deleted #{}.", args.id))
             } else {
                 Err(format!("No entry with id {}.", args.id))
             }
         })
         .await
+    }
+
+    /// Records what an agent just did and pushes it to open admin pages.
+    /// Bookkeeping only: a failure here never fails the tool call.
+    fn note(
+        &self,
+        agent: &str,
+        tool: &str,
+        project: &str,
+        entry_id: Option<i64>,
+        targets: &[i64],
+        summary: &str,
+    ) {
+        match self
+            .db
+            .record_activity(agent, tool, project, entry_id, targets, summary)
+        {
+            Ok(activity) => self.events.publish(activity),
+            Err(error) => tracing::warn!(%error, "recording activity failed"),
+        }
     }
 
     /// Stores the embedding for an entry; a failure only costs semantic recall
@@ -397,6 +510,23 @@ where
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|error| format!("internal error: {error}"))?
+}
+
+/// The agent the request was authenticated as.
+fn agent_of(parts: &Parts) -> String {
+    parts
+        .extensions
+        .get::<Agent>()
+        .map(|agent| agent.0.clone())
+        .unwrap_or_else(|| SHARED_AGENT.to_string())
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max).collect::<String>() + "…"
+    }
 }
 
 fn internal(error: anyhow::Error) -> String {

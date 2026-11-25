@@ -42,6 +42,17 @@ CREATE TABLE IF NOT EXISTS agents (
     requests   INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS activity (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    agent    TEXT NOT NULL,
+    tool     TEXT NOT NULL,
+    project  TEXT NOT NULL DEFAULT '',
+    entry_id INTEGER,
+    targets  TEXT NOT NULL DEFAULT '',
+    summary  TEXT NOT NULL DEFAULT ''
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5 (
     title, body, tags, files,
     content = 'entries', content_rowid = 'id',
@@ -76,7 +87,7 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("dirty", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     pub id: i64,
     pub project: String,
@@ -87,15 +98,21 @@ pub struct Entry {
     pub files: String,
     pub agent: String,
     pub created_at: String,
+    #[serde(default)]
     pub updated_at: Option<String>,
     /// Working directory the agent was in when it logged the entry.
+    #[serde(default)]
     pub path: String,
     /// Git remote of that directory, or empty when it is not a repository.
+    #[serde(default)]
     pub repo: String,
     /// HEAD commit at the time of logging, or empty.
+    #[serde(default)]
     pub commit: String,
+    #[serde(default)]
     pub branch: String,
     /// True when the working tree had uncommitted changes.
+    #[serde(default)]
     pub dirty: bool,
 }
 
@@ -175,6 +192,52 @@ pub struct AgentHead {
     pub at: String,
     pub entry_id: i64,
 }
+
+/// One tool call made by an agent, as shown in the admin activity feed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Activity {
+    pub id: i64,
+    pub at: String,
+    pub agent: String,
+    /// The MCP tool that was called: recall, log, recent, ...
+    pub tool: String,
+    pub project: String,
+    /// The entry the call created, changed, read or removed.
+    pub entry_id: Option<i64>,
+    /// Entries the call returned (search results), for highlighting.
+    pub targets: Vec<i64>,
+    pub summary: String,
+}
+
+pub const BACKUP_FORMAT: &str = "project-lore-backup";
+
+/// Everything needed to rebuild the store. Embeddings are left out: they are
+/// derived data and are recomputed after a restore.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Backup {
+    pub format: String,
+    pub version: u32,
+    pub exported_at: String,
+    pub entries: Vec<Entry>,
+    #[serde(default)]
+    pub activity: Vec<Activity>,
+    #[serde(default)]
+    pub agents: Vec<BackupAgent>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BackupAgent {
+    pub name: String,
+    #[serde(default)]
+    pub client: String,
+    pub first_seen: String,
+    pub last_seen: String,
+    #[serde(default)]
+    pub requests: i64,
+}
+
+/// Activity rows kept; older ones are dropped.
+const ACTIVITY_KEPT: i64 = 2000;
 
 /// A connected agent, as shown in the admin view.
 #[derive(Debug, serde::Serialize)]
@@ -386,6 +449,236 @@ impl Db {
             });
         }
         Ok(projects)
+    }
+
+    /// A complete copy of the store.
+    pub fn export(&self) -> Result<Backup> {
+        let conn = self.lock();
+        let exported_at: String =
+            conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |r| {
+                r.get(0)
+            })?;
+        let entries = {
+            let sql = format!("SELECT {COLUMNS} FROM entries ORDER BY id");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], Entry::from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let agents = {
+            let mut stmt = conn.prepare(
+                "SELECT name, client, first_seen, last_seen, requests FROM agents ORDER BY name",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(BackupAgent {
+                    name: row.get(0)?,
+                    client: row.get(1)?,
+                    first_seen: row.get(2)?,
+                    last_seen: row.get(3)?,
+                    requests: row.get(4)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        drop(conn);
+        let mut activity = self.activity(ACTIVITY_KEPT as usize)?;
+        activity.reverse();
+        Ok(Backup {
+            format: BACKUP_FORMAT.to_string(),
+            version: 1,
+            exported_at,
+            entries,
+            activity,
+            agents,
+        })
+    }
+
+    /// Replaces the whole store with a backup, keeping entry ids. All or
+    /// nothing: on any error the previous contents stay in place.
+    pub fn restore(&self, backup: &Backup) -> Result<usize> {
+        validate_backup(backup)?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "DELETE FROM entries; DELETE FROM activity; DELETE FROM agents;
+             DELETE FROM sqlite_sequence WHERE name IN ('entries', 'activity');",
+        )?;
+        for entry in &backup.entries {
+            tx.execute(
+                "INSERT INTO entries (id, project, kind, title, body, tags, files, agent,
+                                      created_at, updated_at, path, repo, commit_hash, branch, dirty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    entry.id,
+                    entry.project,
+                    entry.kind,
+                    entry.title,
+                    entry.body,
+                    entry.tags,
+                    entry.files,
+                    entry.agent,
+                    entry.created_at,
+                    entry.updated_at,
+                    entry.path,
+                    entry.repo,
+                    entry.commit,
+                    entry.branch,
+                    entry.dirty
+                ],
+            )?;
+        }
+        for activity in &backup.activity {
+            let targets = activity
+                .targets
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            tx.execute(
+                "INSERT INTO activity (id, at, agent, tool, project, entry_id, targets, summary)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    activity.id,
+                    activity.at,
+                    activity.agent,
+                    activity.tool,
+                    activity.project,
+                    activity.entry_id,
+                    targets,
+                    activity.summary
+                ],
+            )?;
+        }
+        for agent in &backup.agents {
+            tx.execute(
+                "INSERT INTO agents (name, client, first_seen, last_seen, requests)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    agent.name,
+                    agent.client,
+                    agent.first_seen,
+                    agent.last_seen,
+                    agent.requests
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(backup.entries.len())
+    }
+
+    /// Adds the backup's entries that are not here yet, under new ids.
+    /// An entry counts as present when project, title, body and creation time
+    /// all match. Returns (added, already present).
+    pub fn merge(&self, backup: &Backup) -> Result<(usize, usize)> {
+        validate_backup(backup)?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let (mut added, mut present) = (0, 0);
+        for entry in &backup.entries {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM entries
+                 WHERE project = ?1 AND title = ?2 AND body = ?3 AND created_at = ?4)",
+                params![entry.project, entry.title, entry.body, entry.created_at],
+                |row| row.get(0),
+            )?;
+            if exists {
+                present += 1;
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO entries (project, kind, title, body, tags, files, agent,
+                                      created_at, updated_at, path, repo, commit_hash, branch, dirty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    entry.project,
+                    entry.kind,
+                    entry.title,
+                    entry.body,
+                    entry.tags,
+                    entry.files,
+                    entry.agent,
+                    entry.created_at,
+                    entry.updated_at,
+                    entry.path,
+                    entry.repo,
+                    entry.commit,
+                    entry.branch,
+                    entry.dirty
+                ],
+            )?;
+            added += 1;
+        }
+        tx.commit()?;
+        Ok((added, present))
+    }
+
+    /// Stores one agent action and returns it as recorded.
+    pub fn record_activity(
+        &self,
+        agent: &str,
+        tool: &str,
+        project: &str,
+        entry_id: Option<i64>,
+        targets: &[i64],
+        summary: &str,
+    ) -> Result<Activity> {
+        let conn = self.lock();
+        let joined = targets
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute(
+            "INSERT INTO activity (agent, tool, project, entry_id, targets, summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![agent, tool, project, entry_id, joined, summary],
+        )?;
+        let id = conn.last_insert_rowid();
+        if id % 200 == 0 {
+            conn.execute(
+                "DELETE FROM activity WHERE id <= ?1",
+                params![id - ACTIVITY_KEPT],
+            )?;
+        }
+        let at: String =
+            conn.query_row("SELECT at FROM activity WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })?;
+        Ok(Activity {
+            id,
+            at,
+            agent: agent.to_string(),
+            tool: tool.to_string(),
+            project: project.to_string(),
+            entry_id,
+            targets: targets.to_vec(),
+            summary: summary.to_string(),
+        })
+    }
+
+    /// The newest `limit` actions, newest first.
+    pub fn activity(&self, limit: usize) -> Result<Vec<Activity>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, at, agent, tool, project, entry_id, targets, summary
+             FROM activity ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let targets: String = row.get(6)?;
+            Ok(Activity {
+                id: row.get(0)?,
+                at: row.get(1)?,
+                agent: row.get(2)?,
+                tool: row.get(3)?,
+                project: row.get(4)?,
+                entry_id: row.get(5)?,
+                targets: targets
+                    .split(',')
+                    .filter_map(|id| id.parse().ok())
+                    .collect(),
+                summary: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Changes whenever an entry is added, amended or removed.
@@ -680,6 +973,24 @@ impl Db {
     }
 }
 
+fn validate_backup(backup: &Backup) -> Result<()> {
+    if backup.format != BACKUP_FORMAT {
+        anyhow::bail!("this file is not a project-lore backup");
+    }
+    if backup.version != 1 {
+        anyhow::bail!("backup version {} is not supported", backup.version);
+    }
+    for entry in &backup.entries {
+        if entry.project.trim().is_empty() || entry.title.trim().is_empty() {
+            anyhow::bail!("entry #{} has no project or title", entry.id);
+        }
+        if !KINDS.contains(&entry.kind.as_str()) {
+            anyhow::bail!("entry #{} has an unknown kind \"{}\"", entry.id, entry.kind);
+        }
+    }
+    Ok(())
+}
+
 /// Adds columns introduced after a database was first created.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
     let existing: Vec<String> = conn
@@ -971,6 +1282,78 @@ mod tests {
             db.search("entry", None, None, None, 5, 0.8).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn activity_is_recorded_newest_first() {
+        let db = temp_db();
+        db.record_activity("claude", "log", "shop", Some(1), &[], "Added refunds")
+            .unwrap();
+        let second = db
+            .record_activity("codex", "recall", "", None, &[1, 4], "refunds")
+            .unwrap();
+        assert_eq!(second.targets, [1, 4]);
+        let feed = db.activity(10).unwrap();
+        assert_eq!(feed.len(), 2);
+        assert_eq!(
+            (feed[0].agent.as_str(), feed[0].tool.as_str()),
+            ("codex", "recall")
+        );
+        assert_eq!(feed[0].targets, [1, 4]);
+        assert_eq!(feed[1].entry_id, Some(1));
+    }
+
+    #[test]
+    fn backup_round_trips_and_merge_skips_what_exists() {
+        let db = temp_db();
+        let first = db
+            .insert(&entry("shop", "Refunds", "refund endpoint"))
+            .unwrap();
+        db.insert(&entry("blog", "Feeds", "rss and atom")).unwrap();
+        db.set_embedding(first.id, &[1.0, 0.0]).unwrap();
+        db.touch_agent("claude", "claude-code/2").unwrap();
+        db.record_activity("claude", "log", "shop", Some(first.id), &[], "Refunds")
+            .unwrap();
+
+        let json = serde_json::to_string(&db.export().unwrap()).unwrap();
+        let backup: Backup = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (
+                backup.entries.len(),
+                backup.activity.len(),
+                backup.agents.len()
+            ),
+            (2, 1, 1)
+        );
+
+        // Merging a backup into the store it came from adds nothing.
+        assert_eq!(db.merge(&backup).unwrap(), (0, 2));
+
+        // Diverge, then restore: the store is exactly the backup again.
+        db.delete(first.id).unwrap();
+        db.insert(&entry("temp", "Scratch", "to be discarded"))
+            .unwrap();
+        assert_eq!(db.restore(&backup).unwrap(), 2);
+        assert_eq!(db.get(first.id).unwrap().unwrap().title, "Refunds");
+        assert!(
+            db.search("discarded", None, None, None, 5, 0.8)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.search("refund", None, None, None, 5, 0.8).unwrap().len(),
+            1
+        );
+        assert_eq!(db.missing_embeddings(10).unwrap().len(), 2);
+        assert_eq!(db.activity(10).unwrap().len(), 1);
+
+        // A file that is not a backup changes nothing.
+        let bogus = Backup {
+            format: "something-else".into(),
+            ..db.export().unwrap()
+        };
+        assert!(db.restore(&bogus).is_err());
+        assert_eq!(db.export().unwrap().entries.len(), 2);
     }
 
     #[test]
