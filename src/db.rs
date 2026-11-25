@@ -3552,18 +3552,29 @@ fn refuse_secret_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Refuses content that holds a private key: a line with `-----BEGIN `
-/// followed by `PRIVATE KEY-----`. The raw bytes are checked, so a key
-/// sent as base64 is refused too.
+/// Refuses content that holds a private key: a PEM header, that is
+/// `-----BEGIN `, then only uppercase letters, digits and spaces (`RSA `,
+/// `OPENSSH `, `ENCRYPTED `, or nothing), then `PRIVATE KEY-----`. Text that
+/// merely mentions the two markers apart is fine. The raw bytes are checked,
+/// so a key sent as base64 is refused too.
 fn refuse_secret_content(content: &[u8]) -> Result<()> {
     const BEGIN: &[u8] = b"-----BEGIN ";
     const END: &[u8] = b"PRIVATE KEY-----";
-    for line in content.split(|byte| *byte == b'\n') {
-        if let Some(start) = find_bytes(line, BEGIN)
-            && find_bytes(&line[start + BEGIN.len()..], END).is_some()
-        {
+    let mut rest = content;
+    while let Some(start) = find_bytes(rest, BEGIN) {
+        let after = &rest[start + BEGIN.len()..];
+        let label = after
+            .iter()
+            .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || **byte == b' ')
+            .count();
+        // `PRIVATE KEY` is itself made of label characters, so the run of
+        // them swallows it; a header is a run that ends in it, right before
+        // the closing dashes.
+        let words = END.len() - "-----".len();
+        if label >= words && after[label - words..].starts_with(END) {
             anyhow::bail!("{SECRET_REFUSAL}: the content holds a private key");
         }
+        rest = after;
     }
     Ok(())
 }
@@ -5310,6 +5321,52 @@ mod tests {
         ))
         .unwrap();
         assert!(db.files(None, 10).unwrap().len() == 2);
+    }
+
+    #[test]
+    fn only_real_pem_private_key_headers_are_refused() {
+        for header in [
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+            "-----BEGIN DSA2 PRIVATE KEY-----",
+            "text before -----BEGIN RSA PRIVATE KEY----- text after",
+        ] {
+            let content = format!("notes\n{header}\nMIIEabc\n");
+            assert!(
+                refuse_secret_content(content.as_bytes()).is_err(),
+                "{header}"
+            );
+        }
+        for text in [
+            // Documentation that names the markers is fine.
+            "A key starts with `-----BEGIN ` followed by `PRIVATE KEY-----`.",
+            "-----BEGIN PUBLIC KEY-----",
+            "-----BEGIN CERTIFICATE-----\nPRIVATE KEY-----",
+            "-----BEGIN rsa PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY",
+            "-----BEGIN PRIVATE KEY----",
+            "PRIVATE KEY----- before -----BEGIN ",
+        ] {
+            assert!(refuse_secret_content(text.as_bytes()).is_ok(), "{text}");
+        }
+        // The documentation sentence is stored, also when sent as base64.
+        use base64::Engine;
+        let db = temp_db();
+        let doc = "A PEM key starts with `-----BEGIN ` followed by `PRIVATE KEY-----`.\n";
+        db.save_file(&new_file("shop", "docs/spec.md", doc))
+            .unwrap();
+        db.save_file(&NewFile {
+            encoding: "base64".into(),
+            ..new_file(
+                "shop",
+                "docs/spec.bin",
+                &base64::engine::general_purpose::STANDARD.encode(doc),
+            )
+        })
+        .unwrap();
     }
 
     #[test]
