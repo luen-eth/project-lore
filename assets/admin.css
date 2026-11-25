@@ -44,8 +44,8 @@ html, body {
   will-change: transform, filter;
 }
 @keyframes breathe {
-  from { filter: blur(2px) brightness(0.4) saturate(1.05); }
-  to { filter: blur(2px) brightness(0.56) saturate(1.25); }
+  from { filter: blur(2px) brightness(0.24) saturate(1.05); }
+  to { filter: blur(2px) brightness(0.33) saturate(1.2); }
 }
 .aurora {
   width: 60vmax; height: 60vmax; border-radius: 50%;
