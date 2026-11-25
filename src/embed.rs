@@ -129,7 +129,8 @@ impl Embedder {
         self.embed(format!("{}{text}", self.kind.prefixes().1))
     }
 
-    /// Embeds every entry without a vector. Safe to call repeatedly.
+    /// Embeds every entry, then every file version, without a vector, and
+    /// returns how many entries it embedded. Safe to call repeatedly.
     pub fn backfill(&self, db: &Db) -> Result<usize> {
         let mut done = 0;
         loop {
@@ -147,6 +148,23 @@ impl Embedder {
         }
         if done > 0 {
             tracing::info!(count = done, "embedded entries");
+        }
+        let mut files = 0;
+        loop {
+            let batch = db.files_missing_embeddings(32)?;
+            if batch.is_empty() {
+                break;
+            }
+            for file in batch {
+                match self.embed_passage(&file.embedding_text())? {
+                    Some(vector) => db.set_file_embedding(file.id, &vector)?,
+                    None => return Ok(done),
+                }
+                files += 1;
+            }
+        }
+        if files > 0 {
+            tracing::info!(count = files, "embedded files");
         }
         Ok(done)
     }

@@ -12,8 +12,9 @@ use serde::Deserialize;
 use crate::{
     auth::{Agent, SHARED_AGENT},
     db::{
-        BODY_MAX_CHARS, Db, Entry, KINDS, Message, NOTE_MAX_CHARS, NewEntry, NewMessage,
-        NewSession, NewTask, Patch, Rule, Session, TASK_ACTIONS, TASK_TITLE_MAX_CHARS, Task,
+        BODY_MAX_CHARS, Db, Entry, FileInfo, KINDS, Message, NOTE_MAX_CHARS, NewEntry, NewFile,
+        NewMessage, NewSession, NewTask, Patch, Rule, Session, TASK_ACTIONS, TASK_TITLE_MAX_CHARS,
+        Task,
     },
     embed::Embedder,
     events::Events,
@@ -53,10 +54,18 @@ The board is how agents work together. Before starting on something that may alr
 be on the list, check it with `tasks`, and use `task_update` to claim a task before \
 working on it and to mark it `done` (with the commit) when you finish it. Leave a `handoff` note \
 when you stop in the middle of something, and use `send` for anything another agent \
-must know.";
+must know.
+
+When a file matters to a project beyond its code (the ideas it is built on, a design \
+note, a schema, an important JSON or config file), keep it with `file_save` so other \
+agents can find it with `files` and read it with `file_get`. Saving the same path again \
+makes a new version. Do not store source code that lives in git, and never store secrets.";
 
 /// Longest body returned inline by `recall` and `recent`; `get` returns everything.
 const PREVIEW_CHARS: usize = 700;
+
+/// Longest file text `file_get` returns; longer text is cut and says so.
+const FILE_TEXT_CHARS: usize = 200_000;
 
 #[derive(Clone)]
 pub struct Lore {
@@ -280,6 +289,63 @@ pub struct InboxArgs {
     pub include_read: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FileSaveArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Repository or folder name in lowercase, e.g. `project-lore`.
+    pub project: String,
+    /// The file's name or path relative to the project, e.g. `docs/ideas.md`.
+    /// Saving the same path again makes a new version.
+    pub path: String,
+    /// The whole file: its text, or its bytes as base64 with `encoding` set
+    /// to `base64`. At most 2 MiB.
+    pub content: String,
+    /// Why the file matters to the project, in one or two sentences.
+    pub description: String,
+    /// One of: idea, doc, data, config, other. Omit it to keep the kind of
+    /// the earlier versions (other for a new file).
+    pub kind: Option<String>,
+    /// utf8 (the default) for text, base64 for binary files.
+    pub encoding: Option<String>,
+    /// The id of a memory entry this file belongs to, if any.
+    pub entry_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FileGetArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// File id, as shown by `files` and `recall`. Or give `project` and `path`.
+    pub id: Option<i64>,
+    /// The project the file belongs to, with `path`.
+    pub project: Option<String>,
+    /// The file's path within the project, with `project`.
+    pub path: Option<String>,
+    /// One version, with `project` and `path`. Omit for the latest.
+    pub version: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FilesArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Restrict to one project. Omit for every project.
+    pub project: Option<String>,
+    /// Search the paths and descriptions instead of listing the newest files.
+    pub query: Option<String>,
+    /// Maximum number of files to return (default 20, max 100).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FileDeleteArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Id of the file version to delete, as shown by `files` and `file_get`.
+    pub id: i64,
+}
+
 #[tool_router]
 impl Lore {
     pub fn new(
@@ -358,11 +424,43 @@ impl Lore {
                 &found,
                 &format!("\"{}\" → {} found", clip(&query, 90), found.len()),
             );
+            // Files the query matches come after the entries; a failure here
+            // only costs the hint.
+            let related = this
+                .db
+                .search_files(
+                    &query,
+                    project.as_deref(),
+                    vector.as_deref(),
+                    this.min_similarity,
+                    3,
+                )
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "file search failed");
+                    Vec::new()
+                });
+            let mut related_text = String::new();
+            if !related.is_empty() {
+                related_text.push_str("\nRelated files:\n");
+                for hit in &related {
+                    related_text.push_str(&format!(
+                        "- #{} {}/{} v{} — {}\n",
+                        hit.file.id,
+                        hit.file.project,
+                        hit.file.path,
+                        hit.file.version,
+                        clip(&hit.file.description, 160)
+                    ));
+                }
+                related_text.push_str("Read one with `file_get`.\n");
+            }
             if hits.is_empty() {
                 let scope = project
                     .map(|p| format!(" in project `{p}`"))
                     .unwrap_or_default();
-                return Ok(format!("No entries found for \"{query}\"{scope}."));
+                let mut out = format!("No entries found for \"{query}\"{scope}.");
+                out.push_str(&related_text);
+                return Ok(out);
             }
             let mut out = format!("{} entries for \"{query}\":\n", hits.len());
             for hit in &hits {
@@ -373,6 +471,7 @@ impl Lore {
                 };
                 out.push_str(&render(&hit.entry, Some(&matched), true));
             }
+            out.push_str(&related_text);
             if !this.embedder.is_ready() {
                 out.push_str(
                     "\n(Semantic search is still warming up; results are keyword-only.)\n",
@@ -672,7 +771,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Open the session for this chat and get the briefing: how to address the user, the language to reply in, the rules the user wants followed, notes left for whoever works on the project next, your unread messages, the open tasks, other open sessions, and where the project was left off. Call this once at the very start of every new chat, before any other lore tool."
+        description = "Open the session for this chat and get the briefing: how to address the user, the language to reply in, the rules the user wants followed, notes left for whoever works on the project next, your unread messages, the open tasks, the files kept for the project, other open sessions, and where the project was left off. Call this once at the very start of every new chat, before any other lore tool."
     )]
     async fn hello(
         &self,
@@ -735,6 +834,16 @@ impl Lore {
                 .map_err(internal)?;
             open_tasks.sort_by_key(|task| task.assignee.as_str() != feed_agent);
             open_tasks.truncate(10);
+            // The files kept for the project: how many, and the newest three.
+            let file_count = this
+                .db
+                .project_file_count(&session.project)
+                .map_err(internal)?;
+            let latest_files = if file_count > 0 {
+                this.db.files(Some(&session.project), 3).map_err(internal)?
+            } else {
+                Vec::new()
+            };
             // Up to ten unread messages are listed and marked read, and
             // handoff notes for whoever works on this project next arrive
             // here, exactly once. Only what this call marked or delivered
@@ -780,6 +889,8 @@ impl Lore {
                     unread_more: unread_more.max(0) as usize,
                     agent: feed_agent,
                     open_tasks: &open_tasks,
+                    file_count: file_count.max(0) as usize,
+                    latest_files: &latest_files,
                 },
                 &other_rows,
                 &entries,
@@ -1232,6 +1343,314 @@ impl Lore {
         .await
     }
 
+    #[tool(
+        description = "Keep a file that matters to a project so future agents can find and read it: the ideas the project is built on, a design note, a schema, an important JSON or config file. Not source code that lives in git, and never secrets (keys, tokens, passwords, .env files). Saving the same path again stores a new version; identical content is not stored twice. Text is sent as is; binary files as base64 with encoding `base64`. At most 2 MiB."
+    )]
+    async fn file_save(
+        &self,
+        Parameters(args): Parameters<FileSaveArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let new = NewFile {
+                project: normalize_project(&args.project)?,
+                path: args.path,
+                kind: args.kind.unwrap_or_default(),
+                description: args.description,
+                encoding: args.encoding.unwrap_or_default(),
+                content: args.content,
+                entry_id: args.entry_id,
+                agent: actor.to_string(),
+                session_id: Some(session.id.clone()),
+            };
+            // A refused file is an answer to the agent, not a server fault:
+            // it says what was wrong with it.
+            let saved = this.db.save_file(&new).map_err(|error| {
+                tracing::warn!(%error, "file save refused");
+                error.to_string()
+            })?;
+            if saved.needs_embedding {
+                this.embed_file(&saved.file);
+            }
+            let file = &saved.file;
+            this.note(
+                actor,
+                "file_save",
+                &file.project,
+                Some(&session.id),
+                None,
+                &[],
+                &format!(
+                    "{} v{}{}",
+                    file.path,
+                    file.version,
+                    if saved.unchanged { " (unchanged)" } else { "" }
+                ),
+            );
+            Ok(if saved.unchanged {
+                format!(
+                    "{} is unchanged (v{}, file #{}).",
+                    file.path, file.version, file.id
+                )
+            } else {
+                format!(
+                    "Saved {} v{} in {} ({}, file #{}).",
+                    file.path,
+                    file.version,
+                    file.project,
+                    human_size(file.size),
+                    file.id
+                )
+            })
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Read a file kept in lore: by `id`, or by `project` and `path` (the latest version unless `version` is given). Returns what the file is and why it matters, its other versions, and its content."
+    )]
+    async fn file_get(
+        &self,
+        Parameters(args): Parameters<FileGetArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let found = match (args.id, args.project.as_deref(), args.path.as_deref()) {
+                (Some(id), _, _) => this.db.file(id).map_err(internal)?,
+                (None, Some(project), Some(path)) => this
+                    .db
+                    .file_at(project, path, args.version)
+                    .map_err(|error| error.to_string())?,
+                _ => return Err("give the file's `id`, or its `project` and `path`".into()),
+            };
+            let Some(file) = found else {
+                return Err(match args.id {
+                    Some(id) => format!("No file with id {id}."),
+                    None => "No such file (or no such version of it).".to_string(),
+                });
+            };
+            let info = &file.info;
+            let versions = this
+                .db
+                .file_versions(&info.project, &info.path)
+                .map_err(internal)?;
+            this.note(
+                actor,
+                "file_get",
+                &info.project,
+                Some(&session.id),
+                None,
+                &[],
+                &format!("{} v{}", info.path, info.version),
+            );
+            let mut out = format!(
+                "#{} {}/{} v{} · {} · {} · sha256 {} · saved by {} at {}\n",
+                info.id,
+                info.project,
+                info.path,
+                info.version,
+                info.kind,
+                human_size(info.size),
+                &info.sha256[..info.sha256.len().min(12)],
+                info.agent,
+                info.created_at
+            );
+            out.push_str(&format!("Why it matters: {}\n", info.description));
+            if let Some(entry_id) = info.entry_id {
+                out.push_str(&format!("Belongs to entry #{entry_id}.\n"));
+            }
+            let others: Vec<String> = versions
+                .iter()
+                .filter(|other| other.id != info.id)
+                .map(|other| format!("v{} (#{})", other.version, other.id))
+                .collect();
+            if others.is_empty() {
+                out.push_str("No other versions.\n");
+            } else {
+                out.push_str(&format!("Other versions: {}.\n", others.join(", ")));
+            }
+            out.push('\n');
+            if info.encoding == "base64" {
+                use base64::Engine;
+                out.push_str(
+                    "Binary file, shown as base64 (decode it to get the raw bytes):\n",
+                );
+                out.push_str(&base64::engine::general_purpose::STANDARD.encode(&file.content));
+                out.push('\n');
+            } else {
+                let text = String::from_utf8_lossy(&file.content);
+                let total = text.chars().count();
+                if total > FILE_TEXT_CHARS {
+                    let cut: String = text.chars().take(FILE_TEXT_CHARS).collect();
+                    out.push_str(&cut);
+                    out.push_str(&format!(
+                        "\n… (truncated: this shows the first {FILE_TEXT_CHARS} of {total} characters)\n"
+                    ));
+                } else {
+                    out.push_str(&text);
+                    if !text.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "List the files kept in lore, newest first, or search their paths and descriptions with `query`. Read one with `file_get`."
+    )]
+    async fn files(
+        &self,
+        Parameters(args): Parameters<FilesArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let project = normalize_project_filter(args.project);
+            let query = args
+                .query
+                .as_deref()
+                .map(str::trim)
+                .filter(|query| !query.is_empty())
+                .map(str::to_string);
+            let limit = args.limit.unwrap_or(20).clamp(1, 100) as usize;
+            // Each file with how a search found it, when this is a search.
+            let list: Vec<(FileInfo, Option<String>)> = match &query {
+                None => this
+                    .db
+                    .files(project.as_deref(), limit)
+                    .map_err(internal)?
+                    .into_iter()
+                    .map(|file| (file, None))
+                    .collect(),
+                Some(query) => {
+                    let vector = this.embedder.embed_query(query).unwrap_or_else(|error| {
+                        tracing::warn!(%error, "query embedding failed");
+                        None
+                    });
+                    this.db
+                        .search_files(
+                            query,
+                            project.as_deref(),
+                            vector.as_deref(),
+                            this.min_similarity,
+                            limit,
+                        )
+                        .map_err(internal)?
+                        .into_iter()
+                        .map(|hit| {
+                            let matched = match hit.similarity {
+                                Some(similarity) => format!("{} ({similarity:.2})", hit.matched),
+                                None => hit.matched.to_string(),
+                            };
+                            (hit.file, Some(matched))
+                        })
+                        .collect()
+                }
+            };
+            this.note(
+                actor,
+                "files",
+                project.as_deref().unwrap_or(""),
+                Some(&session.id),
+                None,
+                &[],
+                &match &query {
+                    Some(query) => format!("\"{}\" → {} found", clip(query, 90), list.len()),
+                    None => format!("{} files", list.len()),
+                },
+            );
+            let scope = project
+                .as_deref()
+                .map(|p| format!(" in `{p}`"))
+                .unwrap_or_default();
+            if list.is_empty() {
+                return Ok(match &query {
+                    Some(query) => format!("No files found for \"{query}\"{scope}."),
+                    None => format!("No files kept{scope} yet."),
+                });
+            }
+            let mut out = match &query {
+                Some(query) => format!("{} files for \"{query}\"{scope}:\n", list.len()),
+                None => format!("{} newest files{scope}:\n", list.len()),
+            };
+            for (file, matched) in &list {
+                let matched = matched
+                    .as_deref()
+                    .map(|matched| format!(" · match: {matched}"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "\n#{} {}/{} v{} [{}] {} · {} · {}{matched}\n{}\n",
+                    file.id,
+                    file.project,
+                    file.path,
+                    file.version,
+                    file.kind,
+                    human_size(file.size),
+                    file.agent,
+                    file.created_at,
+                    file.description
+                ));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Delete one version of a file kept in lore, by id. Use only for a version saved by mistake or one that must not be kept."
+    )]
+    async fn file_delete(
+        &self,
+        Parameters(args): Parameters<FileDeleteArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let Some(file) = this.db.delete_file(args.id).map_err(internal)? else {
+                return Err(format!("No file with id {}.", args.id));
+            };
+            this.note(
+                actor,
+                "file_delete",
+                &file.project,
+                Some(&session.id),
+                None,
+                &[],
+                &format!("{} v{}", file.path, file.version),
+            );
+            Ok(format!(
+                "Deleted {} v{} in {} (file #{}).",
+                file.path, file.version, file.project, file.id
+            ))
+        })
+        .await
+    }
+
     /// Records what an agent just did and pushes it to open admin pages.
     /// Bookkeeping only: a failure here never fails the tool call.
     #[expect(
@@ -1268,6 +1687,21 @@ impl Lore {
             }
             Ok(None) => {}
             Err(error) => tracing::warn!(%error, id = entry.id, "embedding failed"),
+        }
+    }
+
+    /// Stores the embedding of a file's path, kind and description; a
+    /// failure only costs semantic search for that file until the next
+    /// startup backfill.
+    fn embed_file(&self, file: &FileInfo) {
+        match self.embedder.embed_passage(&file.embedding_text()) {
+            Ok(Some(vector)) => {
+                if let Err(error) = self.db.set_file_embedding(file.id, &vector) {
+                    tracing::warn!(%error, id = file.id, "storing file embedding failed");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, id = file.id, "file embedding failed"),
         }
     }
 }
@@ -1419,7 +1853,8 @@ fn render_message(message: &Message, body_clip: usize) -> String {
 }
 
 /// The board sections of the `hello` briefing: the handoff notes delivered
-/// with it, the messages it marks read, and the open tasks of the project.
+/// with it, the messages it marks read, the open tasks of the project, and
+/// the files kept for it.
 struct BriefingBoard<'a> {
     handoffs: &'a [Message],
     unread: &'a [Message],
@@ -1428,6 +1863,10 @@ struct BriefingBoard<'a> {
     /// The agent the briefing is for, to mark the tasks meant for it.
     agent: &'a str,
     open_tasks: &'a [Task],
+    /// How many distinct files the project keeps.
+    file_count: usize,
+    /// The newest of them, newest first.
+    latest_files: &'a [FileInfo],
 }
 
 /// The text `hello` returns: the session, the profile, the rules, the board,
@@ -1528,6 +1967,19 @@ fn briefing(
         }
         sections.push(lines.join("\n"));
     }
+    if board.file_count > 0 {
+        let latest = board
+            .latest_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        sections.push(format!(
+            "Files kept for {}: {} (latest: {latest}). List them with `files`, read one with \
+             `file_get`.",
+            session.project, board.file_count
+        ));
+    }
     if !others.is_empty() {
         let mut lines = vec![format!("Other open sessions on {}:", session.project)];
         for (other, latest) in others {
@@ -1621,6 +2073,18 @@ fn normalize_commit(commit: &str) -> Result<String, String> {
         Ok(commit)
     } else {
         Err("commit must be the hash printed by `git rev-parse HEAD`, or \"none\" outside a git repository".into())
+    }
+}
+
+/// A byte count as people read it: 812 B, 1.2 KB, 1.8 MB.
+fn human_size(bytes: i64) -> String {
+    let bytes = bytes.max(0) as f64;
+    if bytes < 1024.0 {
+        format!("{bytes} B")
+    } else if bytes < 1024.0 * 1024.0 {
+        format!("{:.1} KB", bytes / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes / (1024.0 * 1024.0))
     }
 }
 

@@ -33,10 +33,14 @@ const TOOLS = {
   send: { verb: "sent a message", tone: "write" },
   handoff: { verb: "left a handoff note", tone: "write" },
   inbox: { verb: "read the inbox", tone: "read" },
+  file_save: { verb: "saved a file", tone: "write" },
+  file_get: { verb: "read a file", tone: "read" },
+  files: { verb: "looked at the files", tone: "read" },
+  file_delete: { verb: "deleted a file", tone: "remove" },
 };
 const WRITES = new Set([
   "hello", "checkin", "bye", "log", "amend", "forget", "profile", "rules", "import", "restore", "reindex",
-  "task_add", "task_update", "send", "handoff",
+  "task_add", "task_update", "send", "handoff", "file_save", "file_delete",
 ]);
 const FALLBACK_POLL_MS = 30000;
 const FEED_MAX = 120;
@@ -669,7 +673,7 @@ const state = {
   filter: null, // { type: 'project' | 'agent' | 'kind', value }
   query: "", timer: null, clock: null, source: null, refreshing: null,
   siteKey: null, decorative: false, role: "viewer",
-  sessions: [], openSessions: 0, openTasks: 0,
+  sessions: [], openSessions: 0, openTasks: 0, fileCount: 0,
 };
 
 async function api(path, options) {
@@ -694,6 +698,8 @@ function showLogin() {
   $("profile-toggle").setAttribute("aria-expanded", "false");
   closeBoard();
   Object.assign(board, { data: null, tab: "tasks", filter: "open", project: "" });
+  closeFiles();
+  resetFiles();
   $("app").hidden = true;
   $("login").hidden = false;
   if (!state.decorative) {
@@ -770,6 +776,8 @@ function applyRole(role) {
   // The board forms write as the administrator; a viewer never sees them.
   $("task-form").hidden = !admin;
   $("message-form").hidden = !admin;
+  // So is the file form; a viewer only reads and downloads.
+  $("file-form").hidden = !admin;
   if (!admin) {
     $("backup").hidden = true;
     $("backup-toggle").setAttribute("aria-expanded", "false");
@@ -838,6 +846,11 @@ async function fallbackPoll() {
       renderStats();
       boardActivity();
     }
+    if (pulse.files !== state.fileCount) {
+      state.fileCount = pulse.files;
+      renderStats();
+      filesActivity();
+    }
     if (pulse.version !== state.version) await refresh(false);
   } catch (_) { /* signed out or offline; the next poll retries */ }
 }
@@ -884,6 +897,7 @@ async function load(first) {
       state.model = payload.embedding_model;
       state.openSessions = payload.open_sessions;
       state.openTasks = payload.open_tasks;
+      state.fileCount = payload.files;
       const { counts, colors } = projectColors(payload.brain.neurons);
       state.counts = counts; state.colors = colors;
       for (const agent of payload.agents) agentColor(agent.name);
@@ -1013,6 +1027,7 @@ async function onActivity(activity) {
   if (state.seen.has(activityKey(activity))) return;
   addToFeed(activity, true);
   boardActivity();
+  filesActivity(activity);
 
   const agent = state.agents.find((a) => a.name === activity.agent);
   if (agent) {
@@ -1100,6 +1115,7 @@ function renderStats() {
   setStat("stat-online", state.agents.filter((a) => a.seconds_since_seen !== null && a.seconds_since_seen < 300).length);
   setStat("stat-tasks", state.openTasks);
   setStat("stat-sessions", state.openSessions);
+  setStat("stat-files", state.fileCount);
 }
 
 function clickable(item, onClick) {
@@ -1273,6 +1289,7 @@ $("backup-toggle").addEventListener("click", () => {
     $("profile").hidden = true;
     $("profile-toggle").setAttribute("aria-expanded", "false");
     closeBoard();
+    closeFiles();
   }
 });
 
@@ -1352,6 +1369,7 @@ $("profile-toggle").addEventListener("click", () => {
     $("backup").hidden = true;
     $("backup-toggle").setAttribute("aria-expanded", "false");
     closeBoard();
+    closeFiles();
     profileStatus("");
     loadProfile();
   }
@@ -1578,6 +1596,7 @@ $("board-toggle").addEventListener("click", () => {
   $("backup-toggle").setAttribute("aria-expanded", "false");
   $("profile").hidden = true;
   $("profile-toggle").setAttribute("aria-expanded", "false");
+  closeFiles();
   boardStatus("");
   renderBoard();
   loadBoard();
@@ -1887,6 +1906,430 @@ $("message-form").addEventListener("submit", async (event) => {
   await loadBoard();
 });
 
+/* ---------- Files kept for the projects ---------- */
+
+/* The form is static markup and is never rebuilt, so a refresh while the
+   admin is typing only replaces the list, the detail and the select options. */
+const FILE_MAX_BYTES = 2 * 1024 * 1024;
+const FILE_KINDS = ["idea", "doc", "data", "config", "other"];
+/* Actions that change which files exist; only these reload an open panel. */
+const FILE_WRITES = new Set(["file_save", "file_delete", "import", "restore"]);
+const filesState = {
+  data: null, loading: null, again: false, timer: null, searchTimer: null,
+  query: "", project: "", projects: new Set(), openId: null,
+  picked: null, reading: 0,
+};
+
+function humanSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function kindPill(kind) {
+  const known = FILE_KINDS.includes(kind) ? kind : "other";
+  return el("span", "pill kind-" + known, kind);
+}
+
+function filesStatus(text, tone) {
+  const node = $("files-status");
+  node.textContent = text;
+  node.className = "small-text" + (tone ? " " + tone : "");
+}
+
+function closeFiles() {
+  $("files").hidden = true;
+  $("files-toggle").setAttribute("aria-expanded", "false");
+  clearTimeout(filesState.timer);
+  clearTimeout(filesState.searchTimer);
+}
+
+/* A fresh sign-in starts from the list, with nothing picked or pasted. */
+function resetFiles() {
+  Object.assign(filesState, { data: null, query: "", project: "", openId: null });
+  filesState.projects = new Set();
+  $("files-search").value = "";
+  $("file-text").value = "";
+  clearPicked();
+  $("file-detail").replaceChildren();
+  $("file-detail").hidden = true;
+  $("files-browse").hidden = false;
+}
+
+$("files-toggle").addEventListener("click", () => {
+  const panel = $("files");
+  if (!panel.hidden) { closeFiles(); return; }
+  panel.hidden = false;
+  $("files-toggle").setAttribute("aria-expanded", "true");
+  $("backup").hidden = true;
+  $("backup-toggle").setAttribute("aria-expanded", "false");
+  $("profile").hidden = true;
+  $("profile-toggle").setAttribute("aria-expanded", "false");
+  closeBoard();
+  filesStatus("");
+  renderFiles();
+  loadFiles();
+});
+
+/* One load at a time, and at most one more queued behind it. An open detail
+   is reloaded with the list, so a version deleted elsewhere does not linger. */
+function loadFiles() {
+  if (filesState.loading) {
+    filesState.again = true;
+    return filesState.loading;
+  }
+  filesState.loading = (async () => {
+    try {
+      do {
+        filesState.again = false;
+        const params = new URLSearchParams({ limit: "300" });
+        if (filesState.query) params.set("q", filesState.query);
+        if (filesState.project) params.set("project", filesState.project);
+        const response = await api("/admin/api/files?" + params.toString());
+        if (!response.ok) throw new Error("failed");
+        filesState.data = await response.json();
+        state.fileCount = filesState.data.counts.files;
+        renderStats();
+        if (!$("files").hidden) renderFiles();
+      } while (filesState.again);
+      if (filesState.openId !== null && !$("files").hidden) await showFile(filesState.openId, true);
+    } catch (_) {
+      if (!$("files").hidden) filesStatus("The files could not be loaded.", "bad");
+    } finally {
+      filesState.loading = null;
+    }
+  })();
+  return filesState.loading;
+}
+
+/* Live events reload the panel only while it is open, and only for actions
+   that change which files exist. */
+function filesActivity(activity) {
+  if ($("files").hidden) return;
+  if (activity && !FILE_WRITES.has(activity.tool)) return;
+  clearTimeout(filesState.timer);
+  filesState.timer = setTimeout(loadFiles, 250);
+}
+
+function renderFiles() {
+  const admin = state.role === "admin";
+  const detail = filesState.openId !== null;
+  $("files-browse").hidden = detail;
+  $("file-detail").hidden = !detail;
+  $("file-form").hidden = !admin;
+
+  const data = filesState.data;
+  if (data) for (const file of data.files) filesState.projects.add(file.project);
+  for (const [project] of state.counts) filesState.projects.add(project);
+  if (filesState.project) filesState.projects.add(filesState.project);
+  const projects = [...filesState.projects].filter(Boolean).sort();
+  fillSelect($("files-project"), [["", "All projects"], ...projects.map((p) => [p, p])]);
+  filesState.project = $("files-project").value;
+  const datalist = $("files-projects");
+  datalist.replaceChildren();
+  for (const project of projects) {
+    const option = el("option");
+    option.value = project;
+    datalist.append(option);
+  }
+
+  const list = $("file-list");
+  if (!data) {
+    $("files-count").textContent = "";
+    list.replaceChildren(el("li", "none", "Loading…"));
+    return;
+  }
+  const { counts } = data;
+  $("files-count").textContent =
+    `${counts.files} files · ${counts.versions} versions · ${humanSize(counts.bytes)}`;
+  list.replaceChildren();
+  if (!data.files.length) {
+    let none = "No files kept yet. Agents keep them with file_save.";
+    if (filesState.query) none = `No files match "${filesState.query}".`;
+    else if (filesState.project) none = `No files kept for ${filesState.project}.`;
+    list.append(el("li", "none", none));
+    return;
+  }
+  for (const file of data.files) list.append(fileItem(file));
+}
+
+function fileItem(file) {
+  const item = el("li", "board-item file-item");
+  const head = el("div", "board-item-head");
+  head.append(kindPill(file.kind), el("span", "board-title file-path", file.path),
+    el("span", "board-id", "v" + file.version));
+  const meta = el("div", "board-meta",
+    [file.project, humanSize(file.size), `by ${file.agent}`, ago(file.created_at)].join(" · "));
+  meta.title = shortDate(file.created_at);
+  item.append(head, meta, el("p", "board-body", file.description));
+  clickable(item, () => openFile(file.id));
+  return item;
+}
+
+function openFile(id) {
+  filesState.openId = id;
+  filesStatus("");
+  renderFiles();
+  showFile(id, false);
+}
+
+function backToFiles() {
+  filesState.openId = null;
+  $("file-detail").replaceChildren();
+  renderFiles();
+}
+
+function backButton() {
+  const back = el("button", "ghost small", "← All files");
+  back.type = "button";
+  back.addEventListener("click", backToFiles);
+  return back;
+}
+
+/* Loads one version into the detail view. `quiet` keeps the current view on
+   screen while it reloads. */
+async function showFile(id, quiet) {
+  const box = $("file-detail");
+  if (!quiet) box.replaceChildren(backButton(), el("p", "muted", "Loading…"));
+  let data;
+  try {
+    const response = await api("/admin/api/files/" + encodeURIComponent(id));
+    if (filesState.openId !== id) return;
+    if (response.status === 404) {
+      box.replaceChildren(backButton(), el("p", "muted", "This file version no longer exists."));
+      return;
+    }
+    if (!response.ok) throw new Error("failed");
+    data = await response.json();
+  } catch (_) {
+    if (filesState.openId === id) {
+      box.replaceChildren(backButton(), el("p", "muted", "This file could not be loaded."));
+    }
+    return;
+  }
+  if (filesState.openId !== id) return;
+  renderFileDetail(data);
+}
+
+function renderFileDetail(data) {
+  const admin = state.role === "admin";
+  const { file, versions } = data;
+  const box = $("file-detail");
+  box.replaceChildren(backButton());
+
+  const head = el("div", "board-item-head file-detail-head");
+  head.append(kindPill(file.kind), el("h3", "file-path", file.path), el("span", "board-id", "v" + file.version));
+  box.append(head);
+  const meta = [`#${file.id}`, file.project, humanSize(file.size), `saved by ${file.agent}`,
+    shortDate(file.created_at), `sha256 ${file.sha256.slice(0, 12)}`];
+  if (file.entry_id) meta.push(`entry #${file.entry_id}`);
+  box.append(el("div", "board-meta", meta.join(" · ")), el("p", "board-body", file.description));
+
+  const actions = el("div", "board-actions file-actions");
+  const download = el("a", "ghost small button-link", "Download");
+  download.href = `/admin/api/files/${encodeURIComponent(file.id)}/download`;
+  download.setAttribute("download", "");
+  actions.append(download);
+  if (admin) {
+    const one = el("button", "ghost small danger", "Delete this version");
+    one.type = "button";
+    one.addEventListener("click", () => deleteFile(file, versions, false, actions));
+    actions.append(one);
+    if (versions.length > 1) {
+      const all = el("button", "ghost small danger", "Delete all versions");
+      all.type = "button";
+      all.addEventListener("click", () => deleteFile(file, versions, true, actions));
+      actions.append(all);
+    }
+  }
+  box.append(actions);
+
+  box.append(el("h4", "", versions.length > 1 ? `Versions (${versions.length})` : "Versions"));
+  const list = el("ul", "file-versions");
+  for (const version of versions) {
+    const current = version.id === file.id;
+    const item = el("li", current ? "active" : "");
+    item.append(el("span", "board-id", "v" + version.version),
+      el("span", "", [humanSize(version.size), `by ${version.agent}`, ago(version.created_at)].join(" · ")));
+    item.title = shortDate(version.created_at);
+    if (current) item.setAttribute("aria-current", "true");
+    else clickable(item, () => openFile(version.id));
+    list.append(item);
+  }
+  box.append(list);
+
+  box.append(el("h4", "", "Content"));
+  if (data.text === null) {
+    box.append(el("p", "muted small-text", "Binary file: download it to look inside."));
+  } else {
+    box.append(el("pre", "file-content", data.text));
+    if (data.truncated) {
+      box.append(el("p", "muted small-text",
+        "Showing the first 200 000 characters; download the file for the rest."));
+    }
+  }
+}
+
+async function deleteFile(file, versions, all, row) {
+  const what = all
+    ? `all ${versions.length} versions of ${file.path}`
+    : `${file.path} v${file.version}`;
+  const sure = window.confirm(`Delete ${what} in ${file.project}?\n\n` +
+    "This cannot be undone. Export a backup first if you might want it back.");
+  if (!sure) return;
+  for (const button of row.querySelectorAll("button")) button.disabled = true;
+  try {
+    const response = await api(`/admin/api/files/${encodeURIComponent(file.id)}` + (all ? "?all=true" : ""),
+      { method: "DELETE" });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      filesStatus(result.error || (response.status === 404
+        ? "That file version no longer exists." : "The file could not be deleted."), "bad");
+    } else {
+      filesStatus(all ? `Deleted every version of ${file.path}.` : `Deleted ${file.path} v${file.version}.`, "ok");
+      // After one version goes, the newest one left is shown, if any.
+      const left = all ? [] : versions.filter((version) => version.id !== file.id);
+      if (left.length) {
+        openFile(left[0].id);
+      } else {
+        backToFiles();
+      }
+    }
+  } catch (_) {
+    filesStatus("The file could not be deleted.", "bad");
+  }
+  for (const button of row.querySelectorAll("button")) button.disabled = false;
+  await loadFiles();
+}
+
+$("files-search").addEventListener("input", (event) => {
+  clearTimeout(filesState.searchTimer);
+  filesState.searchTimer = setTimeout(() => {
+    filesState.query = event.target.value.trim();
+    filesState.openId = null;
+    renderFiles();
+    loadFiles();
+  }, 250);
+});
+
+$("files-project").addEventListener("change", (event) => {
+  filesState.project = event.target.value;
+  filesState.openId = null;
+  renderFiles();
+  loadFiles();
+});
+
+/* ---------- The Add file form ---------- */
+
+function clearPicked() {
+  filesState.picked = null;
+  filesState.reading += 1; // a read still running is now stale
+  $("file-picker").value = "";
+  $("file-picked").hidden = true;
+  $("file-picked-name").textContent = "";
+  $("file-text").disabled = false;
+}
+
+function toBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+/* A picked file is read in the page: text that decodes as UTF-8 is sent as
+   it is, anything else as base64. Files over 2 MiB are refused here. */
+$("file-picker").addEventListener("change", (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  if (file.size > FILE_MAX_BYTES) {
+    clearPicked();
+    filesStatus(`${file.name} is ${humanSize(file.size)}; a file may be at most 2 MiB.`, "bad");
+    return;
+  }
+  const token = ++filesState.reading;
+  filesStatus(`Reading ${file.name}…`);
+  const reader = new FileReader();
+  reader.addEventListener("load", () => {
+    if (token !== filesState.reading) return;
+    const bytes = new Uint8Array(reader.result);
+    let text = null;
+    if (!bytes.includes(0)) {
+      try {
+        text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+      } catch (_) { text = null; }
+    }
+    filesState.picked = text !== null
+      ? { name: file.name, encoding: "utf8", content: text }
+      : { name: file.name, encoding: "base64", content: toBase64(bytes) };
+    if (!$("file-path").value.trim()) $("file-path").value = file.name;
+    $("file-picked-name").textContent =
+      `${file.name} · ${humanSize(file.size)} · ${text !== null ? "text" : "binary, sent as base64"}`;
+    $("file-picked").hidden = false;
+    $("file-text").disabled = true;
+    filesStatus("");
+  });
+  reader.addEventListener("error", () => {
+    if (token !== filesState.reading) return;
+    clearPicked();
+    filesStatus(`${file.name} could not be read.`, "bad");
+  });
+  reader.readAsArrayBuffer(file);
+});
+
+$("file-clear").addEventListener("click", clearPicked);
+
+$("file-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const picked = filesState.picked;
+  const text = $("file-text").value;
+  if (!picked && $("file-picker").files.length) {
+    filesStatus("The picked file is still being read.", "bad");
+    return;
+  }
+  if (!picked && !text) {
+    filesStatus("Pick a file or paste its text.", "bad");
+    return;
+  }
+  const button = $("file-submit");
+  button.disabled = true;
+  try {
+    const response = await api("/admin/api/files", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project: $("file-project").value.trim(),
+        path: $("file-path").value.trim(),
+        kind: $("file-kind").value,
+        description: $("file-description").value.trim(),
+        encoding: picked ? picked.encoding : "utf8",
+        content: picked ? picked.content : text,
+      }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      filesStatus(result.error || (response.status === 413
+        ? "That file is too large." : "The file could not be saved."), "bad");
+      return;
+    }
+    const saved = result.file;
+    filesStatus(result.unchanged
+      ? `${saved.path} is unchanged (v${saved.version}).`
+      : `Saved ${saved.path} v${saved.version} in ${saved.project}.`, "ok");
+    // The project and the kind stay for the next file.
+    $("file-path").value = "";
+    $("file-description").value = "";
+    $("file-text").value = "";
+    clearPicked();
+    await loadFiles();
+  } catch (_) {
+    filesStatus("The file could not be saved.", "bad");
+  } finally {
+    button.disabled = false;
+  }
+});
+
 /* ---------- Tooltip and entry drawer ---------- */
 
 graph.onHover = (node, x, y) => {
@@ -1928,7 +2371,9 @@ function closeDetail() {
 $("detail-close").addEventListener("click", closeDetail);
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (!$("board").hidden) {
+  if (!$("files").hidden) {
+    closeFiles();
+  } else if (!$("board").hidden) {
     closeBoard();
   } else if (!$("backup").hidden) {
     $("backup").hidden = true;

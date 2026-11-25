@@ -19,7 +19,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -28,7 +28,10 @@ use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
 use crate::{
     auth::{RateLimiter, client_ip, too_many_requests},
-    db::{Backup, Db, Message, NewMessage, NewTask, ProfileInput, Rule, RuleInput, Session, Task},
+    db::{
+        Backup, Db, FileInfo, Message, NewFile, NewMessage, NewTask, ProfileInput, Rule, RuleInput,
+        Session, Task,
+    },
     embed::Embedder,
     events::Events,
 };
@@ -45,6 +48,10 @@ const FEED_LENGTH: usize = 60;
 const MAX_BACKUP_BYTES: usize = 512 * 1024 * 1024;
 /// Largest profile or rule edit accepted.
 const MAX_JSON_BYTES: usize = 64 * 1024;
+/// Largest file upload accepted: a 2 MiB file as base64, inside its JSON.
+const MAX_FILE_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
+/// Longest file text the detail view returns; longer text is cut.
+const FILE_TEXT_CHARS: usize = 200_000;
 /// Name the feed shows for actions taken from this page.
 const ADMIN_ACTOR: &str = "admin";
 const ICON: &str = include_str!("../assets/icon.svg");
@@ -163,6 +170,9 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/admin/api/sessions", get(sessions))
         .route("/admin/api/sessions/{id}", get(session_detail))
         .route("/admin/api/board", get(board))
+        .route("/admin/api/files", get(files))
+        .route("/admin/api/files/{id}", get(file_detail))
+        .route("/admin/api/files/{id}/download", get(download_file))
         .layer(middleware::from_fn_with_state(
             admin.clone(),
             require_session,
@@ -202,6 +212,13 @@ pub fn router(admin: Arc<Admin>) -> Router {
             "/admin/api/messages",
             post(add_message).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
         )
+        // Only the upload carries a whole file; every other route keeps the
+        // small limit.
+        .route(
+            "/admin/api/files",
+            post(upload_file).layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES)),
+        )
+        .route("/admin/api/files/{id}", delete(delete_file))
         .layer(middleware::from_fn_with_state(admin.clone(), require_admin));
 
     Router::new()
@@ -417,6 +434,7 @@ async fn brain(State(admin): State<Arc<Admin>>) -> Response {
             "activity": state.db.activity(FEED_LENGTH)?,
             "open_sessions": state.db.open_session_count()?,
             "open_tasks": state.db.board_counts()?.open_tasks,
+            "files": state.db.file_counts()?.files,
             "brain": brain,
         }))
     })
@@ -434,6 +452,7 @@ async fn pulse(State(admin): State<Arc<Admin>>) -> Response {
             "agents": state.db.agents(&state.configured_agents)?,
             "open_sessions": state.db.open_session_count()?,
             "open_tasks": state.db.board_counts()?.open_tasks,
+            "files": state.db.file_counts()?.files,
         }))
     })
     .await;
@@ -940,6 +959,283 @@ async fn add_message(State(admin): State<Arc<Admin>>, Json(form): Json<MessageFo
         Ok(Err(error)) => bad_request(&error.to_string()),
         Err(error) => {
             tracing::error!(%error, "adding a message failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct FilesQuery {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// The latest version of each file, newest first, or the files a search
+/// matches, with the totals. Any signed-in role can read it.
+async fn files(State(admin): State<Arc<Admin>>, Query(query): Query<FilesQuery>) -> Response {
+    let project = query
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|project| !project.is_empty())
+        .map(str::to_lowercase);
+    let search = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_string);
+    let limit = query.limit.unwrap_or(100).clamp(1, 300) as usize;
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let project = project.as_deref();
+        // The page searches by words in the path and the description.
+        let list: Vec<FileInfo> = match &search {
+            None => state.db.files(project, limit)?,
+            Some(search) => state
+                .db
+                .search_files(search, project, None, 1.0, limit)?
+                .into_iter()
+                .map(|hit| hit.file)
+                .collect(),
+        };
+        let counts = state.db.file_counts()?;
+        Ok(json!({ "files": list, "counts": counts }))
+    })
+    .await;
+    respond(result)
+}
+
+/// One file version: its metadata, every version of its path, and its text
+/// when it is a text file, cut to `FILE_TEXT_CHARS`.
+async fn file_detail(State(admin): State<Arc<Admin>>, Path(id): Path<i64>) -> Response {
+    let state = admin.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
+            let Some(file) = state.db.file(id)? else {
+                return Ok(None);
+            };
+            let versions = state
+                .db
+                .file_versions(&file.info.project, &file.info.path)?;
+            let (text, truncated) = if file.info.encoding == "base64" {
+                (None, false)
+            } else {
+                let text = String::from_utf8_lossy(&file.content);
+                if text.chars().count() > FILE_TEXT_CHARS {
+                    (
+                        Some(text.chars().take(FILE_TEXT_CHARS).collect::<String>()),
+                        true,
+                    )
+                } else {
+                    (Some(text.into_owned()), false)
+                }
+            };
+            Ok(Some(json!({
+                "file": file.info,
+                "versions": versions,
+                "text": text,
+                "truncated": truncated,
+            })))
+        })
+        .await;
+    match result {
+        Ok(Ok(Some(value))) => Json(value).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "loading a file failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "file task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// The raw bytes of one file version, always as a download: a stored HTML
+/// or SVG file must never render inside the admin page's origin.
+async fn download_file(State(admin): State<Arc<Admin>>, Path(id): Path<i64>) -> Response {
+    let db = admin.db.clone();
+    match tokio::task::spawn_blocking(move || db.file(id)).await {
+        Ok(Ok(Some(file))) => {
+            let disposition = format!(
+                "attachment; filename=\"{}\"",
+                download_name(&file.info.path)
+            );
+            (
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (header::CONTENT_DISPOSITION, disposition),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                ],
+                file.content,
+            )
+                .into_response()
+        }
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        other => {
+            tracing::error!(?other, "downloading a file failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// The last segment of a file path, with every character outside
+/// `[A-Za-z0-9._-]` replaced, so it is safe inside a header.
+fn download_name(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let name: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.trim_matches(['.', '_']).is_empty() {
+        "file".to_string()
+    } else {
+        name
+    }
+}
+
+#[derive(Deserialize)]
+struct FileForm {
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    encoding: String,
+    #[serde(default)]
+    content: String,
+}
+
+/// Saves a file as the admin: a new version, or the latest one again when
+/// the content is the same.
+async fn upload_file(State(admin): State<Arc<Admin>>, Json(form): Json<FileForm>) -> Response {
+    let input = NewFile {
+        project: form.project,
+        path: form.path,
+        kind: form.kind,
+        description: form.description,
+        encoding: form.encoding,
+        content: form.content,
+        entry_id: None,
+        agent: ADMIN_ACTOR.into(),
+        session_id: None,
+    };
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let saved = state.db.save_file(&input)?;
+        let file = &saved.file;
+        if saved.needs_embedding {
+            match state.embedder.embed_passage(&file.embedding_text()) {
+                Ok(Some(vector)) => {
+                    if let Err(error) = state.db.set_file_embedding(file.id, &vector) {
+                        tracing::warn!(%error, id = file.id, "storing file embedding failed");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(%error, id = file.id, "file embedding failed"),
+            }
+        }
+        let summary = format!(
+            "{} v{}{}",
+            file.path,
+            file.version,
+            if saved.unchanged { " (unchanged)" } else { "" }
+        );
+        if let Ok(activity) = state.db.record_activity(
+            ADMIN_ACTOR,
+            "file_save",
+            &file.project,
+            None,
+            None,
+            &[],
+            &summary,
+        ) {
+            state.events.publish(activity);
+        }
+        Ok(json!({ "file": saved.file, "unchanged": saved.unchanged }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "saving a file failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteFileOptions {
+    /// True removes every version of the file's path, not just this one.
+    #[serde(default)]
+    all: bool,
+}
+
+/// Removes one file version, or every version of its path.
+async fn delete_file(
+    State(admin): State<Arc<Admin>>,
+    Path(id): Path<i64>,
+    Query(options): Query<DeleteFileOptions>,
+) -> Response {
+    let state = admin.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
+            let (file, deleted) = if options.all {
+                let Some(file) = state.db.file(id)? else {
+                    return Ok(None);
+                };
+                let deleted = state
+                    .db
+                    .delete_file_path(&file.info.project, &file.info.path)?;
+                (file.info, deleted)
+            } else {
+                let Some(file) = state.db.delete_file(id)? else {
+                    return Ok(None);
+                };
+                (file, 1)
+            };
+            let summary = if options.all {
+                format!("{} (all {deleted} versions)", file.path)
+            } else {
+                format!("{} v{}", file.path, file.version)
+            };
+            if let Ok(activity) = state.db.record_activity(
+                ADMIN_ACTOR,
+                "file_delete",
+                &file.project,
+                None,
+                None,
+                &[],
+                &summary,
+            ) {
+                state.events.publish(activity);
+            }
+            Ok(Some(json!({ "ok": true, "deleted": deleted })))
+        })
+        .await;
+    match result {
+        Ok(Ok(Some(value))) => Json(value).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "deleting a file failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1494,5 +1790,313 @@ mod tests {
         .unwrap();
         let pulse: serde_json::Value = response.json().await.unwrap();
         assert_eq!(pulse["open_tasks"], 1);
+    }
+
+    #[tokio::test]
+    async fn files_follow_the_roles_and_download_safely() {
+        use base64::Engine;
+        let (base, _admin) = serve().await;
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: String, token: Option<&str>| {
+            let mut request = client.request(method, format!("{base}{path}"));
+            if let Some(token) = token {
+                request = request.header(header::COOKIE, format!("{COOKIE}={token}"));
+            }
+            request
+        };
+        let page = json!({
+            "project": "Shop", "path": "docs/page.html", "description": "a page that must not render",
+            "kind": "doc", "encoding": "utf8", "content": "<script>alert(1)</script>",
+        });
+
+        // Reads: any signed-in role, nobody else.
+        for path in [
+            "/admin/api/files",
+            "/admin/api/files/1",
+            "/admin/api/files/1/download",
+        ] {
+            let status = call(reqwest::Method::GET, path.into(), None)
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, 401, "{path} without a session");
+        }
+        let response = call(
+            reqwest::Method::GET,
+            "/admin/api/files".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let listed: serde_json::Value = response.json().await.unwrap();
+        assert!(listed["files"].as_array().unwrap().is_empty());
+        assert_eq!(listed["counts"]["files"], 0);
+
+        // Writes: the viewer is refused, nobody else is not even signed in.
+        for token in [None, Some("viewer-token")] {
+            let expected = if token.is_some() { 403 } else { 401 };
+            for request in [
+                call(reqwest::Method::POST, "/admin/api/files".into(), token).json(&page),
+                call(reqwest::Method::DELETE, "/admin/api/files/1".into(), token),
+                call(
+                    reqwest::Method::DELETE,
+                    "/admin/api/files/1?all=true".into(),
+                    token,
+                ),
+            ] {
+                assert_eq!(request.send().await.unwrap().status(), expected);
+            }
+        }
+
+        // The admin saves a file; the same content again makes no new version.
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/files".into(),
+            Some("admin-token"),
+        )
+        .json(&page)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let saved: serde_json::Value = response.json().await.unwrap();
+        let id = saved["file"]["id"].as_i64().unwrap();
+        assert_eq!(saved["unchanged"], false);
+        assert_eq!(saved["file"]["agent"], "admin");
+        assert_eq!(saved["file"]["project"], "shop");
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/files".into(),
+            Some("admin-token"),
+        )
+        .json(&page)
+        .send()
+        .await
+        .unwrap();
+        let again: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            (again["unchanged"].as_bool(), again["file"]["id"].as_i64()),
+            (Some(true), Some(id))
+        );
+
+        // Validation errors are a 400 with a reason: secrets, bad paths.
+        for bad in [
+            json!({ "project": "shop", "path": ".env", "description": "d", "content": "A=1" }),
+            json!({ "project": "shop", "path": "../x", "description": "d", "content": "x" }),
+            json!({ "project": "shop", "path": "x.md", "description": "", "content": "x" }),
+        ] {
+            let response = call(
+                reqwest::Method::POST,
+                "/admin/api/files".into(),
+                Some("admin-token"),
+            )
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), 400);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert!(body["error"].as_str().is_some_and(|e| !e.is_empty()));
+        }
+
+        // A binary file fits under the upload limit as base64; a body over
+        // 4 MiB is refused before it is read.
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(2 * 1024 * 1024).collect();
+        let binary = json!({
+            "project": "shop", "path": "assets/blob.bin", "description": "binary",
+            "kind": "data", "encoding": "base64",
+            "content": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        });
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/files".into(),
+            Some("admin-token"),
+        )
+        .json(&binary)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let binary_id = response.json::<serde_json::Value>().await.unwrap()["file"]["id"]
+            .as_i64()
+            .unwrap();
+        let huge = json!({ "project": "shop", "path": "huge.txt", "description": "d",
+                           "content": "x".repeat(5 * 1024 * 1024) });
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/files".into(),
+            Some("admin-token"),
+        )
+        .json(&huge)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 413);
+        // Other JSON routes keep the small limit.
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/tasks".into(),
+            Some("admin-token"),
+        )
+        .json(&json!({ "project": "shop", "title": "t", "body": "x".repeat(100 * 1024) }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 413);
+
+        // The viewer reads the detail: text for a text file, none for a
+        // binary one.
+        let response = call(
+            reqwest::Method::GET,
+            format!("/admin/api/files/{id}"),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let detail: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(detail["text"], "<script>alert(1)</script>");
+        assert_eq!(detail["truncated"], false);
+        assert_eq!(detail["versions"].as_array().unwrap().len(), 1);
+        let response = call(
+            reqwest::Method::GET,
+            format!("/admin/api/files/{binary_id}"),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        let detail: serde_json::Value = response.json().await.unwrap();
+        assert!(detail["text"].is_null());
+
+        // Downloads are always attachments that cannot be sniffed into HTML.
+        let response = call(
+            reqwest::Method::GET,
+            format!("/admin/api/files/{id}/download"),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let headers = response.headers().clone();
+        assert_eq!(headers[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"page.html\""
+        );
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            b"<script>alert(1)</script>"
+        );
+        let response = call(
+            reqwest::Method::GET,
+            format!("/admin/api/files/{binary_id}/download"),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.bytes().await.unwrap().as_ref(), bytes.as_slice());
+        assert_eq!(download_name("a/b/we\"ird name;.txt"), "we_ird_name_.txt");
+        assert_eq!(download_name(".."), "file");
+
+        // The list, the search and the totals; the pulse carries the count.
+        let response = call(
+            reqwest::Method::GET,
+            "/admin/api/files?project=shop&q=binary".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        let found: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(found["files"].as_array().unwrap().len(), 1);
+        assert_eq!(found["counts"]["files"], 2);
+        let pulse: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/pulse".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(pulse["files"], 2);
+
+        // Deleting: one version, then every version of a path; unknown
+        // ids are a 404.
+        let second = json!({ "project": "shop", "path": "docs/page.html",
+                             "description": "d", "content": "v2" });
+        call(
+            reqwest::Method::POST,
+            "/admin/api/files".into(),
+            Some("admin-token"),
+        )
+        .json(&second)
+        .send()
+        .await
+        .unwrap();
+        let response = call(
+            reqwest::Method::DELETE,
+            format!("/admin/api/files/{id}"),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["deleted"],
+            1
+        );
+        let response = call(
+            reqwest::Method::DELETE,
+            format!("/admin/api/files/{id}"),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 404);
+        let response = call(
+            reqwest::Method::DELETE,
+            format!("/admin/api/files/{binary_id}?all=true"),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let response = call(
+            reqwest::Method::GET,
+            "/admin/api/files".into(),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        let listed: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(listed["files"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["files"][0]["version"], 2);
+        assert_eq!(
+            call(
+                reqwest::Method::GET,
+                "/admin/api/files/999".into(),
+                Some("admin-token")
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            404
+        );
     }
 }

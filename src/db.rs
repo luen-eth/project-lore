@@ -138,6 +138,26 @@ CREATE TABLE IF NOT EXISTS message_reads (
     PRIMARY KEY (message_id, agent)
 );
 
+CREATE TABLE IF NOT EXISTS files (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project     TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'other',
+    description TEXT NOT NULL,
+    encoding    TEXT NOT NULL DEFAULT 'utf8',
+    content     BLOB NOT NULL,
+    size        INTEGER NOT NULL,
+    sha256      TEXT NOT NULL,
+    entry_id    INTEGER,
+    agent       TEXT NOT NULL,
+    session_id  TEXT,
+    created_at  TEXT NOT NULL,
+    embedding   BLOB,
+    UNIQUE (project, path, version)
+);
+CREATE INDEX IF NOT EXISTS files_project_path ON files (project, path, version DESC);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5 (
     title, body, tags, files,
     content = 'entries', content_rowid = 'id',
@@ -201,6 +221,23 @@ pub const TASK_TITLE_MAX_CHARS: usize = 200;
 pub const BODY_MAX_CHARS: usize = 4000;
 /// Longest task status note accepted.
 pub const NOTE_MAX_CHARS: usize = 1000;
+
+/// The columns of a file row without its content and vector, in the order
+/// `FileInfo::from_row` reads them.
+const FILE_COLUMNS: &str = "id, project, path, version, kind, description, encoding, size, \
+                            sha256, entry_id, agent, session_id, created_at";
+
+/// What a kept file is: the ideas a project is built on, a design note, a
+/// data file, a configuration file, or something else.
+pub const FILE_KINDS: &[&str] = &["idea", "doc", "data", "config", "other"];
+/// How file content is exchanged: as text, or as base64 for binary files.
+pub const FILE_ENCODINGS: &[&str] = &["utf8", "base64"];
+/// Largest file accepted, in raw bytes.
+pub const FILE_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Longest file description accepted.
+pub const FILE_DESCRIPTION_MAX_CHARS: usize = 1000;
+/// Longest file path accepted.
+pub const FILE_PATH_MAX_CHARS: usize = 300;
 
 /// Columns added after the first release, as (table, name, definition).
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
@@ -671,6 +708,134 @@ pub struct BoardCounts {
     pub claimed_tasks: i64,
 }
 
+/// One version of a file kept for a project, without its content.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FileInfo {
+    pub id: i64,
+    pub project: String,
+    /// Name or relative path, with forward slashes, e.g. `docs/ideas.md`.
+    pub path: String,
+    /// 1, 2, 3 … per project and path.
+    pub version: i64,
+    /// One of: idea, doc, data, config, other.
+    pub kind: String,
+    /// Why the file matters to the project.
+    pub description: String,
+    /// How agents exchange it: utf8 or base64.
+    pub encoding: String,
+    /// Raw size in bytes.
+    pub size: i64,
+    /// Hex SHA-256 of the raw bytes.
+    pub sha256: String,
+    /// The memory entry the file belongs to, when it was given one.
+    #[serde(default)]
+    pub entry_id: Option<i64>,
+    /// The agent that saved this version, or "admin".
+    pub agent: String,
+    /// The session it was saved in, when there was one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub created_at: String,
+}
+
+impl FileInfo {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            project: row.get(1)?,
+            path: row.get(2)?,
+            version: row.get(3)?,
+            kind: row.get(4)?,
+            description: row.get(5)?,
+            encoding: row.get(6)?,
+            size: row.get(7)?,
+            sha256: row.get(8)?,
+            entry_id: row.get(9)?,
+            agent: row.get(10)?,
+            session_id: row.get(11)?,
+            created_at: row.get(12)?,
+        })
+    }
+
+    /// The text that gets embedded for semantic search.
+    pub fn embedding_text(&self) -> String {
+        format!("{} {} {}", self.path, self.kind, self.description)
+    }
+}
+
+/// One version of a file with its raw bytes.
+#[derive(Debug, Clone)]
+pub struct StoredFile {
+    pub info: FileInfo,
+    pub content: Vec<u8>,
+}
+
+/// A file as an agent or the admin saves it; the version, the size, the
+/// hash and the time are worked out here.
+#[derive(Debug, Default)]
+pub struct NewFile {
+    pub project: String,
+    pub path: String,
+    /// One of `FILE_KINDS`; empty keeps the kind of the latest version,
+    /// or means "other" for a new path.
+    pub kind: String,
+    pub description: String,
+    /// One of `FILE_ENCODINGS`; empty means "utf8".
+    pub encoding: String,
+    /// The text itself, or the base64 of the raw bytes.
+    pub content: String,
+    pub entry_id: Option<i64>,
+    /// The agent that saves it, or "admin".
+    pub agent: String,
+    pub session_id: Option<String>,
+}
+
+/// What `save_file` did.
+#[derive(Debug)]
+pub struct SavedFile {
+    pub file: FileInfo,
+    /// True when the content matched the latest version, so no new version
+    /// was made.
+    pub unchanged: bool,
+    /// True when a new row was written, or the kind or the description of
+    /// the latest one changed, so its vector needs computing.
+    pub needs_embedding: bool,
+}
+
+/// A file found by `search_files`.
+#[derive(Debug)]
+pub struct FileHit {
+    pub file: FileInfo,
+    /// How the file was found: "text", "semantic" or "text+semantic".
+    pub matched: &'static str,
+    /// Cosine similarity to the query, when a vector was given.
+    pub similarity: Option<f32>,
+}
+
+/// The file totals the admin page shows.
+#[derive(Debug, serde::Serialize)]
+pub struct FileCounts {
+    /// Distinct project and path pairs.
+    pub files: i64,
+    /// Every stored version.
+    pub versions: i64,
+    /// Raw bytes over every version.
+    pub bytes: i64,
+}
+
+/// One file version as a backup carries it.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BackupFile {
+    #[serde(flatten)]
+    pub info: FileInfo,
+    /// The raw bytes, base64 encoded.
+    pub content: String,
+    /// Its vector: little-endian f32 values, base64 encoded. Only reused
+    /// when the backup's `embedding_model` matches the one in use.
+    #[serde(default)]
+    pub embedding: Option<String>,
+}
+
 /// Everything in the store: entries, their embedding vectors, the activity
 /// log and the agent records. Restoring it reproduces the store exactly.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -711,11 +876,18 @@ pub struct Backup {
     /// Who has read which message.
     #[serde(default)]
     pub message_reads: Vec<MessageRead>,
+    /// Every version of every file kept for a project.
+    #[serde(default)]
+    pub files: Vec<BackupFile>,
 }
 
+/// The backup version this build writes.
+const BACKUP_VERSION: u32 = 5;
+
 /// Backup versions this build can read. Version 1 had no embeddings; version
-/// 2 had no sessions, profile or rules; version 3 had no board.
-const BACKUP_VERSIONS: std::ops::RangeInclusive<u32> = 1..=4;
+/// 2 had no sessions, profile or rules; version 3 had no board; version 4
+/// had no files.
+const BACKUP_VERSIONS: std::ops::RangeInclusive<u32> = 1..=BACKUP_VERSION;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BackupAgent {
@@ -1037,9 +1209,26 @@ impl Db {
             let message_reads: Vec<MessageRead> = rows.collect::<rusqlite::Result<_>>()?;
             (messages, message_reads)
         };
+        let files = {
+            use base64::Engine;
+            let conn = self.lock();
+            let sql = format!("SELECT {FILE_COLUMNS}, content, embedding FROM files ORDER BY id");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| {
+                let content: Vec<u8> = row.get(13)?;
+                let embedding: Option<Vec<u8>> = row.get(14)?;
+                Ok(BackupFile {
+                    info: FileInfo::from_row(row)?,
+                    content: base64::engine::general_purpose::STANDARD.encode(content),
+                    embedding: embedding
+                        .map(|blob| base64::engine::general_purpose::STANDARD.encode(blob)),
+                })
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
         Ok(Backup {
             format: BACKUP_FORMAT.to_string(),
-            version: 4,
+            version: BACKUP_VERSION,
             exported_at,
             entries,
             activity,
@@ -1053,6 +1242,7 @@ impl Db {
             tasks,
             messages,
             message_reads,
+            files,
         })
     }
 
@@ -1060,7 +1250,8 @@ impl Db {
     /// nothing: on any error the previous contents stay in place. A backup
     /// older than version 3 leaves the sessions, the profile and the rules
     /// as they are; one older than version 4 also leaves the tasks, the
-    /// messages and the read marks, since it has none to put in their place.
+    /// messages and the read marks; one older than version 5 also leaves the
+    /// files, since it has none to put in their place.
     pub fn restore(&self, backup: &Backup) -> Result<usize> {
         validate_backup(backup)?;
         let mut conn = self.lock();
@@ -1284,6 +1475,30 @@ impl Db {
                 params![read.message_id, read.agent, read.read_at],
             )?;
         }
+        // Backups older than version 5 know nothing of files, so the files
+        // kept here stay as they are.
+        if backup.version >= 5 {
+            let same_model = same_embedding_model(&tx, backup)?;
+            tx.execute_batch(
+                "DELETE FROM files; DELETE FROM sqlite_sequence WHERE name = 'files';",
+            )?;
+            for file in &backup.files {
+                let (content, embedding) = decode_backup_file(file, same_model)?;
+                insert_backup_file(
+                    &tx,
+                    Some(file.info.id),
+                    &file.info,
+                    file.info.version,
+                    &content,
+                )?;
+                if let Some(vector) = embedding {
+                    tx.execute(
+                        "UPDATE files SET embedding = ?2 WHERE id = ?1",
+                        params![file.info.id, vector],
+                    )?;
+                }
+            }
+        }
         tx.commit()?;
         Ok(backup.entries.len())
     }
@@ -1497,6 +1712,52 @@ impl Db {
                  VALUES (?1, ?2, ?3)",
                 params![new_id, read.agent, read.read_at],
             )?;
+        }
+        // A file version counts as present when the same project and path
+        // already hold the same bytes; anything else becomes the next free
+        // version of that path. Nothing here is replaced or removed.
+        let same_model = same_embedding_model(&tx, backup)?;
+        for file in &backup.files {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM files
+                 WHERE project = ?1 AND path = ?2 AND sha256 = ?3)",
+                params![file.info.project, file.info.path, file.info.sha256],
+                |row| row.get(0),
+            )?;
+            if exists {
+                continue;
+            }
+            let (content, embedding) = decode_backup_file(file, same_model)?;
+            let version: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM files WHERE project = ?1 AND path = ?2",
+                params![file.info.project, file.info.path],
+                |row| row.get(0),
+            )?;
+            // Entry ids differ between stores: the link follows the entry
+            // it named, found the way merging finds entries, or is dropped.
+            let mut info = file.info.clone();
+            info.entry_id = match file.info.entry_id {
+                None => None,
+                Some(old) => match backup.entries.iter().find(|entry| entry.id == old) {
+                    None => None,
+                    Some(entry) => tx
+                        .query_row(
+                            "SELECT id FROM entries
+                             WHERE project = ?1 AND title = ?2 AND body = ?3 AND created_at = ?4
+                             ORDER BY id LIMIT 1",
+                            params![entry.project, entry.title, entry.body, entry.created_at],
+                            |row| row.get(0),
+                        )
+                        .optional()?,
+                },
+            };
+            insert_backup_file(&tx, None, &info, version, &content)?;
+            if let Some(vector) = embedding {
+                tx.execute(
+                    "UPDATE files SET embedding = ?2 WHERE id = ?1",
+                    params![tx.last_insert_rowid(), vector],
+                )?;
+            }
         }
         tx.commit()?;
         Ok((added, present))
@@ -2242,6 +2503,319 @@ impl Db {
         })
     }
 
+    /// Saves a file for a project. When the latest version of that path
+    /// holds the same bytes, no new version is made: its kind and
+    /// description are updated if they changed, and it comes back with
+    /// `unchanged` set. Otherwise the file is stored as the next version.
+    /// Reading the latest version and writing the next one happen in one
+    /// transaction under the store's lock, so two saves of the same path
+    /// can never claim the same version.
+    pub fn save_file(&self, new: &NewFile) -> Result<SavedFile> {
+        let project = normalize_file_project(&new.project)?;
+        let path = normalize_file_path(&new.path)?;
+        refuse_secret_path(&path)?;
+        let kind = normalize_file_kind(&new.kind)?;
+        let encoding = normalize_file_encoding(&new.encoding)?;
+        let description = normalize_file_description(&new.description)?;
+        let content = decode_file_content(&encoding, &new.content)?;
+        refuse_secret_content(&content)?;
+        let agent = new.agent.trim().to_lowercase();
+        if agent.is_empty() {
+            anyhow::bail!("the agent saving the file must be named");
+        }
+        let sha256 = sha256_hex(&content);
+
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if let Some(entry_id) = new.entry_id {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM entries WHERE id = ?1)",
+                params![entry_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                anyhow::bail!("there is no entry #{entry_id} to link the file to");
+            }
+        }
+        let latest: Option<(i64, i64, String, String, String)> = tx
+            .query_row(
+                "SELECT id, version, sha256, kind, description FROM files
+                 WHERE project = ?1 AND path = ?2 ORDER BY version DESC LIMIT 1",
+                params![project, path],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        // A save that names no kind keeps the kind the path already has,
+        // instead of turning an `idea` back into `other`.
+        let kind = match &latest {
+            Some((_, _, _, latest_kind, _)) if new.kind.trim().is_empty() => latest_kind.clone(),
+            _ => kind,
+        };
+        if let Some((id, _, latest_sha, latest_kind, latest_description)) = &latest
+            && *latest_sha == sha256
+        {
+            let changed = *latest_kind != kind || *latest_description != description;
+            if changed {
+                // A new description means a new vector.
+                tx.execute(
+                    "UPDATE files SET kind = ?2, description = ?3, embedding = NULL WHERE id = ?1",
+                    params![id, kind, description],
+                )?;
+            }
+            let file = get_file_info(&tx, *id)?.context("file vanished after update")?;
+            tx.commit()?;
+            return Ok(SavedFile {
+                file,
+                unchanged: true,
+                needs_embedding: changed,
+            });
+        }
+        let version = latest.map(|(_, version, ..)| version + 1).unwrap_or(1);
+        tx.execute(
+            "INSERT INTO files (project, path, version, kind, description, encoding, content,
+                                size, sha256, entry_id, agent, session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            params![
+                project,
+                path,
+                version,
+                kind,
+                description,
+                encoding,
+                content,
+                content.len() as i64,
+                sha256,
+                new.entry_id,
+                agent,
+                new.session_id
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        let file = get_file_info(&tx, id)?.context("file vanished after insert")?;
+        tx.commit()?;
+        Ok(SavedFile {
+            file,
+            unchanged: false,
+            needs_embedding: true,
+        })
+    }
+
+    /// One file version with its bytes, by id.
+    pub fn file(&self, id: i64) -> Result<Option<StoredFile>> {
+        let conn = self.lock();
+        let sql = format!("SELECT {FILE_COLUMNS}, content FROM files WHERE id = ?1");
+        Ok(conn
+            .query_row(&sql, params![id], stored_file_from_row)
+            .optional()?)
+    }
+
+    /// One version of a project's file with its bytes: the given version,
+    /// or the latest one.
+    pub fn file_at(
+        &self,
+        project: &str,
+        path: &str,
+        version: Option<i64>,
+    ) -> Result<Option<StoredFile>> {
+        let project = normalize_file_project(project)?;
+        let path = normalize_file_path(path)?;
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {FILE_COLUMNS}, content FROM files
+             WHERE project = ?1 AND path = ?2 AND (?3 IS NULL OR version = ?3)
+             ORDER BY version DESC LIMIT 1"
+        );
+        Ok(conn
+            .query_row(&sql, params![project, path, version], stored_file_from_row)
+            .optional()?)
+    }
+
+    /// Every version of one project's file, newest first, without content.
+    pub fn file_versions(&self, project: &str, path: &str) -> Result<Vec<FileInfo>> {
+        let project = normalize_file_project(project)?;
+        let path = normalize_file_path(path)?;
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {FILE_COLUMNS} FROM files WHERE project = ?1 AND path = ?2
+             ORDER BY version DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![project, path], FileInfo::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The latest version of each file, newest first, without content.
+    pub fn files(&self, project: Option<&str>, limit: usize) -> Result<Vec<FileInfo>> {
+        let conn = self.lock();
+        let mut sql = format!(
+            "SELECT {FILE_COLUMNS} FROM files f
+             WHERE version = (SELECT MAX(version) FROM files g
+                              WHERE g.project = f.project AND g.path = f.path)"
+        );
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(project) = project {
+            sql.push_str(" AND project = ?");
+            args.push(Value::Text(project.to_string()));
+        }
+        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+        args.push(Value::Integer(limit as i64));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), FileInfo::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Finds files by their latest version: a case-insensitive substring
+    /// match of the query's words on the path and the description, plus
+    /// cosine similarity over the stored vectors when a query vector is
+    /// given. Text matches come first, then meaning-only matches by
+    /// similarity.
+    pub fn search_files(
+        &self,
+        query: &str,
+        project: Option<&str>,
+        vector: Option<&[f32]>,
+        min_similarity: f32,
+        limit: usize,
+    ) -> Result<Vec<FileHit>> {
+        let terms = file_search_terms(query);
+        let mut candidates: Vec<(FileInfo, Option<Vec<u8>>)> = Vec::new();
+        {
+            let conn = self.lock();
+            let mut sql = format!(
+                "SELECT {FILE_COLUMNS}, embedding FROM files f
+                 WHERE version = (SELECT MAX(version) FROM files g
+                                  WHERE g.project = f.project AND g.path = f.path)"
+            );
+            let mut args: Vec<Value> = Vec::new();
+            if let Some(project) = project {
+                sql.push_str(" AND project = ?");
+                args.push(Value::Text(project.to_string()));
+            }
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(args), |row| {
+                Ok((FileInfo::from_row(row)?, row.get::<_, Option<Vec<u8>>>(13)?))
+            })?;
+            for row in rows {
+                candidates.push(row?);
+            }
+        }
+        // (text score, similarity, hit)
+        let mut scored: Vec<(usize, f32, FileHit)> = Vec::new();
+        for (file, blob) in candidates {
+            let haystack = format!("{}\n{}", file.path, file.description).to_lowercase();
+            let text = terms
+                .iter()
+                .filter(|term| haystack.contains(term.as_str()))
+                .count();
+            let similarity = match (vector, &blob) {
+                (Some(vector), Some(blob)) => Some(dot(vector, &decode_vector(blob))),
+                _ => None,
+            };
+            let semantic = similarity.is_some_and(|s| s >= min_similarity);
+            if text == 0 && !semantic {
+                continue;
+            }
+            let matched = match (text > 0, semantic) {
+                (true, true) => "text+semantic",
+                (true, false) => "text",
+                _ => "semantic",
+            };
+            scored.push((
+                text,
+                similarity.unwrap_or(0.0),
+                FileHit {
+                    file,
+                    matched,
+                    similarity,
+                },
+            ));
+        }
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(b.1.total_cmp(&a.1))
+                .then(b.2.file.id.cmp(&a.2.file.id))
+        });
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, hit)| hit)
+            .collect())
+    }
+
+    /// Removes one file version and returns it as it was.
+    pub fn delete_file(&self, id: i64) -> Result<Option<FileInfo>> {
+        let conn = self.lock();
+        let Some(file) = get_file_info(&conn, id)? else {
+            return Ok(None);
+        };
+        conn.execute("DELETE FROM files WHERE id = ?1", params![id])?;
+        Ok(Some(file))
+    }
+
+    /// Removes every version of one project's file and returns how many
+    /// there were.
+    pub fn delete_file_path(&self, project: &str, path: &str) -> Result<usize> {
+        let project = normalize_file_project(project)?;
+        let path = normalize_file_path(path)?;
+        Ok(self.lock().execute(
+            "DELETE FROM files WHERE project = ?1 AND path = ?2",
+            params![project, path],
+        )?)
+    }
+
+    pub fn set_file_embedding(&self, id: i64, vector: &[f32]) -> Result<()> {
+        self.lock().execute(
+            "UPDATE files SET embedding = ?2 WHERE id = ?1",
+            params![id, encode_vector(vector)],
+        )?;
+        Ok(())
+    }
+
+    /// File versions that still need an embedding, oldest first.
+    pub fn files_missing_embeddings(&self, limit: usize) -> Result<Vec<FileInfo>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {FILE_COLUMNS} FROM files WHERE embedding IS NULL ORDER BY id LIMIT ?1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![limit as i64], FileInfo::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many files, versions and bytes are kept.
+    pub fn file_counts(&self) -> Result<FileCounts> {
+        let conn = self.lock();
+        let (files, versions, bytes): (i64, i64, i64) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM files GROUP BY project, path)),
+                    COUNT(*), COALESCE(SUM(size), 0) FROM files",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(FileCounts {
+            files,
+            versions,
+            bytes,
+        })
+    }
+
+    /// How many distinct files one project keeps.
+    pub fn project_file_count(&self, project: &str) -> Result<i64> {
+        Ok(self.lock().query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM files WHERE project = ?1 GROUP BY path)",
+            params![project],
+            |row| row.get(0),
+        )?)
+    }
+
     /// The user's profile: the default form of address, the reply language
     /// and each agent's own form of address.
     pub fn profile(&self) -> Result<Profile> {
@@ -2538,6 +3112,7 @@ impl Db {
             .optional()?;
         if current.as_deref() != Some(name) {
             conn.execute("UPDATE entries SET embedding = NULL", [])?;
+            conn.execute("UPDATE files SET embedding = NULL", [])?;
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('embedding_model', ?1)
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -2764,6 +3339,30 @@ fn validate_backup(backup: &Backup) -> Result<()> {
             );
         }
     }
+    let mut versions: std::collections::HashSet<(&str, &str, i64)> =
+        std::collections::HashSet::new();
+    for file in &backup.files {
+        let info = &file.info;
+        if info.project.trim().is_empty() || info.project != info.project.trim().to_lowercase() {
+            anyhow::bail!("file #{} has no project, or one not in lowercase", info.id);
+        }
+        if normalize_file_path(&info.path).ok().as_deref() != Some(info.path.as_str()) {
+            anyhow::bail!("file #{} has an invalid path \"{}\"", info.id, info.path);
+        }
+        if info.version < 1 || !versions.insert((&info.project, &info.path, info.version)) {
+            anyhow::bail!("file #{} has an invalid or repeated version", info.id);
+        }
+        if !FILE_KINDS.contains(&info.kind.as_str()) {
+            anyhow::bail!("file #{} has an unknown kind \"{}\"", info.id, info.kind);
+        }
+        if !FILE_ENCODINGS.contains(&info.encoding.as_str()) {
+            anyhow::bail!(
+                "file #{} has an unknown encoding \"{}\"",
+                info.id,
+                info.encoding
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2897,6 +3496,266 @@ fn normalize_message(kind: &str, project: &str, body: &str) -> Result<(String, S
         anyhow::bail!("the message body must be at most {BODY_MAX_CHARS} characters");
     }
     Ok((kind, project, body.to_string()))
+}
+
+/// A file's project: lowercase and not empty, like every project name.
+fn normalize_file_project(project: &str) -> Result<String> {
+    let project = project.trim().to_lowercase();
+    if project.is_empty() {
+        anyhow::bail!("project must not be empty");
+    }
+    Ok(project)
+}
+
+/// A file's name or relative path: forward slashes, no leading slash, no
+/// empty, `.` or `..` segments, no control characters, at most
+/// `FILE_PATH_MAX_CHARS` characters.
+pub fn normalize_file_path(path: &str) -> Result<String> {
+    let path = path.trim().replace('\\', "/");
+    if path.chars().any(char::is_control) {
+        anyhow::bail!("the file path must not contain control characters");
+    }
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        // Each segment is trimmed as it is kept, so `keys/server.pem /`
+        // cannot hide a key file's name behind a space.
+        match segment.trim() {
+            "" | "." => {}
+            ".." => anyhow::bail!("the file path must not contain a `..` segment"),
+            segment => segments.push(segment),
+        }
+    }
+    let path = segments.join("/");
+    if path.is_empty() {
+        anyhow::bail!("the file path must not be empty");
+    }
+    if path.chars().count() > FILE_PATH_MAX_CHARS {
+        anyhow::bail!("the file path must be at most {FILE_PATH_MAX_CHARS} characters");
+    }
+    Ok(path)
+}
+
+/// The refusal every secret gets, whatever gave it away.
+const SECRET_REFUSAL: &str = "lore does not store secrets";
+
+/// Refuses paths that name an environment file or a private key.
+fn refuse_secret_path(path: &str) -> Result<()> {
+    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    let secret = name == ".env"
+        || name.starts_with(".env.")
+        || [".pem", ".key", "id_rsa", "id_ed25519"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix));
+    if secret {
+        anyhow::bail!("{SECRET_REFUSAL}: `{path}` looks like an environment file or a key");
+    }
+    Ok(())
+}
+
+/// Refuses content that holds a private key: a line with `-----BEGIN `
+/// followed by `PRIVATE KEY-----`. The raw bytes are checked, so a key
+/// sent as base64 is refused too.
+fn refuse_secret_content(content: &[u8]) -> Result<()> {
+    const BEGIN: &[u8] = b"-----BEGIN ";
+    const END: &[u8] = b"PRIVATE KEY-----";
+    for line in content.split(|byte| *byte == b'\n') {
+        if let Some(start) = find_bytes(line, BEGIN)
+            && find_bytes(&line[start + BEGIN.len()..], END).is_some()
+        {
+            anyhow::bail!("{SECRET_REFUSAL}: the content holds a private key");
+        }
+    }
+    Ok(())
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// One of `FILE_KINDS`; empty means "other".
+fn normalize_file_kind(kind: &str) -> Result<String> {
+    let kind = kind.trim().to_lowercase();
+    if kind.is_empty() {
+        return Ok("other".into());
+    }
+    if !FILE_KINDS.contains(&kind.as_str()) {
+        anyhow::bail!("kind must be one of: {}", FILE_KINDS.join(", "));
+    }
+    Ok(kind)
+}
+
+/// One of `FILE_ENCODINGS`; empty means "utf8".
+fn normalize_file_encoding(encoding: &str) -> Result<String> {
+    let encoding = encoding.trim().to_lowercase();
+    match encoding.as_str() {
+        "" | "utf8" | "utf-8" | "text" => Ok("utf8".into()),
+        "base64" => Ok(encoding),
+        _ => anyhow::bail!("encoding must be one of: {}", FILE_ENCODINGS.join(", ")),
+    }
+}
+
+fn normalize_file_description(description: &str) -> Result<String> {
+    let description = description.trim();
+    if description.is_empty() {
+        anyhow::bail!("the description must say why the file matters");
+    }
+    if description.chars().count() > FILE_DESCRIPTION_MAX_CHARS {
+        anyhow::bail!("the description must be at most {FILE_DESCRIPTION_MAX_CHARS} characters");
+    }
+    Ok(description.to_string())
+}
+
+/// The raw bytes of a file as it was sent: the text itself, or the
+/// decoded base64. At most `FILE_MAX_BYTES`.
+fn decode_file_content(encoding: &str, content: &str) -> Result<Vec<u8>> {
+    let too_big = || {
+        anyhow::anyhow!(
+            "the file is larger than {} MiB; lore keeps small files that matter, not large ones",
+            FILE_MAX_BYTES / (1024 * 1024)
+        )
+    };
+    let bytes = if encoding == "base64" {
+        use base64::Engine;
+        // Whitespace from line-wrapped base64 is dropped first.
+        let compact: String = content.split_whitespace().collect();
+        if compact.len() > FILE_MAX_BYTES.div_ceil(3) * 4 {
+            return Err(too_big());
+        }
+        base64::engine::general_purpose::STANDARD
+            .decode(compact.as_bytes())
+            .map_err(|_| anyhow::anyhow!("the content is not valid base64"))?
+    } else {
+        // Text arrives as a string, so it is valid UTF-8 already.
+        content.as_bytes().to_vec()
+    };
+    if bytes.len() > FILE_MAX_BYTES {
+        return Err(too_big());
+    }
+    if encoding != "base64" && std::str::from_utf8(&bytes).is_err() {
+        anyhow::bail!("utf8 content must be valid UTF-8; send binary files as base64");
+    }
+    Ok(bytes)
+}
+
+/// Lowercase hex SHA-256 of the raw bytes.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The lowercase words of a file search: the same words the full-text
+/// query keeps, plus the whole query when it is more than one word or
+/// looks like a path.
+fn file_search_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for word in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        let chars = word.chars().count();
+        let has_digit = word.chars().any(|c| c.is_ascii_digit());
+        if chars < 2 || (chars == 2 && !has_digit) {
+            continue;
+        }
+        let word = word.to_lowercase();
+        if STOPWORDS.contains(&word.as_str()) || terms.contains(&word) {
+            continue;
+        }
+        terms.push(word);
+    }
+    let whole = query.trim().to_lowercase();
+    if whole.chars().count() >= 3 && !terms.contains(&whole) {
+        terms.push(whole);
+    }
+    terms
+}
+
+fn get_file_info(conn: &Connection, id: i64) -> Result<Option<FileInfo>> {
+    let sql = format!("SELECT {FILE_COLUMNS} FROM files WHERE id = ?1");
+    Ok(conn
+        .query_row(&sql, params![id], FileInfo::from_row)
+        .optional()?)
+}
+
+/// Reads `FILE_COLUMNS` followed by `content`.
+fn stored_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredFile> {
+    Ok(StoredFile {
+        info: FileInfo::from_row(row)?,
+        content: row.get(13)?,
+    })
+}
+
+/// True when the backup's vectors came from the model in use here.
+fn same_embedding_model(conn: &Connection, backup: &Backup) -> Result<bool> {
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'embedding_model'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(backup.embedding_model.is_some() && backup.embedding_model == current)
+}
+
+/// A backup file's raw bytes, checked against its size and hash, and its
+/// vector when that can be reused.
+fn decode_backup_file(file: &BackupFile, same_model: bool) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    use base64::Engine;
+    let id = file.info.id;
+    let content = base64::engine::general_purpose::STANDARD
+        .decode(&file.content)
+        .map_err(|_| anyhow::anyhow!("the content of file #{id} is not valid base64"))?;
+    if content.len() as i64 != file.info.size || sha256_hex(&content) != file.info.sha256 {
+        anyhow::bail!("the content of file #{id} does not match its size and hash");
+    }
+    let embedding = match (&file.embedding, same_model) {
+        (Some(encoded), true) => {
+            let blob = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| anyhow::anyhow!("the embedding of file #{id} is not valid base64"))?;
+            if blob.is_empty() || blob.len() % 4 != 0 {
+                anyhow::bail!("the embedding of file #{id} has an invalid length");
+            }
+            Some(blob)
+        }
+        _ => None,
+    };
+    Ok((content, embedding))
+}
+
+/// Writes one file row from a backup: under its own id for a restore, or
+/// under a new one for a merge.
+fn insert_backup_file(
+    conn: &Connection,
+    id: Option<i64>,
+    info: &FileInfo,
+    version: i64,
+    content: &[u8],
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO files (id, project, path, version, kind, description, encoding, content,
+                            size, sha256, entry_id, agent, session_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            id,
+            info.project,
+            info.path,
+            version,
+            info.kind,
+            info.description,
+            info.encoding,
+            content,
+            content.len() as i64,
+            info.sha256,
+            info.entry_id,
+            info.agent,
+            info.session_id,
+            info.created_at
+        ],
+    )?;
+    Ok(())
 }
 
 /// "s_" plus 24 random hex characters.
@@ -3492,7 +4351,7 @@ mod tests {
 
         let json = serde_json::to_string(&db.export().unwrap()).unwrap();
         let backup: Backup = serde_json::from_str(&json).unwrap();
-        assert_eq!(backup.version, 4);
+        assert_eq!(backup.version, BACKUP_VERSION);
         assert_eq!(backup.sessions.len(), 1);
         assert_eq!(backup.session_updates.len(), 1);
         assert_eq!(backup.rules.len(), 1);
@@ -4082,7 +4941,7 @@ mod tests {
 
         let json = serde_json::to_string(&db.export().unwrap()).unwrap();
         let backup: Backup = serde_json::from_str(&json).unwrap();
-        assert_eq!(backup.version, 4);
+        assert_eq!(backup.version, BACKUP_VERSION);
         assert_eq!(backup.tasks.len(), 1);
         assert_eq!(backup.messages.len(), 2);
         assert_eq!(backup.message_reads.len(), 1);
@@ -4242,5 +5101,669 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert_eq!(db.tasks(None, &[], 10).unwrap().len(), 1);
         assert_eq!(db.get(1).unwrap().unwrap().title, "old");
+    }
+
+    fn new_file(project: &str, path: &str, content: &str) -> NewFile {
+        NewFile {
+            project: project.into(),
+            path: path.into(),
+            kind: "doc".into(),
+            description: "why it matters".into(),
+            content: content.into(),
+            agent: "claude".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn files_get_a_new_version_only_when_the_content_changes() {
+        let db = temp_db();
+        let first = db
+            .save_file(&new_file("Shop", "docs/ideas.md", "one"))
+            .unwrap();
+        assert!(!first.unchanged && first.needs_embedding);
+        assert_eq!(
+            (
+                first.file.project.as_str(),
+                first.file.version,
+                first.file.size
+            ),
+            ("shop", 1, 3)
+        );
+        assert_eq!(first.file.sha256, sha256_hex(b"one"));
+        assert_eq!(first.file.encoding, "utf8");
+
+        let second = db
+            .save_file(&new_file("shop", "docs/ideas.md", "two"))
+            .unwrap();
+        assert!(!second.unchanged);
+        assert_eq!(second.file.version, 2);
+
+        // The same bytes again make no new version; a new description is
+        // taken over, and the file needs a new vector for it.
+        let same = db
+            .save_file(&NewFile {
+                description: "a better reason".into(),
+                kind: "idea".into(),
+                ..new_file("shop", "docs/ideas.md", "two")
+            })
+            .unwrap();
+        assert!(same.unchanged && same.needs_embedding);
+        assert_eq!(same.file.id, second.file.id);
+        assert_eq!(
+            (same.file.kind.as_str(), same.file.description.as_str()),
+            ("idea", "a better reason")
+        );
+        let again = db
+            .save_file(&NewFile {
+                description: "a better reason".into(),
+                kind: "idea".into(),
+                ..new_file("shop", "docs/ideas.md", "two")
+            })
+            .unwrap();
+        assert!(again.unchanged && !again.needs_embedding);
+        assert_eq!(db.file_versions("shop", "docs/ideas.md").unwrap().len(), 2);
+
+        // Going back to older content is a change too.
+        let third = db
+            .save_file(&new_file("shop", "docs/ideas.md", "one"))
+            .unwrap();
+        assert_eq!(third.file.version, 3);
+
+        // A link to an entry must name one that exists.
+        let linked = NewFile {
+            entry_id: Some(999),
+            ..new_file("shop", "a.md", "x")
+        };
+        assert!(db.save_file(&linked).is_err());
+        let entry = db.insert(&entry("shop", "t", "b")).unwrap();
+        let linked = NewFile {
+            entry_id: Some(entry.id),
+            ..new_file("shop", "a.md", "x")
+        };
+        assert_eq!(db.save_file(&linked).unwrap().file.entry_id, Some(entry.id));
+    }
+
+    #[test]
+    fn file_paths_are_normalised_and_checked() {
+        assert_eq!(
+            normalize_file_path("  /docs\\ideas.md ").unwrap(),
+            "docs/ideas.md"
+        );
+        assert_eq!(
+            normalize_file_path("./a//b/./c.json").unwrap(),
+            "a/b/c.json"
+        );
+        for bad in ["", "/", " ./ ", "../x", "a/../b", "a/..", "a\nb"] {
+            assert!(normalize_file_path(bad).is_err(), "{bad:?} was accepted");
+        }
+        assert!(normalize_file_path(&"x".repeat(300)).is_ok());
+        assert!(normalize_file_path(&"x".repeat(301)).is_err());
+
+        let db = temp_db();
+        let saved = db
+            .save_file(&new_file("shop", "/docs/./schema.json", "{}"))
+            .unwrap();
+        assert_eq!(saved.file.path, "docs/schema.json");
+        assert!(
+            db.file_at("shop", "docs//schema.json", None)
+                .unwrap()
+                .is_some()
+        );
+        for (field, file) in [
+            ("project", new_file(" ", "a.md", "x")),
+            (
+                "kind",
+                NewFile {
+                    kind: "secret".into(),
+                    ..new_file("p", "a.md", "x")
+                },
+            ),
+            (
+                "encoding",
+                NewFile {
+                    encoding: "hex".into(),
+                    ..new_file("p", "a.md", "x")
+                },
+            ),
+            (
+                "description",
+                NewFile {
+                    description: " ".into(),
+                    ..new_file("p", "a.md", "x")
+                },
+            ),
+            (
+                "long description",
+                NewFile {
+                    description: "d".repeat(1001),
+                    ..new_file("p", "a.md", "x")
+                },
+            ),
+            (
+                "agent",
+                NewFile {
+                    agent: String::new(),
+                    ..new_file("p", "a.md", "x")
+                },
+            ),
+        ] {
+            assert!(db.save_file(&file).is_err(), "a bad {field} was accepted");
+        }
+        // An empty kind and encoding fall back to other and utf8.
+        let plain = db
+            .save_file(&NewFile {
+                kind: String::new(),
+                ..new_file("p", "plain.txt", "x")
+            })
+            .unwrap();
+        assert_eq!(
+            (plain.file.kind.as_str(), plain.file.encoding.as_str()),
+            ("other", "utf8")
+        );
+    }
+
+    #[test]
+    fn secrets_are_refused() {
+        use base64::Engine;
+        let db = temp_db();
+        for path in [
+            ".env",
+            "deploy/.env.production",
+            "certs/server.PEM",
+            "deploy.key",
+            ".ssh/id_rsa",
+            "keys/id_ed25519",
+        ] {
+            let error = db
+                .save_file(&new_file("shop", path, "x"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("lore does not store secrets"),
+                "{path}: {error}"
+            );
+        }
+        let key =
+            "notes\n-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n";
+        let error = db
+            .save_file(&new_file("shop", "notes.md", key))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lore does not store secrets"), "{error}");
+        // The same key sent as base64 is refused too.
+        let encoded = NewFile {
+            encoding: "base64".into(),
+            ..new_file(
+                "shop",
+                "notes.bin",
+                &base64::engine::general_purpose::STANDARD.encode(key),
+            )
+        };
+        assert!(db.save_file(&encoded).is_err());
+        // Names that only look similar, and a public key, are fine.
+        db.save_file(&new_file("shop", ".envrc.md", "x")).unwrap();
+        db.save_file(&new_file(
+            "shop",
+            "docs/keys.md",
+            "-----BEGIN PUBLIC KEY-----",
+        ))
+        .unwrap();
+        assert!(db.files(None, 10).unwrap().len() == 2);
+    }
+
+    #[test]
+    fn files_over_two_mebibytes_are_refused() {
+        use base64::Engine;
+        let db = temp_db();
+        let exact = "a".repeat(FILE_MAX_BYTES);
+        assert_eq!(
+            db.save_file(&new_file("p", "big.txt", &exact))
+                .unwrap()
+                .file
+                .size,
+            FILE_MAX_BYTES as i64
+        );
+        let over = "a".repeat(FILE_MAX_BYTES + 1);
+        assert!(db.save_file(&new_file("p", "bigger.txt", &over)).is_err());
+        let encoded = NewFile {
+            encoding: "base64".into(),
+            ..new_file(
+                "p",
+                "bigger.bin",
+                &base64::engine::general_purpose::STANDARD.encode(vec![7u8; FILE_MAX_BYTES + 1]),
+            )
+        };
+        assert!(db.save_file(&encoded).is_err());
+        let invalid = NewFile {
+            encoding: "base64".into(),
+            ..new_file("p", "broken.bin", "not base64 at all!")
+        };
+        assert!(db.save_file(&invalid).is_err());
+    }
+
+    #[test]
+    fn binary_files_round_trip_as_base64() {
+        use base64::Engine;
+        let db = temp_db();
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        // Line-wrapped base64 is accepted too.
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let saved = db
+            .save_file(&NewFile {
+                encoding: "base64".into(),
+                kind: "data".into(),
+                ..new_file("p", "assets/logo.png", &wrapped)
+            })
+            .unwrap();
+        assert_eq!(saved.file.encoding, "base64");
+        assert_eq!(saved.file.size, 1000);
+        let stored = db.file(saved.file.id).unwrap().unwrap();
+        assert_eq!(stored.content, bytes);
+        assert_eq!(stored.info.sha256, sha256_hex(&bytes));
+        // Binary content is not valid UTF-8, so it cannot be sent as text,
+        // but text bytes may be sent as base64.
+        let text = NewFile {
+            encoding: "base64".into(),
+            ..new_file(
+                "p",
+                "hello.txt",
+                &base64::engine::general_purpose::STANDARD.encode("hello"),
+            )
+        };
+        assert_eq!(db.save_file(&text).unwrap().file.size, 5);
+    }
+
+    #[test]
+    fn files_list_only_the_latest_versions() {
+        let db = temp_db();
+        db.save_file(&new_file("shop", "a.md", "1")).unwrap();
+        db.save_file(&new_file("shop", "a.md", "2")).unwrap();
+        let b = db.save_file(&new_file("shop", "b.md", "1")).unwrap();
+        db.save_file(&new_file("blog", "a.md", "1")).unwrap();
+
+        let all = db.files(None, 10).unwrap();
+        assert_eq!(all.len(), 3);
+        let shop = db.files(Some("shop"), 10).unwrap();
+        assert_eq!(
+            shop.iter()
+                .map(|f| (f.path.as_str(), f.version))
+                .collect::<Vec<_>>(),
+            [("b.md", 1), ("a.md", 2)]
+        );
+        assert_eq!(db.files(Some("shop"), 1).unwrap().len(), 1);
+
+        let versions = db.file_versions("shop", "a.md").unwrap();
+        assert_eq!(
+            versions.iter().map(|f| f.version).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(
+            db.file_at("shop", "a.md", None).unwrap().unwrap().content,
+            b"2"
+        );
+        assert_eq!(
+            db.file_at("shop", "a.md", Some(1))
+                .unwrap()
+                .unwrap()
+                .content,
+            b"1"
+        );
+        assert!(db.file_at("shop", "a.md", Some(9)).unwrap().is_none());
+
+        let counts = db.file_counts().unwrap();
+        assert_eq!((counts.files, counts.versions, counts.bytes), (3, 4, 4));
+        assert_eq!(db.project_file_count("shop").unwrap(), 2);
+
+        // Deleting the latest version brings the previous one back to the
+        // list; deleting the path removes every version.
+        let deleted = db.delete_file(versions[0].id).unwrap().unwrap();
+        assert_eq!(deleted.version, 2);
+        assert!(db.delete_file(versions[0].id).unwrap().is_none());
+        assert_eq!(
+            db.files(Some("shop"), 10)
+                .unwrap()
+                .iter()
+                .find(|f| f.path == "a.md")
+                .unwrap()
+                .version,
+            1
+        );
+        assert_eq!(db.delete_file_path("shop", "a.md").unwrap(), 1);
+        assert_eq!(db.delete_file_path("shop", "a.md").unwrap(), 0);
+        let left = db.files(None, 10).unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().any(|f| f.id == b.file.id));
+    }
+
+    #[test]
+    fn files_are_found_by_text_and_by_vector() {
+        let db = temp_db();
+        let ideas = db
+            .save_file(&NewFile {
+                description: "The principles the checkout is built on".into(),
+                ..new_file("shop", "docs/ideas.md", "x")
+            })
+            .unwrap()
+            .file;
+        let schema = db
+            .save_file(&NewFile {
+                description: "Database layout".into(),
+                ..new_file("shop", "schema.sql", "y")
+            })
+            .unwrap()
+            .file;
+        let other = db
+            .save_file(&NewFile {
+                description: "Checkout settings for the blog".into(),
+                ..new_file("blog", "config.json", "z")
+            })
+            .unwrap()
+            .file;
+        db.set_file_embedding(ideas.id, &[1.0, 0.0]).unwrap();
+        db.set_file_embedding(schema.id, &[0.0, 1.0]).unwrap();
+
+        // Words match the path or the description, whatever their case.
+        let hits = db.search_files("CHECKOUT", None, None, 0.8, 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| hit.matched == "text"));
+        let hits = db.search_files("ideas.md", None, None, 0.8, 10).unwrap();
+        assert_eq!(hits[0].file.id, ideas.id);
+        let hits = db
+            .search_files("checkout", Some("blog"), None, 0.8, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file.id, other.id);
+        assert!(
+            db.search_files("the of", None, None, 0.8, 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A vector finds by meaning; text matches still come first.
+        let hits = db
+            .search_files("zzz", None, Some(&[0.0, 1.0]), 0.8, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].file.id, hits[0].matched), (schema.id, "semantic"));
+        let hits = db
+            .search_files("checkout", None, Some(&[0.0, 1.0]), 0.8, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits[..2].iter().all(|hit| hit.matched == "text"));
+        assert_eq!((hits[2].file.id, hits[2].matched), (schema.id, "semantic"));
+
+        // Only the latest version is searched.
+        db.save_file(&NewFile {
+            description: "Database layout, now with refunds".into(),
+            ..new_file("shop", "schema.sql", "y2")
+        })
+        .unwrap();
+        let hits = db.search_files("layout", None, None, 0.8, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file.version, 2);
+
+        // A new model drops file vectors along with entry vectors.
+        assert_eq!(db.files_missing_embeddings(10).unwrap().len(), 2);
+        db.use_embedding_model("another-model").unwrap();
+        assert_eq!(db.files_missing_embeddings(10).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn backup_v5_round_trips_the_files() {
+        use base64::Engine;
+        let db = temp_db();
+        db.use_embedding_model("test-model").unwrap();
+        let entry = db
+            .insert(&entry("shop", "Ideas", "where they live"))
+            .unwrap();
+        let v1 = db
+            .save_file(&NewFile {
+                entry_id: Some(entry.id),
+                ..new_file("shop", "docs/ideas.md", "first")
+            })
+            .unwrap()
+            .file;
+        let v2 = db
+            .save_file(&new_file("shop", "docs/ideas.md", "second"))
+            .unwrap()
+            .file;
+        let bytes = vec![0u8, 159, 146, 150];
+        let binary = db
+            .save_file(&NewFile {
+                encoding: "base64".into(),
+                ..new_file(
+                    "shop",
+                    "logo.bin",
+                    &base64::engine::general_purpose::STANDARD.encode(&bytes),
+                )
+            })
+            .unwrap()
+            .file;
+        db.set_file_embedding(v2.id, &[1.0, 0.0]).unwrap();
+
+        let json = serde_json::to_string(&db.export().unwrap()).unwrap();
+        let backup: Backup = serde_json::from_str(&json).unwrap();
+        assert_eq!(backup.version, 5);
+        assert_eq!(backup.files.len(), 3);
+        assert!(backup.files.iter().any(|file| file.embedding.is_some()));
+
+        // Diverge, then restore: the files are exactly the backup again,
+        // under their ids, with the vector that existed.
+        db.delete_file(v1.id).unwrap();
+        db.save_file(&new_file("shop", "scratch.md", "discard me"))
+            .unwrap();
+        db.restore(&backup).unwrap();
+        let restored = db.file(v1.id).unwrap().unwrap();
+        assert_eq!(restored.content, b"first");
+        assert_eq!(restored.info.entry_id, Some(entry.id));
+        assert_eq!(db.file(binary.id).unwrap().unwrap().content, bytes);
+        assert!(db.file_at("shop", "scratch.md", None).unwrap().is_none());
+        let missing: Vec<i64> = db
+            .files_missing_embeddings(10)
+            .unwrap()
+            .iter()
+            .map(|file| file.id)
+            .collect();
+        assert_eq!(missing, [v1.id, binary.id]);
+        // A new save continues the version count.
+        assert_eq!(
+            db.save_file(&new_file("shop", "docs/ideas.md", "third"))
+                .unwrap()
+                .file
+                .version,
+            3
+        );
+
+        // Merging the backup back adds nothing: every version is present.
+        let before = db.file_counts().unwrap().versions;
+        db.merge(&backup).unwrap();
+        assert_eq!(db.file_counts().unwrap().versions, before);
+
+        // Into a store without them, merging adds each missing version as
+        // the next free version of its path, and never removes anything.
+        db.delete_file(v1.id).unwrap();
+        db.save_file(&new_file("shop", "kept.md", "stays")).unwrap();
+        db.merge(&backup).unwrap();
+        let versions = db.file_versions("shop", "docs/ideas.md").unwrap();
+        assert_eq!(
+            versions.iter().map(|f| f.version).collect::<Vec<_>>(),
+            [4, 3, 2]
+        );
+        assert_eq!(db.file(versions[0].id).unwrap().unwrap().content, b"first");
+        assert!(db.file_at("shop", "kept.md", None).unwrap().is_some());
+
+        // A backup whose content does not match its hash changes nothing.
+        let mut broken: Backup = serde_json::from_str(&json).unwrap();
+        broken.files[0].content = base64::engine::general_purpose::STANDARD.encode("tampered");
+        broken.files[0].info.sha256 = sha256_hex(b"something else");
+        let count = db.file_counts().unwrap().versions;
+        assert!(db.restore(&broken).is_err());
+        assert!(db.merge(&broken).is_err());
+        assert_eq!(db.file_counts().unwrap().versions, count);
+        assert!(db.file_at("shop", "kept.md", None).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_v4_backup_leaves_the_files_in_place() {
+        let db = temp_db();
+        db.insert(&entry("shop", "Old", "entry")).unwrap();
+        let kept = db
+            .save_file(&new_file("shop", "docs/ideas.md", "kept"))
+            .unwrap()
+            .file;
+
+        // A version 4 file: the same store without the files section.
+        let mut value = serde_json::to_value(db.export().unwrap()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("files");
+        object.insert("version".into(), serde_json::json!(4));
+        let v4: Backup = serde_json::from_value(value).unwrap();
+        assert!(v4.files.is_empty());
+
+        // Files saved after the export survive restoring the older file.
+        let later = db
+            .save_file(&new_file("shop", "docs/ideas.md", "later"))
+            .unwrap()
+            .file;
+        db.restore(&v4).unwrap();
+        assert!(db.file(kept.id).unwrap().is_some());
+        assert_eq!(db.file(later.id).unwrap().unwrap().content, b"later");
+        assert_eq!(db.file_counts().unwrap().versions, 2);
+        // Versions 1 to 3 still load.
+        for version in 1..=3 {
+            let mut older = serde_json::to_value(&v4).unwrap();
+            older
+                .as_object_mut()
+                .unwrap()
+                .insert("version".into(), serde_json::json!(version));
+            let older: Backup = serde_json::from_value(older).unwrap();
+            db.restore(&older).unwrap();
+            db.merge(&older).unwrap();
+        }
+        assert_eq!(db.file_counts().unwrap().versions, 2);
+        // Version 6 does not exist yet.
+        let mut newer = serde_json::to_value(&v4).unwrap();
+        newer
+            .as_object_mut()
+            .unwrap()
+            .insert("version".into(), serde_json::json!(6));
+        let newer: Backup = serde_json::from_value(newer).unwrap();
+        assert!(db.restore(&newer).is_err());
+    }
+
+    #[test]
+    fn a_current_database_gains_the_files_table() {
+        let dir = std::env::temp_dir().join(format!("lore-files-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("lore.db");
+        let (entry_id, session_id) = {
+            // Everything the store held before files existed.
+            let db = Db::open(&path).unwrap();
+            let entry = db.insert(&entry("shop", "old", "entry")).unwrap();
+            db.set_embedding(entry.id, &[1.0, 0.0]).unwrap();
+            let opened = db.open_session(&session("claude", "shop", "chat")).unwrap();
+            db.add_session_update(&opened.id, "step", "", "", false)
+                .unwrap();
+            db.add_rule(&RuleInput {
+                scope: "global".into(),
+                target: String::new(),
+                body: "be kind".into(),
+                enabled: true,
+                position: 0,
+            })
+            .unwrap();
+            db.add_task(&task("shop", "kept task")).unwrap();
+            db.add_message(&message("message", "claude", "", "kept message"))
+                .unwrap();
+            db.lock()
+                .execute_batch("DROP INDEX files_project_path; DROP TABLE files;")
+                .unwrap();
+            (entry.id, opened.id)
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.get(entry_id).unwrap().unwrap().title, "old");
+        assert!(db.missing_embeddings(10).unwrap().is_empty());
+        assert_eq!(db.session_updates(&session_id).unwrap().len(), 1);
+        assert_eq!(db.rules().unwrap().len(), 1);
+        assert_eq!(db.tasks(None, &[], 10).unwrap().len(), 1);
+        assert_eq!(db.messages(None, 10).unwrap().len(), 1);
+        assert_eq!(db.file_counts().unwrap().versions, 0);
+        db.save_file(&new_file("shop", "docs/ideas.md", "new"))
+            .unwrap();
+        // Opening it again changes nothing.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.files(None, 10).unwrap().len(), 1);
+        assert_eq!(db.get(entry_id).unwrap().unwrap().title, "old");
+        assert_eq!(db.export().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn padded_path_segments_cannot_hide_a_secret_name() {
+        assert_eq!(
+            normalize_file_path("docs /ideas.md ").unwrap(),
+            "docs/ideas.md"
+        );
+        assert_eq!(
+            normalize_file_path("keys/server.pem /").unwrap(),
+            "keys/server.pem"
+        );
+        let db = temp_db();
+        for path in ["keys/server.pem /", "deploy/.env /", "x/ id_rsa /"] {
+            let error = db
+                .save_file(&new_file("shop", path, "x"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("lore does not store secrets"),
+                "{path}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_save_without_a_kind_keeps_the_kind_of_the_path() {
+        let db = temp_db();
+        let first = db
+            .save_file(&NewFile {
+                kind: "idea".into(),
+                ..new_file("shop", "docs/ideas.md", "one")
+            })
+            .unwrap();
+        assert_eq!(first.file.kind, "idea");
+        // The same bytes without a kind change nothing.
+        let same = db
+            .save_file(&NewFile {
+                kind: String::new(),
+                ..new_file("shop", "docs/ideas.md", "one")
+            })
+            .unwrap();
+        assert!(same.unchanged && !same.needs_embedding);
+        assert_eq!(same.file.kind, "idea");
+        // A new version without a kind stays an idea; a named kind wins.
+        let second = db
+            .save_file(&NewFile {
+                kind: String::new(),
+                ..new_file("shop", "docs/ideas.md", "two")
+            })
+            .unwrap();
+        assert_eq!(
+            (second.file.version, second.file.kind.as_str()),
+            (2, "idea")
+        );
+        let third = db
+            .save_file(&NewFile {
+                kind: "doc".into(),
+                ..new_file("shop", "docs/ideas.md", "three")
+            })
+            .unwrap();
+        assert_eq!(third.file.kind, "doc");
     }
 }

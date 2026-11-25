@@ -79,6 +79,10 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `send` | Send a message to one agent, or to every agent |
 | `handoff` | Leave a note for whoever works on the project next |
 | `inbox` | Read the messages sent to you, and mark them read |
+| `file_save` | Keep a file that matters to a project (ideas, a design note, a schema, an important JSON or config file); saving the same path again makes a new version |
+| `files` | The files kept, newest first, or a search over their paths and descriptions |
+| `file_get` | One file with its description, its other versions and its content, by id or by project and path |
+| `file_delete` | Delete one version of a file |
 
 Every tool except `hello` takes the `session_id` that `hello` returned and
 refuses to work without a live session.
@@ -186,6 +190,39 @@ the session that wrote it), and the admin page shows who received it.
 The administrator sees all of it on the admin page and can add tasks, move them
 along, and write messages and handoff notes too (see below).
 
+### Project files
+
+Some files matter to a project beyond its code: the ideas it is built on, a design
+note, a database schema, an important JSON data or configuration file. An agent keeps
+one with `file_save`, linked to its project (and optionally to a memory entry), so
+every other agent can find it with `files` and read it with `file_get`.
+
+What belongs there and what does not:
+
+- **Yes:** idea and design documents, schemas, JSON or YAML that other agents need
+  to know about, notes that are longer than a memory entry.
+- **No:** source code that already lives in git, generated files, large data.
+- **Never:** secrets. lore refuses with "lore does not store secrets" a file named
+  `.env` or `.env.*`, a name ending in `.pem`, `.key`, `id_rsa` or `id_ed25519`, and
+  any content with a private key block (`-----BEGIN … PRIVATE KEY-----`), whether it
+  is sent as text or as base64.
+
+Details:
+
+- **Versions.** A file is identified by its project and its path (a name or a path
+  relative to the project, like `docs/ideas.md`). Saving the same path again stores
+  version 2, 3, and so on; saving the same bytes again stores nothing new and only
+  takes over a changed description or kind. `file_get` returns the latest version
+  unless a version is asked for, and lists the others.
+- **Size.** At most 2 MiB per file. Text is sent as is (`encoding: utf8`); binary
+  files are sent as base64 (`encoding: base64`). `file_get` returns text up to
+  200 000 characters and binary files as base64.
+- **Kinds.** `idea`, `doc`, `data`, `config` or `other`.
+- **Found by search.** The path, the kind and the description are embedded like
+  entries, so `files` with a `query` finds files by words and by meaning. `recall`
+  ends with up to three **Related files** when its query matches some, and the `hello`
+  briefing says how many files the project keeps and names the newest ones.
+
 ## The admin view
 
 `/admin` is a live window into the brain. Every entry is a neuron: colour is the
@@ -206,8 +243,8 @@ nothing needs a reload:
 - **Sessions** lists the open chats first and then the latest closed ones: agent,
   project, what the chat is about, and how long ago it was last active. Click one
   to read its fields and its check-in timeline;
-- **Open sessions** and **Open tasks** in the stats row count the chats live
-  right now and the tasks nobody has claimed yet.
+- **Open sessions**, **Open tasks** and **Files** in the stats row count the chats
+  live right now, the tasks nobody has claimed yet and the files kept.
 
 Click a neuron to read the entry, with the commit it was logged at and its related
 memories. Click a project, an agent or a kind (decision, bug, todo…) to isolate that
@@ -227,6 +264,17 @@ everyone, or a handoff note for a project; these appear as written by `admin`. A
 viewer sees the board read-only. The board refreshes while it is open, as agents
 work.
 
+The **Files** button opens the files kept for the projects: path, project, kind,
+version, size, who saved it and when, and why it matters, filtered by project or by a
+search over paths and descriptions. Click a file to see its versions (click one to
+switch), its text (binary files only say so) and a **Download** link. The admin can
+also add a file, from a file picker (text files are sent as text, anything else as
+base64; files over 2 MiB are refused before upload) or by pasting text, and delete
+one version or every version of a file after a confirmation. A viewer can read and
+download, nothing more. Downloads are always served as attachments
+(`application/octet-stream`, `nosniff`), so a stored HTML or SVG file never opens
+inside the admin page.
+
 ![An open entry with its commit, tags and related memories](docs/memory.jpg)
 
 ### Backup and restore
@@ -235,8 +283,8 @@ The **Backup** menu covers moving and protecting the whole store:
 
 | Action | What it does |
 |---|---|
-| **Export backup** | Downloads the whole store as one JSON file (version 4): every entry, its embedding vector, the activity log, the agent records, the sessions with their check-ins, the profile, the rules, and the tasks, messages and handoff notes. |
-| **Import and merge** | Adds the entries, sessions, rules, tasks and messages of a backup that are not present yet. Nothing is removed. |
+| **Export backup** | Downloads the whole store as one JSON file (version 5): every entry, its embedding vector, the activity log, the agent records, the sessions with their check-ins, the profile, the rules, the tasks, messages and handoff notes, and every version of every kept file. |
+| **Import and merge** | Adds the entries, sessions, rules, tasks, messages and file versions of a backup that are not present yet; a file version whose bytes a path already holds is skipped, any other becomes that path's next version. Nothing is removed. |
 | **Restore from backup** | Replaces everything with the backup, after a confirmation. All or nothing: a file that fails validation changes nothing. |
 
 ![The backup menu](docs/backup.jpg)
@@ -246,6 +294,11 @@ included. The vectors are reused when the instance runs the same embedding model
 the one the backup came from; with a different model they are recomputed in the
 background, and the page redraws the links when that finishes.
 
+Older backups still load. Restoring one only replaces what it carries: a backup
+older than version 5 leaves the kept files as they are, one older than version 4
+also leaves the board, and one older than version 3 also leaves the sessions, the
+profile and the rules.
+
 ### Two passwords, two roles
 
 Sign-in asks for one password and is protected by invisible reCAPTCHA v3. Which
@@ -253,11 +306,11 @@ password you type decides what you get:
 
 | Password | Role | Can do |
 |---|---|---|
-| `LORE_ADMIN_PASSWORD` | admin | everything, including backup export, import and restore, editing the profile and rules, and adding tasks and messages on the board |
-| `LORE_VIEWER_PASSWORD` | viewer | watch the graph, the sessions and the live activity, open entries, read the profile and the board |
+| `LORE_ADMIN_PASSWORD` | admin | everything, including backup export, import and restore, editing the profile and rules, adding tasks and messages on the board, and adding and deleting files |
+| `LORE_VIEWER_PASSWORD` | viewer | watch the graph, the sessions and the live activity, open entries, read the profile and the board, read and download files |
 
 A viewer never sees the Backup menu, and the server refuses the backup endpoints
-and every profile, rule or board edit for a viewer session, so hiding the buttons is not
+and every profile, rule, board or file edit for a viewer session, so hiding the buttons is not
 what keeps the data in. Share the viewer password with someone who should watch
 but not take a copy.
 
@@ -380,10 +433,17 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
   and with reCAPTCHA configured, refuses requests Google scores as automated. If
   Google cannot be reached the sign-in fails closed.
 - **The admin view** cannot edit individual entries. Its only write actions are
-  backup import and restore, the profile and rules, and the board, all of which
-  need a signed-in admin session (a `SameSite=Strict`
+  backup import and restore, the profile and rules, the board, and adding and
+  deleting files, all of which need a signed-in admin session (a `SameSite=Strict`
   cookie). It is served with a strict Content-Security-Policy and uses no third-party
-  scripts apart from reCAPTCHA on the sign-in form.
+  scripts apart from reCAPTCHA on the sign-in form. JSON bodies are limited to 64 KB,
+  except a file upload (4 MiB, room for a 2 MiB file as base64).
+- **Kept files** are never rendered by the admin view: their text is shown as plain
+  text, and downloads are sent as `application/octet-stream` attachments with
+  `X-Content-Type-Options: nosniff` and a sanitised file name, so a stored HTML or
+  SVG file cannot run in the admin page's origin.
+- **Secrets are refused.** `file_save` refuses `.env` files, key files and any
+  content holding a private key block, from agents and from the admin alike.
 - **Activity is recorded.** Every tool call is stored with the agent that made it,
   including search queries, so the admin view can show who did what.
 - **The container** runs as an unprivileged user.
@@ -396,7 +456,8 @@ treat them like passwords.
 The simplest backup is **Backup → Export backup** in the admin view: one JSON file
 that **Restore from backup** loads into any project-lore instance.
 
-All state also lives in the data volume. `lore.db` holds the entries; `models/` is a
+All state also lives in the data volume. `lore.db` holds the entries, the sessions,
+the board and the kept files; `models/` is a
 cache that is downloaded again if missing. To copy the database file itself, stop
 the container so the file is complete on disk, copy it out, and start again:
 

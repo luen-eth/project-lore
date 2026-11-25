@@ -50,6 +50,7 @@
       <input id="search" type="search" placeholder="Search memories" aria-label="Search memories" spellcheck="false">
       <button id="side-toggle" class="ghost only-narrow" type="button" aria-expanded="false">Overview</button>
       <button id="feed-toggle" class="ghost only-medium" type="button" aria-expanded="false">Activity</button>
+      <button id="files-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="files">Files</button>
       <button id="board-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="board">Board</button>
       <button id="profile-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="profile">Profile</button>
       <button id="backup-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="backup">Backup</button>
@@ -65,6 +66,7 @@
       <div class="stat"><b id="stat-online">0</b><span>Agents active</span></div>
       <div class="stat"><b id="stat-tasks">0</b><span>Open tasks</span></div>
       <div class="stat"><b id="stat-sessions">0</b><span>Open sessions</span></div>
+      <div class="stat span"><b id="stat-files">0</b><span>Files</span></div>
     </section>
     <section class="panel">
       <h2>Connected models</h2>
@@ -190,6 +192,64 @@
       </section>
     </div>
     <datalist id="board-projects"></datalist>
+  </div>
+
+  <div id="files" class="board files" hidden>
+    <div class="board-head">
+      <h2>Files</h2>
+      <span id="files-count" class="muted small-text"></span>
+    </div>
+    <div class="board-filters">
+      <input id="files-search" type="search" placeholder="Search paths and descriptions" aria-label="Search files" spellcheck="false">
+      <select id="files-project" aria-label="Project"></select>
+    </div>
+    <p id="files-status" class="small-text" role="status"></p>
+    <div class="board-scroll">
+      <section id="files-browse">
+        <form id="file-form" class="board-form" autocomplete="off" hidden>
+          <h4>Add file</h4>
+          <div class="board-form-row">
+            <label class="board-field"><span>Project</span>
+              <input id="file-project" type="text" maxlength="100" list="files-projects" placeholder="project-lore" required spellcheck="false">
+            </label>
+            <label class="board-field"><span>Kind</span>
+              <select id="file-kind">
+                <option value="idea">Idea</option>
+                <option value="doc" selected>Doc</option>
+                <option value="data">Data</option>
+                <option value="config">Config</option>
+                <option value="other">Other</option>
+              </select>
+            </label>
+          </div>
+          <label class="board-field"><span>Path</span>
+            <input id="file-path" type="text" maxlength="300" placeholder="docs/ideas.md" required spellcheck="false">
+          </label>
+          <label class="board-field"><span>Why it matters</span>
+            <textarea id="file-description" maxlength="1000" placeholder="One or two sentences for the agents that find it later" required></textarea>
+          </label>
+          <div class="file-source">
+            <label class="board-field"><span>Pick a file (at most 2 MiB)</span>
+              <input id="file-picker" type="file">
+            </label>
+            <div id="file-picked" class="file-picked" hidden>
+              <span id="file-picked-name" class="small-text"></span>
+              <button id="file-clear" class="ghost small" type="button">Use pasted text instead</button>
+            </div>
+          </div>
+          <label class="board-field"><span>Or paste the text</span>
+            <textarea id="file-text" class="file-text" placeholder="The file's text"></textarea>
+          </label>
+          <p class="muted small-text">Never store secrets: keys, tokens, passwords and .env files are refused.</p>
+          <div class="board-form-actions">
+            <button id="file-submit" class="ghost small" type="submit">Save file</button>
+          </div>
+        </form>
+        <ul id="file-list" class="board-list"></ul>
+      </section>
+      <section id="file-detail" class="file-detail" hidden></section>
+    </div>
+    <datalist id="files-projects"></datalist>
   </div>
 
   <aside id="detail" class="detail" hidden>
