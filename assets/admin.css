@@ -38,14 +38,14 @@ html, body {
 .scene > * { position: absolute; }
 .backdrop {
   inset: -6%;
-  background: url("/admin/backdrop.jpg") 56% 46% / cover no-repeat;
+  background: url("/admin/backdrop.jpg") 60% 50% / cover no-repeat;
   transform: translate(calc(var(--pan-x) * 0.35), calc(var(--pan-y) * 0.35)) scale(var(--zoom));
   animation: breathe 16s ease-in-out infinite alternate;
   will-change: transform, filter;
 }
 @keyframes breathe {
-  from { filter: brightness(0.36) saturate(1.05); }
-  to { filter: brightness(0.5) saturate(1.25); }
+  from { filter: blur(2px) brightness(0.4) saturate(1.05); }
+  to { filter: blur(2px) brightness(0.56) saturate(1.25); }
 }
 .aurora {
   width: 60vmax; height: 60vmax; border-radius: 50%;
