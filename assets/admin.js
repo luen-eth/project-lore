@@ -660,6 +660,8 @@ const state = {
 async function api(path, options) {
   const response = await fetch(path, { credentials: "same-origin", ...options });
   if (response.status === 401 && !path.endsWith("/login")) {
+    // Sessions do not survive a restart, so a 401 often means a new deploy.
+    reloadIfOutdated();
     showLogin();
     throw new Error("signed out");
   }
@@ -769,11 +771,25 @@ function connectStream() {
   if (state.source) state.source.close();
   const source = new EventSource("/admin/api/events");
   state.source = source;
-  source.addEventListener("open", () => setLive(true));
-  source.addEventListener("error", () => setLive(false));
+  source.addEventListener("open", () => {
+    // A stream that had to reconnect may be talking to a redeployed server.
+    if (state.dropped) reloadIfOutdated();
+    state.dropped = false;
+    setLive(true);
+  });
+  source.addEventListener("error", () => { state.dropped = true; setLive(false); });
   source.addEventListener("activity", (event) => {
     try { onActivity(JSON.parse(event.data)); } catch (_) { /* malformed event: ignore */ }
   });
+}
+
+/* After a deploy the server runs newer page code than an open tab holds.
+   Reloading then is the only way the tab gets it. */
+async function reloadIfOutdated() {
+  try {
+    const session = await (await fetch("/admin/api/session", { credentials: "same-origin" })).json();
+    if (state.build && session.build && session.build !== state.build) location.reload();
+  } catch (_) { /* offline: try again on the next occasion */ }
 }
 
 function setLive(on) {
@@ -1292,6 +1308,7 @@ async function openDetail(node) {
   try {
     const session = await (await fetch("/admin/api/session", { credentials: "same-origin" })).json();
     state.siteKey = session.recaptcha_site_key;
+    state.build = session.build;
     loadRecaptcha(state.siteKey);
     if (session.authenticated) await enter(session.role); else showLogin();
   } catch (_) {

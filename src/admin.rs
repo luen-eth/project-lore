@@ -192,6 +192,16 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .with_state(admin)
 }
 
+/// Identifies the page assets compiled into this binary. An open page compares
+/// it with the one it was loaded from and reloads itself after a deploy, so
+/// nobody keeps working in an outdated page.
+fn build_id() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (PAGE, SCRIPT, STYLE).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 fn asset(content_type: &'static str, body: &'static str) -> Response {
     ([(header::CONTENT_TYPE, content_type)], body).into_response()
 }
@@ -253,6 +263,7 @@ async fn session(State(admin): State<Arc<Admin>>, headers: HeaderMap) -> Json<se
     let role = admin.session_role(&headers);
     Json(json!({
         "authenticated": role.is_some(),
+        "build": build_id(),
         "role": role.map(Role::name),
         "recaptcha_site_key": admin.recaptcha.as_ref().map(|r| r.site_key.as_str()),
     }))
