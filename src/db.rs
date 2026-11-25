@@ -23,7 +23,12 @@ CREATE TABLE IF NOT EXISTS entries (
     agent      TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at TEXT,
-    embedding  BLOB
+    embedding  BLOB,
+    path        TEXT NOT NULL DEFAULT '',
+    repo        TEXT NOT NULL DEFAULT '',
+    commit_hash TEXT NOT NULL DEFAULT '',
+    branch      TEXT NOT NULL DEFAULT '',
+    dirty       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS entries_project_created ON entries (project, created_at DESC);
 
@@ -59,7 +64,17 @@ CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE OF title, body, tags, files
 END;
 "#;
 
-const COLUMNS: &str = "id, project, kind, title, body, tags, files, agent, created_at, updated_at";
+const COLUMNS: &str = "id, project, kind, title, body, tags, files, agent, created_at, updated_at, \
+                       path, repo, commit_hash, branch, dirty";
+
+/// Columns added after the first release, as (name, definition).
+const ADDED_COLUMNS: &[(&str, &str)] = &[
+    ("path", "TEXT NOT NULL DEFAULT ''"),
+    ("repo", "TEXT NOT NULL DEFAULT ''"),
+    ("commit_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("branch", "TEXT NOT NULL DEFAULT ''"),
+    ("dirty", "INTEGER NOT NULL DEFAULT 0"),
+];
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Entry {
@@ -73,6 +88,15 @@ pub struct Entry {
     pub agent: String,
     pub created_at: String,
     pub updated_at: Option<String>,
+    /// Working directory the agent was in when it logged the entry.
+    pub path: String,
+    /// Git remote of that directory, or empty when it is not a repository.
+    pub repo: String,
+    /// HEAD commit at the time of logging, or empty.
+    pub commit: String,
+    pub branch: String,
+    /// True when the working tree had uncommitted changes.
+    pub dirty: bool,
 }
 
 impl Entry {
@@ -88,6 +112,11 @@ impl Entry {
             agent: row.get(7)?,
             created_at: row.get(8)?,
             updated_at: row.get(9)?,
+            path: row.get(10)?,
+            repo: row.get(11)?,
+            commit: row.get(12)?,
+            branch: row.get(13)?,
+            dirty: row.get(14)?,
         })
     }
 
@@ -111,6 +140,11 @@ pub struct NewEntry {
     pub tags: String,
     pub files: String,
     pub agent: String,
+    pub path: String,
+    pub repo: String,
+    pub commit: String,
+    pub branch: String,
+    pub dirty: bool,
 }
 
 #[derive(Debug, Default)]
@@ -127,6 +161,19 @@ pub struct ProjectSummary {
     pub project: String,
     pub entries: i64,
     pub last_activity: String,
+    /// Where each agent last was in this project, newest first.
+    pub heads: Vec<AgentHead>,
+}
+
+/// The commit an agent most recently logged against in a project.
+#[derive(Debug)]
+pub struct AgentHead {
+    pub agent: String,
+    pub commit: String,
+    pub branch: String,
+    pub dirty: bool,
+    pub at: String,
+    pub entry_id: i64,
 }
 
 /// A connected agent, as shown in the admin view.
@@ -196,6 +243,7 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(SCHEMA)?;
+        add_missing_columns(&conn)?;
         migrate_fts(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -209,8 +257,9 @@ impl Db {
     pub fn insert(&self, new: &NewEntry) -> Result<Entry> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO entries (project, kind, title, body, tags, files, agent)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO entries (project, kind, title, body, tags, files, agent,
+                                  path, repo, commit_hash, branch, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 new.project,
                 new.kind,
@@ -218,7 +267,12 @@ impl Db {
                 new.body,
                 new.tags,
                 new.files,
-                new.agent
+                new.agent,
+                new.path,
+                new.repo,
+                new.commit,
+                new.branch,
+                new.dirty
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -284,18 +338,54 @@ impl Db {
 
     pub fn projects(&self) -> Result<Vec<ProjectSummary>> {
         let conn = self.lock();
+        let mut heads: HashMap<String, Vec<AgentHead>> = HashMap::new();
+        {
+            // The newest entry with a commit, per project and agent.
+            let mut stmt = conn.prepare(
+                "SELECT project, agent, commit_hash, branch, dirty, created_at, id
+                 FROM entries e
+                 WHERE commit_hash != '' AND id = (
+                     SELECT MAX(id) FROM entries
+                     WHERE project = e.project AND agent = e.agent AND commit_hash != ''
+                 )
+                 ORDER BY id DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    AgentHead {
+                        agent: row.get(1)?,
+                        commit: row.get(2)?,
+                        branch: row.get(3)?,
+                        dirty: row.get(4)?,
+                        at: row.get(5)?,
+                        entry_id: row.get(6)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (project, head) = row?;
+                heads.entry(project).or_default().push(head);
+            }
+        }
         let mut stmt = conn.prepare(
             "SELECT project, COUNT(*), MAX(created_at) FROM entries
              GROUP BY project ORDER BY MAX(created_at) DESC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(ProjectSummary {
-                project: row.get(0)?,
-                entries: row.get(1)?,
-                last_activity: row.get(2)?,
-            })
+            Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut projects = Vec::new();
+        for row in rows {
+            let (project, entries, last_activity) = row?;
+            projects.push(ProjectSummary {
+                heads: heads.remove(&project).unwrap_or_default(),
+                project,
+                entries,
+                last_activity,
+            });
+        }
+        Ok(projects)
     }
 
     /// Changes whenever an entry is added, amended or removed.
@@ -590,6 +680,22 @@ impl Db {
     }
 }
 
+/// Adds columns introduced after a database was first created.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    let existing: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('entries')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (name, definition) in ADDED_COLUMNS {
+        if !existing.iter().any(|column| column == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE entries ADD COLUMN {name} {definition};"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 /// Rebuilds the full-text index when it was created by an older version
 /// with a different tokenizer.
 fn migrate_fts(conn: &Connection) -> Result<()> {
@@ -808,6 +914,63 @@ mod tests {
         assert_eq!((agents[0].name.as_str(), agents[0].requests), ("claude", 2));
         assert_eq!(agents[0].client, "claude-code/2");
         assert!(agents[1].last_seen.is_none());
+    }
+
+    #[test]
+    fn projects_report_each_agents_latest_commit() {
+        let db = temp_db();
+        let at = |agent: &str, commit: &str, dirty: bool| NewEntry {
+            agent: agent.into(),
+            commit: commit.into(),
+            branch: "main".into(),
+            dirty,
+            ..entry("shop", "t", "b")
+        };
+        db.insert(&at("claude", "aaaaaaa", false)).unwrap();
+        db.insert(&at("codex", "bbbbbbb", false)).unwrap();
+        db.insert(&at("claude", "ccccccc", true)).unwrap();
+        db.insert(&at("claude", "", false)).unwrap();
+        let projects = db.projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        let heads: Vec<_> = projects[0]
+            .heads
+            .iter()
+            .map(|h| (h.agent.as_str(), h.commit.as_str(), h.dirty))
+            .collect();
+        assert_eq!(
+            heads,
+            [("claude", "ccccccc", true), ("codex", "bbbbbbb", false)]
+        );
+    }
+
+    #[test]
+    fn old_databases_gain_the_new_columns() {
+        let dir = std::env::temp_dir().join(format!("lore-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lore.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,
+                 kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+                 tags TEXT NOT NULL DEFAULT '', files TEXT NOT NULL DEFAULT '',
+                 agent TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT 'x',
+                 updated_at TEXT, embedding BLOB);
+                 INSERT INTO entries (project, kind, title, body) VALUES ('p', 'note', 'old', 'entry');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let old = db.get(1).unwrap().unwrap();
+        assert_eq!(
+            (old.title.as_str(), old.commit.as_str(), old.dirty),
+            ("old", "", false)
+        );
+        assert_eq!(
+            db.search("entry", None, None, None, 5, 0.8).unwrap().len(),
+            1
+        );
     }
 
     #[test]

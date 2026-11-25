@@ -777,6 +777,17 @@ async function openDetail(node) {
     for (const item of items) row.append(el("span", className, item));
     box.append(el("h4", "", title), row);
   };
+  if (entry.commit || entry.repo || entry.path) {
+    const where = el("div", "chips");
+    if (entry.commit) {
+      const label = entry.commit.slice(0, 10) + (entry.branch ? ` · ${entry.branch}` : "") +
+        (entry.dirty ? " · uncommitted changes" : "");
+      where.append(el("span", "chip file", label));
+    }
+    if (entry.repo) where.append(el("span", "chip file", entry.repo));
+    if (entry.path) where.append(el("span", "chip file", entry.path));
+    box.append(el("h4", "", "Logged at"), where);
+  }
   chips("Tags", entry.tags, "chip");
   chips("Files", entry.files, "chip file");
 

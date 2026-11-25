@@ -64,12 +64,39 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | Tool | Purpose |
 |---|---|
 | `recall` | Search past work, decisions, bugs and notes by topic |
-| `log` | Record an update, decision, bug, note or todo |
+| `log` | Record an update, decision, bug, note or todo, with the directory, repo and commit it was made at |
 | `recent` | Newest entries, to see where a project was left off |
-| `projects` | Every project with its entry count and last activity |
+| `projects` | Every project with its entry count, last activity and each agent's last logged commit |
 | `get` | One entry in full |
 | `amend` | Correct an entry instead of logging a contradicting one |
 | `forget` | Delete an entry |
+
+### Who is ahead, who is behind
+
+Several agents working on one project drift apart: one has pulled the latest commit,
+another is still on last week's. So every `log` call must say where the work stands:
+
+| Field | Value |
+|---|---|
+| `path` | the project directory the agent is working in |
+| `repo` | `git remote get-url origin` |
+| `commit` | `git rev-parse HEAD`, read right before logging |
+| `branch` | the current branch (optional) |
+| `dirty` | `true` when the work is not committed yet (optional) |
+
+`path`, `repo` and `commit` are required; outside a git repository the agent passes
+`"none"`. Each entry then shows the commit it was written at, and `projects` lists the
+last commit every agent logged per project:
+
+```text
+- `shop`: 12 entries, last activity 2026-11-25T15:35:41Z
+    codex last logged at commit 9e8d7c6 on feature/invoices, with uncommitted changes (entry #12)
+    claude last logged at commit 1f3a9c2e7b on main (entry #11)
+```
+
+An agent compares those hashes with its own `HEAD` (`git merge-base --is-ancestor`)
+to see whether it needs to pull before building on someone else's work. The server
+stores the hashes; it has no access to your repositories and does not compare them.
 
 The server also sends instructions on connect that tell the agent when to call
 `recall` and `log`, so most clients use it without extra prompting.
@@ -159,7 +186,9 @@ instructions (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and so on):
 
 ```markdown
 Use the `lore` MCP server as shared memory: call `recall` before starting work on a
-topic, and `log` after any meaningful change, decision or bug fix.
+topic, and `log` after any meaningful change, decision or bug fix. Every `log` call
+includes `path` (project directory), `repo` (`git remote get-url origin`) and `commit`
+(`git rev-parse HEAD`, read right before logging).
 ```
 
 ## Configuration

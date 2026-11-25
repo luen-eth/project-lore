@@ -26,6 +26,12 @@ After any meaningful change, decision, bug fix or discovery, call `log` so futur
 can find it. Write entries for a reader with no context: say what changed, why, and where \
 (files, commands, versions). One entry per topic; do not log trivia or secrets.
 
+Every `log` call must say where the work stands: `path` (the project directory), `repo` \
+(`git remote get-url origin`) and `commit` (`git rev-parse HEAD`), read fresh right before \
+logging. Commit your work first when you can; otherwise set `dirty` to true. This is how \
+agents tell who is ahead and who is behind: `projects` lists the last commit each agent \
+logged per project, so compare it with your own HEAD before building on someone's work.
+
 `project` is the repository or folder name in lowercase (for example `project-lore`). \
 If an earlier entry is wrong or outdated, fix it with `amend` rather than adding a \
 contradicting one.";
@@ -65,6 +71,19 @@ pub struct LogArgs {
     pub title: String,
     /// The details: what changed, why, and how. Written for a reader with no context.
     pub body: String,
+    /// Absolute path of the project directory you are working in.
+    pub path: String,
+    /// Git remote of the project (output of `git remote get-url origin`).
+    /// Pass "none" if the directory is not a git repository or has no remote.
+    pub repo: String,
+    /// Current HEAD commit hash (output of `git rev-parse HEAD`), read right
+    /// before logging. Pass "none" only if the directory is not a git repository.
+    pub commit: String,
+    /// Current branch (output of `git branch --show-current`).
+    pub branch: Option<String>,
+    /// True if the working tree has uncommitted changes, i.e. the work this
+    /// entry describes is not fully contained in `commit`.
+    pub dirty: Option<bool>,
     /// Short topic tags, e.g. ["auth", "docker"].
     pub tags: Option<Vec<String>>,
     /// Paths of the files this entry is about.
@@ -171,7 +190,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Record a change, decision, bug fix, note or open todo in the shared memory so future sessions and other agents can find it. Call this after any meaningful piece of work."
+        description = "Record a change, decision, bug fix, note or open todo in the shared memory so future sessions and other agents can find it. Call this after any meaningful piece of work. Always include the project directory, its git remote and the current HEAD commit."
     )]
     async fn log(
         &self,
@@ -192,13 +211,23 @@ impl Lore {
             tags: join_list(args.tags),
             files: join_list(args.files),
             agent,
+            path: required("path", &args.path)?,
+            repo: optional_ref(&args.repo),
+            commit: normalize_commit(&args.commit)?,
+            branch: args.branch.unwrap_or_default().trim().to_string(),
+            dirty: args.dirty.unwrap_or(false),
         };
         let this = self.clone();
         blocking(move || {
             let entry = this.db.insert(&new).map_err(internal)?;
             this.embed_entry(&entry);
+            let at = if entry.commit.is_empty() {
+                " (no commit recorded)".to_string()
+            } else {
+                format!(" at {}", describe_commit(&entry))
+            };
             Ok(format!(
-                "Logged #{} in `{}` ({}): {}",
+                "Logged #{} in `{}` ({}){at}: {}",
                 entry.id, entry.project, entry.kind, entry.title
             ))
         })
@@ -231,7 +260,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "List every project in the shared memory with its entry count and last activity."
+        description = "List every project in the shared memory with its entry count, last activity, and the commit each agent last logged at. Compare those commits with your own HEAD to see who is ahead or behind."
     )]
     async fn projects(&self) -> Result<String, String> {
         let db = self.db.clone();
@@ -246,6 +275,29 @@ impl Lore {
                     "- `{}`: {} entries, last activity {}\n",
                     p.project, p.entries, p.last_activity
                 ));
+                for head in &p.heads {
+                    let agent = if head.agent.is_empty() {
+                        "unknown agent"
+                    } else {
+                        &head.agent
+                    };
+                    let branch = if head.branch.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" on {}", head.branch)
+                    };
+                    let dirty = if head.dirty {
+                        ", with uncommitted changes"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!(
+                        "    {agent} last logged at commit {}{branch}{dirty} ({}, entry #{})\n",
+                        short(&head.commit),
+                        head.at,
+                        head.entry_id
+                    ));
+                }
             }
             Ok(out)
         })
@@ -391,6 +443,43 @@ fn normalize_kind_filter(kind: Option<String>) -> Result<Option<String>, String>
     }
 }
 
+/// Empty for "none"-like values, otherwise the trimmed text.
+fn optional_ref(value: &str) -> String {
+    let value = value.trim();
+    match value.to_lowercase().as_str() {
+        "" | "none" | "n/a" | "null" | "-" => String::new(),
+        _ => value.to_string(),
+    }
+}
+
+/// Accepts a full or abbreviated git hash, or "none".
+fn normalize_commit(commit: &str) -> Result<String, String> {
+    let commit = optional_ref(commit).to_lowercase();
+    if commit.is_empty() {
+        return Ok(commit);
+    }
+    if (7..=64).contains(&commit.len()) && commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(commit)
+    } else {
+        Err("commit must be the hash printed by `git rev-parse HEAD`, or \"none\" outside a git repository".into())
+    }
+}
+
+fn short(commit: &str) -> &str {
+    &commit[..commit.len().min(10)]
+}
+
+fn describe_commit(entry: &Entry) -> String {
+    let mut text = short(&entry.commit).to_string();
+    if !entry.branch.is_empty() {
+        text.push_str(&format!(" ({})", entry.branch));
+    }
+    if entry.dirty {
+        text.push_str(" + uncommitted changes");
+    }
+    text
+}
+
 fn join_list(items: Option<Vec<String>>) -> String {
     items
         .unwrap_or_default()
@@ -416,6 +505,15 @@ fn render(entry: &Entry, matched: Option<&str>, preview: bool) -> String {
     }
     if !entry.files.is_empty() {
         meta.push(format!("files: {}", entry.files));
+    }
+    if !entry.commit.is_empty() {
+        meta.push(format!("commit: {}", describe_commit(entry)));
+    }
+    if !entry.repo.is_empty() {
+        meta.push(format!("repo: {}", entry.repo));
+    }
+    if !entry.path.is_empty() {
+        meta.push(format!("path: {}", entry.path));
     }
     if let Some(updated) = &entry.updated_at {
         meta.push(format!("amended: {updated}"));
