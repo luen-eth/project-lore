@@ -211,8 +211,8 @@ pub struct Activity {
 
 pub const BACKUP_FORMAT: &str = "project-lore-backup";
 
-/// Everything needed to rebuild the store. Embeddings are left out: they are
-/// derived data and are recomputed after a restore.
+/// Everything in the store: entries, their embedding vectors, the activity
+/// log and the agent records. Restoring it reproduces the store exactly.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Backup {
     pub format: String,
@@ -223,7 +223,17 @@ pub struct Backup {
     pub activity: Vec<Activity>,
     #[serde(default)]
     pub agents: Vec<BackupAgent>,
+    /// The model that produced `embeddings`. Vectors from another model are
+    /// not comparable, so they are only reused when this matches.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    /// Entry id to its vector: little-endian f32 values, base64 encoded.
+    #[serde(default)]
+    pub embeddings: std::collections::BTreeMap<i64, String>,
 }
+
+/// Backup versions this build can read. Version 1 had no embeddings.
+const BACKUP_VERSIONS: std::ops::RangeInclusive<u32> = 1..=2;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BackupAgent {
@@ -479,16 +489,39 @@ impl Db {
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let embedding_model: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'embedding_model'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let embeddings = {
+            use base64::Engine;
+            let mut stmt =
+                conn.prepare("SELECT id, embedding FROM entries WHERE embedding IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut map = std::collections::BTreeMap::new();
+            for row in rows {
+                let (id, blob) = row?;
+                map.insert(id, base64::engine::general_purpose::STANDARD.encode(blob));
+            }
+            map
+        };
         drop(conn);
-        let mut activity = self.activity(ACTIVITY_KEPT as usize)?;
+        let mut activity = self.activity(1_000_000)?;
         activity.reverse();
         Ok(Backup {
             format: BACKUP_FORMAT.to_string(),
-            version: 1,
+            version: 2,
             exported_at,
             entries,
             activity,
             agents,
+            embedding_model,
+            embeddings,
         })
     }
 
@@ -498,6 +531,7 @@ impl Db {
         validate_backup(backup)?;
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        let reusable = reusable_vectors(&tx, backup)?;
         tx.execute_batch(
             "DELETE FROM entries; DELETE FROM activity; DELETE FROM agents;
              DELETE FROM sqlite_sequence WHERE name IN ('entries', 'activity');",
@@ -525,6 +559,12 @@ impl Db {
                     entry.dirty
                 ],
             )?;
+            if let Some(vector) = reusable.get(&entry.id) {
+                tx.execute(
+                    "UPDATE entries SET embedding = ?2 WHERE id = ?1",
+                    params![entry.id, vector],
+                )?;
+            }
         }
         for activity in &backup.activity {
             let targets = activity
@@ -572,6 +612,7 @@ impl Db {
         validate_backup(backup)?;
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        let reusable = reusable_vectors(&tx, backup)?;
         let (mut added, mut present) = (0, 0);
         for entry in &backup.entries {
             let exists: bool = tx.query_row(
@@ -605,6 +646,12 @@ impl Db {
                     entry.dirty
                 ],
             )?;
+            if let Some(vector) = reusable.get(&entry.id) {
+                tx.execute(
+                    "UPDATE entries SET embedding = ?2 WHERE id = ?1",
+                    params![tx.last_insert_rowid(), vector],
+                )?;
+            }
             added += 1;
         }
         tx.commit()?;
@@ -973,11 +1020,38 @@ impl Db {
     }
 }
 
+/// The backup's vectors, decoded, if they came from the model in use here.
+/// Entries without a reusable vector are embedded again after the import.
+fn reusable_vectors(conn: &Connection, backup: &Backup) -> Result<HashMap<i64, Vec<u8>>> {
+    use base64::Engine;
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'embedding_model'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut vectors = HashMap::new();
+    if backup.embedding_model.is_none() || backup.embedding_model != current {
+        return Ok(vectors);
+    }
+    for (id, encoded) in &backup.embeddings {
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| anyhow::anyhow!("the embedding of entry #{id} is not valid base64"))?;
+        if blob.is_empty() || blob.len() % 4 != 0 {
+            anyhow::bail!("the embedding of entry #{id} has an invalid length");
+        }
+        vectors.insert(*id, blob);
+    }
+    Ok(vectors)
+}
+
 fn validate_backup(backup: &Backup) -> Result<()> {
     if backup.format != BACKUP_FORMAT {
         anyhow::bail!("this file is not a project-lore backup");
     }
-    if backup.version != 1 {
+    if !BACKUP_VERSIONS.contains(&backup.version) {
         anyhow::bail!("backup version {} is not supported", backup.version);
     }
     for entry in &backup.entries {
@@ -1310,6 +1384,7 @@ mod tests {
             .insert(&entry("shop", "Refunds", "refund endpoint"))
             .unwrap();
         db.insert(&entry("blog", "Feeds", "rss and atom")).unwrap();
+        db.use_embedding_model("test-model").unwrap();
         db.set_embedding(first.id, &[1.0, 0.0]).unwrap();
         db.touch_agent("claude", "claude-code/2").unwrap();
         db.record_activity("claude", "log", "shop", Some(first.id), &[], "Refunds")
@@ -1325,6 +1400,8 @@ mod tests {
             ),
             (2, 1, 1)
         );
+        assert_eq!(backup.embeddings.len(), 1);
+        assert_eq!(backup.embedding_model.as_deref(), Some("test-model"));
 
         // Merging a backup into the store it came from adds nothing.
         assert_eq!(db.merge(&backup).unwrap(), (0, 2));
@@ -1344,8 +1421,28 @@ mod tests {
             db.search("refund", None, None, None, 5, 0.8).unwrap().len(),
             1
         );
-        assert_eq!(db.missing_embeddings(10).unwrap().len(), 2);
+        // The one vector that existed came back with its entry; the entry
+        // that never had one is still waiting to be embedded.
+        let missing: Vec<i64> = db
+            .missing_embeddings(10)
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(missing.len(), 1);
+        assert!(!missing.contains(&first.id));
+        let hits = db
+            .search("zz", Some(&[1.0, 0.0]), None, None, 5, 0.8)
+            .unwrap();
+        assert_eq!(hits[0].entry.id, first.id);
         assert_eq!(db.activity(10).unwrap().len(), 1);
+
+        // Vectors from a different model are not reused.
+        db.use_embedding_model("other-model").unwrap();
+        db.restore(&backup).unwrap();
+        assert_eq!(db.missing_embeddings(10).unwrap().len(), 2);
+        db.use_embedding_model("test-model").unwrap();
+        db.restore(&backup).unwrap();
 
         // A file that is not a backup changes nothing.
         let bogus = Backup {

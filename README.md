@@ -130,14 +130,16 @@ The **Backup** menu covers moving and protecting the whole store:
 
 | Action | What it does |
 |---|---|
-| **Export backup** | Downloads every entry, the activity log and the agent records as one JSON file. |
+| **Export backup** | Downloads the whole store as one JSON file: every entry, its embedding vector, the activity log and the agent records. |
 | **Import and merge** | Adds the entries of a backup that are not present yet. Nothing is removed. |
 | **Restore from backup** | Replaces everything with the backup, after a confirmation. All or nothing: a file that fails validation changes nothing. |
 
 ![The backup menu](docs/backup.jpg)
 
-Embeddings are not part of a backup; they are recomputed in the background after an
-import, and the page redraws the links when that finishes.
+A backup is complete: restoring it reproduces the store exactly, search index
+included. The vectors are reused when the instance runs the same embedding model as
+the one the backup came from; with a different model they are recomputed in the
+background, and the page redraws the links when that finishes.
 
 Sign-in asks for one password and is protected by invisible reCAPTCHA v3.
 

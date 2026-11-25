@@ -1151,7 +1151,7 @@ $("backup-file").addEventListener("change", async (event) => {
       return;
     }
     backupStatus(result.replaced
-      ? `Restored ${result.added} memories. Search by meaning returns as they are re-indexed.`
+      ? `Restored ${result.added} memories.`
       : `Added ${result.added}; ${result.present} were already here.`, "ok");
     await refresh(false);
   } catch (_) {
