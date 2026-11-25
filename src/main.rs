@@ -123,6 +123,10 @@ async fn main() -> Result<()> {
 
     match admin_password()? {
         Some(password) => {
+            let viewer_password = viewer_password(&password)?;
+            if viewer_password.is_some() {
+                tracing::info!("viewer password set: watch-only sign-in enabled");
+            }
             let recaptcha = recaptcha()?;
             if recaptcha.is_none() {
                 tracing::warn!("admin view runs without reCAPTCHA (keys not set)");
@@ -130,6 +134,7 @@ async fn main() -> Result<()> {
             let admin = Admin::new(
                 db.clone(),
                 password,
+                viewer_password,
                 recaptcha,
                 trust_proxy,
                 configured_agents,
@@ -201,6 +206,22 @@ fn admin_password() -> Result<Option<String>> {
     }
     if password.len() < MIN_ADMIN_PASSWORD_LEN {
         bail!("LORE_ADMIN_PASSWORD must be at least {MIN_ADMIN_PASSWORD_LEN} characters");
+    }
+    Ok(Some(password))
+}
+
+/// The optional watch-only password. It must differ from the admin password,
+/// or signing in with it would silently grant the admin role.
+fn viewer_password(admin: &str) -> Result<Option<String>> {
+    let password = env_or("LORE_VIEWER_PASSWORD", "");
+    if password.is_empty() {
+        return Ok(None);
+    }
+    if password.len() < MIN_ADMIN_PASSWORD_LEN {
+        bail!("LORE_VIEWER_PASSWORD must be at least {MIN_ADMIN_PASSWORD_LEN} characters");
+    }
+    if password == admin {
+        bail!("LORE_VIEWER_PASSWORD must be different from LORE_ADMIN_PASSWORD");
     }
     Ok(Some(password))
 }

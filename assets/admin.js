@@ -715,7 +715,8 @@ $("login-form").addEventListener("submit", async (event) => {
     });
     if (response.ok) {
       $("password").value = "";
-      await enter();
+      const body = await response.json().catch(() => ({}));
+      await enter(body.role);
     } else if (response.status === 429) {
       const wait = Number(response.headers.get("Retry-After")) || 60;
       error.textContent = `Too many attempts. Try again in ${Math.ceil(wait / 60)} min.`;
@@ -735,7 +736,21 @@ $("logout").addEventListener("click", async () => {
   showLogin();
 });
 
-async function enter() {
+/* A viewer session watches; only the admin role is offered the backup menu.
+   The server enforces this too, so hiding the button is a courtesy, not the lock. */
+function applyRole(role) {
+  state.role = role === "admin" ? "admin" : "viewer";
+  const admin = state.role === "admin";
+  $("backup-toggle").hidden = !admin;
+  $("role").hidden = admin;
+  if (!admin) {
+    $("backup").hidden = true;
+    $("backup-toggle").setAttribute("aria-expanded", "false");
+  }
+}
+
+async function enter(role) {
+  applyRole(role);
   $("login").hidden = true;
   $("app").hidden = false;
   graph.byId = new Map();
@@ -1278,7 +1293,7 @@ async function openDetail(node) {
     const session = await (await fetch("/admin/api/session", { credentials: "same-origin" })).json();
     state.siteKey = session.recaptcha_site_key;
     loadRecaptcha(state.siteKey);
-    if (session.authenticated) await enter(); else showLogin();
+    if (session.authenticated) await enter(session.role); else showLogin();
   } catch (_) {
     showLogin();
     $("login-error").textContent = "The server cannot be reached.";

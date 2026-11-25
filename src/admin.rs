@@ -1,4 +1,4 @@
-//! The read-only admin view: password login (optionally guarded by
+//! The admin view: password login with two roles (optionally guarded by
 //! reCAPTCHA v3), a session cookie, and the JSON the brain visualisation draws.
 
 use std::{
@@ -63,9 +63,29 @@ pub struct Recaptcha {
     pub min_score: f64,
 }
 
+/// What a signed-in session may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// Everything, including backup export, import and restore.
+    Admin,
+    /// Watch only: the graph, the activity feed and entries.
+    Viewer,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Viewer => "viewer",
+        }
+    }
+}
+
 pub struct Admin {
     pub db: Db,
     pub password: String,
+    /// A second password that signs in with the watch-only role.
+    pub viewer_password: Option<String>,
     pub recaptcha: Option<Recaptcha>,
     pub trust_proxy: bool,
     /// Agent names that hold a token, so idle ones are listed too.
@@ -74,7 +94,7 @@ pub struct Admin {
     pub link_similarity: f32,
     pub events: Events,
     pub embedder: Embedder,
-    sessions: Mutex<HashMap<String, Instant>>,
+    sessions: Mutex<HashMap<String, (Instant, Role)>>,
     logins: RateLimiter,
     http: reqwest::Client,
 }
@@ -83,6 +103,7 @@ impl Admin {
     pub fn new(
         db: Db,
         password: String,
+        viewer_password: Option<String>,
         recaptcha: Option<Recaptcha>,
         trust_proxy: bool,
         configured_agents: Vec<String>,
@@ -94,6 +115,7 @@ impl Admin {
         Self {
             db,
             password,
+            viewer_password,
             recaptcha,
             trust_proxy,
             configured_agents,
@@ -111,31 +133,34 @@ impl Admin {
         }
     }
 
-    fn session_valid(&self, headers: &HeaderMap) -> bool {
-        let Some(token) = cookie(headers, COOKIE) else {
-            return false;
-        };
+    /// The role of the session a request carries, if it has a live one.
+    fn session_role(&self, headers: &HeaderMap) -> Option<Role> {
+        let token = cookie(headers, COOKIE)?;
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.retain(|_, expires| *expires > Instant::now());
-        sessions.contains_key(&token)
+        sessions.retain(|_, (expires, _)| *expires > Instant::now());
+        sessions.get(&token).map(|(_, role)| *role)
     }
 }
 
 pub fn router(admin: Arc<Admin>) -> Router {
+    // Open to both roles.
     let private = Router::new()
         .route("/admin/api/brain", get(brain))
         .route("/admin/api/pulse", get(pulse))
         .route("/admin/api/events", get(events))
-        .route("/admin/api/export", get(export))
-        .route(
-            "/admin/api/import",
-            post(import).layer(DefaultBodyLimit::max(MAX_BACKUP_BYTES)),
-        )
         .route("/admin/api/entries/{id}", get(entry))
         .layer(middleware::from_fn_with_state(
             admin.clone(),
             require_session,
         ));
+    // Backups carry the whole store, so only the admin role reaches them.
+    let admin_only = Router::new()
+        .route("/admin/api/export", get(export))
+        .route(
+            "/admin/api/import",
+            post(import).layer(DefaultBodyLimit::max(MAX_BACKUP_BYTES)),
+        )
+        .layer(middleware::from_fn_with_state(admin.clone(), require_admin));
 
     Router::new()
         .route(
@@ -162,6 +187,7 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/admin/api/login", post(login))
         .route("/admin/api/logout", post(logout))
         .merge(private)
+        .merge(admin_only)
         .layer(middleware::from_fn(security_headers))
         .with_state(admin)
 }
@@ -195,7 +221,7 @@ async fn require_session(
     request: Request,
     next: Next,
 ) -> Response {
-    if admin.session_valid(request.headers()) {
+    if admin.session_role(request.headers()).is_some() {
         next.run(request).await
     } else {
         (
@@ -206,10 +232,28 @@ async fn require_session(
     }
 }
 
+async fn require_admin(State(admin): State<Arc<Admin>>, request: Request, next: Next) -> Response {
+    match admin.session_role(request.headers()) {
+        Some(Role::Admin) => next.run(request).await,
+        Some(Role::Viewer) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "this needs the admin password" })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "sign in first" })),
+        )
+            .into_response(),
+    }
+}
+
 /// Tells the page whether it is signed in and which reCAPTCHA key to load.
 async fn session(State(admin): State<Arc<Admin>>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let role = admin.session_role(&headers);
     Json(json!({
-        "authenticated": admin.session_valid(&headers),
+        "authenticated": role.is_some(),
+        "role": role.map(Role::name),
         "recaptcha_site_key": admin.recaptcha.as_ref().map(|r| r.site_key.as_str()),
     }))
 }
@@ -244,8 +288,19 @@ async fn login(
         }
     }
 
-    let correct = bool::from(form.password.as_bytes().ct_eq(admin.password.as_bytes()));
-    if !correct {
+    // Check both passwords every time so timing does not tell them apart.
+    let presented = form.password.as_bytes();
+    let is_admin = bool::from(presented.ct_eq(admin.password.as_bytes()));
+    let is_viewer = admin
+        .viewer_password
+        .as_ref()
+        .is_some_and(|viewer| bool::from(presented.ct_eq(viewer.as_bytes())));
+    let role = match (is_admin, is_viewer) {
+        (true, _) => Some(Role::Admin),
+        (false, true) => Some(Role::Viewer),
+        (false, false) => None,
+    };
+    let Some(role) = role else {
         tracing::warn!(%ip, "admin login with a wrong password");
         admin.logins.hit(&ip);
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -254,7 +309,7 @@ async fn login(
             Json(json!({ "error": "Wrong password." })),
         )
             .into_response();
-    }
+    };
 
     admin.logins.reset(&ip);
     let token = match random_token() {
@@ -268,13 +323,17 @@ async fn login(
         .sessions
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(token.clone(), Instant::now() + SESSION_TTL);
-    tracing::info!(%ip, "admin signed in");
+        .insert(token.clone(), (Instant::now() + SESSION_TTL, role));
+    tracing::info!(%ip, role = role.name(), "signed in to the admin view");
     let cookie = format!(
         "{COOKIE}={token}; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age={}",
         SESSION_TTL.as_secs()
     );
-    ([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response()
+    (
+        [(header::SET_COOKIE, cookie)],
+        Json(json!({ "ok": true, "role": role.name() })),
+    )
+        .into_response()
 }
 
 async fn logout(State(admin): State<Arc<Admin>>, headers: HeaderMap) -> Response {

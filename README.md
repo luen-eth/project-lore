@@ -141,7 +141,19 @@ included. The vectors are reused when the instance runs the same embedding model
 the one the backup came from; with a different model they are recomputed in the
 background, and the page redraws the links when that finishes.
 
-Sign-in asks for one password and is protected by invisible reCAPTCHA v3.
+### Two passwords, two roles
+
+Sign-in asks for one password and is protected by invisible reCAPTCHA v3. Which
+password you type decides what you get:
+
+| Password | Role | Can do |
+|---|---|---|
+| `LORE_ADMIN_PASSWORD` | admin | everything, including backup export, import and restore |
+| `LORE_VIEWER_PASSWORD` | viewer | watch the graph and the live activity, open entries |
+
+A viewer never sees the Backup menu, and the server refuses the backup endpoints for
+a viewer session, so hiding the button is not what keeps the data in. Share the
+viewer password with someone who should watch but not take a copy.
 
 ![The sign-in screen](docs/login.jpg)
 
@@ -226,6 +238,7 @@ includes `path` (project directory), `repo` (`git remote get-url origin`) and `c
 | `LORE_TOKENS` | | `agent:secret` pairs, comma separated. Entries are attributed to the agent, and one agent's access can be revoked without touching the others. |
 | `LORE_TOKEN` | | One secret shared by all agents. Can be combined with `LORE_TOKENS`. |
 | `LORE_ADMIN_PASSWORD` | | Password for `/admin` (12 characters or more). Unset disables the admin view. |
+| `LORE_VIEWER_PASSWORD` | | Optional second password for a watch-only sign-in: graph, activity and entries, but no backup menu. Must differ from the admin password. |
 | `LORE_RECAPTCHA_SITE_KEY`, `LORE_RECAPTCHA_SECRET_KEY` | | reCAPTCHA v3 keys for the admin sign-in. Unset skips the check. |
 | `LORE_RECAPTCHA_MIN_SCORE` | `0.5` | Lowest reCAPTCHA score accepted. |
 | `LORE_EMBEDDING_MODEL` | `bge-m3` | `bge-m3`, `e5-large`, `e5-base` or `e5-small`. Changing it re-embeds every entry. |
