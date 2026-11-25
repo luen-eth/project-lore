@@ -19,7 +19,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -28,7 +28,7 @@ use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
 use crate::{
     auth::{RateLimiter, client_ip, too_many_requests},
-    db::{Backup, Db},
+    db::{Backup, Db, ProfileInput, Rule, RuleInput, Session},
     embed::Embedder,
     events::Events,
 };
@@ -43,6 +43,8 @@ const RECAPTCHA_ACTION: &str = "login";
 const FEED_LENGTH: usize = 60;
 /// Largest backup file accepted for import.
 const MAX_BACKUP_BYTES: usize = 512 * 1024 * 1024;
+/// Largest profile or rule edit accepted.
+const MAX_JSON_BYTES: usize = 64 * 1024;
 /// Name the feed shows for actions taken from this page.
 const ADMIN_ACTOR: &str = "admin";
 const ICON: &str = include_str!("../assets/icon.svg");
@@ -92,6 +94,8 @@ pub struct Admin {
     pub configured_agents: Vec<String>,
     pub embedding_model: Option<&'static str>,
     pub link_similarity: f32,
+    /// Hours after which an open session is closed as inactive.
+    pub idle_hours: u32,
     pub events: Events,
     pub embedder: Embedder,
     sessions: Mutex<HashMap<String, (Instant, Role)>>,
@@ -100,6 +104,10 @@ pub struct Admin {
 }
 
 impl Admin {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the router wiring passes every option at once"
+    )]
     pub fn new(
         db: Db,
         password: String,
@@ -111,6 +119,7 @@ impl Admin {
         link_similarity: f32,
         events: Events,
         embedder: Embedder,
+        idle_hours: u32,
     ) -> Self {
         Self {
             db,
@@ -121,6 +130,7 @@ impl Admin {
             configured_agents,
             embedding_model,
             link_similarity,
+            idle_hours,
             events,
             embedder,
             sessions: Mutex::new(HashMap::new()),
@@ -149,16 +159,34 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/admin/api/pulse", get(pulse))
         .route("/admin/api/events", get(events))
         .route("/admin/api/entries/{id}", get(entry))
+        .route("/admin/api/profile", get(profile))
+        .route("/admin/api/sessions", get(sessions))
+        .route("/admin/api/sessions/{id}", get(session_detail))
         .layer(middleware::from_fn_with_state(
             admin.clone(),
             require_session,
         ));
-    // Backups carry the whole store, so only the admin role reaches them.
+    // Backups carry the whole store and profile edits change what every
+    // agent is told, so only the admin role reaches them.
     let admin_only = Router::new()
         .route("/admin/api/export", get(export))
         .route(
             "/admin/api/import",
             post(import).layer(DefaultBodyLimit::max(MAX_BACKUP_BYTES)),
+        )
+        .route(
+            "/admin/api/profile",
+            put(save_profile).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/rules",
+            post(add_rule).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/rules/{id}",
+            put(save_rule)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
+                .delete(delete_rule),
         )
         .layer(middleware::from_fn_with_state(admin.clone(), require_admin));
 
@@ -287,16 +315,16 @@ async fn login(
         return too_many_requests(retry_after);
     }
 
-    if let Some(recaptcha) = &admin.recaptcha {
-        if let Err(reason) = verify_captcha(&admin.http, recaptcha, &form.captcha, &ip).await {
-            tracing::warn!(%ip, %reason, "admin login rejected by reCAPTCHA");
-            admin.logins.hit(&ip);
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "The request looked automated. Try again." })),
-            )
-                .into_response();
-        }
+    if let Some(recaptcha) = &admin.recaptcha
+        && let Err(reason) = verify_captcha(&admin.http, recaptcha, &form.captcha, &ip).await
+    {
+        tracing::warn!(%ip, %reason, "admin login rejected by reCAPTCHA");
+        admin.logins.hit(&ip);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "The request looked automated. Try again." })),
+        )
+            .into_response();
     }
 
     // Check both passwords every time so timing does not tell them apart.
@@ -366,11 +394,14 @@ async fn brain(State(admin): State<Arc<Admin>>) -> Response {
         let brain = state
             .db
             .brain(MAX_NEURONS, NEIGHBOURS, state.link_similarity)?;
+        // Stale sessions never show as open.
+        state.db.close_idle_sessions(state.idle_hours)?;
         Ok(json!({
             "version": state.db.version()?,
             "embedding_model": state.embedding_model,
             "agents": state.db.agents(&state.configured_agents)?,
             "activity": state.db.activity(FEED_LENGTH)?,
+            "open_sessions": state.db.open_session_count()?,
             "brain": brain,
         }))
     })
@@ -378,13 +409,15 @@ async fn brain(State(admin): State<Arc<Admin>>) -> Response {
     respond(result)
 }
 
-/// A cheap poll: the data version and who is connected.
+/// A cheap poll: the data version, who is connected, how many chats are open.
 async fn pulse(State(admin): State<Arc<Admin>>) -> Response {
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        state.db.close_idle_sessions(state.idle_hours)?;
         Ok(json!({
             "version": state.db.version()?,
             "agents": state.db.agents(&state.configured_agents)?,
+            "open_sessions": state.db.open_session_count()?,
         }))
     })
     .await;
@@ -480,9 +513,10 @@ async fn import(
             )
         };
         tracing::info!(tool, added, present, "backup loaded from the admin view");
-        if let Ok(activity) = state
-            .db
-            .record_activity(ADMIN_ACTOR, tool, "", None, &[], &summary)
+        if let Ok(activity) =
+            state
+                .db
+                .record_activity(ADMIN_ACTOR, tool, "", None, None, &[], &summary)
         {
             state.events.publish(activity);
         }
@@ -498,7 +532,7 @@ async fn import(
                 Ok(count) if count > 0 => {
                     let summary = format!("{count} entries searchable by meaning again");
                     if let Ok(activity) =
-                        db.record_activity(ADMIN_ACTOR, "reindex", "", None, &[], &summary)
+                        db.record_activity(ADMIN_ACTOR, "reindex", "", None, None, &[], &summary)
                     {
                         events.publish(activity);
                     }
@@ -534,6 +568,291 @@ async fn entry(State(admin): State<Arc<Admin>>, Path(id): Path<i64>) -> Response
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// The profile the admin page edits: the form of address, the reply language,
+/// each agent's own address, the rules, and every agent a row can be made
+/// for.
+async fn profile(State(admin): State<Arc<Admin>>) -> Response {
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let profile = state.db.profile()?;
+        let rules = state.db.rules()?;
+        let known_agents: Vec<String> = state
+            .db
+            .agents(&state.configured_agents)?
+            .into_iter()
+            .map(|agent| agent.name)
+            .collect();
+        Ok(json!({
+            "address": profile.address,
+            "language": profile.language,
+            "agents": profile.agents,
+            "rules": rules,
+            "known_agents": known_agents,
+        }))
+    })
+    .await;
+    respond(result)
+}
+
+#[derive(Deserialize)]
+struct ProfileForm {
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    language: String,
+    #[serde(default)]
+    agents: Vec<AgentAddressForm>,
+}
+
+#[derive(Deserialize)]
+struct AgentAddressForm {
+    #[serde(default)]
+    agent: String,
+    #[serde(default)]
+    address: String,
+}
+
+/// Saves the profile: the default form of address, the reply language and
+/// each agent's own form of address. Rows with an empty address are dropped
+/// on the store side.
+async fn save_profile(State(admin): State<Arc<Admin>>, Json(form): Json<ProfileForm>) -> Response {
+    let address = form.address.trim();
+    if address.chars().count() > 80 {
+        return bad_request("the form of address must be at most 80 characters");
+    }
+    let language = form.language.trim();
+    if language.chars().count() > 40 {
+        return bad_request("the reply language must be at most 40 characters");
+    }
+    let input = ProfileInput {
+        address: address.to_string(),
+        language: language.to_string(),
+        agents: form
+            .agents
+            .into_iter()
+            .map(|agent| crate::db::AgentAddress {
+                agent: agent.agent.trim().to_lowercase(),
+                address: agent.address.trim().to_string(),
+            })
+            .collect(),
+    };
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        state.db.set_profile(&input)?;
+        // Tell open pages what the agents are told has changed.
+        if let Ok(activity) = state.db.record_activity(
+            ADMIN_ACTOR,
+            "profile",
+            "",
+            None,
+            None,
+            &[],
+            "profile updated",
+        ) {
+            state.events.publish(activity);
+        }
+        Ok(json!({ "ok": true }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "saving the profile failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionsQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// The chat sessions agents opened, newest activity first.
+async fn sessions(State(admin): State<Arc<Admin>>, Query(query): Query<SessionsQuery>) -> Response {
+    let status = match query.status.as_deref() {
+        None | Some("") => None,
+        Some("open") => Some("open"),
+        Some("closed") => Some("closed"),
+        Some(_) => return bad_request("status must be open or closed"),
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Session>> {
+        state.db.close_idle_sessions(state.idle_hours)?;
+        state.db.sessions(status, query.project.as_deref(), limit)
+    })
+    .await;
+    match result {
+        Ok(Ok(list)) => Json(list).into_response(),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "listing sessions failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "sessions task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// One session with its check-in timeline.
+async fn session_detail(State(admin): State<Arc<Admin>>, Path(id): Path<String>) -> Response {
+    let state = admin.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
+            let Some(session) = state.db.session(&id)? else {
+                return Ok(None);
+            };
+            let updates = state.db.session_updates(&id)?;
+            let mut value = serde_json::to_value(session)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("updates".into(), serde_json::to_value(updates)?);
+            }
+            Ok(Some(value))
+        })
+        .await;
+    match result {
+        Ok(Ok(Some(value))) => Json(value).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "loading a session failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "session task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RuleForm {
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    position: i64,
+}
+
+impl RuleForm {
+    fn input(&self) -> RuleInput {
+        RuleInput {
+            scope: self.scope.clone(),
+            target: self.target.clone(),
+            body: self.body.clone(),
+            enabled: self.enabled.unwrap_or(true),
+            position: self.position,
+        }
+    }
+}
+
+/// Adds a rule. The created rule is returned.
+async fn add_rule(State(admin): State<Arc<Admin>>, Json(form): Json<RuleForm>) -> Response {
+    let input = form.input();
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Rule> {
+        let rule = state.db.add_rule(&input)?;
+        let summary = format!("rule #{} added", rule.id);
+        if let Ok(activity) =
+            state
+                .db
+                .record_activity(ADMIN_ACTOR, "rules", "", None, None, &[], &summary)
+        {
+            state.events.publish(activity);
+        }
+        Ok(rule)
+    })
+    .await;
+    match result {
+        Ok(Ok(rule)) => Json(rule).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "adding a rule failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Applies a full edit of one rule.
+async fn save_rule(
+    State(admin): State<Arc<Admin>>,
+    Path(id): Path<i64>,
+    Json(form): Json<RuleForm>,
+) -> Response {
+    let input = form.input();
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Rule>> {
+        let Some(rule) = state.db.update_rule(id, &input)? else {
+            return Ok(None);
+        };
+        let summary = format!("rule #{} saved", rule.id);
+        if let Ok(activity) =
+            state
+                .db
+                .record_activity(ADMIN_ACTOR, "rules", "", None, None, &[], &summary)
+        {
+            state.events.publish(activity);
+        }
+        Ok(Some(rule))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(rule))) => Json(rule).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "saving a rule failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Removes one rule.
+async fn delete_rule(State(admin): State<Arc<Admin>>, Path(id): Path<i64>) -> Response {
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let deleted = state.db.delete_rule(id)?;
+        if deleted {
+            let summary = format!("rule #{id} deleted");
+            if let Ok(activity) =
+                state
+                    .db
+                    .record_activity(ADMIN_ACTOR, "rules", "", None, None, &[], &summary)
+            {
+                state.events.publish(activity);
+            }
+        }
+        Ok(deleted)
+    })
+    .await;
+    match result {
+        Ok(Ok(true)) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "deleting a rule failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// A validation failure the page can show next to the field it came from.
+fn bad_request(message: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
 }
 
 fn respond(result: Result<anyhow::Result<serde_json::Value>, tokio::task::JoinError>) -> Response {
@@ -611,4 +930,159 @@ fn random_token() -> Result<String, getrandom::Error> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serves the admin router on a free local port with one admin and one
+    /// viewer session already signed in.
+    async fn serve() -> (String, Arc<Admin>) {
+        let dir = std::env::temp_dir().join(format!("lore-admin-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        let admin = Arc::new(Admin::new(
+            db,
+            "admin-password".into(),
+            Some("viewer-password".into()),
+            None,
+            false,
+            vec!["claude".into()],
+            None,
+            0.8,
+            Events::new(),
+            Embedder::disabled(),
+            12,
+        ));
+        {
+            let mut sessions = admin.sessions.lock().unwrap();
+            let expires = Instant::now() + Duration::from_secs(600);
+            sessions.insert("admin-token".into(), (expires, Role::Admin));
+            sessions.insert("viewer-token".into(), (expires, Role::Viewer));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(admin.clone());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        (base, admin)
+    }
+
+    #[tokio::test]
+    async fn profile_and_rule_edits_need_the_admin_role() {
+        let (base, _admin) = serve().await;
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: &str, token: Option<&str>| {
+            let mut request = client.request(method, format!("{base}{path}"));
+            if let Some(token) = token {
+                request = request.header(header::COOKIE, format!("{COOKIE}={token}"));
+            }
+            request
+        };
+        let rule = json!({ "scope": "global", "target": "", "body": "be brief" });
+        let profile = json!({ "address": "Boss", "language": "English", "agents": [] });
+
+        // Reads: any signed-in role, nobody else.
+        for path in [
+            "/admin/api/profile",
+            "/admin/api/sessions",
+            "/admin/api/sessions/s_x",
+        ] {
+            let status = call(reqwest::Method::GET, path, None)
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, 401, "{path} without a session");
+        }
+        let status = call(
+            reqwest::Method::GET,
+            "/admin/api/profile",
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(status, 200);
+
+        // Writes: the viewer is refused, the admin gets through.
+        for token in [None, Some("viewer-token")] {
+            let expected = if token.is_some() { 403 } else { 401 };
+            let responses = [
+                call(reqwest::Method::PUT, "/admin/api/profile", token).json(&profile),
+                call(reqwest::Method::POST, "/admin/api/rules", token).json(&rule),
+                call(reqwest::Method::PUT, "/admin/api/rules/1", token).json(&rule),
+                call(reqwest::Method::DELETE, "/admin/api/rules/1", token),
+            ];
+            for request in responses {
+                let status = request.send().await.unwrap().status();
+                assert_eq!(status, expected);
+            }
+        }
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/profile",
+            Some("admin-token"),
+        )
+        .json(&profile)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/rules",
+            Some("admin-token"),
+        )
+        .json(&json!({ "scope": "global", "target": "x", "body": "b" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/rules",
+            Some("admin-token"),
+        )
+        .json(&rule)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            response
+                .headers()
+                .contains_key(header::CONTENT_SECURITY_POLICY)
+        );
+        let response = call(
+            reqwest::Method::DELETE,
+            "/admin/api/rules/1",
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Bodies over 64 KB are refused.
+        let huge = json!({ "address": "x".repeat(70 * 1024), "language": "", "agents": [] });
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/profile",
+            Some("admin-token"),
+        )
+        .json(&huge)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 413);
+    }
 }

@@ -11,13 +11,22 @@ use serde::Deserialize;
 
 use crate::{
     auth::{Agent, SHARED_AGENT},
-    db::{Db, Entry, KINDS, NewEntry, Patch},
+    db::{Db, Entry, KINDS, NewEntry, NewSession, Patch, Rule, Session},
     embed::Embedder,
     events::Events,
 };
 
 const INSTRUCTIONS: &str = "\
 Lore is the user's shared long-term memory across coding agents and sessions.
+
+Every new chat must begin with `hello`, before any other lore tool. It opens a session \
+for this chat and returns the briefing: how to address the user, the language to reply \
+in, and the rules the user wants followed. Follow the briefing for the whole chat; it \
+is given once per chat and is not repeated on later calls.
+
+Pass the `session_id` that `hello` returns to every other lore tool in this chat. Keep \
+the session current: call `checkin` each time you finish a meaningful step, and `bye` \
+with a short summary before the chat ends.
 
 Before starting work on a topic, call `recall` with a short description of what you are \
 about to do, to find out whether it was done, decided or tried before. Use `recent` to see \
@@ -45,6 +54,8 @@ pub struct Lore {
     db: Db,
     embedder: Embedder,
     min_similarity: f32,
+    /// Hours after which an open session is closed as inactive.
+    idle_hours: u32,
     events: Events,
     #[expect(dead_code, reason = "read by the tool_handler macro")]
     tool_router: ToolRouter<Self>,
@@ -52,6 +63,8 @@ pub struct Lore {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecallArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
     /// What you want to know, in natural language or keywords. Any language.
     pub query: String,
     /// Restrict to one project. Omit to search every project.
@@ -64,6 +77,8 @@ pub struct RecallArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LogArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
     /// Repository or folder name in lowercase, e.g. `project-lore`.
     pub project: String,
     /// One of: update (a change you made), decision (a choice and its reason),
@@ -97,6 +112,8 @@ pub struct LogArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecentArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
     /// Restrict to one project. Omit for every project.
     pub project: Option<String>,
     /// Restrict to one kind: update, decision, bug, note or todo.
@@ -106,13 +123,23 @@ pub struct RecentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectsArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct IdArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
     /// Entry id, as shown in `recall` and `recent` results.
     pub id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AmendArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
     /// Id of the entry to change.
     pub id: i64,
     /// New kind. Omit to keep the current one.
@@ -127,16 +154,80 @@ pub struct AmendArgs {
     pub files: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HelloArgs {
+    /// Repository or folder name in lowercase, e.g. `project-lore`.
+    pub project: String,
+    /// Absolute path of the project directory you are working in.
+    pub path: String,
+    /// Git remote of the project (output of `git remote get-url origin`).
+    /// Pass "none" if the directory is not a git repository or has no remote.
+    pub repo: String,
+    /// Current HEAD commit hash (output of `git rev-parse HEAD`), read right
+    /// before this call. Pass "none" if the directory is not a git repository.
+    pub commit: String,
+    /// Current branch (output of `git branch --show-current`).
+    pub branch: Option<String>,
+    /// One line that says what this chat is about.
+    pub title: String,
+    /// The agent starting the chat, e.g. `claude-code`, `codex`, `opencode`.
+    /// Ignored when the server identifies the agent from its token.
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CheckinArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// What happened in this chat since the last check-in.
+    pub note: String,
+    /// Current HEAD commit hash (output of `git rev-parse HEAD`). Omit when
+    /// it has not moved since the last check-in.
+    pub commit: Option<String>,
+    /// Current branch, when it has moved.
+    pub branch: Option<String>,
+    /// True if the working tree has uncommitted changes.
+    pub dirty: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ByeArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// A short summary of what this chat accomplished.
+    pub summary: String,
+}
+
 #[tool_router]
 impl Lore {
-    pub fn new(db: Db, embedder: Embedder, min_similarity: f32, events: Events) -> Self {
+    pub fn new(
+        db: Db,
+        embedder: Embedder,
+        min_similarity: f32,
+        events: Events,
+        idle_hours: u32,
+    ) -> Self {
         Self {
             db,
             embedder,
             min_similarity,
+            idle_hours,
             events,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Verifies the chat's session is open, current and this agent's, or tells
+    /// the agent how to get one.
+    fn require_session(&self, id: &str, agent: &str, shared: bool) -> Result<Session, String> {
+        self.db
+            .touch_session(id, agent, shared, self.idle_hours)
+            .map_err(|error| {
+                format!(
+                    "no open session `{id}`: call `hello` first (once per chat) and pass \
+                     the `session_id` it returns. {error}"
+                )
+            })
     }
 
     #[tool(
@@ -148,15 +239,18 @@ impl Lore {
         Extension(parts): Extension<Parts>,
     ) -> Result<String, String> {
         let agent = agent_of(&parts);
-        let query = args.query.trim().to_string();
-        if query.is_empty() {
-            return Err("query must not be empty".into());
-        }
-        let project = normalize_project_filter(args.project);
-        let kind = normalize_kind_filter(args.kind)?;
-        let limit = args.limit.unwrap_or(8).clamp(1, 25) as usize;
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let query = args.query.trim().to_string();
+            if query.is_empty() {
+                return Err("query must not be empty".into());
+            }
+            let project = normalize_project_filter(args.project);
+            let kind = normalize_kind_filter(args.kind)?;
+            let limit = args.limit.unwrap_or(8).clamp(1, 25) as usize;
             let vector = this.embedder.embed_query(&query).unwrap_or_else(|error| {
                 tracing::warn!(%error, "query embedding failed");
                 None
@@ -177,6 +271,7 @@ impl Lore {
                 &agent,
                 "recall",
                 project.as_deref().unwrap_or(""),
+                Some(&session.id),
                 None,
                 &found,
                 &format!("\"{}\" → {} found", clip(&query, 90), found.len()),
@@ -217,26 +312,30 @@ impl Lore {
         // A per-agent token identifies the writer; only the shared token
         // falls back to what the model says it is.
         let actor = agent_of(&parts);
+        let shared = actor == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
         let agent = match parts.extensions.get::<Agent>() {
             Some(Agent(name)) if name != SHARED_AGENT => name.clone(),
             _ => args.agent.unwrap_or_default().trim().to_lowercase(),
         };
-        let new = NewEntry {
-            project: normalize_project(&args.project)?,
-            kind: normalize_kind(&args.kind)?,
-            title: required("title", &args.title)?,
-            body: required("body", &args.body)?,
-            tags: join_list(args.tags),
-            files: join_list(args.files),
-            agent,
-            path: required("path", &args.path)?,
-            repo: optional_ref(&args.repo),
-            commit: normalize_commit(&args.commit)?,
-            branch: args.branch.unwrap_or_default().trim().to_string(),
-            dirty: args.dirty.unwrap_or(false),
-        };
         let this = self.clone();
         blocking(move || {
+            let session = this.require_session(&session_id, &actor, shared)?;
+            let new = NewEntry {
+                project: normalize_project(&args.project)?,
+                kind: normalize_kind(&args.kind)?,
+                title: required("title", &args.title)?,
+                body: required("body", &args.body)?,
+                tags: join_list(args.tags),
+                files: join_list(args.files),
+                agent,
+                path: required("path", &args.path)?,
+                repo: optional_ref(&args.repo),
+                commit: normalize_commit(&args.commit)?,
+                branch: args.branch.unwrap_or_default().trim().to_string(),
+                dirty: args.dirty.unwrap_or(false),
+                session_id: Some(session.id.clone()),
+            };
             let entry = this.db.insert(&new).map_err(internal)?;
             this.embed_entry(&entry);
             let actor = if entry.agent.is_empty() {
@@ -248,6 +347,7 @@ impl Lore {
                 actor,
                 "log",
                 &entry.project,
+                Some(&session.id),
                 Some(entry.id),
                 &[],
                 &format!("[{}] {}", entry.kind, entry.title),
@@ -274,11 +374,14 @@ impl Lore {
         Extension(parts): Extension<Parts>,
     ) -> Result<String, String> {
         let agent = agent_of(&parts);
-        let project = normalize_project_filter(args.project);
-        let kind = normalize_kind_filter(args.kind)?;
-        let limit = args.limit.unwrap_or(10).clamp(1, 50) as usize;
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let project = normalize_project_filter(args.project);
+            let kind = normalize_kind_filter(args.kind)?;
+            let limit = args.limit.unwrap_or(10).clamp(1, 50) as usize;
             let entries = this
                 .db
                 .recent(project.as_deref(), kind.as_deref(), limit)
@@ -288,6 +391,7 @@ impl Lore {
                 &agent,
                 "recent",
                 project.as_deref().unwrap_or(""),
+                Some(&session.id),
                 None,
                 &seen,
                 &format!("{} newest entries", seen.len()),
@@ -308,15 +412,23 @@ impl Lore {
     #[tool(
         description = "List every project in the shared memory with its entry count, last activity, and the commit each agent last logged at. Compare those commits with your own HEAD to see who is ahead or behind."
     )]
-    async fn projects(&self, Extension(parts): Extension<Parts>) -> Result<String, String> {
+    async fn projects(
+        &self,
+        Parameters(args): Parameters<ProjectsArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
         let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
             let projects = this.db.projects().map_err(internal)?;
             this.note(
                 &agent,
                 "projects",
                 "",
+                Some(&session.id),
                 None,
                 &[],
                 &format!("{} projects", projects.len()),
@@ -368,20 +480,26 @@ impl Lore {
         Extension(parts): Extension<Parts>,
     ) -> Result<String, String> {
         let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
         let this = self.clone();
-        blocking(move || match this.db.get(args.id).map_err(internal)? {
-            Some(entry) => {
-                this.note(
-                    &agent,
-                    "get",
-                    &entry.project,
-                    Some(entry.id),
-                    &[],
-                    &entry.title,
-                );
-                Ok(render(&entry, None, false))
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            match this.db.get(args.id).map_err(internal)? {
+                Some(entry) => {
+                    this.note(
+                        &agent,
+                        "get",
+                        &entry.project,
+                        Some(&session.id),
+                        Some(entry.id),
+                        &[],
+                        &entry.title,
+                    );
+                    Ok(render(&entry, None, false))
+                }
+                None => Err(format!("No entry with id {}.", args.id)),
             }
-            None => Err(format!("No entry with id {}.", args.id)),
         })
         .await
     }
@@ -395,30 +513,34 @@ impl Lore {
         Extension(parts): Extension<Parts>,
     ) -> Result<String, String> {
         let agent = agent_of(&parts);
-        let patch = Patch {
-            kind: args.kind.as_deref().map(normalize_kind).transpose()?,
-            title: args
-                .title
-                .as_deref()
-                .map(|t| required("title", t))
-                .transpose()?,
-            body: args
-                .body
-                .as_deref()
-                .map(|b| required("body", b))
-                .transpose()?,
-            tags: args.tags.map(|t| join_list(Some(t))),
-            files: args.files.map(|f| join_list(Some(f))),
-        };
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
         let this = self.clone();
-        blocking(
-            move || match this.db.amend(args.id, &patch).map_err(internal)? {
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let patch = Patch {
+                kind: args.kind.as_deref().map(normalize_kind).transpose()?,
+                title: args
+                    .title
+                    .as_deref()
+                    .map(|t| required("title", t))
+                    .transpose()?,
+                body: args
+                    .body
+                    .as_deref()
+                    .map(|b| required("body", b))
+                    .transpose()?,
+                tags: args.tags.map(|t| join_list(Some(t))),
+                files: args.files.map(|f| join_list(Some(f))),
+            };
+            match this.db.amend(args.id, &patch).map_err(internal)? {
                 Some(entry) => {
                     this.embed_entry(&entry);
                     this.note(
                         &agent,
                         "amend",
                         &entry.project,
+                        Some(&session.id),
                         Some(entry.id),
                         &[],
                         &entry.title,
@@ -426,8 +548,8 @@ impl Lore {
                     Ok(format!("Updated #{}: {}", entry.id, entry.title))
                 }
                 None => Err(format!("No entry with id {}.", args.id)),
-            },
-        )
+            }
+        })
         .await
     }
 
@@ -440,14 +562,25 @@ impl Lore {
         Extension(parts): Extension<Parts>,
     ) -> Result<String, String> {
         let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
             let existing = this.db.get(args.id).map_err(internal)?;
             if this.db.delete(args.id).map_err(internal)? {
                 let (project, title) = existing
                     .map(|entry| (entry.project, entry.title))
                     .unwrap_or_default();
-                this.note(&agent, "forget", &project, Some(args.id), &[], &title);
+                this.note(
+                    &agent,
+                    "forget",
+                    &project,
+                    Some(&session.id),
+                    Some(args.id),
+                    &[],
+                    &title,
+                );
                 Ok(format!("Deleted #{}.", args.id))
             } else {
                 Err(format!("No entry with id {}.", args.id))
@@ -456,20 +589,190 @@ impl Lore {
         .await
     }
 
+    #[tool(
+        description = "Open the session for this chat and get the briefing: how to address the user, the language to reply in, the rules the user wants followed, other open sessions, and where the project was left off. Call this once at the very start of every new chat, before any other lore tool."
+    )]
+    async fn hello(
+        &self,
+        Parameters(args): Parameters<HelloArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        // A per-agent token identifies the agent; only the shared token
+        // falls back to what the model says it is.
+        let actor = agent_of(&parts);
+        let agent = match parts.extensions.get::<Agent>() {
+            Some(Agent(name)) if name != SHARED_AGENT => name.clone(),
+            _ => args.agent.unwrap_or_default().trim().to_lowercase(),
+        };
+        let this = self.clone();
+        blocking(move || {
+            let new = NewSession {
+                agent,
+                project: normalize_project(&args.project)?,
+                path: required("path", &args.path)?,
+                repo: optional_ref(&args.repo),
+                commit: normalize_commit(&args.commit)?,
+                branch: args.branch.unwrap_or_default().trim().to_string(),
+                title: one_line("title", &args.title)?,
+            };
+            // Stale sessions never show as open in the briefing.
+            this.db
+                .close_idle_sessions(this.idle_hours)
+                .map_err(internal)?;
+            let session = this.db.open_session(&new).map_err(internal)?;
+            let address = this.db.address_for(&session.agent).map_err(internal)?;
+            let language = this.db.profile().map_err(internal)?.language;
+            let rules = this
+                .db
+                .briefing_rules(&session.agent, &session.project)
+                .map_err(internal)?;
+            let mut others = this
+                .db
+                .sessions(Some("open"), Some(&session.project), 9)
+                .map_err(internal)?;
+            others.retain(|other| other.id != session.id);
+            let mut other_rows = Vec::new();
+            for other in others {
+                let latest = this.db.latest_session_update(&other.id).map_err(internal)?;
+                other_rows.push((other, latest));
+            }
+            let entries = this
+                .db
+                .recent(Some(&session.project), None, 5)
+                .map_err(internal)?;
+            let feed_agent = if session.agent.is_empty() {
+                &actor
+            } else {
+                &session.agent
+            };
+            this.note(
+                feed_agent,
+                "hello",
+                &session.project,
+                Some(&session.id),
+                None,
+                &[],
+                &clip(&session.title, 90),
+            );
+            Ok(briefing(
+                &session,
+                &address,
+                &language,
+                &rules,
+                &other_rows,
+                &entries,
+            ))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Record what happened in this chat since the last check-in, keeping the session current. Call it after every meaningful step."
+    )]
+    async fn checkin(
+        &self,
+        Parameters(args): Parameters<CheckinArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let note = required("note", &args.note)?;
+            let commit = match args.commit.as_deref() {
+                None => None,
+                Some(commit) => Some(normalize_commit(commit)?),
+            };
+            let branch = args
+                .branch
+                .as_deref()
+                .map(str::trim)
+                .filter(|branch| !branch.is_empty());
+            if let Some(commit) = &commit {
+                this.db
+                    .set_session_head(&session.id, commit, branch)
+                    .map_err(internal)?;
+            }
+            let update = this
+                .db
+                .add_session_update(
+                    &session.id,
+                    &note,
+                    commit.as_deref().unwrap_or(""),
+                    branch.unwrap_or(""),
+                    args.dirty.unwrap_or(false),
+                )
+                .map_err(internal)?;
+            let clipped = clip(&note, 90);
+            this.note(
+                &agent,
+                "checkin",
+                &session.project,
+                Some(&session.id),
+                None,
+                &[],
+                &clipped,
+            );
+            Ok(format!("Checked in on {}: {}", update.session_id, clipped))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Close the session with a short summary of what this chat accomplished. Call it before the chat ends."
+    )]
+    async fn bye(
+        &self,
+        Parameters(args): Parameters<ByeArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let summary = required("summary", &args.summary)?;
+            let closed = this
+                .db
+                .close_session(&session.id, &summary)
+                .map_err(internal)?;
+            let clipped = clip(&summary, 90);
+            this.note(
+                &agent,
+                "bye",
+                &closed.project,
+                Some(&closed.id),
+                None,
+                &[],
+                &clipped,
+            );
+            Ok(format!("Session {} closed: {}", closed.id, clipped))
+        })
+        .await
+    }
+
     /// Records what an agent just did and pushes it to open admin pages.
     /// Bookkeeping only: a failure here never fails the tool call.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per column of the activity row"
+    )]
     fn note(
         &self,
         agent: &str,
         tool: &str,
         project: &str,
+        session_id: Option<&str>,
         entry_id: Option<i64>,
         targets: &[i64],
         summary: &str,
     ) {
         match self
             .db
-            .record_activity(agent, tool, project, entry_id, targets, summary)
+            .record_activity(agent, tool, project, session_id, entry_id, targets, summary)
         {
             Ok(activity) => self.events.publish(activity),
             Err(error) => tracing::warn!(%error, "recording activity failed"),
@@ -541,6 +844,93 @@ fn required(name: &str, value: &str) -> Result<String, String> {
     } else {
         Ok(value.to_string())
     }
+}
+
+/// Required text, flattened to a single line.
+fn one_line(name: &str, value: &str) -> Result<String, String> {
+    let flat: String = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    required(name, &flat)
+}
+
+/// The text `hello` returns: the session, the profile, the rules, the other
+/// open sessions and where the project was left off. A section that has
+/// nothing to say is left out entirely.
+fn briefing(
+    session: &Session,
+    address: &str,
+    language: &str,
+    rules: &[Rule],
+    others: &[(Session, Option<String>)],
+    entries: &[Entry],
+) -> String {
+    let agent = if session.agent.is_empty() {
+        "unknown agent"
+    } else {
+        &session.agent
+    };
+    let mut sections = vec![format!(
+        "Session {} opened for {} on {}.\nPass `session_id` with this value to every \
+         other lore tool in this chat.",
+        session.id, agent, session.project
+    )];
+    let mut profile = Vec::new();
+    if !address.is_empty() {
+        profile.push(format!("How to address the user: {address}"));
+    }
+    if !language.is_empty() {
+        profile.push(format!("Reply to the user in: {language}"));
+    }
+    if !profile.is_empty() {
+        sections.push(profile.join("\n"));
+    }
+    if !rules.is_empty() {
+        let mut lines = vec!["Rules the user wants followed:".to_string()];
+        for (index, rule) in rules.iter().enumerate() {
+            lines.push(format!("{}. {}", index + 1, rule.body));
+        }
+        sections.push(lines.join("\n"));
+    }
+    if !others.is_empty() {
+        let mut lines = vec![format!("Other open sessions on {}:", session.project)];
+        for (other, latest) in others {
+            let agent = if other.agent.is_empty() {
+                "unknown agent"
+            } else {
+                &other.agent
+            };
+            let mut line = format!(
+                "- {} · started {} · {}",
+                agent, other.started_at, other.title
+            );
+            if let Some(latest) = latest {
+                line.push_str(&format!(" (last update: {})", clip(latest, 160)));
+            }
+            lines.push(line);
+        }
+        sections.push(lines.join("\n"));
+    }
+    if !entries.is_empty() {
+        let mut lines = vec![format!("Where {} was left off:", session.project)];
+        for entry in entries {
+            let agent = if entry.agent.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", entry.agent)
+            };
+            lines.push(format!(
+                "- #{} [{}] {}{} · {}",
+                entry.id, entry.kind, entry.title, agent, entry.created_at
+            ));
+        }
+        sections.push(lines.join("\n"));
+    }
+    sections.push(
+        "Keep this session current: call `checkin` when you finish a meaningful step, and \
+         `bye` with a short summary before the chat ends. This briefing is given once per \
+         chat; it is not repeated on later calls."
+            .to_string(),
+    );
+    sections.join("\n\n")
 }
 
 fn normalize_project(project: &str) -> Result<String, String> {

@@ -63,6 +63,7 @@ Queries take a few tens of milliseconds because everything happens in one proces
 
 | Tool | Purpose |
 |---|---|
+| `hello` | Open the session for this chat, once, at the very start. Returns the briefing: how to address the user, the reply language, the user's rules, other open sessions and where the project was left off |
 | `recall` | Search past work, decisions, bugs and notes by topic |
 | `log` | Record an update, decision, bug, note or todo, with the directory, repo and commit it was made at |
 | `recent` | Newest entries, to see where a project was left off |
@@ -70,6 +71,11 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `get` | One entry in full |
 | `amend` | Correct an entry instead of logging a contradicting one |
 | `forget` | Delete an entry |
+| `checkin` | Record what happened in this chat since the last check-in |
+| `bye` | Close the session with a short summary of the chat |
+
+Every tool except `hello` takes the `session_id` that `hello` returned and
+refuses to work without a live session.
 
 ### Who is ahead, who is behind
 
@@ -98,8 +104,41 @@ An agent compares those hashes with its own `HEAD` (`git merge-base --is-ancesto
 to see whether it needs to pull before building on someone else's work. The server
 stores the hashes; it has no access to your repositories and does not compare them.
 
-The server also sends instructions on connect that tell the agent when to call
-`recall` and `log`, so most clients use it without extra prompting.
+### Sessions and first contact
+
+Every new chat an agent opens must register itself. The first thing it does in a
+chat is call `hello`, which opens a session and returns the **briefing**:
+
+- **How to address the user** — a form of address set for that agent, or the
+  default one — and **which language to reply in**.
+- **The rules the user wants followed**: global rules first, then rules for that
+  agent, then rules for that project.
+- **Other open sessions** on the same project, and **where the project was left
+  off** (the five most recent entries).
+
+The briefing is given once per chat: it arrives with `hello` and is not repeated
+on later calls. The agent keeps the session current with `checkin` after every
+meaningful step — each check-in lands on the session's timeline with the commit
+it was made at — and closes it with `bye` and a short summary before the chat
+ends. Every other lore tool takes the `session_id` that `hello` returned.
+
+A session that sees no activity for `LORE_SESSION_IDLE_HOURS` hours (default 12)
+is closed automatically with the summary "closed after inactivity", so stale
+sessions never show as open.
+
+The **Profile** dialog on the admin page is where the administrator edits all of
+this: the default form of address, the reply language, one form of address per
+known agent, and the rule list (global, per agent or per project). A viewer can
+read the dialog but not change it. Open admin pages refresh the moment a profile,
+a rule or a session changes.
+
+Backups are version 3: they include the sessions with their check-in timelines,
+the profile and the rules. Older backup files still import and restore; restoring one
+replaces the entries but keeps the sessions, profile and rules, which it does not carry.
+
+The server also sends instructions on connect that tell the agent to open the
+session with `hello` and when to call `recall` and `log`, so most clients use it
+without extra prompting.
 
 ## The admin view
 
@@ -115,12 +154,21 @@ nothing needs a reload:
 - when an agent searches, beams run from that agent to the entries it found;
 - when an agent logs something, the new neuron appears and lights up;
 - the **Live activity** column lists every action: which agent, what it did
-  (searched, logged, amended, read, deleted), on which project, and when;
-- **Connected models** shows who is active right now and each agent's last action.
+  (opened a session, searched, logged, amended, checked in, read, deleted), on
+  which project, and when;
+- **Connected models** shows who is active right now and each agent's last action;
+- **Sessions** lists the open chats first and then the latest closed ones: agent,
+  project, what the chat is about, and how long ago it was last active. Click one
+  to read its fields and its check-in timeline;
+- **Open sessions** in the stats row counts the chats live right now.
 
 Click a neuron to read the entry, with the commit it was logged at and its related
 memories. Click a project, an agent or a kind (decision, bug, todo…) to isolate that
 part of the graph, or type in the search box to highlight matches.
+
+The **Profile** button opens the dialog where the form of address, the reply
+language, per-agent addresses and the rule list are edited; a signed-in viewer
+sees it read-only.
 
 ![An open entry with its commit, tags and related memories](docs/memory.jpg)
 
@@ -130,8 +178,8 @@ The **Backup** menu covers moving and protecting the whole store:
 
 | Action | What it does |
 |---|---|
-| **Export backup** | Downloads the whole store as one JSON file: every entry, its embedding vector, the activity log and the agent records. |
-| **Import and merge** | Adds the entries of a backup that are not present yet. Nothing is removed. |
+| **Export backup** | Downloads the whole store as one JSON file (version 3): every entry, its embedding vector, the activity log, the agent records, the sessions with their check-ins, the profile and the rules. |
+| **Import and merge** | Adds the entries, sessions and rules of a backup that are not present yet. Nothing is removed. |
 | **Restore from backup** | Replaces everything with the backup, after a confirmation. All or nothing: a file that fails validation changes nothing. |
 
 ![The backup menu](docs/backup.jpg)
@@ -148,12 +196,13 @@ password you type decides what you get:
 
 | Password | Role | Can do |
 |---|---|---|
-| `LORE_ADMIN_PASSWORD` | admin | everything, including backup export, import and restore |
-| `LORE_VIEWER_PASSWORD` | viewer | watch the graph and the live activity, open entries |
+| `LORE_ADMIN_PASSWORD` | admin | everything, including backup export, import and restore, and editing the profile and rules |
+| `LORE_VIEWER_PASSWORD` | viewer | watch the graph, the sessions and the live activity, open entries, read the profile |
 
-A viewer never sees the Backup menu, and the server refuses the backup endpoints for
-a viewer session, so hiding the button is not what keeps the data in. Share the
-viewer password with someone who should watch but not take a copy.
+A viewer never sees the Backup menu, and the server refuses the backup endpoints
+and every profile or rule edit for a viewer session, so hiding the buttons is not
+what keeps the data in. Share the viewer password with someone who should watch
+but not take a copy.
 
 ![The sign-in screen](docs/login.jpg)
 
@@ -225,9 +274,13 @@ To make agents use the memory consistently, add a line to your global agent
 instructions (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and so on):
 
 ```markdown
-Use the `lore` MCP server as shared memory: call `recall` before starting work on a
-topic, and `log` after any meaningful change, decision or bug fix. Every `log` call
-includes `path` (project directory), `repo` (`git remote get-url origin`) and `commit`
+Use the `lore` MCP server as shared memory. Start every new chat with `hello`
+and pass the `session_id` it returns to every other lore tool; follow the
+briefing it returns (form of address, reply language, the user's rules), call
+`checkin` after each meaningful step, and `bye` with a short summary when the
+chat ends. Call `recall` before starting work on a topic, and `log` after any
+meaningful change, decision or bug fix. Every `log` call includes `path`
+(project directory), `repo` (`git remote get-url origin`) and `commit`
 (`git rev-parse HEAD`, read right before logging).
 ```
 
@@ -244,6 +297,7 @@ includes `path` (project directory), `repo` (`git remote get-url origin`) and `c
 | `LORE_EMBEDDING_MODEL` | `bge-m3` | `bge-m3`, `e5-large`, `e5-base` or `e5-small`. Changing it re-embeds every entry. |
 | `LORE_EMBEDDINGS` | `on` | `off` gives keyword-only search with no model download. |
 | `LORE_MIN_SIMILARITY` | per model | Similarity below which a meaning-only match is dropped. |
+| `LORE_SESSION_IDLE_HOURS` | `12` | Hours without activity after which an open session is closed. Whole number between 1 and 720. |
 | `LORE_ALLOWED_HOSTS` | any | Hostnames accepted in the `Host` header. |
 | `LORE_TRUST_PROXY` | `on` in Docker | Read the client address from `X-Forwarded-For`. Turn off if the port is exposed directly. |
 | `LORE_DATA_DIR` | `/data` in Docker | Where the database and model cache live. |

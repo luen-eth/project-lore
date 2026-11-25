@@ -59,6 +59,10 @@ async fn main() -> Result<()> {
             .parse()
             .context("LORE_MIN_SIMILARITY must be a number between 0 and 1")?,
     };
+    let idle_hours: u32 = match env_or("LORE_SESSION_IDLE_HOURS", "12").parse() {
+        Ok(hours) if (1..=720).contains(&hours) => hours,
+        _ => bail!("LORE_SESSION_IDLE_HOURS must be a whole number between 1 and 720"),
+    };
 
     let db = Db::open(&data_dir.join("lore.db"))?;
     let semantic = flag("LORE_EMBEDDINGS", true);
@@ -106,6 +110,7 @@ async fn main() -> Result<()> {
                     embedder.clone(),
                     min_similarity,
                     events.clone(),
+                    idle_hours,
                 ))
             },
             Arc::new(LocalSessionManager::default()),
@@ -142,6 +147,7 @@ async fn main() -> Result<()> {
                 model.link_similarity(),
                 events.clone(),
                 embedder.clone(),
+                idle_hours,
             );
             app = app.merge(admin::router(Arc::new(admin)));
             tracing::info!("admin view enabled at /admin");

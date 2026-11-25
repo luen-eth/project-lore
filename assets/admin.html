@@ -50,6 +50,7 @@
       <input id="search" type="search" placeholder="Search memories" aria-label="Search memories" spellcheck="false">
       <button id="side-toggle" class="ghost only-narrow" type="button" aria-expanded="false">Overview</button>
       <button id="feed-toggle" class="ghost only-medium" type="button" aria-expanded="false">Activity</button>
+      <button id="profile-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="profile">Profile</button>
       <button id="backup-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="backup">Backup</button>
       <button id="logout" class="ghost" type="button">Sign out</button>
     </div>
@@ -61,10 +62,15 @@
       <div class="stat"><b id="stat-links">0</b><span>Links</span></div>
       <div class="stat"><b id="stat-projects">0</b><span>Projects</span></div>
       <div class="stat"><b id="stat-online">0</b><span>Agents active</span></div>
+      <div class="stat span"><b id="stat-sessions">0</b><span>Open sessions</span></div>
     </section>
     <section class="panel">
       <h2>Connected models</h2>
       <ul id="agents" class="list agents"></ul>
+    </section>
+    <section class="panel">
+      <h2>Sessions</h2>
+      <ul id="sessions" class="list sessions"></ul>
     </section>
     <section class="panel">
       <h2>Projects</h2>
@@ -89,11 +95,32 @@
 
   <div id="backup" class="backup" hidden>
     <h2>Backup and restore</h2>
-    <button id="backup-export" class="ghost" type="button"><b>Export backup</b><span>Download everything as one JSON file: every memory with its search index, the activity log and the agent records.</span></button>
-    <button id="backup-import" class="ghost" type="button"><b>Import and merge</b><span>Add the entries from a backup that are not here yet. Nothing is removed.</span></button>
+    <button id="backup-export" class="ghost" type="button"><b>Export backup</b><span>Download everything as one JSON file: every memory with its search index, the sessions, the profile, the rules and the agent records.</span></button>
+    <button id="backup-import" class="ghost" type="button"><b>Import and merge</b><span>Add the entries, sessions and rules from a backup that are not here yet. Nothing is removed.</span></button>
     <button id="backup-restore" class="ghost danger" type="button"><b>Restore from backup</b><span>Replace everything here with the contents of a backup file.</span></button>
     <p id="backup-status" class="small-text" role="status"></p>
     <input id="backup-file" type="file" accept="application/json,.json" hidden>
+  </div>
+
+  <div id="profile" class="profile" hidden>
+    <h2>Profile and rules</h2>
+    <p id="profile-status" class="small-text" role="status"></p>
+    <div class="profile-fields">
+      <label class="profile-field"><span>Default form of address</span>
+        <input id="profile-address" type="text" maxlength="80" placeholder="How agents should address the user">
+      </label>
+      <label class="profile-field"><span>Reply language</span>
+        <input id="profile-language" type="text" maxlength="40" placeholder="The language agents reply in">
+      </label>
+    </div>
+    <h4>Per agent</h4>
+    <div id="profile-agents" class="profile-agents"></div>
+    <div class="profile-actions">
+      <button id="profile-save" class="ghost" type="button"><b>Save profile</b></button>
+    </div>
+    <h4>Rules the agents must follow</h4>
+    <div id="profile-rules" class="profile-rules"></div>
+    <button id="profile-add-rule" class="ghost" type="button">Add rule</button>
   </div>
 
   <aside id="detail" class="detail" hidden>

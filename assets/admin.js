@@ -12,6 +12,9 @@ const KINDS = ["update", "decision", "bug", "note", "todo"];
 const KIND_LABEL = { update: "Update", decision: "Decision", bug: "Bug", note: "Note", todo: "Todo" };
 const KIND_RADIUS = { update: 3.4, decision: 4.6, bug: 3.9, note: 3.1, todo: 3.4 };
 const TOOLS = {
+  hello: { verb: "opened a session", tone: "write" },
+  checkin: { verb: "checked in", tone: "write" },
+  bye: { verb: "closed the session", tone: "remove" },
   log: { verb: "logged", tone: "write" },
   amend: { verb: "amended", tone: "write" },
   forget: { verb: "deleted", tone: "remove" },
@@ -19,11 +22,13 @@ const TOOLS = {
   recent: { verb: "checked recent work", tone: "read" },
   projects: { verb: "listed projects", tone: "read" },
   get: { verb: "read", tone: "read" },
+  profile: { verb: "updated the profile", tone: "write" },
+  rules: { verb: "edited the rules", tone: "write" },
   import: { verb: "imported a backup", tone: "write" },
   restore: { verb: "restored a backup", tone: "remove" },
   reindex: { verb: "re-indexed memories", tone: "write" },
 };
-const WRITES = new Set(["log", "amend", "forget", "import", "restore", "reindex"]);
+const WRITES = new Set(["hello", "checkin", "bye", "log", "amend", "forget", "profile", "rules", "import", "restore", "reindex"]);
 const FALLBACK_POLL_MS = 30000;
 const FEED_MAX = 120;
 const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -654,7 +659,8 @@ const state = {
   agentColors: new Map(), lastAction: new Map(), feed: [], seen: new Set(),
   filter: null, // { type: 'project' | 'agent' | 'kind', value }
   query: "", timer: null, clock: null, source: null, refreshing: null,
-  siteKey: null, decorative: false,
+  siteKey: null, decorative: false, role: "viewer",
+  sessions: [], openSessions: 0,
 };
 
 async function api(path, options) {
@@ -672,6 +678,11 @@ function showLogin() {
   clearInterval(state.timer); clearInterval(state.clock);
   if (state.source) { state.source.close(); state.source = null; }
   state.version = null; state.brain = null;
+  // Panels keep their rendered state; a fresh sign-in must not inherit it.
+  $("backup").hidden = true;
+  $("backup-toggle").setAttribute("aria-expanded", "false");
+  $("profile").hidden = true;
+  $("profile-toggle").setAttribute("aria-expanded", "false");
   $("app").hidden = true;
   $("login").hidden = false;
   if (!state.decorative) {
@@ -803,6 +814,11 @@ async function fallbackPoll() {
     const pulse = await (await api("/admin/api/pulse")).json();
     state.agents = pulse.agents;
     renderAgents();
+    if (pulse.open_sessions !== state.openSessions) {
+      state.openSessions = pulse.open_sessions;
+      renderStats();
+      loadSessions();
+    }
     if (pulse.version !== state.version) await refresh(false);
   } catch (_) { /* signed out or offline; the next poll retries */ }
 }
@@ -847,6 +863,7 @@ async function load(first) {
       state.brain = payload.brain;
       state.agents = payload.agents;
       state.model = payload.embedding_model;
+      state.openSessions = payload.open_sessions;
       const { counts, colors } = projectColors(payload.brain.neurons);
       state.counts = counts; state.colors = colors;
       for (const agent of payload.agents) agentColor(agent.name);
@@ -866,6 +883,105 @@ async function load(first) {
       $("empty").hidden = payload.brain.neurons.length > 0;
     }
   }
+  await loadSessions();
+}
+
+/* ---------- Sessions ---------- */
+
+/* The panel lists the open sessions first, then the latest closed ones. */
+async function loadSessions() {
+  try {
+    const [open, closed] = await Promise.all([
+      (await api("/admin/api/sessions?status=open&limit=20")).json(),
+      (await api("/admin/api/sessions?status=closed&limit=10")).json(),
+    ]);
+    state.sessions = [...open, ...closed];
+    renderSessions();
+  } catch (_) { /* signed out or offline; the next refresh retries */ }
+}
+
+function renderSessions() {
+  const list = $("sessions");
+  list.replaceChildren();
+  if (!state.sessions.length) {
+    list.append(el("li", "none", "No sessions yet. They appear when an agent calls hello."));
+    return;
+  }
+  for (const session of state.sessions) {
+    const open = session.status === "open";
+    const item = el("li", open ? "session" : "session closed");
+    const avatar = el("span", "avatar small", (session.agent || "?").slice(0, 1));
+    avatar.style.background = agentColor(session.agent || "unknown");
+    const name = el("span", "name", session.agent || "unknown agent");
+    const when = el("span", "count", relative(secondsSince(session.last_seen_at)));
+    const sub = el("span", "sub");
+    sub.textContent = `${session.project} · ${session.title}`;
+    sub.append(el("span", "pill " + (open ? "open" : "closed"), open ? "open" : "closed"));
+    item.title = `${session.title} · started ${shortDate(session.started_at)}`;
+    item.append(avatar, name, when, sub);
+    clickable(item, () => openSessionDetail(session));
+    list.append(item);
+  }
+}
+
+/* The chat drawer: a session's fields and its check-in timeline. */
+async function openSessionDetail(session) {
+  graph.selected = null;
+  $("tooltip").hidden = true;
+  const box = $("detail-body");
+  box.replaceChildren(el("p", "muted", "Loading…"));
+  $("detail").hidden = false;
+  let data;
+  try {
+    const response = await api("/admin/api/sessions/" + encodeURIComponent(session.id));
+    if (!response.ok) throw new Error("gone");
+    data = await response.json();
+  } catch (_) {
+    box.replaceChildren(el("p", "muted", "This session could not be loaded. It may be gone."));
+    return;
+  }
+  box.replaceChildren();
+  const open = data.status === "open";
+  const badge = el("span", "pill " + (open ? "open" : "closed"), open ? "open" : "closed");
+  box.append(badge, el("h3", "", data.title || "(untitled chat)"));
+  const meta = [
+    `by ${data.agent || "unknown agent"}`,
+    data.project,
+    `started ${shortDate(data.started_at)}`,
+    `last activity ${shortDate(data.last_seen_at)}`,
+  ];
+  if (data.ended_at) meta.push(`ended ${shortDate(data.ended_at)}`);
+  box.append(el("div", "meta", meta.join(" · ")));
+  if (data.summary) box.append(el("p", "muted", `Summary: ${data.summary}`));
+  if (data.commit || data.repo || data.path) {
+    const where = el("div", "chips");
+    if (data.commit) {
+      where.append(el("span", "chip file",
+        data.commit.slice(0, 10) + (data.branch ? ` · ${data.branch}` : "")));
+    }
+    if (data.repo) where.append(el("span", "chip file", data.repo));
+    if (data.path) where.append(el("span", "chip file", data.path));
+    box.append(el("h4", "", "Working at"), where);
+  }
+  box.append(el("h4", "", "Check-ins"));
+  if (!data.updates.length) {
+    box.append(el("p", "muted", "No check-ins recorded in this chat."));
+    return;
+  }
+  const timeline = el("ul", "timeline");
+  for (const update of data.updates) {
+    const item = el("li");
+    item.append(el("div", "at", shortDate(update.at)));
+    item.append(el("div", "note", update.body));
+    if (update.commit) {
+      const label = update.commit.slice(0, 10)
+        + (update.branch ? ` · ${update.branch}` : "")
+        + (update.dirty ? " · uncommitted changes" : "");
+      item.append(el("span", "chip file", label));
+    }
+    timeline.append(item);
+  }
+  box.append(timeline);
 }
 
 /* ---------- Live activity ---------- */
@@ -961,6 +1077,7 @@ function renderStats() {
   setStat("stat-links", state.brain.synapses.length);
   setStat("stat-projects", state.counts.length);
   setStat("stat-online", state.agents.filter((a) => a.seconds_since_seen !== null && a.seconds_since_seen < 300).length);
+  setStat("stat-sessions", state.openSessions);
 }
 
 function clickable(item, onClick) {
@@ -1128,7 +1245,12 @@ $("backup-toggle").addEventListener("click", () => {
   const panel = $("backup");
   panel.hidden = !panel.hidden;
   $("backup-toggle").setAttribute("aria-expanded", String(!panel.hidden));
-  if (!panel.hidden) backupStatus("");
+  if (!panel.hidden) {
+    backupStatus("");
+    // The two menus share a corner; only one is open at a time.
+    $("profile").hidden = true;
+    $("profile-toggle").setAttribute("aria-expanded", "false");
+  }
 });
 
 $("backup-export").addEventListener("click", () => {
@@ -1190,6 +1312,203 @@ $("backup-file").addEventListener("change", async (event) => {
   }
 });
 
+/* ---------- Profile and rules ---------- */
+
+function profileStatus(text, tone) {
+  const node = $("profile-status");
+  node.textContent = text;
+  node.className = "small-text" + (tone ? " " + tone : "");
+}
+
+$("profile-toggle").addEventListener("click", () => {
+  const panel = $("profile");
+  const open = panel.hidden;
+  panel.hidden = !open;
+  $("profile-toggle").setAttribute("aria-expanded", String(open));
+  if (open) {
+    $("backup").hidden = true;
+    $("backup-toggle").setAttribute("aria-expanded", "false");
+    profileStatus("");
+    loadProfile();
+  }
+});
+
+async function loadProfile() {
+  let data;
+  try {
+    const response = await api("/admin/api/profile");
+    if (!response.ok) throw new Error("gone");
+    data = await response.json();
+  } catch (_) {
+    profileStatus("The profile could not be loaded.", "bad");
+    return;
+  }
+  const admin = state.role === "admin";
+  $("profile-address").value = data.address || "";
+  $("profile-language").value = data.language || "";
+  $("profile-address").readOnly = !admin;
+  $("profile-language").readOnly = !admin;
+  $("profile-save").hidden = !admin;
+  $("profile-add-rule").hidden = !admin;
+
+  const byAgent = new Map(data.agents.map((row) => [row.agent, row.address]));
+  // Saving replaces the whole per-agent list, so an agent that has an
+  // address but is no longer known (say, after a restore) still gets a row;
+  // otherwise the next save would silently drop its address.
+  const names = [...new Set([...data.known_agents, ...byAgent.keys()])];
+  const rows = $("profile-agents");
+  rows.replaceChildren();
+  if (!names.length) {
+    rows.append(el("p", "muted small-text", "No agents have connected yet."));
+  }
+  for (const name of names) {
+    const row = el("div", "profile-row");
+    const input = el("input");
+    input.type = "text";
+    input.value = byAgent.get(name) || "";
+    input.placeholder = "uses the default";
+    if (!admin) input.readOnly = true;
+    input.dataset.agent = name;
+    row.append(el("span", "name", name), input);
+    rows.append(row);
+  }
+
+  const rules = $("profile-rules");
+  rules.replaceChildren();
+  if (!data.rules.length) {
+    rules.append(el("p", "muted small-text", "No rules yet. Every agent gets the briefing without rules."));
+  } else {
+    for (const rule of data.rules) rules.append(ruleRow(rule, admin));
+  }
+}
+
+/* One editable rule. `rule` without an id is a fresh row that is added on
+   its save click; existing rows save individually. */
+function ruleRow(rule, admin) {
+  const row = el("div", "rule-row");
+  const top = el("div", "rule-top");
+
+  const scope = el("select");
+  for (const value of ["global", "agent", "project"]) {
+    const option = el("option", "", value);
+    option.value = value;
+    scope.append(option);
+  }
+  scope.value = rule.scope;
+
+  const target = el("input");
+  target.type = "text";
+  target.value = rule.target || "";
+
+  const enabled = el("input");
+  enabled.type = "checkbox";
+  enabled.checked = rule.enabled !== false && rule.enabled !== 0;
+  const toggle = el("label", "rule-toggle");
+  toggle.append(enabled, el("span", "", "enabled"));
+
+  const syncTarget = () => {
+    target.hidden = scope.value === "global";
+    target.placeholder = scope.value === "agent" ? "agent name" : "project name";
+  };
+  scope.addEventListener("change", syncTarget);
+  syncTarget();
+
+  const body = el("textarea");
+  body.value = rule.body || "";
+  body.placeholder = "What every matching agent must do";
+
+  top.append(scope, target, toggle);
+  if (admin) {
+    const save = el("button", "ghost small", rule.id ? "Save" : "Add");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      const payload = {
+        scope: scope.value,
+        target: target.value.trim(),
+        body: body.value,
+        enabled: enabled.checked,
+      };
+      try {
+        const path = rule.id ? "/admin/api/rules/" + rule.id : "/admin/api/rules";
+        const method = rule.id ? "PUT" : "POST";
+        const response = await api(path, {
+          method,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(rule.id ? { ...payload, position: rule.position || 0 } : payload),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          profileStatus(result.error || "The rule could not be saved.", "bad");
+          return;
+        }
+        profileStatus(`Rule #${result.id} saved.`, "ok");
+        await loadProfile();
+      } catch (_) {
+        profileStatus("The rule could not be saved.", "bad");
+      }
+    });
+    const remove = el("button", "ghost small danger", "Delete");
+    remove.type = "button";
+    remove.addEventListener("click", async () => {
+      if (!rule.id) { row.remove(); return; }
+      if (!window.confirm(`Delete rule #${rule.id}?`)) return;
+      try {
+        const response = await api("/admin/api/rules/" + rule.id, { method: "DELETE" });
+        if (!response.ok) {
+          profileStatus("The rule could not be deleted.", "bad");
+          return;
+        }
+        profileStatus(`Rule #${rule.id} deleted.`, "ok");
+        await loadProfile();
+      } catch (_) {
+        profileStatus("The rule could not be deleted.", "bad");
+      }
+    });
+    top.append(save, remove);
+  } else {
+    scope.disabled = true;
+    target.readOnly = true;
+    enabled.disabled = true;
+    body.readOnly = true;
+  }
+  row.append(top, body);
+  return row;
+}
+
+$("profile-add-rule").addEventListener("click", () => {
+  const rules = $("profile-rules");
+  const placeholder = rules.querySelector("p");
+  if (placeholder) rules.replaceChildren();
+  rules.append(ruleRow({ scope: "global", target: "", body: "", enabled: true }, true));
+});
+
+$("profile-save").addEventListener("click", async () => {
+  const agents = [];
+  for (const input of $("profile-agents").querySelectorAll("input")) {
+    agents.push({ agent: input.dataset.agent, address: input.value.trim() });
+  }
+  try {
+    const response = await api("/admin/api/profile", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        address: $("profile-address").value.trim(),
+        language: $("profile-language").value.trim(),
+        agents,
+      }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      profileStatus(result.error || "The profile could not be saved.", "bad");
+      return;
+    }
+    profileStatus("Profile saved. The next chat gets the new briefing.", "ok");
+    await loadProfile();
+  } catch (_) {
+    profileStatus("The profile could not be saved.", "bad");
+  }
+});
+
 /* ---------- Tooltip and entry drawer ---------- */
 
 graph.onHover = (node, x, y) => {
@@ -1234,6 +1553,9 @@ document.addEventListener("keydown", (event) => {
   if (!$("backup").hidden) {
     $("backup").hidden = true;
     $("backup-toggle").setAttribute("aria-expanded", "false");
+  } else if (!$("profile").hidden) {
+    $("profile").hidden = true;
+    $("profile-toggle").setAttribute("aria-expanded", "false");
   } else {
     closeDetail();
   }
