@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="dark">
+<title>project-lore</title>
+<link rel="stylesheet" href="/admin/app.css">
+</head>
+<body>
+<canvas id="graph" aria-label="Memory graph"></canvas>
+
+<section id="login" class="login" hidden>
+  <form id="login-form" class="login-card" autocomplete="off">
+    <div class="mark" aria-hidden="true"><span></span><span></span><span></span></div>
+    <h1>project-lore</h1>
+    <p class="muted">The shared memory of your agents.</p>
+    <label class="field">
+      <span class="sr-only">Password</span>
+      <input id="password" type="password" placeholder="Password" autocomplete="current-password" required autofocus>
+    </label>
+    <button id="login-button" type="submit">Enter</button>
+    <p id="login-error" class="error" role="alert"></p>
+    <p id="captcha-note" class="fine" hidden>Protected by reCAPTCHA. Google's
+      <a href="https://policies.google.com/privacy" target="_blank" rel="noopener noreferrer">Privacy Policy</a> and
+      <a href="https://policies.google.com/terms" target="_blank" rel="noopener noreferrer">Terms of Service</a> apply.</p>
+  </form>
+</section>
+
+<div id="app" hidden>
+  <header class="top">
+    <div class="brand">
+      <div class="mark small" aria-hidden="true"><span></span><span></span><span></span></div>
+      <div>
+        <strong>project-lore</strong>
+        <div id="summary" class="muted small-text"></div>
+      </div>
+    </div>
+    <div class="actions">
+      <input id="search" type="search" placeholder="Search memories" aria-label="Search memories" spellcheck="false">
+      <button id="panel-toggle" class="ghost only-narrow" type="button" aria-expanded="false">Panels</button>
+      <button id="logout" class="ghost" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <aside id="side" class="side">
+    <section class="panel">
+      <h2>Connected models</h2>
+      <ul id="agents" class="list"></ul>
+    </section>
+    <section class="panel">
+      <h2>Projects</h2>
+      <ul id="projects" class="list"></ul>
+    </section>
+    <section class="panel">
+      <h2>Last 30 days</h2>
+      <div id="activity" class="activity" role="img" aria-label="Entries logged per day"></div>
+      <div id="activity-note" class="muted small-text"></div>
+    </section>
+  </aside>
+
+  <aside id="detail" class="detail" hidden>
+    <button id="detail-close" class="ghost close" type="button" aria-label="Close">Close</button>
+    <div id="detail-body"></div>
+  </aside>
+
+  <div id="tooltip" class="tooltip" hidden></div>
+  <div id="empty" class="empty" hidden>
+    <h2>No memories yet</h2>
+    <p class="muted">Connect an agent to the MCP endpoint and let it log its first entry.</p>
+  </div>
+  <div id="legend" class="legend muted small-text">
+    Neurons are entries, colour is the project, lines join related memories. Scroll to zoom, drag to move.
+  </div>
+</div>
+
+<script src="/admin/app.js"></script>
+</body>
+</html>

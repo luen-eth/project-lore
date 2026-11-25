@@ -1,0 +1,13 @@
+services:
+  lore:
+    build: .
+    image: project-lore:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${LORE_PORT:-8080}:8080"
+    volumes:
+      - lore-data:/data
+
+volumes:
+  lore-data:
