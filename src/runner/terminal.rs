@@ -447,7 +447,7 @@ async fn write_all(master: &AsyncFd<OwnedFd>, mut bytes: &[u8]) -> io::Result<()
 
 /// Kills a terminal's session: its process group, then every process
 /// still in the session (a shell's jobs run in groups of their own).
-fn kill_session(session: Pid) {
+pub(super) fn kill_session(session: Pid) {
     let _ = rustix::process::kill_process_group(session, Signal::KILL);
     for pid in session_members(session) {
         let _ = rustix::process::kill_process(pid, Signal::KILL);

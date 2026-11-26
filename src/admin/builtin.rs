@@ -77,6 +77,19 @@ pub(super) const ROUTES: &[(&str, &str, Access)] = &[
         Access::Needs(Perm::Agents),
     ),
     ("GET", "/admin/api/builtin", Access::SignedIn),
+    // The task runner: anyone signed in may watch, only `agents` stops.
+    ("GET", "/admin/api/builtin/runs", Access::SignedIn),
+    ("GET", "/admin/api/builtin/active", Access::SignedIn),
+    (
+        "GET",
+        "/admin/api/builtin/runs/{id}/events",
+        Access::SignedIn,
+    ),
+    (
+        "POST",
+        "/admin/api/builtin/{name}/stop",
+        Access::Needs(Perm::Agents),
+    ),
     (
         "PUT",
         "/admin/api/builtin/{name}",
@@ -134,6 +147,10 @@ pub(super) fn routes() -> Router<Arc<Admin>> {
             get(|| async { asset("text/css; charset=utf-8", STYLE) }),
         )
         .route("/admin/api/builtin", get(list))
+        .route("/admin/api/builtin/runs", get(runs))
+        .route("/admin/api/builtin/active", get(active))
+        .route("/admin/api/builtin/runs/{id}/events", get(run_events))
+        .route("/admin/api/builtin/{name}/stop", post(stop))
         .route(
             "/admin/api/builtin/{name}",
             put(update).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
@@ -952,6 +969,139 @@ async fn logout(
         Ok(FromRunner::Error { message, .. }) => bad_request(&message),
         Ok(_) => StatusCode::BAD_GATEWAY.into_response(),
         Err(error) => unreachable_runner(error),
+    }
+}
+
+/// `GET /admin/api/builtin/runs`: the task runner's queue, the runs going
+/// on and the history. Output lines are read from `…/runs/{id}/events`
+/// and arrive live as `run` events on the stream.
+async fn runs(State(admin): State<Arc<Admin>>, Extension(me): Extension<SignedIn>) -> Response {
+    let Some(runner) = admin.task_runner.clone() else {
+        return Json(json!({ "configured": false })).into_response();
+    };
+    let manage = me.perms.contains(Perm::Agents);
+    let result = async {
+        let active = runner.active().await?;
+        let queue = runner.queue().await?;
+        let readiness = runner.readiness().await?;
+        let db = admin.db.clone();
+        let history = tokio::task::spawn_blocking(move || db.runs(40)).await??;
+        let settings = runner.settings();
+        anyhow::Ok(json!({
+            "configured": true,
+            "manage": manage,
+            "active": active,
+            "queue": queue,
+            "agents": readiness,
+            "history": history,
+            "settings": {
+                "idle_minutes": settings.idle_minutes,
+                "hard_limit_minutes": settings.hard_limit.as_secs() / 60,
+                "wall_clock_minutes": settings.wall_clock.as_secs() / 60,
+                "output_cap_bytes": settings.output_cap_bytes,
+            },
+        }))
+    }
+    .await;
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            tracing::error!(error = %format!("{error:#}"), "reading the task runner failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// `GET /admin/api/builtin/active`: the runs going on, for the graph when
+/// the page loads. Empty without built-in agents.
+async fn active(State(admin): State<Arc<Admin>>) -> Response {
+    let Some(runner) = admin.task_runner.clone() else {
+        return Json(json!({ "runs": [] })).into_response();
+    };
+    match runner.active().await {
+        Ok(runs) => {
+            let runs: Vec<serde_json::Value> = runs
+                .into_iter()
+                .map(|run| {
+                    json!({
+                        "run_id": run["id"],
+                        "agent": run["agent"],
+                        "avatar": run["avatar"],
+                        "project": run["project"],
+                    })
+                })
+                .collect();
+            Json(json!({ "runs": runs })).into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %format!("{error:#}"), "reading the active runs failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    after: Option<i64>,
+}
+
+/// `GET /admin/api/builtin/runs/{id}/events?after=N`: a run's stored
+/// output, already redacted, read-only for everyone signed in.
+async fn run_events(
+    State(admin): State<Arc<Admin>>,
+    Path(id): Path<String>,
+    Query(query): Query<EventsQuery>,
+) -> Response {
+    if admin.task_runner.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let db = admin.db.clone();
+    let after = query.after.unwrap_or(0);
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
+            let Some(run) = db.run(&id)? else {
+                return Ok(None);
+            };
+            let events = db.run_events(&id, after, crate::db::RUN_EVENTS_KEPT as usize)?;
+            Ok(Some(json!({ "run": run, "events": events })))
+        })
+        .await;
+    match result {
+        Ok(Ok(Some(value))) => Json(value).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `POST /admin/api/builtin/{name}/stop`: stops the agent's run. Its token
+/// dies at once; the runner interrupts the CLI and deletes the work.
+async fn stop(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    Path(name): Path<String>,
+) -> Response {
+    let (_, name) = match target(&admin, &name) {
+        Ok(found) => found,
+        Err(status) => return status.into_response(),
+    };
+    let Some(runner) = admin.task_runner.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match runner.stop(&name).await {
+        Ok(true) => {
+            note_activity(
+                &admin,
+                "builtin",
+                &format!("{} stopped the run of {name}", me.username),
+            );
+            Json(json!({ "stopped": true })).into_response()
+        }
+        Ok(false) => bad_request(&format!("{name} has no run going")),
+        Err(error) => {
+            tracing::error!(error = %format!("{error:#}"), "stopping a run failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 

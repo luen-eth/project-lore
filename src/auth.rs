@@ -16,7 +16,7 @@ use axum::{
 };
 use subtle::ConstantTimeEq;
 
-use crate::db::Db;
+use crate::{db::Db, runscope::RunScope};
 
 const MIN_TOKEN_LEN: usize = 24;
 /// Name recorded for requests made with the shared `LORE_TOKEN`.
@@ -187,12 +187,24 @@ pub enum Authenticated {
     Env(String),
     /// An OAuth access token lore issued.
     OAuth(String),
+    /// A built-in agent's run-scoped token: valid while its run lasts, for
+    /// what its scope allows (see `runscope`).
+    Run(RunScope),
 }
 
 impl Authenticated {
     pub fn agent(&self) -> &str {
         match self {
             Authenticated::Env(agent) | Authenticated::OAuth(agent) => agent,
+            Authenticated::Run(scope) => &scope.agent,
+        }
+    }
+
+    /// The run's scope, for a run-scoped token.
+    pub fn scope(&self) -> Option<&RunScope> {
+        match self {
+            Authenticated::Run(scope) => Some(scope),
+            _ => None,
         }
     }
 }
@@ -247,6 +259,9 @@ impl McpAuth {
                 }
             };
         }
+        if crate::runscope::looks_like_token(presented) {
+            return self.authenticate_run(presented).await;
+        }
         if !crate::oauth::looks_like_token(presented) {
             return Err(Refused::Invalid);
         }
@@ -261,6 +276,41 @@ impl McpAuth {
             Ok(Ok(None)) => Err(Refused::Invalid),
             other => {
                 tracing::error!(?other, "checking an OAuth token failed");
+                Err(Refused::Invalid)
+            }
+        }
+    }
+
+    /// A run-scoped token: its run has not ended, the token was not
+    /// revoked, its hard limit has not passed, and its agent is not
+    /// disabled. Anything else is an invalid token (401).
+    async fn authenticate_run(&self, presented: &str) -> Result<Authenticated, Refused> {
+        let db = self.db.clone();
+        let hash = crate::oauth::token_hash(presented);
+        let found = tokio::task::spawn_blocking(move || -> Result<Option<(RunScope, bool)>> {
+            let Some((run_id, agent, scope)) = db.run_for_token(&hash, crate::db::unix_now())?
+            else {
+                return Ok(None);
+            };
+            let mut scope: RunScope = serde_json::from_str(&scope)?;
+            // The row is the authority on whose run it is.
+            scope.run_id = run_id;
+            scope.agent = agent;
+            let disabled = db
+                .registry_agent(&scope.agent)?
+                .is_some_and(|agent| agent.disabled);
+            Ok(Some((scope, disabled)))
+        })
+        .await;
+        match found {
+            Ok(Ok(Some((scope, false)))) => Ok(Authenticated::Run(scope)),
+            Ok(Ok(Some((scope, true)))) => Err(Refused::Disabled {
+                agent: scope.agent,
+                env: false,
+            }),
+            Ok(Ok(None)) => Err(Refused::Invalid),
+            other => {
+                tracing::error!(?other, "checking a run token failed");
                 Err(Refused::Invalid)
             }
         }
@@ -317,8 +367,8 @@ pub async fn require_token(
         .unwrap_or("")
         .to_string();
 
-    let agent = match auth.authenticate(&presented).await {
-        Ok(found) => found.agent().to_string(),
+    let (agent, scope) = match auth.authenticate(&presented).await {
+        Ok(found) => (found.agent().to_string(), found.scope().cloned()),
         Err(Refused::Disabled { agent, env: true }) => {
             tracing::warn!(%agent, "a disabled agent was refused");
             return (
@@ -371,6 +421,11 @@ pub async fn require_token(
     });
 
     request.extensions_mut().insert(Agent(agent));
+    // A run token's scope travels with the request to the tools, which
+    // check every provider call against it.
+    if let Some(scope) = scope {
+        request.extensions_mut().insert(scope);
+    }
     next.run(request).await
 }
 

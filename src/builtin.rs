@@ -218,6 +218,17 @@ struct Inner {
     terminals: HashMap<String, Terminal>,
 }
 
+/// What the hub hands the task runner: what a runner said about a run,
+/// and that a runner's link closed.
+#[derive(Debug)]
+pub enum HubEvent {
+    /// `run_started`, `run_output`, `run_exit`, or an `unsupported`
+    /// answer to `run_start`.
+    Run { agent: String, message: FromRunner },
+    /// The agent's runner disconnected: its run, if any, is gone.
+    Disconnected { agent: String },
+}
+
 /// Every built-in agent's runner link.
 pub struct Hub {
     db: Db,
@@ -226,17 +237,40 @@ pub struct Hub {
     next_id: AtomicU64,
     /// Wrong runner secrets, by address: ten in fifteen minutes lock it out.
     failures: RateLimiter,
+    /// Run events for the task runner, which takes the receiver once.
+    run_tx: mpsc::UnboundedSender<HubEvent>,
+    run_rx: Mutex<Option<mpsc::UnboundedReceiver<HubEvent>>>,
 }
 
 impl Hub {
     pub fn new(db: Db, tokens: Vec<RunnerToken>) -> Self {
+        let (run_tx, run_rx) = mpsc::unbounded_channel();
         Self {
             db,
             tokens,
             inner: Mutex::default(),
             next_id: AtomicU64::new(1),
             failures: RateLimiter::new(10, Duration::from_secs(15 * 60)),
+            run_tx,
+            run_rx: Mutex::new(Some(run_rx)),
         }
+    }
+
+    /// The run events, for the one task runner that listens.
+    pub fn take_events(&self) -> Option<mpsc::UnboundedReceiver<HubEvent>> {
+        self.run_rx.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Sends a command that has no answer (a run's start or stop).
+    pub async fn send(&self, agent: &str, command: ToRunner) -> Result<(), HubError> {
+        let tx = {
+            let inner = self.inner();
+            let Some(link) = inner.links.get(agent) else {
+                return Err(HubError::NotConnected);
+            };
+            link.tx.clone()
+        };
+        tx.send(command).await.map_err(|_| HubError::Closed)
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -558,6 +592,20 @@ impl Hub {
             }
             FromRunner::Unsupported { command, .. } => {
                 tracing::warn!(%agent, %command, "the runner does not support a command");
+                if command == "run_start" {
+                    let _ = self.run_tx.send(HubEvent::Run {
+                        agent: agent.to_string(),
+                        message: message.clone(),
+                    });
+                }
+            }
+            FromRunner::RunStarted { .. }
+            | FromRunner::RunOutput { .. }
+            | FromRunner::RunExit { .. } => {
+                let _ = self.run_tx.send(HubEvent::Run {
+                    agent: agent.to_string(),
+                    message: message.clone(),
+                });
             }
             FromRunner::TerminalOutput { term_id, data } => {
                 self.on_terminal_output(agent, term_id, data);
@@ -707,6 +755,9 @@ impl Hub {
             current
         };
         if current {
+            let _ = self.run_tx.send(HubEvent::Disconnected {
+                agent: agent.clone(),
+            });
             if let Err(error) = self.db.builtin_disconnected(&agent) {
                 tracing::warn!(%agent, %error, "recording a runner's disconnection failed");
             }
@@ -949,6 +1000,7 @@ esac
                 program: fake_cli(&pair.dir, kind),
             },
             work: pair.dir.clone(),
+            git: std::path::PathBuf::from("git"),
         }
     }
 

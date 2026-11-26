@@ -4,7 +4,7 @@
 //! `/runner/ws` on lore's internal listener), says who it is, and then
 //! carries out lore's commands with the CLI it was built with: report the
 //! sign-in state, sign in and out, list the models, open terminals
-//! (`terminal`). lore never reaches into
+//! (`terminal`), and run the CLI on a task (`runs`). lore never reaches into
 //! the container: no Docker socket, no inbound port. When the link drops
 //! the runner dials again, waiting a little longer each time.
 //!
@@ -21,9 +21,12 @@
 //! - `LORE_RUNNER_URL`: default `ws://lore:8081/runner/ws`.
 //! - `LORE_RUNNER_HOME`: the agent's home volume; default `$HOME`.
 //! - `LORE_RUNNER_CLI`: the CLI executable; default the kind's name.
+//! - `LORE_RUNNER_WORK`: where runs clone their repositories; default
+//!   `/work`. `LORE_RUNNER_GIT`: the git executable; default `git`.
 
 pub mod drivers;
 pub mod protocol;
+pub mod runs;
 pub mod terminal;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -56,9 +59,10 @@ pub struct Config {
     pub token: Secret,
     pub agent: String,
     pub settings: Settings,
-    /// Where runs clone their repositories (part 6b), for the free-space
-    /// reading.
+    /// Where runs clone their repositories (part 6b): `/work/<run id>`.
     pub work: PathBuf,
+    /// The git executable runs use (`LORE_RUNNER_GIT`, default `git`).
+    pub git: PathBuf,
 }
 
 impl std::fmt::Debug for Config {
@@ -149,6 +153,9 @@ impl Config {
             work: var("LORE_RUNNER_WORK")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/work")),
+            git: var("LORE_RUNNER_GIT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("git")),
         })
     }
 }
@@ -255,6 +262,15 @@ pub async fn session(config: &Config, driver: Arc<Driver>) -> Result<End> {
     // Closed with the link: dropping it kills every terminal's session.
     let terminals =
         terminal::Terminals::new(driver.clone(), out_tx.clone(), terminal::Limits::default());
+    // Closed with the link too: dropping it stops the run, which still
+    // deletes its work directory.
+    let runs = runs::Runs::new(
+        driver.clone(),
+        out_tx.clone(),
+        config.work.clone(),
+        config.git.clone(),
+        config.agent.clone(),
+    );
     {
         let (driver, out) = (driver.clone(), out_tx.clone());
         tokio::spawn(async move {
@@ -274,7 +290,10 @@ pub async fn session(config: &Config, driver: Arc<Driver>) -> Result<End> {
                         Ok(command) => {
                             // Terminal commands are carried out in order,
                             // here; everything else in a task of its own.
-                            if let Some(command) = terminals.handle(command) {
+                            if let Some(command) = terminals
+                                .handle(command)
+                                .and_then(|command| runs.handle(command))
+                            {
                                 handle(command, &driver, &out_tx);
                             }
                         }
@@ -392,22 +411,22 @@ fn handle(command: ToRunner, driver: &Arc<Driver>, out: &mpsc::Sender<FromRunner
                 let _ = out.send(answer).await;
                 driver.status(None).await
             }
-            ToRunner::RunStart { spec } => FromRunner::Unsupported {
-                command: "run_start".into(),
-                target: Some(spec.run_id),
-            },
+            // Follow-up messages to a running CLI belong to part 6c.
             ToRunner::RunInput { run_id, .. } => FromRunner::Unsupported {
                 command: "run_input".into(),
                 target: Some(run_id),
             },
-            ToRunner::RunStop { run_id } => FromRunner::Unsupported {
-                command: "run_stop".into(),
-                target: Some(run_id),
+            // `session` gives these to its `Runs` before they reach here.
+            ToRunner::RunStart { spec } => FromRunner::Unsupported {
+                command: "run_start".into(),
+                target: Some(spec.run_id),
             },
-            ToRunner::CleanWorkdir { run_id } => FromRunner::Unsupported {
-                command: "clean_workdir".into(),
-                target: Some(run_id),
-            },
+            ToRunner::RunStop { run_id } | ToRunner::CleanWorkdir { run_id } => {
+                FromRunner::Unsupported {
+                    command: "run".into(),
+                    target: Some(run_id),
+                }
+            }
             // `session` gives these to its `Terminals` before they reach
             // here.
             ToRunner::TerminalOpen { term_id, .. }
@@ -467,8 +486,9 @@ mod tests {
         }));
         let (tx, mut rx) = mpsc::channel(4);
         handle(
-            ToRunner::RunStop {
+            ToRunner::RunInput {
                 run_id: "r1".into(),
+                text: "more".into(),
             },
             &driver,
             &tx,
@@ -476,7 +496,7 @@ mod tests {
         assert_eq!(
             rx.recv().await,
             Some(FromRunner::Unsupported {
-                command: "run_stop".into(),
+                command: "run_input".into(),
                 target: Some("r1".into()),
             })
         );

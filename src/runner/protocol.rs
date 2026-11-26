@@ -229,13 +229,11 @@ pub enum ToRunner {
     /// Liveness check (answered with `Pong`).
     Ping { id: u64 },
     /// Part 6b: start a run.
-    #[allow(dead_code, reason = "sent from part 6b on")]
     RunStart { spec: RunSpec },
     /// Part 6b/6c: a follow-up message to a running CLI.
     #[allow(dead_code, reason = "sent from part 6b on")]
     RunInput { run_id: String, text: String },
     /// Part 6b: interrupt the CLI, then kill it if it does not stop.
-    #[allow(dead_code, reason = "sent from part 6b on")]
     RunStop { run_id: String },
     /// Part 6b: delete `/work/<run id>` (the runner also does it by itself
     /// when a run ends).
@@ -383,7 +381,7 @@ pub enum FromRunner {
         stream: String,
         line: String,
     },
-    /// Part 6b: a run ended and its work area was deleted.
+    /// A run ended and its work area was deleted.
     RunExit {
         run_id: String,
         #[serde(default)]
@@ -393,6 +391,11 @@ pub enum FromRunner {
         head: Option<String>,
         #[serde(default)]
         work_free_bytes: Option<u64>,
+        /// Why the CLI did not end by itself (`timeout`, `stopped`,
+        /// `output_cap`, `link_closed`), or why the run failed before or
+        /// around it (`failed: …`). None when the CLI exited on its own.
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// Terminal bytes, base64.
     TerminalOutput {
@@ -577,6 +580,7 @@ mod tests {
                 pushed: true,
                 head: Some("abc".into()),
                 work_free_bytes: Some(1),
+                reason: Some("timeout".into()),
             },
             FromRunner::TerminalOutput {
                 term_id: "t1".into(),

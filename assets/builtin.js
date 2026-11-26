@@ -121,7 +121,7 @@
     clearTimeout(ui.poll);
     if (panel.hidden || !ui.data || !ui.data.configured) return;
     const waiting = ui.data.agents.some((agent) => agent.login && ["starting", "waiting"].includes(agent.login.state));
-    ui.poll = setTimeout(load, waiting ? 3000 : 30000);
+    ui.poll = setTimeout(() => { load(); if (!waiting) loadRunner(); }, waiting ? 3000 : 30000);
   }
 
   function render() {
@@ -534,6 +534,169 @@
     if (event.data && event.data.type === "lore-terminal-close") closeTerminal();
   });
 
+  /* ---------- Task runner ---------- */
+
+  const runner = {
+    data: null,
+    /* Output lines per run id, and the newest seq seen. */
+    lines: new Map(),
+    seen: new Map(),
+    /* Run ids whose output the page shows. */
+    open: new Set(),
+  };
+  const OUTPUT_KEEP = 400;
+  const STATUS_LABEL = {
+    starting: "starting", running: "running", pushed: "pushed", done: "done", failed: "failed",
+    stopped: "stopped", timeout: "timed out", interrupted: "interrupted",
+  };
+
+  async function loadRunner() {
+    let result;
+    try {
+      result = await call("/admin/api/builtin/runs");
+    } catch (_) {
+      return;
+    }
+    const box = $("runner-section");
+    if (!result.ok || !result.body.configured) { box.hidden = true; return; }
+    runner.data = result.body;
+    box.hidden = false;
+    for (const run of runner.data.active) {
+      runner.open.add(run.id);
+      if (!runner.lines.has(run.id)) await loadOutput(run.id);
+    }
+    renderRunner();
+  }
+
+  async function loadOutput(id) {
+    const result = await call(`/admin/api/builtin/runs/${encodeURIComponent(id)}/events?after=0`).catch(() => null);
+    if (!result || !result.ok) return;
+    const lines = result.body.events.map((event) => ({ seq: event.seq, stream: event.stream, line: event.body }));
+    runner.lines.set(id, lines.slice(-OUTPUT_KEEP));
+    runner.seen.set(id, lines.length ? lines[lines.length - 1].seq : 0);
+  }
+
+  function outputBox(id) {
+    const pre = el("pre", "runner-output");
+    pre.dataset.run = id;
+    pre.setAttribute("aria-label", "Output of run " + id);
+    for (const item of runner.lines.get(id) || []) pre.append(outputLine(item));
+    if (!pre.childNodes.length) pre.append(el("span", "muted", "No output yet."));
+    requestAnimationFrame(() => { pre.scrollTop = pre.scrollHeight; });
+    return pre;
+  }
+
+  function outputLine(item) {
+    return el("span", item.stream, `${item.stream === "text" ? "" : item.stream + ": "}${item.line}\n`);
+  }
+
+  function minutes(from, to) {
+    const start = Date.parse(from), end = to ? Date.parse(to) : Date.now();
+    if (isNaN(start) || isNaN(end)) return "";
+    const m = Math.max(0, Math.round((end - start) / 60000));
+    return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+  }
+
+  function renderRunner() {
+    const data = runner.data;
+    if (!data) return;
+    const active = $("runner-active");
+    active.replaceChildren();
+    for (const run of data.active) {
+      const item = el("li", "board-item agent-card");
+      const head = el("div", "board-item-head agent-head");
+      const image = el("img", "builtin-avatar");
+      image.src = `/admin/avatars/${encodeURIComponent(run.avatar || "orbit")}.svg`;
+      image.alt = "";
+      head.append(image, el("span", "board-title", `${run.agent} · task #${run.task_id}`),
+        pill(run.stopping ? "stopping" : STATUS_LABEL[run.status] || run.status, "open"));
+      item.append(head);
+      item.append(el("div", "board-meta",
+        `${run.task_title} · ${run.repo} · ${run.model || "default model"} · ${minutes(run.started_at)}`));
+      item.append(outputBox(run.id));
+      if (data.manage && !run.stopping) {
+        const row = el("div", "board-actions");
+        row.append(button("Stop", "danger", () => stopRun(run)));
+        item.append(row);
+      }
+      active.append(item);
+    }
+    const waiting = data.agents.filter((agent) => !agent.ready).map((agent) => `${agent.agent}: ${agent.why}`);
+    const ready = data.agents.filter((agent) => agent.ready).map((agent) => agent.agent);
+    $("runner-summary").textContent = data.active.length
+      ? `${data.active.length} running`
+      : ready.length ? `ready: ${ready.join(", ")}` : "no agent is ready";
+    $("runner-summary").title = waiting.join("\n");
+
+    const queue = $("runner-queue");
+    queue.replaceChildren();
+    const eligible = data.queue.filter((task) => task.state === "eligible").length;
+    $("runner-queue-count").textContent = `(${data.queue.length} open, ${eligible} eligible · idle after ${data.settings.idle_minutes} min)`;
+    if (!data.queue.length) queue.append(el("li", "runner-why", "No open, unclaimed tasks."));
+    for (const task of data.queue) {
+      const item = el("li");
+      item.append(el("span", "runner-line", `#${task.id} ${task.title} · ${task.project}`),
+        el("span", "runner-why", `${task.state.replace("_", " ")}: ${task.why}`));
+      queue.append(item);
+    }
+
+    const history = $("runner-history");
+    history.replaceChildren();
+    const ended = data.history.filter((run) => !["starting", "running"].includes(run.status));
+    $("runner-history-count").textContent = `(${ended.length})`;
+    if (!ended.length) history.append(el("li", "runner-why", "No runs yet."));
+    for (const run of ended) {
+      const item = el("li");
+      const line = `${run.agent} · task #${run.task_id} · ${STATUS_LABEL[run.status] || run.status}`
+        + ` · ${minutes(run.started_at, run.ended_at)}` + (run.commit ? ` · ${run.commit.slice(0, 10)}` : "");
+      item.append(el("span", "runner-line", line), el("span", "runner-why", `${day(run.created_at)} · ${run.summary}`));
+      const show = button(runner.open.has(run.id) ? "Hide output" : "Show output", "", async () => {
+        if (runner.open.has(run.id)) runner.open.delete(run.id);
+        else { runner.open.add(run.id); await loadOutput(run.id); }
+        renderRunner();
+      });
+      item.append(show);
+      if (runner.open.has(run.id)) item.append(outputBox(run.id));
+      history.append(item);
+    }
+  }
+
+  async function stopRun(run) {
+    if (!window.confirm(`Stop ${run.agent}'s run on task #${run.task_id}?\n\nIts token stops working at once; the task is released with a note.`)) return;
+    const result = await post(url(run.agent, "/stop")).catch(() => null);
+    if (!result || !result.ok) {
+      status((result && result.body.error) || "The run could not be stopped.", "bad");
+      return;
+    }
+    status(`Stopping ${run.agent}'s run…`, "ok");
+    await loadRunner();
+  }
+
+  /* Live run events, relayed by the page's event stream. */
+  window.addEventListener("lore-run", (event) => {
+    const run = event.detail || {};
+    if (run.type === "output") {
+      const last = runner.seen.get(run.run_id) || 0;
+      if (run.seq <= last) return;
+      runner.seen.set(run.run_id, run.seq);
+      const lines = runner.lines.get(run.run_id) || [];
+      lines.push({ seq: run.seq, stream: run.stream, line: run.line });
+      if (lines.length > OUTPUT_KEEP) lines.splice(0, lines.length - OUTPUT_KEEP);
+      runner.lines.set(run.run_id, lines);
+      if (panel.hidden) return;
+      const pre = section.querySelector(`pre.runner-output[data-run="${CSS.escape(run.run_id)}"]`);
+      if (pre) {
+        const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
+        if (pre.firstChild && pre.firstChild.classList && pre.firstChild.classList.contains("muted")) pre.replaceChildren();
+        pre.append(outputLine({ stream: run.stream, line: run.line }));
+        while (pre.childNodes.length > OUTPUT_KEEP) pre.firstChild.remove();
+        if (stick) pre.scrollTop = pre.scrollHeight;
+      }
+    } else if (!panel.hidden) {
+      loadRunner();
+    }
+  });
+
   /* Loads when the Agents panel opens; stops polling when it closes. */
   new MutationObserver(() => {
     if (panel.hidden) {
@@ -542,6 +705,7 @@
       status("");
     } else {
       load();
+      loadRunner();
     }
   }).observe(panel, { attributes: true, attributeFilter: ["hidden"] });
 })();

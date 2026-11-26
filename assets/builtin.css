@@ -39,6 +39,33 @@
 .builtin-actions { justify-content: flex-start; }
 
 
+/* The task runner: its runs with their live output, the queue, history. */
+.runner-section { display: grid; gap: 8px; margin-top: 6px; }
+.runner-section .board-head h4 { margin: 0; font-size: 13px; }
+.runner-section > p.muted { margin: 0; }
+.runner-box { font-size: 12px; color: var(--muted); }
+.runner-box summary { cursor: pointer; padding: 4px 0; }
+.runner-box summary:hover, .runner-box[open] summary { color: var(--text); }
+.runner-list { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 4px; }
+.runner-list li {
+  display: grid; gap: 2px; padding: 6px 8px; border-radius: 8px;
+  background: rgba(0, 0, 0, 0.18); overflow-wrap: anywhere;
+}
+.runner-list .runner-line { color: var(--text); }
+.runner-list .runner-why { color: var(--muted); }
+.runner-output {
+  margin: 4px 0 0; padding: 6px 8px; border-radius: 8px; background: rgba(0, 0, 0, 0.28);
+  font: 11px/1.45 var(--mono); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 18em; overflow: auto;
+}
+.runner-output .text { color: var(--text); }
+.runner-output .tool { color: var(--accent); }
+.runner-output .error, .runner-output .stderr { color: var(--danger); }
+.runner-output .result { color: var(--ok); }
+.task-targets { font-size: 12px; color: var(--muted); }
+.task-targets summary { cursor: pointer; padding: 2px 0 6px; }
+.task-targets[open] { display: grid; gap: 6px; }
+
 /* Terminal: the buttons on a card and the overlay holding its frame. */
 .builtin-terminal { align-items: center; }
 .builtin-more { font-size: 12px; color: var(--muted); }

@@ -253,7 +253,8 @@ const RULE_BODY_MAX_CHARS: usize = 2000;
 /// The columns of a task row, in the order `Task::from_row` reads them.
 const TASK_COLUMNS: &str = "id, project, title, body, status, assignee, created_by, \
                             claimed_by, done_by, done_commit, note, session_id, \
-                            created_at, updated_at, done_at";
+                            created_at, updated_at, done_at, repo, dokploy_project_id, \
+                            cloudflare_zone";
 
 /// The columns of a message row, in the order `Message::from_row` reads them.
 const MESSAGE_COLUMNS: &str = "id, kind, project, from_agent, to_agent, body, session_id, \
@@ -325,8 +326,10 @@ const OPS_LOG_KEPT: i64 = 5000;
 ///
 /// 1: users. 2: the agent registry and the OAuth tables. 3: the mailbox
 /// columns of `vault` (host, port, account). 4: the built-in agents
-/// (`builtin_agents`, `agent_runs`, `agent_run_events`).
-pub const SCHEMA_VERSION: i64 = 4;
+/// (`builtin_agents`, `agent_runs`, `agent_run_events`). 5: the task
+/// runner's task columns (`repo`, `dokploy_project_id`, `cloudflare_zone`,
+/// `auto_attempts`, `auto_last_at`) and run columns.
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Columns every database lore ever created has in `entries`: a full
 /// backup without them is not a lore database.
@@ -370,6 +373,22 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("vault", "host", "TEXT NOT NULL DEFAULT ''"),
     ("vault", "port", "INTEGER NOT NULL DEFAULT 0"),
     ("vault", "account", "TEXT NOT NULL DEFAULT ''"),
+    // The task runner (schema 5): where a task's work goes, and what the
+    // runner did with it. `repo` empty means "the latest repository lore
+    // recorded for the project".
+    ("tasks", "repo", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "dokploy_project_id", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "cloudflare_zone", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "auto_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    // When the runner last took or skipped the task: it waits until the
+    // task is touched again (`updated_at` moves past this).
+    ("tasks", "auto_last_at", "TEXT"),
+    ("agent_runs", "model", "TEXT NOT NULL DEFAULT ''"),
+    ("agent_runs", "task_title", "TEXT NOT NULL DEFAULT ''"),
+    ("agent_runs", "pushed", "INTEGER NOT NULL DEFAULT 0"),
+    ("agent_runs", "work_free_bytes", "INTEGER"),
+    ("agent_runs", "cli_session", "TEXT NOT NULL DEFAULT ''"),
+    ("agent_runs", "output_lines", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -723,6 +742,16 @@ pub struct Task {
     /// Set when the task was marked done.
     #[serde(default)]
     pub done_at: Option<String>,
+    /// The repository the work goes to (`github.com/<owner>/<repo>`);
+    /// empty for the latest one lore recorded for the project.
+    #[serde(default)]
+    pub repo: String,
+    /// A Dokploy project the work may change; empty for read-only.
+    #[serde(default)]
+    pub dokploy_project_id: String,
+    /// A Cloudflare zone id the work may change; empty for read-only.
+    #[serde(default)]
+    pub cloudflare_zone: String,
 }
 
 impl Task {
@@ -743,6 +772,9 @@ impl Task {
             created_at: row.get(12)?,
             updated_at: row.get(13)?,
             done_at: row.get(14)?,
+            repo: row.get(15)?,
+            dokploy_project_id: row.get(16)?,
+            cloudflare_zone: row.get(17)?,
         })
     }
 }
@@ -759,6 +791,83 @@ pub struct NewTask {
     pub created_by: String,
     /// The chat session it was added in, when there is one.
     pub session_id: Option<String>,
+    /// Where the work goes and what it may change (see `Task`); checked
+    /// by `normalize_task_targets`.
+    pub targets: TaskTargets,
+}
+
+/// The optional fields that say where a task's work goes: the repository,
+/// and the Dokploy project and Cloudflare zone a built-in agent may change
+/// for it. Empty is "not set".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TaskTargets {
+    pub repo: String,
+    pub dokploy_project_id: String,
+    pub cloudflare_zone: String,
+}
+
+/// Longest value of a task target field.
+const TARGET_MAX_CHARS: usize = 200;
+
+/// Checks the target fields: a repository is a `github.com/<owner>/<repo>`
+/// address (any of the forms `parse_github_repo` reads, kept as given);
+/// a Dokploy project id and a Cloudflare zone id are plain ids.
+pub fn normalize_task_targets(targets: &TaskTargets) -> Result<TaskTargets> {
+    let repo = targets.repo.trim().to_string();
+    if !repo.is_empty() && parse_github_repo(&repo).is_none() {
+        anyhow::bail!(
+            "repo must be a GitHub repository such as github.com/owner/name or \
+             https://github.com/owner/name.git"
+        );
+    }
+    let plain_id = |name: &str, value: &str| -> Result<String> {
+        let value = value.trim();
+        if value.chars().count() > TARGET_MAX_CHARS
+            || !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            anyhow::bail!("{name} must be a plain id (letters, digits, `-`, `_`, `.`)");
+        }
+        Ok(value.to_string())
+    };
+    Ok(TaskTargets {
+        repo,
+        dokploy_project_id: plain_id("dokploy_project_id", &targets.dokploy_project_id)?,
+        cloudflare_zone: plain_id("cloudflare_zone", &targets.cloudflare_zone)?,
+    })
+}
+
+/// `(owner, repo)` of a GitHub repository address: `github.com/o/r`,
+/// `https://github.com/o/r(.git)`, `git@github.com:o/r(.git)` or
+/// `ssh://git@github.com/o/r(.git)`. Anything else, another host
+/// included, is `None`.
+pub fn parse_github_repo(address: &str) -> Option<(String, String)> {
+    let address = address.trim();
+    let rest = address
+        .strip_prefix("https://")
+        .or_else(|| address.strip_prefix("http://"))
+        .or_else(|| address.strip_prefix("ssh://git@"))
+        .or_else(|| address.strip_prefix("git@"))
+        .unwrap_or(address);
+    let rest = rest
+        .strip_prefix("www.")
+        .unwrap_or(rest)
+        .strip_prefix("github.com")?;
+    let rest = rest.strip_prefix('/').or_else(|| rest.strip_prefix(':'))?;
+    let rest = rest.trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (owner, repo) = rest.split_once('/')?;
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 100
+            && part != "."
+            && part != ".."
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (plain(owner) && plain(repo)).then(|| (owner.to_string(), repo.to_string()))
 }
 
 /// One message between agents, or one handoff note for a project.
@@ -2042,8 +2151,10 @@ impl Db {
             tx.execute(
                 "INSERT INTO tasks (id, project, title, body, status, assignee, created_by,
                                       claimed_by, done_by, done_commit, note, session_id,
-                                      created_at, updated_at, done_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                      created_at, updated_at, done_at, repo,
+                                      dokploy_project_id, cloudflare_zone)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18)",
                 params![
                     task.id,
                     task.project,
@@ -2059,7 +2170,10 @@ impl Db {
                     task.session_id,
                     task.created_at,
                     task.updated_at,
-                    task.done_at
+                    task.done_at,
+                    task.repo,
+                    task.dokploy_project_id,
+                    task.cloudflare_zone
                 ],
             )?;
         }
@@ -2265,8 +2379,10 @@ impl Db {
             tx.execute(
                 "INSERT INTO tasks (project, title, body, status, assignee, created_by,
                                       claimed_by, done_by, done_commit, note, session_id,
-                                      created_at, updated_at, done_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                      created_at, updated_at, done_at, repo,
+                                      dokploy_project_id, cloudflare_zone)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17)",
                 params![
                     task.project,
                     task.title,
@@ -2281,7 +2397,10 @@ impl Db {
                     task.session_id,
                     task.created_at,
                     task.updated_at,
-                    task.done_at
+                    task.done_at,
+                    task.repo,
+                    task.dokploy_project_id,
+                    task.cloudflare_zone
                 ],
             )?;
         }
@@ -2706,27 +2825,32 @@ impl Db {
         let (project, title, body) = normalize_task(&new.project, &new.title, &new.body)?;
         let assignee = new.assignee.trim().to_lowercase();
         let created_by = new.created_by.trim().to_lowercase();
+        let targets = normalize_task_targets(&new.targets)?;
         let conn = self.lock();
         conn.execute(
             "INSERT INTO tasks (project, title, body, assignee, created_by, session_id,
-                                 created_at, updated_at)
+                                 created_at, updated_at, repo, dokploy_project_id,
+                                 cloudflare_zone)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6,
                      strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
-            params![project, title, body, assignee, created_by, new.session_id],
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?7, ?8, ?9)",
+            params![
+                project,
+                title,
+                body,
+                assignee,
+                created_by,
+                new.session_id,
+                targets.repo,
+                targets.dokploy_project_id,
+                targets.cloudflare_zone
+            ],
         )?;
         let id = conn.last_insert_rowid();
         get_task(&conn, id)?.context("task vanished after insert")
     }
 
     /// One task by its id.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "part of the board API; no single-task route reads it yet"
-        )
-    )]
     pub fn task(&self, id: i64) -> Result<Option<Task>> {
         get_task(&self.lock(), id)
     }
@@ -6512,6 +6636,7 @@ mod tests {
                 assignee: "codex".into(),
                 created_by: "claude".into(),
                 session_id: Some("s_1".into()),
+                ..Default::default()
             })
             .unwrap();
         db.update_task(task.id, "claim", "codex", Some("on it"), None)
@@ -7909,6 +8034,7 @@ mod tests {
             assignee: String::new(),
             created_by: "admin".into(),
             session_id: None,
+            ..Default::default()
         })
         .unwrap();
         db.add_user(&user_fixture("luis", Some("luis@example.com"), &["write"]))

@@ -226,6 +226,22 @@
         <p class="muted small-text">Claude Code, Codex and DeepSeek (through opencode) in their own containers next to lore. Sign each in once with your own subscription or key; the credential stays in that agent's volume and never reaches lore's database.</p>
         <p id="builtin-status" class="small-text" role="status"></p>
         <ul id="builtin-list" class="board-list"></ul>
+        <div id="runner-section" class="runner-section" hidden>
+          <div class="board-head">
+            <h4 id="runner-title">Task runner</h4>
+            <span id="runner-summary" class="muted small-text"></span>
+          </div>
+          <p class="muted small-text">An enabled agent takes an open, unclaimed task nobody touched for a while, works on it in a fresh clone of the task's repository and pushes to its default branch. It may change only that repository (and the Dokploy project or Cloudflare zone the task names). A run that fails or is stopped releases the task with a note, and the task is not taken again until someone touches it.</p>
+          <ul id="runner-active" class="board-list"></ul>
+          <details class="runner-box">
+            <summary>Queue <span id="runner-queue-count" class="muted"></span></summary>
+            <ul id="runner-queue" class="runner-list"></ul>
+          </details>
+          <details class="runner-box">
+            <summary>History <span id="runner-history-count" class="muted"></span></summary>
+            <ul id="runner-history" class="runner-list"></ul>
+          </details>
+        </div>
       </section>
       <ul id="agent-list" class="board-list"></ul>
     </div>
@@ -262,6 +278,20 @@
           <label class="board-field"><span>Details</span>
             <textarea id="task-body" maxlength="4000" placeholder="Optional: what exactly the task involves"></textarea>
           </label>
+          <details class="task-targets">
+            <summary>Where the work goes (optional)</summary>
+            <label class="board-field"><span>Repository</span>
+              <input id="task-repo" type="text" maxlength="200" placeholder="github.com/owner/name; empty for the project's latest" spellcheck="false">
+            </label>
+            <div class="board-form-row">
+              <label class="board-field"><span>Dokploy project id</span>
+                <input id="task-dokploy" type="text" maxlength="200" placeholder="read-only without it" spellcheck="false">
+              </label>
+              <label class="board-field"><span>Cloudflare zone id</span>
+                <input id="task-zone" type="text" maxlength="200" placeholder="read-only without it" spellcheck="false">
+              </label>
+            </div>
+          </details>
           <div class="board-form-actions">
             <button id="task-submit" class="ghost small" type="submit">Add task</button>
           </div>

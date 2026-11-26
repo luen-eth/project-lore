@@ -333,6 +333,8 @@ pub struct Admin {
     /// The built-in agents' runner links; `None` without
     /// `LORE_RUNNER_TOKENS`.
     builtin: Option<Arc<crate::builtin::Hub>>,
+    /// The task runner, with the built-in agents.
+    task_runner: Option<Arc<crate::taskrunner::TaskRunner>>,
 }
 
 /// Clears `Admin::busy` when the work that set it ends, however it ends.
@@ -390,12 +392,19 @@ impl Admin {
             ops_http: ops::client(),
             oauth: None,
             builtin: None,
+            task_runner: None,
         }
     }
 
     /// Lets the page show and sign in the built-in agents.
     pub fn with_builtin(mut self, hub: Arc<crate::builtin::Hub>) -> Self {
         self.builtin = Some(hub);
+        self
+    }
+
+    /// Lets the page show the task runner's queue and runs, and stop a run.
+    pub fn with_task_runner(mut self, runner: Arc<crate::taskrunner::TaskRunner>) -> Self {
+        self.task_runner = Some(runner);
         self
     }
 
@@ -1645,7 +1654,7 @@ async fn pulse(State(admin): State<Arc<Admin>>) -> Response {
 async fn events(
     State(admin): State<Arc<Admin>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(admin.events.subscribe()).filter_map(|message| {
+    let activity = BroadcastStream::new(admin.events.subscribe()).filter_map(|message| {
         // A listener that fell behind skips what it missed; the page's
         // periodic refresh catches up.
         let activity = message.ok()?;
@@ -1655,6 +1664,14 @@ async fn events(
             .ok()?;
         Some(Ok(event))
     });
+    // The built-in agents' runs: started, a line of output, ended. Lines
+    // are redacted before they are published.
+    let runs = BroadcastStream::new(admin.events.subscribe_runs()).filter_map(|message| {
+        let run = message.ok()?;
+        let event = Event::default().event("run").json_data(&run).ok()?;
+        Some(Ok(event))
+    });
+    let stream = activity.merge(runs);
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
 }
 
@@ -1991,6 +2008,12 @@ struct TaskForm {
     body: String,
     #[serde(default)]
     assignee: String,
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    dokploy_project_id: String,
+    #[serde(default)]
+    cloudflare_zone: String,
 }
 
 /// Adds a task as the admin. The created task is returned.
@@ -2002,6 +2025,11 @@ async fn add_task(State(admin): State<Arc<Admin>>, Json(form): Json<TaskForm>) -
         assignee: form.assignee,
         created_by: ADMIN_ACTOR.into(),
         session_id: None,
+        targets: crate::db::TaskTargets {
+            repo: form.repo,
+            dokploy_project_id: form.dokploy_project_id,
+            cloudflare_zone: form.cloudflare_zone,
+        },
     };
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Task> {
@@ -2037,10 +2065,19 @@ struct TaskUpdateForm {
     action: String,
     #[serde(default)]
     note: String,
+    /// With `action` "targets": the task's repository, Dokploy project
+    /// and Cloudflare zone, replacing the old ones.
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    dokploy_project_id: String,
+    #[serde(default)]
+    cloudflare_zone: String,
 }
 
 /// Moves one task along its life cycle as the admin, who may release or
-/// reopen any task.
+/// reopen any task; or, with the action `targets`, sets where its work
+/// goes.
 async fn update_task(
     State(admin): State<Arc<Admin>>,
     Path(id): Path<i64>,
@@ -2048,6 +2085,29 @@ async fn update_task(
 ) -> Response {
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Task>> {
+        if form.action.trim() == "targets" {
+            let targets = crate::db::TaskTargets {
+                repo: form.repo,
+                dokploy_project_id: form.dokploy_project_id,
+                cloudflare_zone: form.cloudflare_zone,
+            };
+            let Some(task) = state.db.set_task_targets(id, &targets)? else {
+                return Ok(None);
+            };
+            let summary = format!("task #{} targets set", task.id);
+            if let Ok(activity) = state.db.record_activity(
+                ADMIN_ACTOR,
+                "task_update",
+                &task.project,
+                None,
+                None,
+                &[],
+                &summary,
+            ) {
+                state.events.publish(activity);
+            }
+            return Ok(Some(task));
+        }
         let note = form.note.trim();
         let note = (!note.is_empty()).then(|| note.to_string());
         let Some(task) =

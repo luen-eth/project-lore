@@ -384,8 +384,8 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
     // An OAuth access token works as well, as on `/mcp`; a disabled
     // agent is refused either way.
     let presented = presented_token(&parts.headers);
-    let agent = match state.auth.authenticate(&presented).await {
-        Ok(found) => found.agent().to_string(),
+    let (agent, scope) = match state.auth.authenticate(&presented).await {
+        Ok(found) => (found.agent().to_string(), found.scope().cloned()),
         Err(Refused::Disabled { agent, env: true }) => {
             return plain(
                 StatusCode::FORBIDDEN,
@@ -458,6 +458,26 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
         )
         .await;
         return plain(StatusCode::BAD_REQUEST, &reason);
+    }
+
+    // A built-in agent's run token pushes only to its task's repository,
+    // through its task's provider; it fetches from anywhere the
+    // credential can read. This is the one place the git proxy checks it.
+    if let Some(scope) = &scope
+        && is_push(git.endpoint, query)
+        && let Err(reason) = scope.check_push(&git.provider, &git.repo)
+    {
+        conclude(
+            &state,
+            &agent,
+            &git,
+            0,
+            "denied",
+            &reason,
+            elapsed_ms(started),
+        )
+        .await;
+        return plain(StatusCode::FORBIDDEN, &reason);
     }
 
     // Authorisation: `read` covers the fetch pair, `full` is needed for
@@ -1542,6 +1562,169 @@ mod tests {
         );
         db.set_agent_disabled("claude", false, "admin").unwrap();
         assert_eq!(with(TOKEN).send().await.unwrap().status(), StatusCode::OK);
+    }
+
+    /// A run in the database for a built-in agent, scoped to `me/shop`
+    /// through the personal account; answers the run token.
+    fn run_token(db: &Db, run_id: &str) -> String {
+        db.register_builtin_agents(&[("claude-builtin".into(), "claude".into(), "ember")])
+            .unwrap();
+        let token = crate::runscope::new_token().unwrap();
+        let scope = crate::runscope::RunScope {
+            run_id: run_id.into(),
+            agent: "claude-builtin".into(),
+            provider: "github".into(),
+            owner: "me".into(),
+            repo: "shop".into(),
+            dokploy_project_id: None,
+            cloudflare_zone: None,
+        };
+        db.insert_run(&crate::db::NewRun {
+            id: run_id.into(),
+            agent: "claude-builtin".into(),
+            kind: "task".into(),
+            token_hash: crate::oauth::token_hash(&token),
+            token_expires_at: crate::db::unix_now() + 600,
+            scope: serde_json::to_string(&scope).unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+        token
+    }
+
+    /// A run token pushes only to its task's repository, through its
+    /// task's provider; it fetches from anywhere; it dies with its run,
+    /// its revocation and its hard limit; and it is never logged.
+    #[tokio::test]
+    async fn a_run_token_pushes_only_to_its_task_s_repository() {
+        let (base, db, log) = working_proxy().await;
+        let client = reqwest::Client::new();
+        let token = run_token(&db, "run-git-1");
+        let with = |user: &str, token: &str| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{token}"))
+            )
+        };
+        let get = |path: &str, auth: String| {
+            client
+                .get(format!("{base}{path}"))
+                .header(header::AUTHORIZATION, auth)
+                .send()
+        };
+        let push_refs = |repo: &str| format!("/git/{repo}.git/info/refs?service=git-receive-pack");
+        // Its own repository: both halves of a push go through.
+        let response = get(&push_refs("github/me/shop"), with("lore", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = client
+            .post(format!("{base}/git/github/me/shop.git/git-receive-pack"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(b"0000".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = log.lock().unwrap().len();
+        // Another repository, another owner, the other account: refused
+        // before anything goes upstream.
+        for repo in [
+            "github/me/other",
+            "github/someone/shop",
+            "github-org/me/shop",
+        ] {
+            let response = get(&push_refs(repo), with("lore", &token)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{repo}");
+            assert!(
+                response
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains("may push only to me/shop"),
+                "{repo}"
+            );
+            let row = &db.ops_log(1).unwrap()[0];
+            assert_eq!(row.outcome, "denied");
+        }
+        let response = client
+            .post(format!("{base}/git/github/me/other.git/git-receive-pack"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(b"0000".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            sent,
+            "nothing refused went upstream"
+        );
+        // Fetching another repository is allowed.
+        let response = get(
+            "/git/github/someone/library.git/info/refs?service=git-upload-pack",
+            with("lore", &token),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The user name in the Basic header changes nothing: the token's
+        // agent is the one recorded.
+        get(&push_refs("github/me/shop"), with("codex-builtin", &token))
+            .await
+            .unwrap();
+        let row = &db.ops_log(1).unwrap()[0];
+        assert_eq!(row.agent, "claude-builtin");
+        // Never logged.
+        let dump = format!(
+            "{:?}{:?}",
+            db.ops_log(100).unwrap(),
+            db.activity(100).unwrap()
+        );
+        assert!(!dump.contains(&token));
+
+        // Revoked: 401.
+        db.revoke_run_token("run-git-1").unwrap();
+        let response = get(&push_refs("github/me/shop"), with("lore", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // Past its hard limit: 401.
+        let late = run_token(&db, "run-git-2");
+        db.execute_for_test("UPDATE agent_runs SET token_expires_at = 1 WHERE id = 'run-git-2'");
+        let response = get(&push_refs("github/me/shop"), with("lore", &late))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // Its run ended: 401.
+        let ended = run_token(&db, "run-git-3");
+        assert_eq!(
+            get(&push_refs("github/me/shop"), with("lore", &ended))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        db.finish_run(
+            "run-git-3",
+            &crate::db::RunEnd {
+                status: "failed".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let response = get(&push_refs("github/me/shop"), with("lore", &ended))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // A disabled built-in agent's run token: refused too.
+        let live = run_token(&db, "run-git-4");
+        db.set_agent_disabled("claude-builtin", true, "admin")
+            .unwrap();
+        let response = get(&push_refs("github/me/shop"), with("lore", &live))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

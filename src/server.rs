@@ -14,13 +14,14 @@ use serde::Deserialize;
 use crate::{
     auth::{Agent, SHARED_AGENT},
     db::{
-        BODY_MAX_CHARS, Db, Entry, FileInfo, Implicit, KINDS, Message, NOTE_MAX_CHARS, NewEntry,
-        NewFile, NewMessage, NewSession, NewTask, Patch, Rule, Session, TASK_ACTIONS,
+        self, BODY_MAX_CHARS, Db, Entry, FileInfo, Implicit, KINDS, Message, NOTE_MAX_CHARS,
+        NewEntry, NewFile, NewMessage, NewSession, NewTask, Patch, Rule, Session, TASK_ACTIONS,
         TASK_TITLE_MAX_CHARS, Task,
     },
     embed::Embedder,
     events::Events,
     leakscan, mail, ops,
+    runscope::{Decision, RunScope},
     vault::VaultKey,
 };
 
@@ -294,6 +295,17 @@ pub struct TaskAddArgs {
     pub body: Option<String>,
     /// The agent the task is meant for. Omit for anyone.
     pub assignee: Option<String>,
+    /// The GitHub repository the work goes to, e.g.
+    /// `github.com/owner/name`. Omit to use the latest repository lore
+    /// recorded for the project. A built-in agent working on the task may
+    /// push only there.
+    pub repo: Option<String>,
+    /// A Dokploy project id the work may change. Without it a built-in
+    /// agent working on the task may only read Dokploy.
+    pub dokploy_project_id: Option<String>,
+    /// A Cloudflare zone id the work may change. Without it a built-in
+    /// agent working on the task may only read Cloudflare.
+    pub cloudflare_zone: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1261,7 +1273,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Add a task to the shared to-do list of a project: work that should not be forgotten, or that another agent could pick up. Say exactly what needs doing."
+        description = "Add a task to the shared to-do list of a project: work that should not be forgotten, or that another agent could pick up. Say exactly what needs doing. Optionally name the GitHub repository the work goes to (`repo`), and a Dokploy project (`dokploy_project_id`) or Cloudflare zone (`cloudflare_zone`) the work may change: a built-in agent that takes the task may write only there."
     )]
     async fn task_add(
         &self,
@@ -1286,6 +1298,12 @@ impl Lore {
                     .unwrap_or_default(),
                 created_by: actor.to_string(),
                 session_id: Some(session.id.clone()),
+                targets: db::normalize_task_targets(&db::TaskTargets {
+                    repo: args.repo.unwrap_or_default(),
+                    dokploy_project_id: args.dokploy_project_id.unwrap_or_default(),
+                    cloudflare_zone: args.cloudflare_zone.unwrap_or_default(),
+                })
+                .map_err(|error| error.to_string())?,
             };
             let task = this.db.add_task(&new).map_err(internal)?;
             this.note(
@@ -2219,6 +2237,8 @@ impl Lore {
     ) -> Result<String, String> {
         let agent = agent_of(parts);
         let shared = agent == SHARED_AGENT;
+        // A built-in agent's run token carries the scope of its task.
+        let scope = parts.extensions.get::<RunScope>().cloned();
         let session_id = args.session_id.trim().to_string();
         let request = ops::OpsRequest {
             provider,
@@ -2233,8 +2253,13 @@ impl Lore {
         // credential is never even decrypted. Every row of this call is
         // logged under the same name: the session's agent, with the token's
         // agent added when they differ.
-        let (session, label, method, path, granted, guard, leak) = {
-            let (agent, session_id, request) = (agent.clone(), session_id.clone(), request.clone());
+        let (session, label, method, path, granted, guard, leak, decision) = {
+            let (agent, session_id, request, scope) = (
+                agent.clone(),
+                session_id.clone(),
+                request.clone(),
+                scope.clone(),
+            );
             blocking(move || {
                 let session = this.require_session(&session_id, &agent, shared)?;
                 let actor = session_agent(&agent, &session).to_string();
@@ -2280,6 +2305,26 @@ impl Lore {
                         return Err(error.message().to_string());
                     }
                 };
+                // A run token: the one check of what its task allows.
+                let decision = match &scope {
+                    Some(scope) => scope.check_call(&provider, &method, &path),
+                    None => Decision::Allow,
+                };
+                if let Decision::Deny(reason) = &decision {
+                    this.log_op_call(
+                        &label,
+                        &actor,
+                        Some(&session.id),
+                        provider,
+                        &method,
+                        &path,
+                        "denied",
+                        reason,
+                        0,
+                        0,
+                    );
+                    return Err(reason.clone());
+                }
                 match ops::authorize(
                     &this.db,
                     this.vault.as_ref(),
@@ -2303,7 +2348,7 @@ impl Lore {
                         } else {
                             None
                         };
-                        Ok((session, label, method, path, granted, guard, leak))
+                        Ok((session, label, method, path, granted, guard, leak, decision))
                     }
                     Err(denied) => {
                         this.log_op_call(
@@ -2329,6 +2374,45 @@ impl Lore {
             Some(base) if provider.service() == ops::GITHUB.id => base.clone(),
             _ => granted.api_base.clone(),
         };
+        // A Dokploy write in a run: only inside the task's project, whose
+        // ids Dokploy itself lists.
+        if let (Decision::DokployProject(project), Some(scope)) = (&decision, &scope) {
+            let checked =
+                match dokploy_project_ids(&self.http, &api_base, &granted.secret, &guard, project)
+                    .await
+                {
+                    Ok(ids) => scope.check_dokploy(&request, &ids),
+                    Err(reason) => Err(reason),
+                };
+            if let Err(reason) = checked {
+                let this = self.clone();
+                let (session_id, label, actor, method, path, detail) = (
+                    session.id.clone(),
+                    label.clone(),
+                    actor.clone(),
+                    method.clone(),
+                    path.clone(),
+                    reason.clone(),
+                );
+                let _ = blocking(move || {
+                    this.log_op_call(
+                        &label,
+                        &actor,
+                        Some(&session_id),
+                        provider,
+                        &method,
+                        &path,
+                        "denied",
+                        &detail,
+                        0,
+                        0,
+                    );
+                    Ok(())
+                })
+                .await;
+                return Err(reason);
+            }
+        }
         // A write to a public GitHub repository is scanned before anything
         // is sent: a secret lore can recognise never reaches it, and
         // neither does a new public repository unless the administrator
@@ -2757,6 +2841,42 @@ fn public_host(parts: &Parts) -> String {
         })
         .map(str::to_string)
         .unwrap_or_else(|| "<this lore host>".to_string())
+}
+
+/// The ids a Dokploy project holds (`GET /project.one`), for a run that
+/// may change only that project. A project Dokploy does not answer for is
+/// an error: the write is refused.
+async fn dokploy_project_ids(
+    http: &reqwest::Client,
+    api_base: &str,
+    secret: &crate::vault::Secret,
+    guard: &ops::Guard,
+    project: &str,
+) -> Result<Vec<String>, String> {
+    let mut query = serde_json::Map::new();
+    query.insert("projectId".into(), project.into());
+    let request = ops::OpsRequest {
+        provider: ops::DOKPLOY,
+        method: "GET".into(),
+        path: "/project.one".into(),
+        query: Some(query),
+        body: None,
+    };
+    match ops::call(http, api_base, secret, guard, &request).await {
+        Ok(response) if response.status == 200 && !response.truncated => {
+            Ok(crate::runscope::dokploy_tree_ids(&response.body))
+        }
+        Ok(response) => Err(format!(
+            "this run may change Dokploy only inside the project {project}, and Dokploy did not \
+             list it (HTTP {})",
+            response.status
+        )),
+        Err(error) => Err(format!(
+            "this run may change Dokploy only inside the project {project}, and its resources \
+             could not be read: {}",
+            error.message()
+        )),
+    }
 }
 
 /// One provider answer as the tools return it: `HTTP <status>` on the
@@ -3998,6 +4118,242 @@ mod tests {
         for odd in [None, Some("evil.example/x"), Some("a b"), Some("")] {
             assert_eq!(public_host(&parts(odd)), "<this lore host>", "{odd:?}");
         }
+    }
+
+    /// A built-in agent's run token: GitHub writes only under its task's
+    /// repository and through its task's provider, GET anywhere, Dokploy
+    /// and Cloudflare writes only with the task's field and inside it, and
+    /// lore's own protections (the leak scan, `LORE_DOKPLOY_PROTECTED`)
+    /// still apply. Every refusal is logged and nothing is sent.
+    #[tokio::test]
+    async fn a_run_token_writes_only_inside_its_task() {
+        let mut lore = test_lore("run-scope");
+        lore.guard = ops::Guard::new(
+            ["lore-own-secret-value-0001"],
+            ops::parse_protected("lore-app_Xk29fQ").unwrap(),
+        );
+        let (dokploy, dokploy_sent) = dokploy_mock().await;
+        let key = VaultKey::from_env_value(&"ab".repeat(32)).unwrap().unwrap();
+        for (provider, base, credential) in [
+            ("github", "", "ghp_personal-credential"),
+            ("github_org", "", "ghp_organization-credential"),
+            ("dokploy", dokploy.as_str(), "dokploy-credential-value"),
+            ("cloudflare", "", "cloudflare-credential-value"),
+        ] {
+            let (nonce, secret) = key.encrypt(provider, base, credential);
+            lore.db
+                .set_vault(provider, base, &nonce, &secret, "alue")
+                .unwrap();
+        }
+        lore.vault = Some(key);
+        let (api, sent) = github_mock().await;
+        lore.github_api_base = Some(api);
+        let agent = "claude-builtin";
+        let mut scope = RunScope {
+            run_id: "run-1".into(),
+            agent: agent.into(),
+            provider: "github".into(),
+            owner: "me".into(),
+            repo: "shop".into(),
+            dokploy_project_id: None,
+            cloudflare_zone: None,
+        };
+        let as_run = |scope: &RunScope| {
+            let Extension(mut parts) = as_agent(Some(agent));
+            parts.extensions.insert(scope.clone());
+            Extension(parts)
+        };
+        let first = lore.recent(args(json!({})), as_run(&scope)).await.unwrap();
+        let session = notice_id(&first);
+        let call = |method: &str, path: &str, body: Option<serde_json::Value>| {
+            args::<OpsArgs>(json!({
+                "session_id": session, "method": method, "path": path, "body": body
+            }))
+        };
+
+        // GitHub: its own repository, through its own provider.
+        lore.github(
+            call("POST", "/repos/me/shop/pulls", Some(json!({"title": "x"}))),
+            as_run(&scope),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        for (org, path) in [
+            (false, "/repos/me/other/pulls"),
+            (false, "/user/repos"),
+            (false, "/repos/me/shop"),
+            (true, "/repos/me/shop/pulls"),
+        ] {
+            let body = Some(json!({"title": "x"}));
+            let refused = if org {
+                lore.github_org(call("POST", path, body), as_run(&scope))
+                    .await
+            } else {
+                lore.github(call("POST", path, body), as_run(&scope)).await
+            }
+            .unwrap_err();
+            assert!(
+                refused.contains("this run may change only me/shop"),
+                "{refused}"
+            );
+            let row = &lore.db.ops_log(1).unwrap()[0];
+            assert_eq!(row.outcome, "denied", "{path}");
+        }
+        assert_eq!(sent.lock().unwrap().len(), 1, "nothing refused was sent");
+        // GET anywhere, through either account.
+        lore.github(call("GET", "/repos/someone/else", None), as_run(&scope))
+            .await
+            .unwrap();
+        lore.github_org(call("GET", "/orgs/acme/repos", None), as_run(&scope))
+            .await
+            .unwrap();
+        // The leak scan still applies inside the task's repository (an
+        // unknown visibility counts as public).
+        let leaked = lore
+            .github(
+                call(
+                    "POST",
+                    "/repos/me/public-shop/issues",
+                    Some(json!({"body": "lore-own-secret-value-0001"})),
+                ),
+                as_run(&RunScope {
+                    repo: "public-shop".into(),
+                    ..scope.clone()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(leaked.contains("lore refused this call"), "{leaked}");
+
+        // Dokploy and Cloudflare: read-only without the task's field.
+        let refused = lore
+            .dokploy(
+                call(
+                    "POST",
+                    "/application.deploy",
+                    Some(json!({"applicationId": "app-1"})),
+                ),
+                as_run(&scope),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("names no Dokploy project"), "{refused}");
+        let refused = lore
+            .cloudflare(
+                call(
+                    "POST",
+                    "/zones/zone-1/dns_records",
+                    Some(json!({"type": "A"})),
+                ),
+                as_run(&scope),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("names no Cloudflare zone"), "{refused}");
+        lore.dokploy(call("GET", "/project.all", None), as_run(&scope))
+            .await
+            .unwrap();
+        // With the fields: inside the project and the zone only.
+        scope.dokploy_project_id = Some("proj-1234".into());
+        scope.cloudflare_zone = Some("zone-1".into());
+        lore.dokploy(
+            call(
+                "POST",
+                "/application.deploy",
+                Some(json!({"applicationId": "app-1"})),
+            ),
+            as_run(&scope),
+        )
+        .await
+        .unwrap();
+        assert!(
+            dokploy_sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with("POST /api/application.deploy")),
+            "{:?}",
+            dokploy_sent.lock().unwrap()
+        );
+        let refused = lore
+            .dokploy(
+                call(
+                    "POST",
+                    "/application.deploy",
+                    Some(json!({"applicationId": "app-other"})),
+                ),
+                as_run(&scope),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("not one of its resources"), "{refused}");
+        let refused = lore
+            .cloudflare(
+                call(
+                    "POST",
+                    "/zones/zone-2/dns_records",
+                    Some(json!({"type": "A"})),
+                ),
+                as_run(&scope),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("only under /zones/zone-1/"), "{refused}");
+        // lore's own deployment stays protected even inside the project.
+        let refused = lore
+            .dokploy(
+                call(
+                    "POST",
+                    "/application.deploy",
+                    Some(json!({"applicationId": "lore-app_Xk29fQ"})),
+                ),
+                as_run(&scope),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("its own Dokploy deployment"), "{refused}");
+        // Without a run token the same agent name is not limited by a
+        // scope (a built-in agent has no other token; this is the plain
+        // level check).
+        lore.github(
+            call("POST", "/repos/me/other/pulls", Some(json!({"title": "x"}))),
+            as_agent(Some(agent)),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A Dokploy mock: `GET /api/project.one` lists one project's tree;
+    /// everything else is recorded and answered 200. Never a real server.
+    async fn dokploy_mock() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::{Router, extract::Request, routing::any};
+        let sent: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let log = sent.clone();
+        let router = Router::new().route(
+            "/{*rest}",
+            any(move |request: Request| {
+                let log = log.clone();
+                async move {
+                    let path = request.uri().path().to_string();
+                    log.lock()
+                        .unwrap()
+                        .push(format!("{} {}", request.method(), path));
+                    if path == "/api/project.one" {
+                        return r#"{"projectId":"proj-1234","environments":[{"environmentId":"env-1","applications":[{"applicationId":"app-1"},{"applicationId":"lore-app_Xk29fQ"}]}]}"#;
+                    }
+                    "{}"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service())
+                .await
+                .unwrap();
+        });
+        (base, sent)
     }
 
     /// The mock GitHub for the leak scan: `GET /repos/{owner}/{repo}`

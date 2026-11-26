@@ -293,6 +293,16 @@ impl Driver {
         command
     }
 
+    /// A command for a run (part 6b): the CLI's cleared environment and
+    /// stored credentials, in the run's checkout. Lore's link secret never
+    /// reaches it; the run token is added by the caller.
+    pub fn run_command(&self, program: &Path, args: &[String], cwd: &Path) -> Command {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut command = self.command_for(program, &args);
+        command.current_dir(cwd);
+        command
+    }
+
     fn command_for(&self, program: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(program);
         command.args(args).env_clear();

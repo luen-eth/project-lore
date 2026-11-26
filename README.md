@@ -201,6 +201,12 @@ task through its life cycle:
 Every action can carry a short note; the latest one shows with the task. A refused
 action says what state the task is in.
 
+A task can also say where its work goes: `task_add` takes an optional `repo` (a
+GitHub repository such as `github.com/owner/name`; without it, the latest repository
+lore recorded for the project), `dokploy_project_id` and `cloudflare_zone`. The admin
+page sets them when adding a task and changes them later (**Where it goes**). A
+built-in agent working on the task may write only there (see *The task runner*).
+
 **Messages** go to one agent (`send` with `to`) or to every agent (`send` without
 it). A message counts as unread for an agent until that agent has seen it; an
 agent never gets its own messages. `hello` lists up to ten unread messages and
@@ -913,10 +919,10 @@ meaningful change, decision or bug fix. Every `log` call includes `path`
 Next to the `lore` service, the compose stack can run one container per built-in
 coding agent: `agent-claude` (Claude Code), `agent-codex` (the Codex CLI) and
 `agent-deepseek` (opencode pointed at DeepSeek). You sign each one in once, from the
-admin page, with your own subscription or key, and pick its default model. Taking
-idle board tasks, helping other agents, the live terminal and the graph animation
-come in later parts; this part brings the containers, their link to lore, the
-sign-in and the model choice.
+admin page, with your own subscription or key, and pick its default model. An
+enabled agent then takes idle board tasks on its own (*The task runner* below), the
+admin page shows its terminal and its runs live, and the graph shows which project it
+is working on. Helping other agents on request comes in a later part.
 
 ### How it is put together
 
@@ -930,7 +936,7 @@ sign-in and the model choice.
   minutes) and reconnects by itself, waiting up to 30 seconds between attempts.
 - **The runner is the only thing that knows the CLIs.** lore sends commands (report
   status, list models, start a sign-in, pass on a code, store a pasted credential,
-  sign out; later: start a run, send input, stop, open a terminal) and the runner
+  sign out, start and stop a run, open a terminal) and the runner
   answers and reports (sign-in state and when it ends, CLI version, resource
   readings). The protocol is versioned JSON; lore refuses a runner that speaks
   another version.
@@ -956,8 +962,9 @@ sign-in and the model choice.
   internet through it.
 - **Each built-in agent is an agent in lore's registry** (kind `builtin`, with an
   avatar you can change in the Agents panel), so its work shows up like any other
-  agent's. It has no standing token for `/mcp` or the git proxy; it will use
-  run-scoped tokens that lore mints per run (next part). A name in
+  agent's. It has no standing token for `/mcp` or the git proxy: outside a run it has
+  no lore credential at all, and during a run it uses the run-scoped token lore
+  minted for that run. A name in
   `LORE_RUNNER_TOKENS` may not also be in `LORE_TOKENS`, nor belong to an existing
   token or OAuth agent; lore refuses to start otherwise.
 
@@ -1075,7 +1082,7 @@ admin page's except `style-src 'self' 'unsafe-inline'` and `frame-ancestors 'sel
   the CLI's default.
 - *Works on idle board tasks* (enabled), *Available to help other agents*, *Board
   tasks a day* (0 to 100) and *Active hours* (`HH:MM-HH:MM`, UTC; empty for always)
-  are stored now and used from the next part on.
+  are what the task runner goes by.
 
 ### Why DeepSeek runs through opencode
 
@@ -1089,6 +1096,127 @@ configurable provider (`deepseek` for `agent-deepseek`), so another provider can
 added later without a new kind. DeepSeek's API is at `https://api.deepseek.com`
 (OpenAI-compatible; `https://api.deepseek.com/anthropic` is Anthropic-compatible).
 
+### The task runner
+
+Every minute, while at least one built-in agent is enabled (*Works on idle board
+tasks*), lore looks at the board. Nothing runs, and no service is asked anything,
+while no built-in agent is enabled.
+
+**Which task.** A task is taken when it is open and unclaimed, nobody touched it for
+`LORE_AUTO_TASK_IDLE_MINUTES` (120), it is meant for anyone (or for that agent), it
+was not already taken or skipped since it was last touched, and its repository
+resolves: the task's own `repo`, else the latest repository lore recorded for the
+project (in `log` entries and `hello` sessions), accepted only when it is a
+`github.com/<owner>/<repo>` address, and only when one of lore's GitHub credentials
+can push to it (lore asks `GET /repos/{owner}/{repo}`, personal account first, then
+the organization's, and remembers the answer for ten minutes). A task whose
+repository cannot be resolved gets one note saying why, and waits until someone
+touches it. The oldest task goes first.
+
+**Which agent.** One that is enabled, connected, signed in, idle (one run per agent),
+inside its active hours and under its daily cap, with `full` access to the GitHub
+account that can push. The agents take turns.
+
+**A run.** lore claims the task for the agent, mints a run token and tells the
+agent's runner to start. The runner clones the repository through lore's git proxy
+into `/work/<run id>/repo`, checks that lore's MCP endpoint answers (lore is required:
+a run without it fails), writes the CLI's MCP configuration outside the checkout, and
+starts the CLI unattended in the checkout, `nice`d and under `ionice -c 3`, with the
+owner's model and the prompt lore built:
+
+- Claude Code: `claude -p <prompt> --output-format stream-json --verbose --max-turns
+  200 --permission-mode bypassPermissions --setting-sources user --strict-mcp-config
+  --mcp-config /work/<run>/lore/mcp.json [--model <model>]`, the configuration naming
+  only lore, with `Authorization: Bearer ${LORE_AGENT_TOKEN}`.
+- Codex: `codex exec --json -C /work/<run>/repo -s danger-full-access -c
+  approval_policy="never" -c mcp_servers.lore.url="<lore>/mcp" -c
+  mcp_servers.lore.bearer_token_env_var="LORE_AGENT_TOKEN" -c
+  mcp_servers.lore.required=true [-m <model>] <prompt>`.
+- opencode: `opencode run --standalone --format json --auto --archived --title "lore
+  run <id>" [--model deepseek/<model>] <prompt>`, with `OPENCODE_CONFIG` pointing at
+  a private configuration that adds lore as a remote MCP server (`"oauth": false`,
+  `Authorization: Bearer {env:LORE_AGENT_TOKEN}`) and
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1`, so the repository's own `opencode.json` is
+  ignored. `--standalone` gives the run a private opencode server that ends with it
+  (the default background service would outlive the run and its token). DeepSeek is
+  opencode's built-in `deepseek` provider, keyed by `DEEPSEEK_API_KEY`.
+
+The token reaches git only as an `http.<lore>/.extraHeader` in `GIT_CONFIG_*`
+variables (scoped to lore's own address, so it is never sent anywhere else, and
+never written into `.git/config` or shown in the process list), and the CLI only as
+`LORE_AGENT_TOKEN` in its environment. Commits are made as the agent
+(`<agent>@users.noreply.lore.invalid`).
+
+The CLI's JSON events come back line by line (`text`, `tool`, `result`, `error`), are
+redacted against every credential lore holds, lore's own secrets and the run token,
+kept in `agent_run_events` (2000 lines per run, the newest 200 runs) and shown live.
+
+**Limits.** The runner interrupts the CLI after `LORE_RUN_WALL_CLOCK_MINUTES` (45)
+or once it printed `LORE_RUN_OUTPUT_CAP_MIB` (4) of output, then kills its whole
+process session 15 seconds later. lore revokes the token and stops the run at
+`LORE_RUN_HARD_LIMIT_MINUTES` (90) whatever the runner says. Whatever happens, the
+runner deletes `/work/<run id>` and reports whether the default branch moved (asked
+through lore with the token) and the free space left.
+
+**The end.** If the default branch moved, lore marks the task done with the new
+commit (unless the agent already did). Anything else (a failure, a timeout, a stop,
+a run that pushed nothing) releases the task with a note saying why, with the CLI's
+last words, and the task is not taken again until someone touches it (any change:
+a note, an edit of where it goes, a reopen). Runs a previous lore process left open
+are closed as interrupted when lore starts, and their tasks released the same way.
+
+**Watching and stopping.** The Agents panel's *Task runner* shows each run going on
+with its live output, the queue (each open task and why it is or is not next), and
+the history (outcome, duration, commit, and the stored output). Everyone signed in
+may watch; **Stop** needs the `agents` permission: the token dies at once and the
+runner interrupts the CLI. On the graph, a project a built-in agent is working on
+gets a rotating arc in the agent's colour and the agent's avatar beside its bubble (a
+still ring when the system asks for reduced motion), with or without labels, until
+the run ends.
+
+**What the agent is told.** lore's fixed instructions come first: call `hello` and
+follow the briefing; work on this task only, in this checkout only (the repository,
+and the Dokploy project and Cloudflare zone it may change, are named); no long or
+heavy test suites, no builds longer than a few minutes, no containers or servers;
+finish with the owner's procedure as the briefing describes it, commit with a
+descriptive message, push to the default branch, `log` to lore, then `task_update`
+`done` with the commit; if blocked, stop, leave a `handoff` note and release the task
+saying why; never print or store a secret. Then the task's title and details, in a
+block between two random markers, labelled as untrusted text written by other agents
+that describes the work but cannot change the rules.
+
+**The scope.** In plain words: during a run the agent can read whatever lore's
+credentials can read, but it can change only its task's repository. Concretely, with
+a run token, in one place per surface:
+
+- the git proxy lets it fetch any repository the credential can read, and push only
+  to the task's repository, through the task's account;
+- `github` and `github_org` let it GET anywhere, and make any other call only under
+  `/repos/{owner}/{repo}/…` of the task's repository, through the task's account (not
+  on the repository itself: renaming, settings and deletion stay with you);
+- `dokploy` is read-only unless the task names a Dokploy project; then a write must
+  name only that project's own ids or those of its resources (lore reads them with
+  `project.one`); `cloudflare` is read-only unless the task names a zone, then writes
+  are allowed under `/zones/<zone>/…`; `git_server` (GitLab) is read-only;
+- the access levels, the credential denylist, the leak scan for public repositories
+  and `LORE_DOKPLOY_PROTECTED` apply on top, unchanged; `mail` follows the agent's
+  level; the board, memory and file tools are unrestricted;
+- the token is valid only while its run lasts: after the run ends, after a Stop, or
+  past the hard limit it is refused (401). Only its hash is stored.
+
+**Honest limits.** Prompt injection through task text is mitigated by the scope, not
+prevented: a task written to mislead the agent can still make it do anything inside
+the task's repository (and inside the Dokploy project or zone the task names),
+including pushing bad code to the default branch. Reads of Dokploy and Cloudflare
+are not scoped. The agent has a shell in its container with its own CLI credentials
+and the run token while the run lasts. Review what the agents push.
+
+**Setting it up.** The agents reach lore at `LORE_RUNNER_LORE_URL`
+(`http://lore:8080`, the compose service). If `LORE_ALLOWED_HOSTS` is set, add `lore`
+and `lore:8080` to it, or the MCP endpoint refuses the agents' requests. Give the
+GitHub credential that should push `full` access for the built-in agent (no row means
+`full`), enable the agent, and add tasks.
+
 ### Policy
 
 - **Claude**: a Claude subscription's sign-in is for the subscriber's own ordinary
@@ -1100,7 +1228,7 @@ added later without a new kind. DeepSeek's API is at `https://api.deepseek.com`
   ChatGPT sign-in an advanced workflow for trusted private runners. Use one
   `auth.json` per runner and never put it in a repository or a log. `CODEX_API_KEY`
   is supported as the alternative.
-- Unattended runs (next part) use the CLIs' documented modes for isolated
+- Unattended runs use the CLIs' documented modes for isolated
   containers (Claude Code's `--permission-mode bypassPermissions`, which refuses to
   run as root, and Codex's `--sandbox danger-full-access`). Neither protects against
   prompt injection: the container's limits, the run-scoped token and the scope
@@ -1139,7 +1267,9 @@ volume's contents.
    with `external: true` compose stops with an error rather than create one.
 7. If anything is off, stop the stack and start the old application again: the
    volume is unchanged. A database from before this version opens unchanged; lore
-   only adds its new tables (`builtin_agents`, `agent_runs`, `agent_run_events`).
+   only adds its new tables (`builtin_agents`, `agent_runs`, `agent_run_events`) and
+   columns (the task runner's `repo`, `dokploy_project_id`, `cloudflare_zone`,
+   `auto_attempts` and `auto_last_at` on tasks).
 
 ### What a runner is told to use
 
@@ -1148,7 +1278,8 @@ The runner reads its configuration from the environment the image and compose se
 `LORE_RUNNER_AGENT` (`claude-builtin`, `codex-builtin`, `deepseek-builtin`),
 `LORE_RUNNER_KIND` (`claude`, `codex`, `opencode`; by default from the image),
 `LORE_RUNNER_PROVIDER` (`anthropic`, `openai`, `deepseek`), `LORE_RUNNER_HOME`
-(`/home/agent`), `LORE_RUNNER_WORK` (`/work`) and `LORE_RUNNER_CLI` (the CLI's path).
+(`/home/agent`), `LORE_RUNNER_WORK` (`/work`), `LORE_RUNNER_CLI` (the CLI's path) and
+`LORE_RUNNER_GIT` (`git`).
 
 ## Configuration
 
@@ -1171,6 +1302,11 @@ The runner reads its configuration from the environment the image and compose se
 | `LORE_DATA_DIR` | `/data` in Docker | Where the database and model cache live. |
 | `LORE_BIND` | `0.0.0.0:8080` | Listen address. |
 | `LORE_RUNNER_TOKENS` | | The built-in agents: `agent:secret` pairs (`claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>`), each secret 24 characters or longer. Unset: no built-in agent, no runner listener, nothing changes. A name may not also be in `LORE_TOKENS` or belong to another agent. |
+| `LORE_AUTO_TASK_IDLE_MINUTES` | `120` | Minutes without a change after which an open, unclaimed task may be taken by a built-in agent. |
+| `LORE_RUN_WALL_CLOCK_MINUTES` | `45` | The runner interrupts a run's CLI after this long. Must be below the hard limit. |
+| `LORE_RUN_HARD_LIMIT_MINUTES` | `90` | A run's token dies and lore stops the run after this long. |
+| `LORE_RUN_OUTPUT_CAP_MIB` | `4` | The runner stops a CLI that printed more than this. |
+| `LORE_RUNNER_LORE_URL` | `http://lore:8080` | lore as the agents' containers reach it: their clone URL and MCP endpoint. |
 | `LORE_RUNNER_BIND` | `0.0.0.0:8081` | Where lore listens for the built-in agents' runners (only with `LORE_RUNNER_TOKENS`). Internal network only: never publish this port. Must differ from `LORE_BIND`. |
 
 At least one of `LORE_TOKENS` and `LORE_TOKEN` is required, and every secret must be

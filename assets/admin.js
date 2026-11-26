@@ -114,6 +114,8 @@ class Graph {
     this.rings = [];
     this.beams = [];
     this.sprites = new Map();
+    // Built-in agents at work: project → { color, image } (see `work`).
+    this.working = new Map();
     this.view = { x: 0, y: 0, k: 1 };
     this.alpha = 0;
     this.hover = null;
@@ -291,6 +293,15 @@ class Graph {
     this.beams.push({ a, b, color, t: 0 });
   }
 
+  /* A built-in agent's run on a project: `run` is { project, agent,
+     avatar, color }, or null to end the one on `project`. */
+  work(project, run) {
+    if (!run) { this.working.delete(project); return; }
+    const image = new Image();
+    image.src = `/admin/avatars/${encodeURIComponent(run.avatar || "orbit")}.svg`;
+    this.working.set(project, { ...run, image });
+  }
+
   ring(key, color) {
     const node = this.byId.get(key);
     if (node) this.rings.push({ node, age: 0, color });
@@ -396,6 +407,25 @@ class Graph {
         ctx.beginPath();
         ctx.arc(node.x, node.y, node.radius * (node.kind === "hub" ? 1.7 : 1.5), 0, Math.PI * 2);
         ctx.stroke();
+      }
+    }
+
+    // Built-in agents at work: a rotating arc in the agent's colour on the
+    // project's hub (a still ring when motion is reduced), the avatar
+    // beside it. Drawn whether labels show or not.
+    for (const [project, work] of this.working) {
+      const node = this.byId.get("p:" + project);
+      if (!node) continue;
+      const r = node.radius * 2.5 + 5 * thin;
+      ctx.globalAlpha = 0.95; ctx.strokeStyle = work.color; ctx.lineWidth = 2.6 * thin;
+      ctx.beginPath();
+      if (REDUCED_MOTION) ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
+      else { const a = (time / 520) % (Math.PI * 2); ctx.arc(node.x, node.y, r, a, a + Math.PI * 1.25); }
+      ctx.stroke();
+      if (work.image.complete && work.image.naturalWidth) {
+        const size = 24 / k;
+        ctx.globalAlpha = 1;
+        ctx.drawImage(work.image, node.x + r + 2 / k, node.y - r - size * 0.35, size, size);
       }
     }
 
@@ -968,6 +998,7 @@ async function enter(session) {
   state.decorative = false;
   await refresh(true);
   connectStream();
+  loadWorking();
   clearInterval(state.timer); clearInterval(state.clock);
   state.timer = setInterval(fallbackPoll, FALLBACK_POLL_MS);
   state.clock = setInterval(tickClock, 15000);
@@ -989,6 +1020,34 @@ function connectStream() {
   source.addEventListener("activity", (event) => {
     try { onActivity(JSON.parse(event.data)); } catch (_) { /* malformed event: ignore */ }
   });
+  // Built-in agents' runs: the graph shows them; the Agents panel's
+  // built-in section hears them as "lore-run" events.
+  source.addEventListener("run", (event) => {
+    let run;
+    try { run = JSON.parse(event.data); } catch (_) { return; }
+    if (run.type === "started") {
+      graph.work(run.project, { agent: run.agent, run_id: run.run_id, avatar: run.avatar, color: agentColor(run.agent) });
+    } else if (run.type === "ended") {
+      const work = graph.working.get(run.project);
+      if (work && work.run_id === run.run_id) graph.work(run.project, null);
+    }
+    window.dispatchEvent(new CustomEvent("lore-run", { detail: run }));
+  });
+}
+
+/* The runs going on when the page loads (and after a dropped stream). */
+async function loadWorking() {
+  try {
+    const { runs } = await (await api("/admin/api/builtin/active")).json();
+    const projects = new Set(runs.map((run) => run.project));
+    for (const project of [...graph.working.keys()]) if (!projects.has(project)) graph.work(project, null);
+    for (const run of runs) {
+      const work = graph.working.get(run.project);
+      if (!work || work.run_id !== run.run_id) {
+        graph.work(run.project, { agent: run.agent, run_id: run.run_id, avatar: run.avatar, color: agentColor(run.agent) });
+      }
+    }
+  } catch (_) { /* no built-in agents, or offline */ }
 }
 
 /* After a deploy the server runs newer page code than an open tab holds.
@@ -1008,6 +1067,7 @@ function setLive(on) {
 async function fallbackPoll() {
   if (document.hidden) return;
   try {
+    if (state.dropped || graph.working.size) loadWorking();
     const pulse = await (await api("/admin/api/pulse")).json();
     state.agents = pulse.agents;
     renderAgents();
@@ -2030,21 +2090,78 @@ function taskItem(task, admin) {
   metaLine.title = `added ${shortDate(task.created_at)} · updated ${shortDate(task.updated_at)}`;
   item.append(head, metaLine);
   if (task.body) item.append(el("p", "board-body", task.body));
+  const targets = [];
+  if (task.repo) targets.push(`repo ${task.repo}`);
+  if (task.dokploy_project_id) targets.push(`Dokploy ${task.dokploy_project_id}`);
+  if (task.cloudflare_zone) targets.push(`zone ${task.cloudflare_zone}`);
+  if (targets.length) item.append(el("div", "board-meta", targets.join(" · ")));
   if (task.note) item.append(el("p", "board-note", "Note: " + task.note));
   if (admin) {
     const actions = TASK_ACTIONS[task.status] || [];
-    if (actions.length) {
-      const row = el("div", "board-actions");
-      for (const action of actions) {
-        const button = el("button", "ghost small" + (action === "cancel" ? " danger" : ""), ACTION_LABEL[action]);
-        button.type = "button";
-        button.addEventListener("click", () => updateTask(task, action, row));
-        row.append(button);
-      }
-      item.append(row);
+    const row = el("div", "board-actions");
+    for (const action of actions) {
+      const button = el("button", "ghost small" + (action === "cancel" ? " danger" : ""), ACTION_LABEL[action]);
+      button.type = "button";
+      button.addEventListener("click", () => updateTask(task, action, row));
+      row.append(button);
     }
+    if (task.status === "open" || task.status === "claimed") {
+      const edit = el("button", "ghost small", "Where it goes");
+      edit.type = "button";
+      edit.addEventListener("click", () => {
+        const open = item.querySelector(".task-targets-form");
+        if (open) { open.remove(); return; }
+        item.append(targetsForm(task));
+      });
+      row.append(edit);
+    }
+    if (row.childNodes.length) item.append(row);
   }
   return item;
+}
+
+/* The task's repository, Dokploy project and Cloudflare zone: where a
+   built-in agent working on it may write. */
+function targetsForm(task) {
+  const form = el("form", "board-form task-targets-form");
+  form.autocomplete = "off";
+  const field = (label, value, placeholder) => {
+    const wrap = el("label", "board-field");
+    const input = el("input");
+    input.type = "text"; input.maxLength = 200; input.spellcheck = false;
+    input.value = value || ""; input.placeholder = placeholder;
+    wrap.append(el("span", "", label), input);
+    form.append(wrap);
+    return input;
+  };
+  const repo = field("Repository", task.repo, "github.com/owner/name; empty for the project's latest");
+  const dokploy = field("Dokploy project id", task.dokploy_project_id, "read-only without it");
+  const zone = field("Cloudflare zone id", task.cloudflare_zone, "read-only without it");
+  const actions = el("div", "board-form-actions");
+  const save = el("button", "ghost small", "Save");
+  save.type = "submit";
+  actions.append(save);
+  form.append(actions);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    save.disabled = true;
+    try {
+      const response = await api("/admin/api/tasks/" + task.id, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "targets", repo: repo.value.trim(), dokploy_project_id: dokploy.value.trim(), cloudflare_zone: zone.value.trim() }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) { boardStatus(result.error || "That could not be saved.", "bad"); return; }
+      boardStatus(`Task #${task.id}: where the work goes is saved.`, "ok");
+      await loadBoard();
+    } catch (_) {
+      boardStatus("That could not be saved.", "bad");
+    } finally {
+      save.disabled = false;
+    }
+  });
+  return form;
 }
 
 async function updateTask(task, action, row) {
@@ -2154,11 +2271,15 @@ $("task-form").addEventListener("submit", async (event) => {
     title: $("task-title").value.trim(),
     body: $("task-body").value.trim(),
     assignee: $("task-assignee").value,
+    repo: $("task-repo").value.trim(),
+    dokploy_project_id: $("task-dokploy").value.trim(),
+    cloudflare_zone: $("task-zone").value.trim(),
   }, $("task-submit"));
   if (!task) return;
   // The project and the assignee stay for the next task.
   $("task-title").value = "";
   $("task-body").value = "";
+  for (const id of ["task-repo", "task-dokploy", "task-zone"]) $(id).value = "";
   boardStatus(`Task #${task.id} added to ${task.project}.`, "ok");
   await loadBoard();
 });

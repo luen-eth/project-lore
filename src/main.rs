@@ -14,7 +14,9 @@ mod oauth;
 mod ops;
 mod packscan;
 mod runner;
+mod runscope;
 mod server;
+mod taskrunner;
 mod users;
 mod vault;
 
@@ -220,9 +222,26 @@ async fn main() -> Result<()> {
     if admin.is_some() {
         tracing::info!("admin view enabled at /admin; agents may also authorize through OAuth");
     }
-    let admin = match (admin, &hub) {
-        (Some(admin), Some(hub)) => Some(admin.with_builtin(hub.clone())),
-        (admin, _) => admin,
+    // The task runner: built-in agents take idle board tasks. It runs
+    // only with built-in agents, and does nothing while none is enabled.
+    let task_runner = match &hub {
+        Some(hub) => Some(taskrunner::start(
+            db.clone(),
+            hub.clone(),
+            events.clone(),
+            guard.clone(),
+            vault.clone(),
+        )?),
+        None => None,
+    };
+    let admin = match (admin, &hub, &task_runner) {
+        (Some(admin), Some(hub), Some(runner)) => Some(
+            admin
+                .with_builtin(hub.clone())
+                .with_task_runner(runner.clone()),
+        ),
+        (Some(admin), Some(hub), None) => Some(admin.with_builtin(hub.clone())),
+        (admin, _, _) => admin,
     };
     if let Some(hub) = &hub {
         let runner_bind: SocketAddr = env_or("LORE_RUNNER_BIND", "0.0.0.0:8081")

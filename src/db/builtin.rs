@@ -288,6 +288,419 @@ impl Db {
     }
 }
 
+/// Lines of output kept per run; later ones are counted, not stored.
+pub const RUN_EVENTS_KEPT: i64 = 2000;
+
+/// Runs whose output is kept; older runs keep their row, not their lines.
+const RUNS_WITH_EVENTS: i64 = 200;
+
+/// The columns of a run row, in the order `Run::from_row` reads them.
+const RUN_COLUMNS: &str = "id, agent, task_id, kind, project, repo, provider, status, \
+     started_at, ended_at, exit_code, summary, commit_hash, model, task_title, pushed, \
+     work_free_bytes, output_lines, created_at, scope";
+
+/// One run of a built-in agent, as the admin page and the runner see it.
+/// The token is never part of it, not even hashed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Run {
+    pub id: String,
+    pub agent: String,
+    pub task_id: Option<i64>,
+    pub kind: String,
+    pub project: String,
+    pub repo: String,
+    pub provider: String,
+    /// starting | running | done | pushed | failed | stopped | timeout |
+    /// interrupted
+    pub status: String,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub exit_code: Option<i64>,
+    pub summary: String,
+    #[serde(rename = "commit")]
+    pub commit_hash: String,
+    pub model: String,
+    pub task_title: String,
+    pub pushed: bool,
+    pub work_free_bytes: Option<i64>,
+    pub output_lines: i64,
+    pub created_at: String,
+    /// The JSON scope (provider, repository, Dokploy project, zone).
+    #[serde(skip)]
+    pub scope: String,
+}
+
+impl Run {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            agent: row.get(1)?,
+            task_id: row.get(2)?,
+            kind: row.get(3)?,
+            project: row.get(4)?,
+            repo: row.get(5)?,
+            provider: row.get(6)?,
+            status: row.get(7)?,
+            started_at: row.get(8)?,
+            ended_at: row.get(9)?,
+            exit_code: row.get(10)?,
+            summary: row.get(11)?,
+            commit_hash: row.get(12)?,
+            model: row.get(13)?,
+            task_title: row.get(14)?,
+            pushed: row.get(15)?,
+            work_free_bytes: row.get(16)?,
+            output_lines: row.get(17)?,
+            created_at: row.get(18)?,
+            scope: row.get(19)?,
+        })
+    }
+}
+
+/// A run as it starts. The token is given only as its hash.
+#[derive(Debug, Default)]
+pub struct NewRun {
+    pub id: String,
+    pub agent: String,
+    pub task_id: Option<i64>,
+    pub kind: String,
+    pub project: String,
+    pub repo: String,
+    pub provider: String,
+    pub model: String,
+    pub task_title: String,
+    pub token_hash: String,
+    pub token_expires_at: i64,
+    pub scope: String,
+}
+
+/// How a run ended.
+#[derive(Debug, Default)]
+pub struct RunEnd {
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub summary: String,
+    pub commit: String,
+    pub pushed: bool,
+    pub work_free_bytes: Option<i64>,
+}
+
+/// One stored line of a run's output (already redacted).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RunEvent {
+    pub seq: i64,
+    pub at: String,
+    pub stream: String,
+    pub body: String,
+}
+
+/// An open, unclaimed task as the task runner sees it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutoTask {
+    #[serde(flatten)]
+    pub task: super::Task,
+    /// Not touched for the idle threshold.
+    pub idle: bool,
+    /// Taken or skipped by the runner since it was last touched.
+    pub waiting: bool,
+    pub auto_attempts: i64,
+}
+
+impl Db {
+    /// Sets a task's target fields (repository, Dokploy project,
+    /// Cloudflare zone). Touches the task, so the runner looks at it
+    /// again. `None` when there is no such task.
+    pub fn set_task_targets(
+        &self,
+        id: i64,
+        targets: &super::TaskTargets,
+    ) -> Result<Option<super::Task>> {
+        let targets = super::normalize_task_targets(targets)?;
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE tasks SET repo = ?2, dokploy_project_id = ?3, cloudflare_zone = ?4,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1",
+            params![
+                id,
+                targets.repo,
+                targets.dokploy_project_id,
+                targets.cloudflare_zone
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        super::get_task(&conn, id)
+    }
+
+    /// The repository lore recorded most recently for a project: the
+    /// newest `repo` of an entry or a session, whatever its host. Empty
+    /// values and "none" are not repositories.
+    pub fn latest_project_repo(&self, project: &str) -> Result<Option<String>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT repo FROM (
+                     SELECT repo, created_at AS at FROM entries
+                      WHERE project = ?1 AND repo != '' AND lower(repo) != 'none'
+                     UNION ALL
+                     SELECT repo, started_at AS at FROM sessions
+                      WHERE project = ?1 AND repo != '' AND lower(repo) != 'none'
+                 ) ORDER BY at DESC LIMIT 1",
+                params![project],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Every open, unclaimed task, oldest first, with whether it is idle
+    /// (not updated for `idle_minutes`) and whether the runner already
+    /// took or skipped it since it was last touched.
+    pub fn auto_tasks(&self, idle_minutes: i64, limit: usize) -> Result<Vec<AutoTask>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {}, updated_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1),
+                    auto_last_at IS NOT NULL AND auto_last_at >= updated_at, auto_attempts
+             FROM tasks WHERE status = 'open' AND claimed_by = ''
+             ORDER BY created_at, id LIMIT ?2",
+            super::TASK_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let offset = format!("-{} minutes", idle_minutes.max(0));
+        let rows = stmt.query_map(params![offset, limit as i64], |row| {
+            Ok(AutoTask {
+                task: super::Task::from_row(row)?,
+                idle: row.get(18)?,
+                waiting: row.get(19)?,
+                auto_attempts: row.get(20)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Notes on a task why the runner skipped it, without touching it: it
+    /// waits until someone does.
+    pub fn note_task_skip(&self, id: i64, note: &str) -> Result<()> {
+        let note: String = note.chars().take(super::NOTE_MAX_CHARS).collect();
+        self.lock().execute(
+            "UPDATE tasks SET note = ?2, auto_last_at = updated_at WHERE id = ?1",
+            params![id, note],
+        )?;
+        Ok(())
+    }
+
+    /// Records that the runner took a task (counted) or left it (not
+    /// counted): either way it waits until it is touched again.
+    pub fn mark_task_auto(&self, id: i64, attempt: bool) -> Result<()> {
+        self.lock().execute(
+            "UPDATE tasks SET auto_attempts = auto_attempts + ?2, auto_last_at = updated_at
+             WHERE id = ?1",
+            params![id, i64::from(attempt)],
+        )?;
+        Ok(())
+    }
+
+    /// A new run. Its token is stored only as `token_hash`.
+    pub fn insert_run(&self, new: &NewRun) -> Result<Run> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO agent_runs (id, agent, task_id, kind, project, repo, provider, status,
+                                     started_at, token_hash, token_expires_at, scope, model,
+                                     task_title)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'starting',
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?8, ?9, ?10, ?11, ?12)",
+            params![
+                new.id,
+                new.agent,
+                new.task_id,
+                new.kind,
+                new.project,
+                new.repo,
+                new.provider,
+                new.token_hash,
+                new.token_expires_at,
+                new.scope,
+                new.model,
+                new.task_title
+            ],
+        )?;
+        get_run(&conn, &new.id)?.context("run vanished after insert")
+    }
+
+    pub fn run(&self, id: &str) -> Result<Option<Run>> {
+        get_run(&self.lock(), id)
+    }
+
+    /// The runner started the CLI: the run is running.
+    pub fn run_running(&self, id: &str, cli_session: Option<&str>) -> Result<()> {
+        self.lock().execute(
+            "UPDATE agent_runs SET status = CASE WHEN status = 'starting' THEN 'running'
+                                                ELSE status END,
+                 cli_session = COALESCE(?2, cli_session)
+             WHERE id = ?1",
+            params![id, cli_session],
+        )?;
+        Ok(())
+    }
+
+    /// The run ended: its outcome is kept, its token is gone.
+    pub fn finish_run(&self, id: &str, end: &RunEnd) -> Result<Option<Run>> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE agent_runs SET status = ?2, exit_code = ?3, summary = ?4, commit_hash = ?5,
+                 pushed = ?6, work_free_bytes = COALESCE(?7, work_free_bytes),
+                 ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                 token_hash = NULL, token_expires_at = NULL
+             WHERE id = ?1",
+            params![
+                id,
+                end.status,
+                end.exit_code,
+                end.summary.chars().take(1000).collect::<String>(),
+                end.commit,
+                end.pushed,
+                end.work_free_bytes
+            ],
+        )?;
+        get_run(&conn, id)
+    }
+
+    /// Revokes a run's token at once (a stop, the hard limit), before the
+    /// run's end is known.
+    pub fn revoke_run_token(&self, id: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE agent_runs SET token_hash = NULL, token_expires_at = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// The open run a token hash belongs to, while the token is valid:
+    /// the run has not ended, the token was not revoked, and `now` (unix
+    /// seconds) is before its hard limit. Answers `(run id, agent, scope)`.
+    pub fn run_for_token(&self, hash: &str, now: i64) -> Result<Option<(String, String, String)>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT id, agent, scope FROM agent_runs
+                 WHERE token_hash = ?1 AND token_expires_at > ?2
+                   AND status IN ('starting', 'running')",
+                params![hash, now],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// The newest runs, open ones first.
+    pub fn runs(&self, limit: usize) -> Result<Vec<Run>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {RUN_COLUMNS} FROM agent_runs
+             ORDER BY status IN ('starting', 'running') DESC, created_at DESC, rowid DESC
+             LIMIT ?1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![limit as i64], Run::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Runs that have not ended.
+    pub fn open_runs(&self) -> Result<Vec<Run>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {RUN_COLUMNS} FROM agent_runs WHERE status IN ('starting', 'running')
+             ORDER BY created_at"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Run::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Task runs an agent started since midnight UTC, for its daily cap.
+    pub fn task_runs_today(&self, agent: &str) -> Result<i64> {
+        Ok(self.lock().query_row(
+            "SELECT COUNT(*) FROM agent_runs
+             WHERE agent = ?1 AND kind = 'task'
+               AND created_at >= strftime('%Y-%m-%dT00:00:00Z', 'now')",
+            params![agent],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Stores one line of a run's (already redacted) output. Past
+    /// `RUN_EVENTS_KEPT` lines only the count grows.
+    pub fn add_run_event(&self, run_id: &str, seq: i64, stream: &str, body: &str) -> Result<()> {
+        let conn = self.lock();
+        let lines: i64 = conn
+            .query_row(
+                "SELECT output_lines FROM agent_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if lines < RUN_EVENTS_KEPT {
+            conn.execute(
+                "INSERT INTO agent_run_events (run_id, seq, stream, body) VALUES (?1, ?2, ?3, ?4)",
+                params![run_id, seq, stream, body],
+            )?;
+        }
+        conn.execute(
+            "UPDATE agent_runs SET output_lines = output_lines + 1 WHERE id = ?1",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    /// A run's stored output after `after` (a `seq`), oldest first.
+    pub fn run_events(&self, run_id: &str, after: i64, limit: usize) -> Result<Vec<RunEvent>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT seq, at, stream, body FROM agent_run_events
+             WHERE run_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![run_id, after, limit as i64], |row| {
+            Ok(RunEvent {
+                seq: row.get(0)?,
+                at: row.get(1)?,
+                stream: row.get(2)?,
+                body: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Drops the output of all but the newest runs.
+    pub fn prune_run_events(&self) -> Result<()> {
+        self.lock().execute(
+            "DELETE FROM agent_run_events WHERE run_id NOT IN (
+                 SELECT id FROM agent_runs ORDER BY created_at DESC, rowid DESC LIMIT ?1)",
+            params![RUNS_WITH_EVENTS],
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Db {
+    /// A run's token hash, for tests that check it was revoked.
+    pub fn run_token_hash(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.lock().query_row(
+            "SELECT token_hash FROM agent_runs WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?)
+    }
+}
+
+fn get_run(conn: &rusqlite::Connection, id: &str) -> Result<Option<Run>> {
+    let sql = format!("SELECT {RUN_COLUMNS} FROM agent_runs WHERE id = ?1");
+    Ok(conn
+        .query_row(&sql, params![id], Run::from_row)
+        .optional()?)
+}
+
 /// Whether a database already has the built-in agent tables (for tests of
 /// older databases).
 #[cfg(test)]
@@ -348,6 +761,59 @@ mod tests {
         );
         // Without LORE_RUNNER_TOKENS nothing else is written.
         assert!(db.builtin_agent("claude").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_database_of_schema_4_opens_with_every_row_and_gains_the_runner_columns() {
+        let (db, path) = temp_db("schema4");
+        // What a database of schema 4 looks like: the built-in tables, but
+        // none of the task runner's columns.
+        db.execute_for_test(
+            "ALTER TABLE tasks DROP COLUMN repo;
+             ALTER TABLE tasks DROP COLUMN dokploy_project_id;
+             ALTER TABLE tasks DROP COLUMN cloudflare_zone;
+             ALTER TABLE tasks DROP COLUMN auto_attempts;
+             ALTER TABLE tasks DROP COLUMN auto_last_at;
+             ALTER TABLE agent_runs DROP COLUMN model;
+             ALTER TABLE agent_runs DROP COLUMN task_title;
+             ALTER TABLE agent_runs DROP COLUMN pushed;
+             ALTER TABLE agent_runs DROP COLUMN work_free_bytes;
+             ALTER TABLE agent_runs DROP COLUMN cli_session;
+             ALTER TABLE agent_runs DROP COLUMN output_lines;
+             UPDATE meta SET value = '4' WHERE key = 'schema_version';
+             INSERT INTO entries (project, kind, title, body, agent)
+               VALUES ('lore', 'note', 'kept', 'body', 'claude');
+             INSERT INTO tasks (project, title, body, status, created_by, note, created_at, updated_at)
+               VALUES ('lore', 'a task', 'details', 'open', 'claude', 'a note', '2025-01-01T00:00:00Z', '2025-01-02T00:00:00Z');
+             INSERT INTO builtin_agents (name, kind, model, enabled) VALUES ('claude-builtin', 'claude', 'opus', 1);
+             INSERT INTO agent_runs (id, agent, kind, status) VALUES ('old-run', 'claude-builtin', 'task', 'done');",
+        );
+        let before: HashMap<String, i64> = db.table_counts().unwrap().into_iter().collect();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let after: HashMap<String, i64> = db.table_counts().unwrap().into_iter().collect();
+        for (table, count) in &before {
+            assert_eq!(after.get(table), Some(count), "{table}");
+        }
+        assert_eq!(
+            super::super::schema_version(&db.lock()).unwrap(),
+            super::super::SCHEMA_VERSION
+        );
+        let task = &db.tasks(None, &[], 10).unwrap()[0];
+        assert_eq!(
+            (task.title.as_str(), task.body.as_str(), task.note.as_str()),
+            ("a task", "details", "a note")
+        );
+        assert_eq!(task.updated_at, "2025-01-02T00:00:00Z");
+        assert!(task.repo.is_empty() && task.dokploy_project_id.is_empty());
+        let auto = &db.auto_tasks(120, 10).unwrap()[0];
+        assert!(auto.idle && !auto.waiting && auto.auto_attempts == 0);
+        let run = db.run("old-run").unwrap().unwrap();
+        assert_eq!((run.status.as_str(), run.pushed), ("done", false));
+        assert_eq!(
+            db.builtin_agent("claude-builtin").unwrap().unwrap().model,
+            "opus"
+        );
     }
 
     #[test]
