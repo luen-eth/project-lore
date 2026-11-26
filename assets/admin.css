@@ -642,6 +642,66 @@ a.button-link:hover { background: rgba(255, 255, 255, 0.11); }
   #files-project { max-width: none; }
 }
 
+/* The Integrations panel: provider cards, the permissions table and the
+   operations log, in the Board panel's frame. The card forms are static
+   markup; only the status lines and the lists are re-rendered. */
+.integrations-banner {
+  margin: 0; padding: 10px 12px; border-radius: 12px;
+  background: rgba(230, 193, 90, 0.1); border: 1px solid rgba(230, 193, 90, 0.35);
+  color: var(--warn); font-size: 13px;
+}
+.integrations-switch {
+  display: inline-flex; align-items: center; gap: 10px; font-size: 13px;
+  padding: 8px 12px; border-radius: 11px; background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+}
+#integrations-status { margin: 0; min-height: 1.4em; color: var(--muted); }
+#integrations-status:empty { display: none; }
+#integrations-status.ok { color: var(--ok); }
+#integrations-status.bad { color: var(--danger); }
+.integrations h4 {
+  margin: 6px 0 0; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.1em; color: var(--muted); font-weight: 600;
+}
+.integration-form { display: grid; gap: 8px; padding-top: 8px; margin-top: 2px; }
+.int-url-view { margin: 2px 0 0; }
+.int-result { margin: 4px 0 0; color: var(--muted); }
+.int-result.ok { color: var(--ok); }
+.int-result.bad { color: var(--danger); }
+.integrations .board-actions { margin-top: 0; }
+.perm-box { overflow-x: auto; }
+.perm-grid { width: 100%; border-collapse: collapse; font-size: 12px; }
+.perm-grid th, .perm-grid td { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.perm-grid tr > :first-child { padding-left: 0; }
+.perm-grid th { color: var(--muted); font-weight: 500; }
+.perm-grid thead th { padding-top: 0; }
+.perm-grid select { padding: 4px 8px; font-size: 12px; }
+.pill.level-off { color: var(--muted); }
+.pill.level-read { color: var(--warn); }
+.pill.level-full { color: var(--ok); }
+.pill.ok { color: var(--ok); }
+.pill.denied { color: var(--warn); }
+.pill.error { color: var(--danger); }
+.ops-log { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; font-size: 12px; }
+.ops-log .none { color: var(--muted); }
+.ops-row {
+  display: flex; align-items: baseline; gap: 10px; min-width: 0;
+  padding: 4px 6px; border-radius: 8px; background: rgba(255, 255, 255, 0.03);
+  overflow-wrap: anywhere;
+}
+.ops-when { font-family: var(--mono); color: var(--muted); flex: none; }
+.ops-agent { font-weight: 560; flex: none; }
+.ops-provider { color: var(--muted); flex: none; }
+.ops-call { font-family: var(--mono); flex: 1; min-width: 0; }
+.ops-status { font-family: var(--mono); color: var(--muted); flex: none; }
+
+@media (max-width: 760px) {
+  .perm-grid th, .perm-grid td { padding: 6px 8px; }
+  .perm-grid select { min-height: 40px; font-size: 14px; }
+  .ops-row { flex-wrap: wrap; }
+  .ops-call { flex-basis: 100%; order: 5; }
+}
+
 .tooltip {
   position: fixed; z-index: 5; pointer-events: none;
   max-width: 300px; padding: 8px 11px;

@@ -29,11 +29,13 @@ use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use crate::{
     auth::{RateLimiter, client_ip, too_many_requests},
     db::{
-        Backup, Db, FileInfo, Message, NewFile, NewMessage, NewTask, ProfileInput, Rule, RuleInput,
-        Session, Task,
+        Backup, Db, FileInfo, Message, NewFile, NewMessage, NewTask, OPS_LEVELS, ProfileInput,
+        Rule, RuleInput, Session, Task,
     },
     embed::Embedder,
     events::Events,
+    ops,
+    vault::{Secret, VaultKey},
 };
 
 const COOKIE: &str = "lore_session";
@@ -105,9 +107,14 @@ pub struct Admin {
     pub idle_hours: u32,
     pub events: Events,
     pub embedder: Embedder,
+    /// The vault key, when the administrator set one. Without it no
+    /// credential can be stored, and the integrations panel says so.
+    pub vault: Option<VaultKey>,
     sessions: Mutex<HashMap<String, (Instant, Role)>>,
     logins: RateLimiter,
     http: reqwest::Client,
+    /// The client provider calls go through: no redirects, 60 s timeout.
+    ops_http: reqwest::Client,
 }
 
 impl Admin {
@@ -127,6 +134,7 @@ impl Admin {
         events: Events,
         embedder: Embedder,
         idle_hours: u32,
+        vault: Option<VaultKey>,
     ) -> Self {
         Self {
             db,
@@ -140,6 +148,7 @@ impl Admin {
             idle_hours,
             events,
             embedder,
+            vault,
             sessions: Mutex::new(HashMap::new()),
             // Five wrong attempts lock the address out for fifteen minutes.
             logins: RateLimiter::new(5, Duration::from_secs(15 * 60)),
@@ -147,6 +156,7 @@ impl Admin {
                 .timeout(Duration::from_secs(8))
                 .build()
                 .expect("building the HTTP client"),
+            ops_http: ops::client(),
         }
     }
 
@@ -173,6 +183,7 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/admin/api/files", get(files))
         .route("/admin/api/files/{id}", get(file_detail))
         .route("/admin/api/files/{id}/download", get(download_file))
+        .route("/admin/api/integrations", get(integrations))
         .layer(middleware::from_fn_with_state(
             admin.clone(),
             require_session,
@@ -219,6 +230,26 @@ pub fn router(admin: Arc<Admin>) -> Router {
             post(upload_file).layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES)),
         )
         .route("/admin/api/files/{id}", delete(delete_file))
+        // Credentials speak for the whole server, so only the admin role
+        // reaches the integrations writes.
+        .route(
+            "/admin/api/integrations/{provider}",
+            put(save_integration)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
+                .delete(delete_integration),
+        )
+        .route(
+            "/admin/api/integrations/{provider}/test",
+            post(test_integration),
+        )
+        .route(
+            "/admin/api/integrations/permissions",
+            put(save_permission).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/integrations/enabled",
+            put(set_integration_enabled).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
         .layer(middleware::from_fn_with_state(admin.clone(), require_admin));
 
     Router::new()
@@ -1267,6 +1298,443 @@ impl RuleForm {
     }
 }
 
+/// Everything the Integrations panel shows: the vault state, the kill
+/// switch, the four providers, the agents with their permissions and the
+/// latest operations. No credential in any of it.
+async fn integrations(State(admin): State<Arc<Admin>>) -> Response {
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let vault = state.db.vault_status()?;
+        let enabled = state.db.ops_enabled()?;
+        let agents: Vec<String> = state
+            .db
+            .agents(&state.configured_agents)?
+            .into_iter()
+            .map(|agent| agent.name)
+            .collect();
+        let permissions = state.db.ops_permissions()?;
+        let log = state.db.ops_log(100)?;
+        let mut providers: Vec<serde_json::Value> = Vec::new();
+        for (provider, row) in ops::ALL.iter().zip(vault.iter()) {
+            // Whether the current key still opens the stored credential: a
+            // changed LORE_VAULT_KEY leaves rows nobody can use. Only the
+            // yes or no leaves this block.
+            let readable = match (row.configured, state.vault.as_ref()) {
+                (true, Some(key)) => state.db.vault(provider.id)?.is_some_and(|stored| {
+                    key.decrypt(provider.id, &stored.base_url, &stored.nonce, &stored.secret)
+                        .is_ok()
+                }),
+                _ => false,
+            };
+            providers.push(json!({
+                "id": provider.id,
+                "label": provider.label,
+                "needs_url": provider.needs_url,
+                "configured": row.configured,
+                "readable": readable,
+                "base_url": row.base_url,
+                "hint": row.hint,
+                "updated_at": row.updated_at,
+            }));
+        }
+        Ok(json!({
+            "vault_enabled": state.vault.is_some(),
+            "enabled": enabled,
+            "providers": providers,
+            "agents": agents,
+            "permissions": permissions,
+            "log": log,
+        }))
+    })
+    .await;
+    respond(result)
+}
+
+#[derive(Deserialize)]
+struct IntegrationForm {
+    #[serde(default)]
+    secret: String,
+    #[serde(default)]
+    base_url: String,
+}
+
+/// Stores one provider's credential, or changes the server URL of one
+/// already stored. The secret is encrypted before it is written; no
+/// response, log line or activity summary ever carries it.
+async fn save_integration(
+    State(admin): State<Arc<Admin>>,
+    Path(provider_id): Path<String>,
+    Json(form): Json<IntegrationForm>,
+) -> Response {
+    let Some(provider) = ops::Provider::find(&provider_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(key) = admin.vault.clone() else {
+        return bad_request(
+            "the vault is not enabled: set LORE_VAULT_KEY on the server to store credentials",
+        );
+    };
+    let secret = form.secret.trim().to_string();
+    let url = form.base_url.trim().to_string();
+    // Everything is validated before the secret is used, so no error
+    // message can echo it back.
+    if secret.is_empty() && !url.is_empty() {
+        // The server URL is sealed into the credential: pointing a stored
+        // credential at another server would send it there unseen.
+        return bad_request("enter the credential again to change the server URL");
+    }
+    if secret.is_empty() {
+        return bad_request("paste the credential");
+    }
+    if !(8..=4096).contains(&secret.chars().count()) {
+        return bad_request("the credential must be between 8 and 4096 characters");
+    }
+    // It travels in an HTTP header: printable ASCII, no spaces.
+    if !secret.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return bad_request(
+            "the credential must be printable ASCII without spaces; check what was pasted",
+        );
+    }
+    if !provider.needs_url && !url.is_empty() {
+        return bad_request(&format!(
+            "{} does not take a server URL; its API base is fixed",
+            provider.label
+        ));
+    }
+    if provider.needs_url && url.is_empty() {
+        return bad_request(&format!("{} needs the server URL as well", provider.id));
+    }
+    let url = if url.is_empty() {
+        url
+    } else {
+        match ops::normalize_server_url(&url) {
+            Ok(url) => url,
+            Err(message) => return bad_request(&message),
+        }
+    };
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let (nonce, ciphertext) = key.encrypt(provider.id, &url, &secret);
+        let count = secret.chars().count();
+        let hint: String = secret.chars().skip(count.saturating_sub(4)).collect();
+        state
+            .db
+            .set_vault(provider.id, &url, &nonce, &ciphertext, &hint)?;
+        let summary = format!("saved the {} credential", provider.id);
+        if let Ok(activity) =
+            state
+                .db
+                .record_activity(ADMIN_ACTOR, "integrations", "", None, None, &[], &summary)
+        {
+            state.events.publish(activity);
+        }
+        Ok(json!({ "ok": true }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "saving a credential failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Removes one provider's credential.
+async fn delete_integration(
+    State(admin): State<Arc<Admin>>,
+    Path(provider_id): Path<String>,
+) -> Response {
+    let Some(provider) = ops::Provider::find(&provider_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let state = admin.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
+            if !state.db.delete_vault(provider.id)? {
+                return Ok(None);
+            }
+            let summary = format!("removed the {} credential", provider.id);
+            if let Ok(activity) =
+                state
+                    .db
+                    .record_activity(ADMIN_ACTOR, "integrations", "", None, None, &[], &summary)
+            {
+                state.events.publish(activity);
+            }
+            Ok(Some(json!({ "ok": true })))
+        })
+        .await;
+    match result {
+        Ok(Ok(Some(value))) => Json(value).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "removing a credential failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Makes one harmless read through the very same call the agents use, so
+/// the administrator sees whether a stored credential works. The answer is
+/// one human sentence, never the response body.
+async fn test_integration(
+    State(admin): State<Arc<Admin>>,
+    Path(provider_id): Path<String>,
+) -> Response {
+    let Some(provider) = ops::Provider::find(&provider_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // The credential is read and decrypted off the async runtime; a
+    // refusal writes its own log row and is answered without a call.
+    let prepared = {
+        let state = admin.clone();
+        tokio::task::spawn_blocking(
+            move || -> anyhow::Result<Result<(String, Secret), String>> {
+                let request = provider.test_request();
+                let Some(key) = state.vault.as_ref() else {
+                    state.db.log_op(
+                        ADMIN_ACTOR,
+                        None,
+                        provider.id,
+                        "GET",
+                        &request.path,
+                        0,
+                        "denied",
+                        "the vault is not enabled",
+                        0,
+                    )?;
+                    return Ok(Err(
+                        "Set LORE_VAULT_KEY on the server to store credentials.".into(),
+                    ));
+                };
+                let Some(row) = state.db.vault(provider.id)? else {
+                    state.db.log_op(
+                        ADMIN_ACTOR,
+                        None,
+                        provider.id,
+                        "GET",
+                        &request.path,
+                        0,
+                        "denied",
+                        "no credential is stored",
+                        0,
+                    )?;
+                    return Ok(Err(format!("No {} credential is stored.", provider.id)));
+                };
+                if provider.needs_url && row.base_url.trim().is_empty() {
+                    state.db.log_op(
+                        ADMIN_ACTOR,
+                        None,
+                        provider.id,
+                        "GET",
+                        &request.path,
+                        0,
+                        "denied",
+                        "no server URL is stored",
+                        0,
+                    )?;
+                    return Ok(Err(format!("No {} server URL is stored.", provider.id)));
+                }
+                let Ok(secret) = key.decrypt(provider.id, &row.base_url, &row.nonce, &row.secret)
+                else {
+                    state.db.log_op(
+                        ADMIN_ACTOR,
+                        None,
+                        provider.id,
+                        "GET",
+                        &request.path,
+                        0,
+                        "denied",
+                        "the stored credential cannot be decrypted",
+                        0,
+                    )?;
+                    return Ok(Err(format!(
+                        "The stored {} credential cannot be decrypted with the current \
+                         LORE_VAULT_KEY; enter it again.",
+                        provider.id
+                    )));
+                };
+                Ok(Ok((provider.api_base(&row.base_url), secret)))
+            },
+        )
+        .await
+    };
+    let (base, secret) = match prepared {
+        Ok(Ok(Ok(pair))) => pair,
+        Ok(Ok(Err(message))) => {
+            return Json(json!({ "ok": false, "status": 0, "message": message })).into_response();
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "reading the vault failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "the vault task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let request = provider.test_request();
+    let started = Instant::now();
+    let outcome = ops::call(&admin.ops_http, &base, &secret, &request).await;
+    // What the test found, ready to answer and to log.
+    let (ok, status, message, log_status, log_outcome, log_detail) = match &outcome {
+        Ok(response) => {
+            let status = response.status;
+            let ok = (200..300).contains(&status);
+            let message = if ok {
+                format!(
+                    "{} answered {status}: the credential works.",
+                    provider.label
+                )
+            } else if status == 401 || status == 403 {
+                format!("{} refused the credential ({status}).", provider.label)
+            } else {
+                format!("{} answered {status}.", provider.label)
+            };
+            (ok, status, message, status as i64, "ok", String::new())
+        }
+        Err(ops::OpsError::Transport(reason)) => (
+            false,
+            0,
+            format!("{} could not be reached: {reason}.", provider.label),
+            0,
+            "error",
+            reason.clone(),
+        ),
+        Err(ops::OpsError::Invalid(reason)) => {
+            (false, 0, reason.clone(), 0, "error", reason.clone())
+        }
+    };
+    let summary = format!(
+        "tested {} ({})",
+        provider.id,
+        if ok { "ok" } else { "failed" }
+    );
+    let state = admin.clone();
+    let log = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let duration = started.elapsed().as_millis() as i64;
+        state.db.log_op(
+            ADMIN_ACTOR,
+            None,
+            provider.id,
+            "GET",
+            &request.path,
+            log_status,
+            log_outcome,
+            &log_detail,
+            duration,
+        )?;
+        if let Ok(activity) =
+            state
+                .db
+                .record_activity(ADMIN_ACTOR, "integrations", "", None, None, &[], &summary)
+        {
+            state.events.publish(activity);
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(error) = log {
+        tracing::warn!(%error, "writing the ops log failed");
+    }
+    Json(json!({ "ok": ok, "status": status, "message": message })).into_response()
+}
+
+#[derive(Deserialize)]
+struct PermissionForm {
+    #[serde(default)]
+    agent: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    level: String,
+}
+
+/// Sets one agent's level on one provider.
+async fn save_permission(
+    State(admin): State<Arc<Admin>>,
+    Json(form): Json<PermissionForm>,
+) -> Response {
+    let agent = form.agent.trim().to_lowercase();
+    if agent.is_empty() {
+        return bad_request("agent must not be empty");
+    }
+    let Some(provider) = ops::Provider::find(&form.provider) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let level = form.level.trim().to_lowercase();
+    if !OPS_LEVELS.contains(&level.as_str()) {
+        return bad_request("level must be one of: off, read, full");
+    }
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        state.db.set_ops_level(&agent, provider.id, &level)?;
+        let summary = format!("{} → {}: {}", agent, provider.id, level);
+        if let Ok(activity) =
+            state
+                .db
+                .record_activity(ADMIN_ACTOR, "integrations", "", None, None, &[], &summary)
+        {
+            state.events.publish(activity);
+        }
+        Ok(json!({ "ok": true }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "saving a permission failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct EnabledForm {
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+/// Sets the kill switch: whether agents may operate the services at all.
+async fn set_integration_enabled(
+    State(admin): State<Arc<Admin>>,
+    Json(form): Json<EnabledForm>,
+) -> Response {
+    let Some(enabled) = form.enabled else {
+        return bad_request("enabled must be true or false");
+    };
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        state.db.set_ops_enabled(enabled)?;
+        let summary = if enabled {
+            "switched agent operations on"
+        } else {
+            "switched agent operations off"
+        };
+        if let Ok(activity) =
+            state
+                .db
+                .record_activity(ADMIN_ACTOR, "integrations", "", None, None, &[], summary)
+        {
+            state.events.publish(activity);
+        }
+        Ok(json!({ "ok": true }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "switching operations failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 /// Adds a rule. The created rule is returned.
 async fn add_rule(State(admin): State<Arc<Admin>>, Json(form): Json<RuleForm>) -> Response {
     let input = form.input();
@@ -1443,9 +1911,13 @@ fn random_token() -> Result<String, getrandom::Error> {
 mod tests {
     use super::*;
 
+    fn test_vault_key() -> VaultKey {
+        VaultKey::from_env_value(&"ab".repeat(32)).unwrap().unwrap()
+    }
+
     /// Serves the admin router on a free local port with one admin and one
     /// viewer session already signed in.
-    async fn serve() -> (String, Arc<Admin>) {
+    async fn serve_with(vault: Option<VaultKey>) -> (String, Arc<Admin>) {
         // The thread id keeps parallel tests off each other's database.
         let dir = std::env::temp_dir().join(format!(
             "lore-admin-test-{}-{:?}",
@@ -1466,6 +1938,7 @@ mod tests {
             Events::new(),
             Embedder::disabled(),
             12,
+            vault,
         ));
         {
             let mut sessions = admin.sessions.lock().unwrap();
@@ -1485,6 +1958,10 @@ mod tests {
             .unwrap();
         });
         (base, admin)
+    }
+
+    async fn serve() -> (String, Arc<Admin>) {
+        serve_with(Some(test_vault_key())).await
     }
 
     #[tokio::test]
@@ -2098,5 +2575,442 @@ mod tests {
             .status(),
             404
         );
+    }
+
+    #[tokio::test]
+    async fn integrations_reads_and_writes_follow_the_roles() {
+        let (base, _admin) = serve().await;
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: String, token: Option<&str>| {
+            let mut request = client.request(method, format!("{base}{path}"));
+            if let Some(token) = token {
+                request = request.header(header::COOKIE, format!("{COOKIE}={token}"));
+            }
+            request
+        };
+
+        // Reads: any signed-in role, nobody else.
+        let status = call(reqwest::Method::GET, "/admin/api/integrations".into(), None)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 401);
+        let response = call(
+            reqwest::Method::GET,
+            "/admin/api/integrations".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let first: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(first["vault_enabled"], true);
+        assert_eq!(first["enabled"], true);
+        assert_eq!(first["providers"].as_array().unwrap().len(), 4);
+        assert!(first["permissions"].as_array().unwrap().is_empty());
+        assert!(first["log"].as_array().unwrap().is_empty());
+        let names: Vec<&str> = first["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| agent.as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"claude"));
+
+        // Writes: the viewer is refused, nobody else is not even signed in.
+        let credential = json!({ "secret": "ghp_not-a-real-token-9999", "base_url": "" });
+        for token in [None, Some("viewer-token")] {
+            let expected = if token.is_some() { 403 } else { 401 };
+            for request in [
+                call(
+                    reqwest::Method::PUT,
+                    "/admin/api/integrations/github".into(),
+                    token,
+                )
+                .json(&credential),
+                call(
+                    reqwest::Method::DELETE,
+                    "/admin/api/integrations/github".into(),
+                    token,
+                ),
+                call(
+                    reqwest::Method::POST,
+                    "/admin/api/integrations/github/test".into(),
+                    token,
+                ),
+                call(
+                    reqwest::Method::PUT,
+                    "/admin/api/integrations/permissions".into(),
+                    token,
+                )
+                .json(&json!({ "agent": "claude", "provider": "github", "level": "read" })),
+                call(
+                    reqwest::Method::PUT,
+                    "/admin/api/integrations/enabled".into(),
+                    token,
+                )
+                .json(&json!({ "enabled": false })),
+            ] {
+                assert_eq!(request.send().await.unwrap().status(), expected);
+            }
+        }
+
+        // The admin stores a GitHub credential.
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/github".into(),
+            Some("admin-token"),
+        )
+        .json(&credential)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        // The stored credential never appears in the integrations JSON.
+        let response = call(
+            reqwest::Method::GET,
+            "/admin/api/integrations".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let shown: serde_json::Value = response.json().await.unwrap();
+        let raw = serde_json::to_string(&shown).unwrap();
+        assert!(
+            !raw.contains("not-a-real-token"),
+            "the credential leaked into the panel JSON"
+        );
+        let github = shown["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "github")
+            .cloned()
+            .unwrap();
+        assert_eq!(github["configured"], true);
+        assert_eq!(github["hint"], "9999");
+        assert!(
+            github["updated_at"]
+                .as_str()
+                .is_some_and(|at| !at.is_empty())
+        );
+
+        // A gitlab credential with its server URL; the pasted /api/v4 form
+        // is accepted. The URL alone cannot move the stored credential to
+        // another server: it is sealed with it, so it must be entered again.
+        let gitlab = json!({
+            "secret": "glpat_not-real-either-88",
+            "base_url": "https://git.example.com/api/v4/",
+        });
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/gitlab".into(),
+            Some("admin-token"),
+        )
+        .json(&gitlab)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/gitlab".into(),
+            Some("admin-token"),
+        )
+        .json(&json!({ "secret": "", "base_url": "https://git.example.de/" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("enter the credential again")),
+            "{body}"
+        );
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/gitlab".into(),
+            Some("admin-token"),
+        )
+        .json(
+            &json!({ "secret": "glpat_not-real-either-88", "base_url": "https://git.example.de/" }),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let shown: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/integrations".into(),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let gitlab = shown["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "gitlab")
+            .cloned()
+            .unwrap();
+        assert_eq!(gitlab["base_url"], "https://git.example.de");
+        assert_eq!(gitlab["readable"], true);
+        assert!(
+            !serde_json::to_string(&shown)
+                .unwrap()
+                .contains("not-real-either"),
+            "the credential leaked into the panel JSON"
+        );
+
+        // Validation: no secret and no URL; a secret that is too short; a
+        // URL on a provider with a fixed base; a URL that is not https.
+        for bad in [
+            json!({ "secret": "", "base_url": "" }),
+            json!({ "secret": "short", "base_url": "" }),
+            json!({ "secret": "has a space in it", "base_url": "" }),
+            json!({ "secret": "non-ascii-é-secret", "base_url": "" }),
+            json!({ "secret": "valid-length-secret", "base_url": "https://example.com" }),
+            json!({ "secret": "valid-length-secret", "base_url": "http://git.example.com" }),
+        ] {
+            let response = call(
+                reqwest::Method::PUT,
+                "/admin/api/integrations/github".into(),
+                Some("admin-token"),
+            )
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), 400);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty())
+            );
+        }
+        // An unknown provider is a 404, on every route.
+        for request in [
+            call(
+                reqwest::Method::PUT,
+                "/admin/api/integrations/shop".into(),
+                Some("admin-token"),
+            )
+            .json(&credential),
+            call(
+                reqwest::Method::DELETE,
+                "/admin/api/integrations/shop".into(),
+                Some("admin-token"),
+            ),
+            call(
+                reqwest::Method::POST,
+                "/admin/api/integrations/shop/test".into(),
+                Some("admin-token"),
+            ),
+        ] {
+            assert_eq!(request.send().await.unwrap().status(), 404);
+        }
+
+        // The permissions and the kill switch, as the admin sets them.
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/permissions".into(),
+            Some("admin-token"),
+        )
+        .json(&json!({ "agent": "Claude", "provider": "GitHub", "level": "READ" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/enabled".into(),
+            Some("admin-token"),
+        )
+        .json(&json!({ "enabled": false }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let shown: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/integrations".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(shown["enabled"], false);
+        let rows = shown["permissions"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (
+                rows[0]["agent"].as_str().unwrap(),
+                rows[0]["provider"].as_str().unwrap(),
+                rows[0]["level"].as_str().unwrap()
+            ),
+            ("claude", "github", "read")
+        );
+        for bad in [
+            json!({ "agent": "", "provider": "github", "level": "read" }),
+            json!({ "agent": "claude", "provider": "github", "level": "sometimes" }),
+            json!({ "agent": "claude", "provider": "github" }),
+        ] {
+            let response = call(
+                reqwest::Method::PUT,
+                "/admin/api/integrations/permissions".into(),
+                Some("admin-token"),
+            )
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), 400);
+        }
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/permissions".into(),
+            Some("admin-token"),
+        )
+        .json(&json!({ "agent": "claude", "provider": "shop", "level": "read" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 404);
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/enabled".into(),
+            Some("admin-token"),
+        )
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        // Switched back on.
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/enabled".into(),
+            Some("admin-token"),
+        )
+        .json(&json!({ "enabled": true }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // A test call against a provider with nothing stored says so, and
+        // records itself in the log with the admin's name.
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/integrations/cloudflare/test".into(),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let tested: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(tested["ok"], false);
+        assert!(
+            tested["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("No cloudflare credential"))
+        );
+
+        // Deleting: once, then a 404.
+        let response = call(
+            reqwest::Method::DELETE,
+            "/admin/api/integrations/github".into(),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let shown: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/integrations".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let github = shown["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "github")
+            .cloned()
+            .unwrap();
+        assert_eq!(github["configured"], false);
+        assert_eq!(github["hint"], "");
+        assert_eq!(
+            call(
+                reqwest::Method::DELETE,
+                "/admin/api/integrations/github".into(),
+                Some("admin-token"),
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            404
+        );
+        // The refused test call left its row, under the admin's name.
+        let log = shown["log"].as_array().unwrap();
+        assert!(
+            log.iter()
+                .any(|row| row["agent"] == "admin" && row["provider"] == "cloudflare"),
+            "the refused test was not logged"
+        );
+    }
+
+    #[tokio::test]
+    async fn storing_a_credential_needs_the_vault() {
+        let (base, _admin) = serve_with(None).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .put(format!("{base}/admin/api/integrations/github"))
+            .header(header::COOKIE, format!("{COOKIE}=admin-token"))
+            .json(&json!({ "secret": "valid-length-secret", "base_url": "" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("LORE_VAULT_KEY")),
+            "the error should name the variable: {body}"
+        );
+        // The panel says the vault is off.
+        let shown: serde_json::Value = client
+            .get(format!("{base}/admin/api/integrations"))
+            .header(header::COOKIE, format!("{COOKIE}=viewer-token"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(shown["vault_enabled"], false);
     }
 }

@@ -37,10 +37,18 @@ const TOOLS = {
   file_get: { verb: "read a file", tone: "read" },
   files: { verb: "looked at the files", tone: "read" },
   file_delete: { verb: "deleted a file", tone: "remove" },
+  integrations: { verb: "looked at the integrations", tone: "read" },
+  cloudflare: { verb: "called Cloudflare", tone: "write" },
+  github: { verb: "called GitHub", tone: "write" },
+  git_server: { verb: "called the git server", tone: "write" },
+  dokploy: { verb: "called Dokploy", tone: "write" },
+  git_fetch: { verb: "fetched a repository", tone: "read" },
+  git_push: { verb: "pushed to a repository", tone: "write" },
 };
 const WRITES = new Set([
   "hello", "checkin", "bye", "log", "amend", "forget", "profile", "rules", "import", "restore", "reindex",
   "task_add", "task_update", "send", "handoff", "file_save", "file_delete",
+  "cloudflare", "github", "git_server", "dokploy", "git_push",
 ]);
 const FALLBACK_POLL_MS = 30000;
 const FEED_MAX = 120;
@@ -742,6 +750,8 @@ function showLogin() {
   Object.assign(board, { data: null, tab: "tasks", filter: "open", project: "" });
   closeFiles();
   resetFiles();
+  closeIntegrations();
+  resetIntegrations();
   closeDetail();
   $("side").classList.remove("open");
   $("feed").classList.remove("open");
@@ -1077,6 +1087,7 @@ async function onActivity(activity) {
   addToFeed(activity, true);
   boardActivity();
   filesActivity(activity);
+  integrationsActivity(activity);
 
   const agent = state.agents.find((a) => a.name === activity.agent);
   if (agent) {
@@ -1339,6 +1350,7 @@ $("backup-toggle").addEventListener("click", () => {
     $("profile-toggle").setAttribute("aria-expanded", "false");
     closeBoard();
     closeFiles();
+    closeIntegrations();
   }
 });
 
@@ -1419,6 +1431,7 @@ $("profile-toggle").addEventListener("click", () => {
     $("backup-toggle").setAttribute("aria-expanded", "false");
     closeBoard();
     closeFiles();
+    closeIntegrations();
     profileStatus("");
     loadProfile();
   }
@@ -1646,6 +1659,7 @@ $("board-toggle").addEventListener("click", () => {
   $("profile").hidden = true;
   $("profile-toggle").setAttribute("aria-expanded", "false");
   closeFiles();
+  closeIntegrations();
   boardStatus("");
   renderBoard();
   loadBoard();
@@ -2015,6 +2029,7 @@ $("files-toggle").addEventListener("click", () => {
   $("profile").hidden = true;
   $("profile-toggle").setAttribute("aria-expanded", "false");
   closeBoard();
+  closeIntegrations();
   filesStatus("");
   renderFiles();
   loadFiles();
@@ -2379,6 +2394,385 @@ $("file-form").addEventListener("submit", async (event) => {
   }
 });
 
+/* ---------- Integrations: the services lore can operate ---------- */
+
+/* The provider cards are static markup and are never rebuilt, so a
+   refresh while the admin is pasting a credential only replaces the
+   status lines, the permission table and the operations log. */
+const LEVELS = [["off", "Off"], ["read", "Read"], ["full", "Full"]];
+const OPS_TOOLS = new Set(["integrations", "cloudflare", "github", "git_server", "dokploy"]);
+const integrationsState = {
+  data: null, loading: null, again: false, timer: null,
+};
+
+function integrationsStatus(text, tone) {
+  const node = $("integrations-status");
+  node.textContent = text;
+  node.className = "small-text" + (tone ? " " + tone : "");
+}
+
+function closeIntegrations() {
+  $("integrations").hidden = true;
+  $("integrations-toggle").setAttribute("aria-expanded", "false");
+  clearTimeout(integrationsState.timer);
+  // A credential pasted but not saved does not outlive the panel.
+  for (const input of $("integrations").querySelectorAll(".int-secret")) input.value = "";
+}
+
+/* True when the browser filled the field in itself (a saved password),
+   not the admin: such a value is never sent as a credential. */
+function autofilled(input) {
+  for (const selector of [":autofill", ":-webkit-autofill"]) {
+    try {
+      if (input.matches(selector)) return true;
+    } catch (_) {
+      // A browser that does not know the selector did not autofill by it.
+    }
+  }
+  return false;
+}
+
+/* A fresh sign-in starts from nothing stored, with nothing typed. */
+function resetIntegrations() {
+  Object.assign(integrationsState, { data: null, loading: null, again: false });
+  clearTimeout(integrationsState.timer);
+  for (const input of $("integrations").querySelectorAll(".int-secret, .int-url")) input.value = "";
+  for (const result of $("integrations").querySelectorAll(".int-result")) {
+    result.textContent = "";
+    result.className = "int-result small-text";
+  }
+}
+
+$("integrations-toggle").addEventListener("click", () => {
+  const panel = $("integrations");
+  if (!panel.hidden) { closeIntegrations(); return; }
+  panel.hidden = false;
+  $("integrations-toggle").setAttribute("aria-expanded", "true");
+  $("backup").hidden = true;
+  $("backup-toggle").setAttribute("aria-expanded", "false");
+  $("profile").hidden = true;
+  $("profile-toggle").setAttribute("aria-expanded", "false");
+  closeBoard();
+  closeFiles();
+  integrationsStatus("");
+  renderIntegrations();
+  loadIntegrations();
+});
+
+/* One load at a time, and at most one more queued behind it, like the
+   other panels. */
+function loadIntegrations() {
+  if (integrationsState.loading) {
+    integrationsState.again = true;
+    return integrationsState.loading;
+  }
+  integrationsState.loading = (async () => {
+    try {
+      do {
+        integrationsState.again = false;
+        const response = await api("/admin/api/integrations");
+        if (!response.ok) throw new Error("failed");
+        integrationsState.data = await response.json();
+        if (!$("integrations").hidden) renderIntegrations();
+      } while (integrationsState.again);
+    } catch (_) {
+      if (!$("integrations").hidden) integrationsStatus("The integrations could not be loaded.", "bad");
+    } finally {
+      integrationsState.loading = null;
+    }
+  })();
+  return integrationsState.loading;
+}
+
+/* Live events reload the panel only while it is open, and only for
+   actions that touch the services. */
+function integrationsActivity(activity) {
+  if ($("integrations").hidden) return;
+  if (activity && !OPS_TOOLS.has(activity.tool)) return;
+  clearTimeout(integrationsState.timer);
+  integrationsState.timer = setTimeout(loadIntegrations, 250);
+}
+
+function renderIntegrations() {
+  const admin = state.role === "admin";
+  const data = integrationsState.data;
+
+  $("integrations-vault").hidden = !data || data.vault_enabled;
+  $("integrations-switch").hidden = !admin || !data;
+  if (data) $("integrations-enabled").checked = data.enabled;
+
+  let configured = 0;
+  for (const item of $("integrations-list").children) {
+    const provider = item.dataset.provider;
+    const row = data && data.providers.find((entry) => entry.id === provider);
+    const isSet = !!(row && row.configured);
+    if (isSet) configured += 1;
+
+    const status = item.querySelector(".int-status");
+    const unreadable = isSet && data.vault_enabled && !row.readable;
+    status.textContent = !isSet
+      ? "Not set"
+      : unreadable
+        ? "Set · cannot be decrypted with the current key · enter it again"
+        : `Set · ends in ••••${row.hint} · updated ${ago(row.updated_at)}`;
+    status.title = isSet ? `saved ${shortDate(row.updated_at)}` : "";
+
+    const urlView = item.querySelector(".int-url-view");
+    // A viewer reads the URL as text; the admin has the input for it.
+    urlView.textContent = isSet && row && row.base_url ? row.base_url : "";
+    urlView.hidden = admin;
+
+    const form = item.querySelector(".integration-form");
+    form.hidden = !admin;
+    if (admin) {
+      // The URL field keeps what the admin typed; it is only pre-filled
+      // when it is empty, and the credential field is never pre-filled.
+      const urlInput = form.querySelector(".int-url");
+      if (urlInput && !urlInput.value.trim() && row && row.base_url) urlInput.value = row.base_url;
+      item.querySelector(".int-test").hidden = !isSet;
+      item.querySelector(".int-remove").hidden = !isSet;
+    }
+  }
+  $("integrations-count").textContent = data
+    ? `${configured} of ${data.providers.length} services set`
+    : "";
+
+  renderPermissions(admin);
+  renderOpsLog();
+}
+
+/* One row per known agent, one column per provider: a select for the
+   admin, the level as text for a viewer. */
+function renderPermissions(admin) {
+  const data = integrationsState.data;
+  const box = $("integrations-perms");
+  box.replaceChildren();
+  if (!data) {
+    box.append(el("p", "muted small-text", "Loading…"));
+    return;
+  }
+  if (!data.agents.length) {
+    box.append(el("p", "muted small-text", "No agents have connected yet."));
+    return;
+  }
+  const byKey = new Map(data.permissions.map((row) => [`${row.agent}|${row.provider}`, row.level]));
+  const table = el("table", "perm-grid");
+  const head = el("tr");
+  head.append(el("th", "", "agent"));
+  for (const provider of data.providers) head.append(el("th", "", provider.id));
+  table.append(head);
+  for (const agent of data.agents) {
+    const row = el("tr");
+    row.append(el("th", "", agent));
+    for (const provider of data.providers) {
+      const cell = el("td");
+      const level = byKey.get(`${agent}|${provider.id}`) || "full";
+      if (admin) {
+        const select = el("select");
+        fillSelect(select, LEVELS);
+        select.value = level;
+        select.dataset.level = level;
+        select.dataset.agent = agent;
+        select.dataset.provider = provider.id;
+        select.setAttribute("aria-label", `${agent} on ${provider.id}`);
+        select.addEventListener("change", () => savePermission(select));
+        cell.append(select);
+      } else {
+        cell.append(el("span", "pill level-" + level, level));
+      }
+      row.append(cell);
+    }
+    table.append(row);
+  }
+  box.append(table);
+}
+
+async function savePermission(select) {
+  const payload = {
+    agent: select.dataset.agent,
+    provider: select.dataset.provider,
+    level: select.value,
+  };
+  try {
+    const response = await api("/admin/api/integrations/permissions", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      // The select shows what is stored, not what was refused.
+      select.value = select.dataset.level;
+      integrationsStatus(result.error || "The permission could not be saved.", "bad");
+      return;
+    }
+    select.dataset.level = payload.level;
+    integrationsStatus(`${payload.agent} → ${payload.provider}: ${payload.level}`, "ok");
+  } catch (_) {
+    select.value = select.dataset.level;
+    integrationsStatus("The permission could not be saved.", "bad");
+  }
+}
+
+/* The operations log: time, agent, provider, method, path, status,
+   outcome. */
+function renderOpsLog() {
+  const data = integrationsState.data;
+  const list = $("ops-log");
+  list.replaceChildren();
+  if (!data) {
+    list.append(el("li", "none", "Loading…"));
+    return;
+  }
+  if (!data.log.length) {
+    list.append(el("li", "none", "No service calls yet."));
+    return;
+  }
+  for (const row of data.log) {
+    const item = el("li", "ops-row");
+    const when = el("span", "ops-when", ago(row.created_at));
+    when.title = shortDate(row.created_at);
+    item.append(
+      when,
+      el("span", "ops-agent", row.agent),
+      el("span", "ops-provider", row.provider),
+      el("span", "ops-call", `${row.method} ${row.path}`),
+      el("span", "ops-status", row.status ? String(row.status) : "—"),
+      el("span", "pill " + row.outcome, row.outcome)
+    );
+    if (row.detail) item.title = row.detail;
+    list.append(item);
+  }
+}
+
+/* The card forms: static markup, bound once. Saving clears the
+   credential field; nothing ever fills it back in. */
+for (const form of $("integrations").querySelectorAll(".integration-form")) {
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveIntegration(form.dataset.provider, form);
+  });
+  form.querySelector(".int-test").addEventListener("click", () => {
+    testIntegration(form.dataset.provider, form);
+  });
+  form.querySelector(".int-remove").addEventListener("click", () => {
+    removeIntegration(form.dataset.provider, form);
+  });
+}
+
+async function saveIntegration(provider, form) {
+  const secretField = form.querySelector(".int-secret");
+  if (autofilled(secretField)) {
+    secretField.value = "";
+    integrationsStatus("The browser filled the credential in by itself; paste the credential.", "bad");
+    return;
+  }
+  const secret = secretField.value.trim();
+  const urlField = form.querySelector(".int-url");
+  const payload = { secret, base_url: urlField ? urlField.value.trim() : "" };
+  if (!payload.secret) {
+    // The server URL is sealed with the credential: changing it needs the
+    // credential again.
+    integrationsStatus(
+      urlField ? "Paste the credential; changing the server URL needs it again." : "Paste the credential.",
+      "bad"
+    );
+    return;
+  }
+  try {
+    const response = await api(`/admin/api/integrations/${encodeURIComponent(provider)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      integrationsStatus(result.error || "The credential could not be saved.", "bad");
+      return;
+    }
+    secretField.value = "";
+    integrationsStatus(`Saved the ${provider} credential.`, "ok");
+    await loadIntegrations();
+  } catch (_) {
+    integrationsStatus("The credential could not be saved.", "bad");
+  }
+}
+
+async function testIntegration(provider, form) {
+  const result = form.closest(".integration").querySelector(".int-result");
+  result.textContent = "Testing…";
+  result.className = "int-result small-text";
+  try {
+    const response = await api(`/admin/api/integrations/${encodeURIComponent(provider)}/test`, {
+      method: "POST",
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      result.textContent = data.error || "The test could not run.";
+      result.className = "int-result small-text bad";
+      return;
+    }
+    result.textContent = data.message;
+    result.className = "int-result small-text " + (data.ok ? "ok" : "bad");
+  } catch (_) {
+    result.textContent = "The test could not run.";
+    result.className = "int-result small-text bad";
+  }
+}
+
+async function removeIntegration(provider, form) {
+  const sure = window.confirm(
+    `Remove the ${provider} credential?\n\n` +
+    "Agents will no longer be able to call it through lore. This cannot be undone."
+  );
+  if (!sure) return;
+  try {
+    const response = await api(`/admin/api/integrations/${encodeURIComponent(provider)}`, {
+      method: "DELETE",
+    });
+    if (response.status === 404) {
+      integrationsStatus(`No ${provider} credential was stored.`, "bad");
+      await loadIntegrations();
+      return;
+    }
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      integrationsStatus(result.error || "The credential could not be removed.", "bad");
+      return;
+    }
+    form.querySelector(".int-secret").value = "";
+    integrationsStatus(`Removed the ${provider} credential.`, "ok");
+    await loadIntegrations();
+  } catch (_) {
+    integrationsStatus("The credential could not be removed.", "bad");
+  }
+}
+
+/* The master switch: whether agents may operate services at all. */
+$("integrations-enabled").addEventListener("change", async (event) => {
+  const enabled = event.target.checked;
+  try {
+    const response = await api("/admin/api/integrations/enabled", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      event.target.checked = !enabled;
+      integrationsStatus(result.error || "The switch could not be saved.", "bad");
+      return;
+    }
+    integrationsStatus(
+      enabled ? "Agents may operate services." : "Service operations are switched off.",
+      "ok"
+    );
+  } catch (_) {
+    event.target.checked = !enabled;
+    integrationsStatus("The switch could not be saved.", "bad");
+  }
+});
+
 /* ---------- Tooltip and entry drawer ---------- */
 
 graph.onHover = (node, x, y) => {
@@ -2422,6 +2816,8 @@ document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (!$("files").hidden) {
     closeFiles();
+  } else if (!$("integrations").hidden) {
+    closeIntegrations();
   } else if (!$("board").hidden) {
     closeBoard();
   } else if (!$("backup").hidden) {
@@ -2531,6 +2927,11 @@ const DESTINATIONS = {
     open: () => $("files-toggle").click(),
     close: () => closeFiles(),
   },
+  integrations: {
+    shown: () => !$("integrations").hidden,
+    open: () => $("integrations-toggle").click(),
+    close: () => closeIntegrations(),
+  },
   profile: {
     shown: () => !$("profile").hidden,
     open: () => $("profile-toggle").click(),
@@ -2542,8 +2943,8 @@ const DESTINATIONS = {
     close: () => { $("backup").hidden = true; $("backup-toggle").setAttribute("aria-expanded", "false"); },
   },
 };
-/* Profile and Backup live behind the More tab. */
-const TAB_OF = { side: "side", feed: "feed", board: "board", files: "files", profile: "more", backup: "more" };
+/* Profile, Integrations and Backup live behind the More tab. */
+const TAB_OF = { side: "side", feed: "feed", board: "board", files: "files", integrations: "more", profile: "more", backup: "more" };
 
 function moreOpen() { return !$("more").hidden; }
 
@@ -2560,7 +2961,7 @@ function closeMore() {
 }
 
 function currentDestination() {
-  for (const name of ["profile", "backup", "board", "files", "side", "feed"]) {
+  for (const name of ["integrations", "profile", "backup", "board", "files", "side", "feed"]) {
     if (DESTINATIONS[name].shown()) return name;
   }
   return "graph";
@@ -2584,7 +2985,7 @@ function showDestination(name) {
     if (other !== name && destination.shown()) destination.close();
   }
   if (name !== "graph" && !DESTINATIONS[name].shown()) DESTINATIONS[name].open();
-  for (const sheet of [$("side"), $("feed"), $("board"), $("files"), $("profile"), $("backup")]) sheet.scrollTop = 0;
+  for (const sheet of [$("side"), $("feed"), $("board"), $("files"), $("integrations"), $("profile"), $("backup")]) sheet.scrollTop = 0;
   syncTabs();
 }
 
@@ -2601,6 +3002,7 @@ for (const tab of document.querySelectorAll("#tabbar .tab")) {
   });
 }
 $("more-scrim").addEventListener("click", closeMore);
+$("more-integrations").addEventListener("click", () => showDestination("integrations"));
 $("more-profile").addEventListener("click", () => showDestination("profile"));
 $("more-backup").addEventListener("click", () => showDestination("backup"));
 $("more-logout").addEventListener("click", () => { closeMore(); $("logout").click(); });
@@ -2608,7 +3010,7 @@ $("more-logout").addEventListener("click", () => { closeMore(); $("logout").clic
 /* On a phone only one panel shows at a time: whichever opened last wins,
    whatever code path opened it. */
 {
-  const panels = { side: $("side"), feed: $("feed"), board: $("board"), files: $("files"), profile: $("profile"), backup: $("backup") };
+  const panels = { side: $("side"), feed: $("feed"), board: $("board"), files: $("files"), integrations: $("integrations"), profile: $("profile"), backup: $("backup") };
   const observer = new MutationObserver((records) => {
     if (isPhone()) {
       // The last record is the newest change; the panel it opened stays.

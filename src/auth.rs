@@ -167,6 +167,19 @@ pub struct McpAuth {
     pub requests: RateLimiter,
 }
 
+/// The token a presented secret matches, if any. Every token is compared
+/// in constant time, so timing does not reveal which one matched. Shared
+/// by the `/mcp` middleware and the git proxy.
+pub fn match_token<'a>(tokens: &'a [Token], presented: &str) -> Option<&'a Token> {
+    let mut matched = None;
+    for token in tokens {
+        if bool::from(presented.as_bytes().ct_eq(token.secret.as_bytes())) {
+            matched = Some(token);
+        }
+    }
+    matched
+}
+
 /// Rejects requests without a known `Authorization: Bearer <token>`, throttles
 /// repeated failures per address, and tags the rest with the token's agent.
 pub async fn require_token(
@@ -186,15 +199,7 @@ pub async fn require_token(
         .map(str::trim)
         .unwrap_or("");
 
-    // Compare against every token so timing does not reveal which one matched.
-    let mut matched: Option<&Token> = None;
-    for token in &auth.tokens {
-        if bool::from(presented.as_bytes().ct_eq(token.secret.as_bytes())) {
-            matched = Some(token);
-        }
-    }
-
-    let Some(token) = matched else {
+    let Some(token) = match_token(&auth.tokens, presented) else {
         let peer = request
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()

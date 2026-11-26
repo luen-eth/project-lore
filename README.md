@@ -83,6 +83,11 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `files` | The files kept, newest first, or a search over their paths and descriptions |
 | `file_get` | One file with its description, its other versions and its content, by id or by project and path |
 | `file_delete` | Delete one version of a file |
+| `integrations` | The services you may operate through lore (Cloudflare, GitHub, a self-hosted GitLab, Dokploy): which are configured, your own access level on each, and how to address them |
+| `cloudflare` | Call the Cloudflare API (zones, DNS records, …) |
+| `github` | Call the GitHub REST API (repositories, pull requests, issues, …) |
+| `git_server` | Call the REST API of the self-hosted GitLab server (projects, merge requests, issues, …) |
+| `dokploy` | Call the Dokploy API of the deployment server (projects, applications, deployments, …) |
 
 Every tool except `hello` takes the `session_id` that `hello` returned and
 refuses to work without a live session.
@@ -223,6 +228,106 @@ Details:
   ends with up to three **Related files** when its query matches some, and the `hello`
   briefing says how many files the project keeps and names the newest ones.
 
+## Operating services through lore
+
+lore can hold the credentials of four services and let agents call those services
+*through* it. An agent never sees a credential: it names a method and a path, lore adds
+the credential on the server side, checks what that agent is allowed to do, and returns
+the answer with the credential redacted out.
+
+| Provider | Tool | API base | Credential |
+|---|---|---|---|
+| Cloudflare | `cloudflare` | `https://api.cloudflare.com/client/v4` | API token |
+| GitHub | `github` | `https://api.github.com` | token |
+| GitLab (self-hosted) | `git_server` | `<your server>/api/v4` | access token |
+| Dokploy | `dokploy` | `<your server>/api` | API key |
+
+`integrations` lists which providers are configured, your own access level on each, and
+the API base with a link to each API reference. The four call tools take a `method`
+(`GET`, `POST`, `PUT`, `PATCH`, `DELETE`), a `path` after the API base, optional `query`
+parameters and an optional JSON `body` (never with `GET`), and answer `HTTP <status>`
+followed by the response body. A path cannot reach another host or climb out of the
+API base (`..`, encoded dots and backslashes are refused), carry a query or a
+fragment, and responses are read up to 2 MiB and cut to 100 000 characters.
+
+**Endpoints that mint credentials are refused.** An agent with full access could
+otherwise create a credential of its own — a new API token, a personal, project,
+group or deploy token, an SSH or deploy key, a runner registration token, an API key —
+and so hold one after all. lore keeps a fixed list of those endpoints per provider
+(for example Cloudflare `/user/tokens`, GitHub `/user/keys` and
+`/repos/{owner}/{repo}/keys`, GitLab `/personal_access_tokens` and
+`/projects/{id}/access_tokens`, Dokploy `/user.createApiKey`) and refuses them on every
+method, whatever the encoding of the path. Do those by hand.
+
+**How a credential is stored.** The administrator enters it once, on the **Integrations**
+panel of the admin view; the server encrypts it immediately (XChaCha20-Poly1305, a fresh
+nonce per write, the provider id and the server URL bound in) and keeps only the
+ciphertext, plus the last
+four characters as a visible hint. The key comes from `LORE_VAULT_KEY` (64 hex
+characters, `openssl rand -hex 32`); without it the vault is off, no credential can be
+stored, and the tools say the vault is not enabled. **Losing the key means entering the
+credentials again** — the ciphertext cannot be decrypted with any other key, and the
+panel marks such a credential as unreadable. Because the server URL is sealed into the
+credential, changing the URL of GitLab or Dokploy means entering the credential again:
+a stored credential can never be pointed at another server unseen.
+
+**What never leaves the server.** No agent, no admin response, no log line and no
+backup ever carries a credential. The call is made by lore, which refuses to follow a
+redirect (so the credential is never forwarded to another host) and replaces every
+occurrence of the credential in a response with `[redacted]` before the agent sees it.
+
+**Who may do what.** Each agent has a level per provider — **off**, **read** (GET only)
+or **full** (the default) — set on the same panel, one row per known agent. A call
+gets the stricter of two levels: that of the token it authenticated with, and that of
+the agent its session names. A client using the shared `LORE_TOKEN` names its session
+itself, so **restricting `shared` is the only way to restrict every shared-token
+client**; a restriction on a name such as `codex` binds a shared-token client only
+while it calls itself `codex`. Give agents their own `LORE_TOKENS` entries when their
+levels should differ. A master
+switch, **"Agents may operate services"**, turns every call off at once. Every call,
+allowed or refused, lands in the operations log under the session's agent (with
+`via <token agent>` when the token says something else): time, agent, provider,
+method, path as the service sees it,
+status, outcome — kept to its newest 5000 rows and shown on the panel.
+
+**Backups contain none of it.** The vault, the permissions and the operations log are
+not part of a backup; exporting, restoring or merging one never moves a credential.
+
+### Cloning and pushing through lore
+
+The two git providers also speak plain `git`. An agent clones through lore with its
+own lore token as the password, and lore forwards the request to GitHub or the
+GitLab server with the stored credential:
+
+```bash
+git clone https://lore:<its own lore token>@lore.example.com/git/github/<owner>/<repo>.git
+git clone https://lore:<its own lore token>@lore.example.com/git/gitlab/<group>/<sub>/<repo>.git
+```
+
+The three requests of the git smart-HTTP protocol are proxied — the ref
+advertisement (`info/refs`), fetch (`git-upload-pack`) and push
+(`git-receive-pack`); everything else under `/git/` is answered with a 404. The
+token goes in the password field of the URL (the user name is ignored), so the
+credential stored in the vault never reaches the agent's machine: git talks to
+lore, lore talks to GitHub or GitLab. `integrations` prints the clone URL
+pattern for the providers an agent may use.
+
+Permission levels follow the same table as the call tools: **read** lets an
+agent clone and fetch, **full** also lets it push, **off** refuses everything,
+and the master switch turns the proxy off with the rest. A git request has no
+session, so the level is that of the token's agent — for the shared token, `shared`.
+The per-agent request budget of `/mcp` applies here too. Every request is
+answered in plain text when it is refused — a denied push with the permission
+sentence, an unreachable or redirecting upstream with a 502 — so git fails
+instead of prompting for a password. When the stored credential is rejected
+upstream, lore answers 502 with "the stored <provider> credential was refused
+upstream" for the same reason: it is never a lore login failure.
+
+A reverse proxy in front of lore must allow large request bodies and long
+responses for `/git/` (lore itself accepts pushes up to 2 GiB and imposes no
+overall timeout — a clone may take minutes), or big pushes and slow clones will
+be cut short in front of lore without any hint from lore itself.
+
 ## The admin view
 
 `/admin` is a live window into the brain. Every entry is a neuron: colour is the
@@ -275,6 +380,16 @@ download, nothing more. Downloads are always served as attachments
 (`application/octet-stream`, `nosniff`), so a stored HTML or SVG file never opens
 inside the admin page.
 
+The **Integrations** button opens the services lore can operate for agents: one card
+per provider showing whether a credential is set (with its last four characters and
+when it was saved), and, for GitLab and Dokploy, the server URL. The admin can enter
+or replace a credential, change the server URL, make one harmless **Test** call and
+remove the credential after a confirmation; below the cards sit the per-agent
+permission table (Off / Read / Full), the master switch that turns agent operations
+off entirely, and the log of the most recent calls. A viewer sees all of it
+read-only, with no inputs and no buttons. When `LORE_VAULT_KEY` is not set the panel
+says so, and nothing can be stored.
+
 ![An open entry with its commit, tags and related memories](docs/memory.jpg)
 
 ### Backup and restore
@@ -306,8 +421,8 @@ password you type decides what you get:
 
 | Password | Role | Can do |
 |---|---|---|
-| `LORE_ADMIN_PASSWORD` | admin | everything, including backup export, import and restore, editing the profile and rules, adding tasks and messages on the board, and adding and deleting files |
-| `LORE_VIEWER_PASSWORD` | viewer | watch the graph, the sessions and the live activity, open entries, read the profile and the board, read and download files |
+| `LORE_ADMIN_PASSWORD` | admin | everything, including backup export, import and restore, editing the profile and rules, adding tasks and messages on the board, adding and deleting files, and storing service credentials |
+| `LORE_VIEWER_PASSWORD` | viewer | watch the graph, the sessions and the live activity, open entries, read the profile, the board and the integrations, read and download files |
 
 A viewer never sees the Backup menu, and the server refuses the backup endpoints
 and every profile, rule, board or file edit for a viewer session, so hiding the buttons is not
@@ -404,6 +519,7 @@ meaningful change, decision or bug fix. Every `log` call includes `path`
 | `LORE_VIEWER_PASSWORD` | | Optional second password for a watch-only sign-in: graph, activity and entries, but no backup menu. Must differ from the admin password. |
 | `LORE_RECAPTCHA_SITE_KEY`, `LORE_RECAPTCHA_SECRET_KEY` | | reCAPTCHA v3 keys for the admin sign-in. Unset skips the check. |
 | `LORE_RECAPTCHA_MIN_SCORE` | `0.5` | Lowest reCAPTCHA score accepted. |
+| `LORE_VAULT_KEY` | | Key the service credentials are encrypted with: exactly 64 hex characters (`openssl rand -hex 32`). Unset disables the credential vault: no credential can be stored and the provider tools refuse. Losing it means entering the credentials again. |
 | `LORE_EMBEDDING_MODEL` | `bge-m3` | `bge-m3`, `e5-large`, `e5-base` or `e5-small`. Changing it re-embeds every entry. |
 | `LORE_EMBEDDINGS` | `on` | `off` gives keyword-only search with no model download. |
 | `LORE_MIN_SIMILARITY` | per model | Similarity below which a meaning-only match is dropped. |
@@ -444,6 +560,24 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
   SVG file cannot run in the admin page's origin.
 - **Secrets are refused.** `file_save` refuses `.env` files, key files and any
   content holding a private key block, from agents and from the admin alike.
+- **Service credentials never travel.** They are stored only encrypted
+  (XChaCha20-Poly1305 with a key from `LORE_VAULT_KEY`), never appear in a tool
+  response, an admin API response, a log line, the activity feed or a backup, and are
+  added to a call on the server side. The provider client follows no redirects, so a
+  credential is never forwarded to another host, and every occurrence of a credential
+  in a response is replaced with `[redacted]` before an agent sees it. Each call is
+  checked against the agent's permission level and recorded in the operations log
+  with the path only — no query, no body, no response.
+- **The git proxy never hands out a credential either.** An agent authenticates with
+  its own lore token (compared in constant time, throttled like `/mcp`), the request
+  is checked against the same permission levels, and the stored credential is added
+  only on the hop from lore to the git server. The agent's token never travels
+  upstream, only six harmless request headers are forwarded, upstream response
+  headers pass an allow-list only (never `Set-Cookie`, `WWW-Authenticate` or
+  `Location`), the upstream client follows no redirects, and a refused credential is
+  reported as a 502 so git never prompts for a password. Both bodies stream through
+  (a request is capped at 2 GiB) and are never buffered whole, and each request lands
+  in the operations log with the repository path only.
 - **Activity is recorded.** Every tool call is stored with the agent that made it,
   including search queries, so the admin view can show who did what.
 - **The container** runs as an unprivileged user.

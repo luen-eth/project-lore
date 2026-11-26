@@ -58,6 +58,7 @@
       <button id="feed-toggle" class="ghost only-medium" type="button" aria-expanded="false">Activity</button>
       <button id="files-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="files">Files</button>
       <button id="board-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="board">Board</button>
+      <button id="integrations-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="integrations">Integrations</button>
       <button id="profile-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="profile">Profile</button>
       <button id="backup-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="backup">Backup</button>
       <button id="logout" class="ghost" type="button">Sign out</button>
@@ -258,6 +259,109 @@
     <datalist id="files-projects"></datalist>
   </div>
 
+  <div id="integrations" class="board integrations" hidden>
+    <div class="board-head">
+      <h2>Integrations</h2>
+      <span id="integrations-count" class="muted small-text"></span>
+    </div>
+    <p id="integrations-vault" class="integrations-banner" hidden>Set LORE_VAULT_KEY on the server to store credentials.</p>
+    <label id="integrations-switch" class="integrations-switch" hidden>
+      <input id="integrations-enabled" type="checkbox">
+      <span>Agents may operate services</span>
+    </label>
+    <p id="integrations-status" class="small-text" role="status"></p>
+    <div class="board-scroll">
+      <ul id="integrations-list" class="board-list">
+        <li class="board-item integration" data-provider="cloudflare">
+          <div class="board-item-head">
+            <span class="board-title">Cloudflare</span>
+            <span class="board-id int-status">Not set</span>
+          </div>
+          <p class="int-url-view muted small-text"></p>
+          <form class="integration-form" autocomplete="off" data-provider="cloudflare" hidden>
+            <label class="board-field"><span>Credential (API token)</span>
+              <input class="int-secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" placeholder="Paste once; lore stores it encrypted" spellcheck="false">
+            </label>
+            <div class="board-actions">
+              <button class="ghost small int-save" type="submit">Save</button>
+              <button class="ghost small int-test" type="button">Test</button>
+              <button class="ghost small danger int-remove" type="button">Remove</button>
+            </div>
+          </form>
+          <p class="int-result small-text" role="status"></p>
+        </li>
+        <li class="board-item integration" data-provider="github">
+          <div class="board-item-head">
+            <span class="board-title">GitHub</span>
+            <span class="board-id int-status">Not set</span>
+          </div>
+          <p class="int-url-view muted small-text"></p>
+          <form class="integration-form" autocomplete="off" data-provider="github" hidden>
+            <label class="board-field"><span>Credential (token)</span>
+              <input class="int-secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" placeholder="Paste once; lore stores it encrypted" spellcheck="false">
+            </label>
+            <div class="board-actions">
+              <button class="ghost small int-save" type="submit">Save</button>
+              <button class="ghost small int-test" type="button">Test</button>
+              <button class="ghost small danger int-remove" type="button">Remove</button>
+            </div>
+          </form>
+          <p class="int-result small-text" role="status"></p>
+        </li>
+        <li class="board-item integration" data-provider="gitlab">
+          <div class="board-item-head">
+            <span class="board-title">GitLab (self-hosted)</span>
+            <span class="board-id int-status">Not set</span>
+          </div>
+          <p class="int-url-view muted small-text"></p>
+          <form class="integration-form" autocomplete="off" data-provider="gitlab" hidden>
+            <label class="board-field"><span>Server URL</span>
+              <input class="int-url" type="url" placeholder="https://git.example.com" spellcheck="false">
+            </label>
+            <label class="board-field"><span>Credential (access token)</span>
+              <input class="int-secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" placeholder="Paste once; lore stores it encrypted" spellcheck="false">
+            </label>
+            <div class="board-actions">
+              <button class="ghost small int-save" type="submit">Save</button>
+              <button class="ghost small int-test" type="button">Test</button>
+              <button class="ghost small danger int-remove" type="button">Remove</button>
+            </div>
+          </form>
+          <p class="int-result small-text" role="status"></p>
+        </li>
+        <li class="board-item integration" data-provider="dokploy">
+          <div class="board-item-head">
+            <span class="board-title">Dokploy</span>
+            <span class="board-id int-status">Not set</span>
+          </div>
+          <p class="int-url-view muted small-text"></p>
+          <form class="integration-form" autocomplete="off" data-provider="dokploy" hidden>
+            <label class="board-field"><span>Server URL</span>
+              <input class="int-url" type="url" placeholder="https://deploy.example.com" spellcheck="false">
+            </label>
+            <label class="board-field"><span>Credential (API key)</span>
+              <input class="int-secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" placeholder="Paste once; lore stores it encrypted" spellcheck="false">
+            </label>
+            <div class="board-actions">
+              <button class="ghost small int-save" type="submit">Save</button>
+              <button class="ghost small int-test" type="button">Test</button>
+              <button class="ghost small danger int-remove" type="button">Remove</button>
+            </div>
+          </form>
+          <p class="int-result small-text" role="status"></p>
+        </li>
+      </ul>
+      <section class="integrations-perms">
+        <h4>Agent permissions</h4>
+        <div id="integrations-perms" class="perm-box"></div>
+      </section>
+      <section>
+        <h4>Recent operations</h4>
+        <ul id="ops-log" class="ops-log"></ul>
+      </section>
+    </div>
+  </div>
+
   <aside id="detail" class="detail" hidden>
     <button id="detail-close" class="ghost close" type="button" aria-label="Close">Close</button>
     <div id="detail-body"></div>
@@ -293,6 +397,7 @@
   <div id="more-scrim" class="more-scrim" hidden></div>
   <div id="more" class="more" role="menu" aria-label="More" hidden>
     <span id="more-role" class="role" hidden>Viewer</span>
+    <button id="more-integrations" class="ghost" type="button" role="menuitem">Integrations</button>
     <button id="more-profile" class="ghost" type="button" role="menuitem">Profile and rules</button>
     <button id="more-backup" class="ghost" type="button" role="menuitem">Backup and restore</button>
     <button id="more-logout" class="ghost" type="button" role="menuitem">Sign out</button>

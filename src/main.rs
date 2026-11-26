@@ -5,7 +5,10 @@ mod auth;
 mod db;
 mod embed;
 mod events;
+mod gitproxy;
+mod ops;
 mod server;
+mod vault;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -21,7 +24,9 @@ use crate::{
     db::Db,
     embed::{Embedder, Model},
     events::Events,
+    gitproxy::GitProxy,
     server::Lore,
+    vault::VaultKey,
 };
 
 const MIN_ADMIN_PASSWORD_LEN: usize = 12;
@@ -63,6 +68,15 @@ async fn main() -> Result<()> {
         Ok(hours) if (1..=720).contains(&hours) => hours,
         _ => bail!("LORE_SESSION_IDLE_HOURS must be a whole number between 1 and 720"),
     };
+    let vault = VaultKey::from_env_value(&env_or("LORE_VAULT_KEY", ""))?;
+    if vault.is_some() {
+        tracing::info!("credential vault enabled (LORE_VAULT_KEY set)");
+    } else {
+        tracing::info!(
+            "credential vault disabled: set LORE_VAULT_KEY (64 hex characters, \
+             `openssl rand -hex 32`) to store service credentials"
+        );
+    }
 
     let db = Db::open(&data_dir.join("lore.db"))?;
     let semantic = flag("LORE_EMBEDDINGS", true);
@@ -103,6 +117,7 @@ async fn main() -> Result<()> {
     let events = Events::new();
     let mcp = {
         let (db, embedder, events) = (db.clone(), embedder.clone(), events.clone());
+        let vault = vault.clone();
         StreamableHttpService::new(
             move || {
                 Ok(Lore::new(
@@ -111,6 +126,7 @@ async fn main() -> Result<()> {
                     min_similarity,
                     events.clone(),
                     idle_hours,
+                    vault.clone(),
                 ))
             },
             Arc::new(LocalSessionManager::default()),
@@ -121,10 +137,18 @@ async fn main() -> Result<()> {
     let mut app = Router::new()
         .nest_service("/mcp", mcp)
         .layer(middleware::from_fn_with_state(
-            mcp_auth,
+            mcp_auth.clone(),
             auth::require_token,
         ))
-        .route("/health", get(|| async { "ok" }));
+        .route("/health", get(|| async { "ok" }))
+        // Plain `git` speaks to /git: lore authenticates the agent with
+        // its own lore token and adds the stored credential upstream,
+        // where the agent's machine never sees it.
+        .merge(gitproxy::router(Arc::new(GitProxy::new(
+            mcp_auth,
+            vault.clone(),
+            events.clone(),
+        ))));
 
     match admin_password()? {
         Some(password) => {
@@ -148,6 +172,7 @@ async fn main() -> Result<()> {
                 events.clone(),
                 embedder.clone(),
                 idle_hours,
+                vault.clone(),
             );
             app = app.merge(admin::router(Arc::new(admin)));
             tracing::info!("admin view enabled at /admin");

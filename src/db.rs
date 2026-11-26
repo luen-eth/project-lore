@@ -158,6 +158,35 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS files_project_path ON files (project, path, version DESC);
 
+CREATE TABLE IF NOT EXISTS vault (
+    provider   TEXT PRIMARY KEY,            -- cloudflare | github | gitlab | dokploy
+    base_url   TEXT NOT NULL DEFAULT '',    -- gitlab and dokploy only
+    nonce      BLOB NOT NULL,
+    secret     BLOB NOT NULL,               -- ciphertext
+    hint       TEXT NOT NULL DEFAULT '',    -- last 4 characters of the credential
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ops_permissions (
+    agent    TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    level    TEXT NOT NULL,                 -- off | read | full
+    PRIMARY KEY (agent, provider)
+);
+CREATE TABLE IF NOT EXISTS ops_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent      TEXT NOT NULL,               -- agent name, or 'admin' for a test call
+    session_id TEXT,
+    provider   TEXT NOT NULL,
+    method     TEXT NOT NULL,
+    path       TEXT NOT NULL,               -- path only: no query string, no body
+    status     INTEGER NOT NULL,            -- upstream HTTP status; 0 = no response
+    outcome    TEXT NOT NULL,               -- ok | denied | error
+    detail     TEXT NOT NULL DEFAULT '',    -- short reason for denied / error
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ops_log_created ON ops_log (created_at DESC);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5 (
     title, body, tags, files,
     content = 'entries', content_rowid = 'id',
@@ -238,6 +267,19 @@ pub const FILE_MAX_BYTES: usize = 2 * 1024 * 1024;
 pub const FILE_DESCRIPTION_MAX_CHARS: usize = 1000;
 /// Longest file path accepted.
 pub const FILE_PATH_MAX_CHARS: usize = 300;
+
+/// The services whose credentials lore can keep, with fixed ids.
+pub const PROVIDERS: &[&str] = &["cloudflare", "github", "gitlab", "dokploy"];
+
+/// What an agent may do with a provider: off, read or full. No permission
+/// row means full.
+pub const OPS_LEVELS: &[&str] = &["off", "read", "full"];
+
+/// How a provider call went: it answered, it was refused, or it failed.
+pub const OPS_OUTCOMES: &[&str] = &["ok", "denied", "error"];
+
+/// Ops log rows kept; older ones are dropped.
+const OPS_LOG_KEPT: i64 = 5000;
 
 /// Columns added after the first release, as (table, name, definition).
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
@@ -821,6 +863,65 @@ pub struct FileCounts {
     pub versions: i64,
     /// Raw bytes over every version.
     pub bytes: i64,
+}
+
+/// A stored credential, exactly as the store keeps it: encrypted, with its
+/// nonce beside it. Only the vault key ever reads the secret field, on
+/// its way to one call.
+#[derive(Debug, Clone)]
+pub struct StoredVault {
+    pub provider: String,
+    /// The admin-entered server URL; gitlab and dokploy only.
+    pub base_url: String,
+    /// An XChaCha20-Poly1305 nonce, 24 random bytes per write.
+    pub nonce: Vec<u8>,
+    /// The credential, encrypted with the provider id as associated data.
+    pub secret: Vec<u8>,
+    pub hint: String,
+    pub updated_at: String,
+}
+
+/// One provider's credential as the admin page shows it: never the nonce
+/// and never the secret.
+#[derive(Debug, serde::Serialize)]
+pub struct VaultStatus {
+    pub provider: String,
+    /// True when a credential is stored.
+    pub configured: bool,
+    /// The admin-entered server URL, gitlab and dokploy only.
+    pub base_url: String,
+    /// The last four characters of the credential.
+    pub hint: String,
+    pub updated_at: String,
+}
+
+/// One agent's permission on one provider: off, read or full.
+#[derive(Debug, serde::Serialize)]
+pub struct OpsPermission {
+    pub agent: String,
+    pub provider: String,
+    pub level: String,
+}
+
+/// One provider call in the operations log: who called what, and how it
+/// went. Never a query string, a body or a credential.
+#[derive(Debug, serde::Serialize)]
+pub struct OpLog {
+    pub id: i64,
+    /// An agent name, or "admin" for a test call from the admin page.
+    pub agent: String,
+    pub session_id: Option<String>,
+    pub provider: String,
+    pub method: String,
+    pub path: String,
+    /// The upstream HTTP status; 0 when there was no response.
+    pub status: i64,
+    /// One of: ok, denied, error.
+    pub outcome: String,
+    /// A short reason for a denied or failed call.
+    pub detail: String,
+    pub duration_ms: i64,
+    pub created_at: String,
 }
 
 /// One file version as a backup carries it.
@@ -2816,6 +2917,260 @@ impl Db {
         )?)
     }
 
+    /// Stores one provider's credential. The secret arrives already
+    /// encrypted, with its nonce; the hint is the last four characters of
+    /// the credential, and the base URL is the admin-entered server URL
+    /// for gitlab and dokploy.
+    pub fn set_vault(
+        &self,
+        provider: &str,
+        base_url: &str,
+        nonce: &[u8],
+        secret: &[u8],
+        hint: &str,
+    ) -> Result<()> {
+        let provider = normalize_provider(provider)?;
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO vault (provider, base_url, nonce, secret, hint, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             ON CONFLICT (provider) DO UPDATE SET
+                base_url = excluded.base_url, nonce = excluded.nonce,
+                secret = excluded.secret, hint = excluded.hint,
+                updated_at = excluded.updated_at",
+            params![provider, base_url.trim(), nonce, secret, hint],
+        )?;
+        Ok(())
+    }
+
+    /// One provider's stored credential, still encrypted. The only reader
+    /// is the vault key, on its way to a call.
+    pub fn vault(&self, provider: &str) -> Result<Option<StoredVault>> {
+        let provider = normalize_provider(provider)?;
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT provider, base_url, nonce, secret, hint, updated_at
+                 FROM vault WHERE provider = ?1",
+                params![provider],
+                |row| {
+                    Ok(StoredVault {
+                        provider: row.get(0)?,
+                        base_url: row.get(1)?,
+                        nonce: row.get(2)?,
+                        secret: row.get(3)?,
+                        hint: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Every provider's credential as the admin page shows it, in the
+    /// fixed provider order: configured, the server URL, the hint and the
+    /// time. Never the nonce and never the secret.
+    pub fn vault_status(&self) -> Result<Vec<VaultStatus>> {
+        let conn = self.lock();
+        let mut stored: HashMap<String, StoredVault> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT provider, base_url, nonce, secret, hint, updated_at FROM vault")?;
+            let rows = stmt.query_map([], |row| {
+                Ok(StoredVault {
+                    provider: row.get(0)?,
+                    base_url: row.get(1)?,
+                    nonce: row.get(2)?,
+                    secret: row.get(3)?,
+                    hint: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?;
+            for row in rows {
+                let stored_row = row?;
+                stored.insert(stored_row.provider.clone(), stored_row);
+            }
+        }
+        let mut list = Vec::new();
+        for id in PROVIDERS {
+            let row = stored.remove(*id);
+            list.push(VaultStatus {
+                provider: (*id).to_string(),
+                configured: row.is_some(),
+                base_url: row
+                    .as_ref()
+                    .map(|row| row.base_url.clone())
+                    .unwrap_or_default(),
+                hint: row.as_ref().map(|row| row.hint.clone()).unwrap_or_default(),
+                updated_at: row.map(|row| row.updated_at).unwrap_or_default(),
+            });
+        }
+        Ok(list)
+    }
+
+    /// Removes one provider's credential. False when none was stored.
+    pub fn delete_vault(&self, provider: &str) -> Result<bool> {
+        let provider = normalize_provider(provider)?;
+        Ok(self
+            .lock()
+            .execute("DELETE FROM vault WHERE provider = ?1", params![provider])?
+            > 0)
+    }
+
+    /// One agent's level on one provider: off, read or full. No row means
+    /// full, so a fresh store grants everything and the admin only ever
+    /// restricts.
+    pub fn ops_level(&self, agent: &str, provider: &str) -> Result<String> {
+        let agent = agent.trim().to_lowercase();
+        let provider = normalize_provider(provider)?;
+        let level: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT level FROM ops_permissions WHERE agent = ?1 AND provider = ?2",
+                params![agent, provider],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(level.unwrap_or_else(|| "full".into()))
+    }
+
+    /// Sets one agent's level on one provider. Level `full` deletes the
+    /// row, keeping the default out of the store.
+    pub fn set_ops_level(&self, agent: &str, provider: &str, level: &str) -> Result<()> {
+        let agent = agent.trim().to_lowercase();
+        if agent.is_empty() {
+            anyhow::bail!("the agent must be named");
+        }
+        let provider = normalize_provider(provider)?;
+        let level = level.trim().to_lowercase();
+        if !OPS_LEVELS.contains(&level.as_str()) {
+            anyhow::bail!("level must be one of: {}", OPS_LEVELS.join(", "));
+        }
+        let conn = self.lock();
+        if level == "full" {
+            conn.execute(
+                "DELETE FROM ops_permissions WHERE agent = ?1 AND provider = ?2",
+                params![agent, provider],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO ops_permissions (agent, provider, level) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (agent, provider) DO UPDATE SET level = excluded.level",
+                params![agent, provider, level],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every permission row, by agent then provider.
+    pub fn ops_permissions(&self) -> Result<Vec<OpsPermission>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT agent, provider, level FROM ops_permissions ORDER BY agent, provider",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(OpsPermission {
+                agent: row.get(0)?,
+                provider: row.get(1)?,
+                level: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The operations kill switch: the `meta` key `ops.enabled`, missing
+    /// meaning enabled.
+    pub fn ops_enabled(&self) -> Result<bool> {
+        let conn = self.lock();
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'ops.enabled'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Missing means on; anything but "1" (a damaged value) means off.
+        Ok(matches!(value.as_deref(), None | Some("1")))
+    }
+
+    /// Sets the operations kill switch.
+    pub fn set_ops_enabled(&self, enabled: bool) -> Result<()> {
+        let conn = self.lock();
+        set_meta(&conn, "ops.enabled", if enabled { "1" } else { "0" })
+    }
+
+    /// Records one provider call — allowed or refused — and keeps the log
+    /// bounded to its newest rows. `agent` is an agent name, or "admin"
+    /// for a test call from the admin page.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per column of the ops_log row"
+    )]
+    pub fn log_op(
+        &self,
+        agent: &str,
+        session_id: Option<&str>,
+        provider: &str,
+        method: &str,
+        path: &str,
+        status: i64,
+        outcome: &str,
+        detail: &str,
+        duration_ms: i64,
+    ) -> Result<OpLog> {
+        let agent = agent.trim().to_lowercase();
+        let provider = normalize_provider(provider)?;
+        let outcome = outcome.trim().to_lowercase();
+        if !OPS_OUTCOMES.contains(&outcome.as_str()) {
+            anyhow::bail!("outcome must be one of: {}", OPS_OUTCOMES.join(", "));
+        }
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO ops_log (agent, session_id, provider, method, path, status,
+                                  outcome, detail, duration_ms, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            params![
+                agent,
+                session_id,
+                provider,
+                method,
+                path,
+                status,
+                outcome,
+                detail,
+                duration_ms
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        // The newest rows are the newest ids: rows only ever leave from
+        // the old end, so one statement keeps the log bounded.
+        conn.execute(
+            "DELETE FROM ops_log WHERE id <= ?1",
+            params![id - OPS_LOG_KEPT],
+        )?;
+        conn.query_row(
+            "SELECT id, agent, session_id, provider, method, path, status, outcome,
+                    detail, duration_ms, created_at
+             FROM ops_log WHERE id = ?1",
+            params![id],
+            op_log_from_row,
+        )
+        .context("the ops log row vanished after insert")
+    }
+
+    /// The newest `limit` provider calls, newest first.
+    pub fn ops_log(&self, limit: usize) -> Result<Vec<OpLog>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, agent, session_id, provider, method, path, status, outcome,
+                    detail, duration_ms, created_at
+             FROM ops_log ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], op_log_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The user's profile: the default form of address, the reply language
     /// and each agent's own form of address.
     pub fn profile(&self) -> Result<Profile> {
@@ -3507,6 +3862,17 @@ fn normalize_file_project(project: &str) -> Result<String> {
     Ok(project)
 }
 
+/// One of `PROVIDERS`, lowercased: the fixed list everywhere a provider
+/// is named.
+fn normalize_provider(provider: &str) -> Result<String> {
+    let provider = provider.trim().to_lowercase();
+    if PROVIDERS.contains(&provider.as_str()) {
+        Ok(provider)
+    } else {
+        anyhow::bail!("provider must be one of: {}", PROVIDERS.join(", "));
+    }
+}
+
 /// A file's name or relative path: forward slashes, no leading slash, no
 /// empty, `.` or `..` segments, no control characters, at most
 /// `FILE_PATH_MAX_CHARS` characters.
@@ -3688,6 +4054,23 @@ fn get_file_info(conn: &Connection, id: i64) -> Result<Option<FileInfo>> {
     Ok(conn
         .query_row(&sql, params![id], FileInfo::from_row)
         .optional()?)
+}
+
+/// Reads one operations log row.
+fn op_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpLog> {
+    Ok(OpLog {
+        id: row.get(0)?,
+        agent: row.get(1)?,
+        session_id: row.get(2)?,
+        provider: row.get(3)?,
+        method: row.get(4)?,
+        path: row.get(5)?,
+        status: row.get(6)?,
+        outcome: row.get(7)?,
+        detail: row.get(8)?,
+        duration_ms: row.get(9)?,
+        created_at: row.get(10)?,
+    })
 }
 
 /// Reads `FILE_COLUMNS` followed by `content`.
@@ -5822,5 +6205,296 @@ mod tests {
             })
             .unwrap();
         assert_eq!(third.file.kind, "doc");
+    }
+
+    // ---- The credential vault and the operations log ----
+
+    fn vault_key() -> crate::vault::VaultKey {
+        crate::vault::VaultKey::from_env_value(&"ab".repeat(32))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn vault_rows_round_trip_and_delete() {
+        let db = temp_db();
+        let key = vault_key();
+        assert!(db.vault("github").unwrap().is_none());
+
+        let (nonce, secret) = key.encrypt("github", "", "ghp_test-token-42");
+        // Provider ids are validated and lowercased.
+        db.set_vault(" GitHub ", "", &nonce, &secret, "d-42")
+            .unwrap();
+        let stored = db.vault("github").unwrap().unwrap();
+        assert_eq!(stored.base_url, "");
+        assert_eq!(stored.hint, "d-42");
+        assert!(!stored.nonce.is_empty());
+        // The store holds the credential encrypted, never as written.
+        assert_ne!(stored.secret, b"ghp_test-token-42".as_slice());
+        assert_eq!(
+            key.decrypt("github", "", &stored.nonce, &stored.secret)
+                .unwrap()
+                .expose(),
+            "ghp_test-token-42"
+        );
+        for bad in ["", "shop", "cloudflare2"] {
+            assert!(
+                db.set_vault(bad, "", &nonce, &secret, "x").is_err(),
+                "{bad:?}"
+            );
+            assert!(db.vault(bad).is_err(), "{bad:?}");
+            assert!(db.delete_vault(bad).is_err(), "{bad:?}");
+        }
+
+        // The status lists all four providers, in the fixed order, and
+        // never carries a nonce or a secret.
+        let status = db.vault_status().unwrap();
+        let ids: Vec<&str> = status.iter().map(|row| row.provider.as_str()).collect();
+        assert_eq!(ids, ["cloudflare", "github", "gitlab", "dokploy"]);
+        let github = &status[1];
+        assert!(github.configured && github.hint == "d-42");
+        assert!(status[0].hint.is_empty() && !status[0].configured);
+
+        // gitlab keeps the admin-entered server URL.
+        let (nonce, secret) = key.encrypt("gitlab", "https://git.example.com", "glpat-1234");
+        db.set_vault("gitlab", "https://git.example.com", &nonce, &secret, "1234")
+            .unwrap();
+        assert_eq!(
+            db.vault_status().unwrap()[2].base_url,
+            "https://git.example.com"
+        );
+
+        assert!(db.delete_vault("github").unwrap());
+        assert!(!db.delete_vault("github").unwrap());
+        assert!(db.vault("github").unwrap().is_none());
+    }
+
+    #[test]
+    fn ops_levels_default_to_full_and_can_be_restricted() {
+        let db = temp_db();
+        // No row means full.
+        assert_eq!(db.ops_level("Claude", "GitHub").unwrap(), "full");
+        assert!(db.ops_level("claude", "shop").is_err());
+        db.set_ops_level("Claude", "GitHub", "READ").unwrap();
+        assert_eq!(db.ops_level("claude", "github").unwrap(), "read");
+        assert_eq!(db.ops_permissions().unwrap().len(), 1);
+        // `full` deletes the row again.
+        db.set_ops_level("claude", "github", "full").unwrap();
+        assert_eq!(db.ops_level("claude", "github").unwrap(), "full");
+        assert!(db.ops_permissions().unwrap().is_empty());
+        db.set_ops_level("claude", "dokploy", "off").unwrap();
+        assert!(
+            db.ops_permissions()
+                .unwrap()
+                .iter()
+                .any(|row| row.agent == "claude" && row.provider == "dokploy")
+        );
+        for (agent, provider, level) in [
+            ("", "github", "off"),
+            ("claude", "nope", "off"),
+            ("claude", "github", "sometimes"),
+        ] {
+            assert!(db.set_ops_level(agent, provider, level).is_err());
+        }
+
+        // The kill switch: missing means enabled.
+        assert!(db.ops_enabled().unwrap());
+        db.set_ops_enabled(false).unwrap();
+        assert!(!db.ops_enabled().unwrap());
+        db.set_ops_enabled(true).unwrap();
+        assert!(db.ops_enabled().unwrap());
+        // A damaged value fails closed.
+        set_meta(&db.lock(), "ops.enabled", "yes please").unwrap();
+        assert!(!db.ops_enabled().unwrap());
+    }
+
+    #[test]
+    fn the_ops_log_is_newest_first_and_bounded() {
+        let db = temp_db();
+        let row = db
+            .log_op(
+                "Claude",
+                Some("s_1"),
+                "GitHub",
+                "GET",
+                "/user",
+                200,
+                "ok",
+                "",
+                3,
+            )
+            .unwrap();
+        // Agent names are trimmed and lowercased like everywhere else.
+        assert_eq!((row.agent.as_str(), row.method.as_str()), ("claude", "GET"));
+        assert_eq!(row.status, 200);
+        assert!(row.created_at.contains('T'));
+        db.log_op(
+            "claude",
+            None,
+            "github",
+            "POST",
+            "/x",
+            0,
+            "denied",
+            "no access",
+            1,
+        )
+        .unwrap();
+        let log = db.ops_log(10).unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].path, "/x");
+        assert_eq!(log[0].outcome, "denied");
+        assert_eq!(log[0].detail, "no access");
+        assert_eq!(log[1].session_id.as_deref(), Some("s_1"));
+        assert!(
+            db.log_op("claude", None, "github", "GET", "/", 0, "later", "", 0)
+                .is_err()
+        );
+        assert!(
+            db.log_op("claude", None, "shop", "GET", "/", 0, "ok", "", 0)
+                .is_err()
+        );
+
+        // The log keeps at most its newest 5000 rows.
+        for i in 0..5_005 {
+            db.log_op(
+                &format!("agent{i}"),
+                None,
+                "github",
+                "GET",
+                &format!("/p{i}"),
+                200,
+                "ok",
+                "",
+                i,
+            )
+            .unwrap();
+        }
+        let all = db.ops_log(10_000).unwrap();
+        assert_eq!(all.len(), OPS_LOG_KEPT as usize);
+        assert_eq!(all[0].path, "/p5004");
+        assert_eq!(all[0].agent, "agent5004");
+        // The oldest five went, the rest stayed in order.
+        assert_eq!(all[all.len() - 1].path, "/p5");
+    }
+
+    #[test]
+    fn backups_do_not_carry_the_vault_the_permissions_or_the_log() {
+        let db = temp_db();
+        let key = vault_key();
+        let (nonce, secret) = key.encrypt("github", "", "ghp_test-token-42");
+        db.set_vault("github", "", &nonce, &secret, "d-42").unwrap();
+        db.set_ops_level("claude", "github", "read").unwrap();
+        db.log_op("claude", None, "github", "GET", "/user", 200, "ok", "", 2)
+            .unwrap();
+        db.insert(&entry("shop", "Payments", "the credential vault arrived"))
+            .unwrap();
+
+        let json = serde_json::to_string(&db.export().unwrap()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(!keys.contains(&"vault"));
+        assert!(!keys.contains(&"ops_permissions"));
+        assert!(!keys.contains(&"ops_log"));
+        assert!(!json.contains("ghp_test-token-42"));
+
+        // The store moves on after the export, then a restore replaces the
+        // entries and leaves all three tables exactly as they are.
+        let backup: Backup = serde_json::from_str(&json).unwrap();
+        db.set_ops_level("claude", "github", "off").unwrap();
+        db.log_op(
+            "codex",
+            None,
+            "dokploy",
+            "POST",
+            "/application.deploy",
+            201,
+            "ok",
+            "",
+            9,
+        )
+        .unwrap();
+        db.insert(&entry("temp", "Scratch", "discarded by the restore"))
+            .unwrap();
+        db.restore(&backup).unwrap();
+        assert!(
+            db.search("discarded", None, None, None, 5, 0.8)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.ops_level("claude", "github").unwrap(), "off");
+        let log = db.ops_log(10).unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].provider, "dokploy");
+        let stored = db.vault("github").unwrap().unwrap();
+        assert_eq!(stored.hint, "d-42");
+        assert_eq!(
+            key.decrypt("github", "", &stored.nonce, &stored.secret)
+                .unwrap()
+                .expose(),
+            "ghp_test-token-42"
+        );
+
+        // Merging a backup adds nothing to them either.
+        db.merge(&backup).unwrap();
+        assert_eq!(db.ops_log(10).unwrap().len(), 2);
+        assert_eq!(db.ops_level("claude", "github").unwrap(), "off");
+        assert!(db.vault("github").unwrap().is_some());
+    }
+
+    #[test]
+    fn an_old_database_gains_the_vault_tables() {
+        let dir = std::env::temp_dir().join(format!("lore-vault-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lore.db");
+        {
+            // The schema before the vault: entries and meta, nothing more.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,
+                 kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+                 tags TEXT NOT NULL DEFAULT '', files TEXT NOT NULL DEFAULT '',
+                 agent TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT 'x',
+                 updated_at TEXT, embedding BLOB);
+                 INSERT INTO entries (project, kind, title, body) VALUES ('p', 'note', 'old', 'entry');
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        // Nothing was lost, and the vault works right away.
+        assert_eq!(db.get(1).unwrap().unwrap().title, "old");
+        let key = vault_key();
+        let (nonce, secret) = key.encrypt("dokploy", "http://localhost:3000", "dky_test-1234");
+        db.set_vault("dokploy", "http://localhost:3000", &nonce, &secret, "1234")
+            .unwrap();
+        db.set_ops_level("claude", "dokploy", "read").unwrap();
+        assert_eq!(db.ops_level("claude", "dokploy").unwrap(), "read");
+        assert!(db.vault_status().unwrap()[3].configured);
+        db.log_op(
+            "claude",
+            None,
+            "dokploy",
+            "GET",
+            "/project.all",
+            200,
+            "ok",
+            "",
+            1,
+        )
+        .unwrap();
+        assert_eq!(db.ops_log(10).unwrap().len(), 1);
+        // Opening it again changes nothing.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.get(1).unwrap().unwrap().title, "old");
+        assert_eq!(db.ops_log(10).unwrap().len(), 1);
+        assert!(db.vault("dokploy").unwrap().is_some());
     }
 }

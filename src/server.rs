@@ -1,5 +1,7 @@
 //! The MCP surface: tool definitions and their text rendering.
 
+use std::time::Instant;
+
 use axum::http::request::Parts;
 use rmcp::{
     ServerHandler,
@@ -18,6 +20,8 @@ use crate::{
     },
     embed::Embedder,
     events::Events,
+    ops,
+    vault::VaultKey,
 };
 
 const INSTRUCTIONS: &str = "\
@@ -59,7 +63,13 @@ must know.
 When a file matters to a project beyond its code (the ideas it is built on, a design \
 note, a schema, an important JSON or config file), keep it with `file_save` so other \
 agents can find it with `files` and read it with `file_get`. Saving the same path again \
-makes a new version. Do not store source code that lives in git, and never store secrets.";
+makes a new version. Do not store source code that lives in git, and never store secrets.
+
+When the briefing lists services you can operate, call them through their tools — \
+`cloudflare`, `github`, `git_server` for the self-hosted GitLab, `dokploy` — and check \
+`integrations` first to see what you may do and how to address each one. The \
+credentials are stored by the administrator and added by lore on the server side: \
+never ask the user for one, and never send one yourself.";
 
 /// Longest body returned inline by `recall` and `recent`; `get` returns everything.
 const PREVIEW_CHARS: usize = 700;
@@ -75,6 +85,12 @@ pub struct Lore {
     /// Hours after which an open session is closed as inactive.
     idle_hours: u32,
     events: Events,
+    /// The vault key, when the administrator set one. Without it no
+    /// credential exists and the provider tools say so.
+    vault: Option<VaultKey>,
+    /// The HTTP client provider calls go through: no redirects, so a
+    /// credential is never forwarded to another host.
+    http: reqwest::Client,
     #[expect(dead_code, reason = "read by the tool_handler macro")]
     tool_router: ToolRouter<Self>,
 }
@@ -346,6 +362,28 @@ pub struct FileDeleteArgs {
     pub id: i64,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IntegrationsArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OpsArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// One of: GET, POST, PUT, PATCH, DELETE.
+    pub method: String,
+    /// The path after the provider's API base, starting with `/`, e.g.
+    /// `/zones`. Query parameters go in `query`, never in the path.
+    pub path: String,
+    /// Query parameters, e.g. {"per_page": 1}. Values are strings,
+    /// numbers or booleans.
+    pub query: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The JSON body of the request. Not allowed with GET.
+    pub body: Option<serde_json::Value>,
+}
+
 #[tool_router]
 impl Lore {
     pub fn new(
@@ -354,6 +392,7 @@ impl Lore {
         min_similarity: f32,
         events: Events,
         idle_hours: u32,
+        vault: Option<VaultKey>,
     ) -> Self {
         Self {
             db,
@@ -361,6 +400,8 @@ impl Lore {
             min_similarity,
             idle_hours,
             events,
+            vault,
+            http: ops::client(),
             tool_router: Self::tool_router(),
         }
     }
@@ -844,6 +885,8 @@ impl Lore {
             } else {
                 Vec::new()
             };
+            // The services this agent may operate, named when there is one.
+            let services = this.usable_services(&actor, feed_agent)?;
             // Up to ten unread messages are listed and marked read, and
             // handoff notes for whoever works on this project next arrive
             // here, exactly once. Only what this call marked or delivered
@@ -891,6 +934,7 @@ impl Lore {
                     open_tasks: &open_tasks,
                     file_count: file_count.max(0) as usize,
                     latest_files: &latest_files,
+                    services: &services,
                 },
                 &other_rows,
                 &entries,
@@ -1651,6 +1695,363 @@ impl Lore {
         .await
     }
 
+    #[tool(
+        description = "List the services you may operate through lore — Cloudflare, GitHub, a self-hosted GitLab, Dokploy — with your access level on each, the API base to address them and a link to each API reference. The credentials are stored by the administrator and added by lore on the server side; you never see them."
+    )]
+    async fn integrations(
+        &self,
+        Parameters(args): Parameters<IntegrationsArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let host = public_host(&parts);
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            let enabled = this.db.ops_enabled().map_err(internal)?;
+            let status = this.db.vault_status().map_err(internal)?;
+            let mut out = String::new();
+            if this.vault.is_none() {
+                out.push_str(
+                    "The vault is not enabled on this server, so no credential is stored.\n",
+                );
+            } else if !enabled {
+                out.push_str("Operations are switched off by the administrator right now.\n");
+            }
+            out.push_str("Services you can call through lore:\n");
+            let mut usable = 0;
+            for (provider, row) in ops::ALL.iter().zip(status.iter()) {
+                let level =
+                    ops::effective_level(&this.db, &agent, actor, provider.id).map_err(internal)?;
+                let line = if !row.configured {
+                    format!("- {} — not configured yet", provider.label)
+                } else {
+                    let access = match level {
+                        "off" => "no access".to_string(),
+                        "read" => "read-only".to_string(),
+                        _ => {
+                            usable += 1;
+                            "full access".to_string()
+                        }
+                    };
+                    let called_as = if provider.tool != provider.id {
+                        format!(" (called with `{}`)", provider.tool)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "- {} ({access}) — API base {} — API reference: {}{called_as}",
+                        provider.label,
+                        provider.api_base(&row.base_url),
+                        provider.api_docs
+                    )
+                };
+                out.push_str(&line);
+                out.push('\n');
+                // The git providers the agent may use also say how to
+                // clone through lore: the URL pattern, with the request's
+                // public origin or the placeholder in it, and which token
+                // is the password. The code knows no public origin, so
+                // the placeholder stands in for it.
+                if row.configured && matches!(provider.id, "github" | "gitlab") && level != "off" {
+                    let depth = if provider.id == "github" {
+                        "<owner>/<repo>"
+                    } else {
+                        "<group>/<sub>/<repo>"
+                    };
+                    out.push_str(&format!(
+                        "  git clone https://lore:<your lore token>@{host}/git/{}/{}.git\n",
+                        provider.id, depth
+                    ));
+                    out.push_str(
+                        "  Use your own lore token as the password; never print it. `read` \
+                         lets you clone and fetch, `full` lets you push.\n",
+                    );
+                }
+            }
+            out.push_str(
+                "\nThe credential is added by lore on the server side: never ask the user \
+                 for one, and never send one yourself.",
+            );
+            this.note(
+                actor,
+                "integrations",
+                "",
+                Some(&session.id),
+                None,
+                &[],
+                &format!("{usable} of {} services usable", ops::ALL.len()),
+            );
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Operate Cloudflare through lore: zones, DNS records and anything else the account's token allows. Examples: `GET /zones` lists the zones; `POST /zones/{zone_id}/dns_records` with body {\"type\":\"A\",\"name\":\"sub.example.com\",\"content\":\"203.0.113.10\"} creates a DNS record. The Cloudflare credential is added by lore on the server side: never ask the user for it, and never send one yourself."
+    )]
+    async fn cloudflare(
+        &self,
+        Parameters(args): Parameters<OpsArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.operate(&parts, ops::CLOUDFLARE, args).await
+    }
+
+    #[tool(
+        description = "Call the GitHub REST API through lore: repositories, pull requests, issues and anything else the account's token allows. Examples: `GET /user/repos?per_page=10` lists your repositories; `POST /repos/{owner}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The GitHub credential is added by lore on the server side: never ask the user for it, and never send one yourself."
+    )]
+    async fn github(
+        &self,
+        Parameters(args): Parameters<OpsArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.operate(&parts, ops::GITHUB, args).await
+    }
+
+    #[tool(
+        description = "Call the REST API of the user's self-hosted GitLab server through lore: projects, merge requests, issues and anything else the account's token allows. Examples: `GET /projects?membership=true` lists your projects; `POST /projects/{id}/merge_requests` with body {\"title\":\"Add refunds\",\"source_branch\":\"feature/refunds\",\"target_branch\":\"main\"} opens a merge request. The GitLab credential is added by lore on the server side: never ask the user for it, and never send one yourself."
+    )]
+    async fn git_server(
+        &self,
+        Parameters(args): Parameters<OpsArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.operate(&parts, ops::GITLAB, args).await
+    }
+
+    #[tool(
+        description = "Operate the user's Dokploy server through lore: projects, applications, deployments and anything else the API key allows. Examples: `GET /project.all` lists the projects; `POST /application.deploy` with body {\"applicationId\":\"...\"} deploys an application. The Dokploy credential is added by lore on the server side: never ask the user for it, and never send one yourself."
+    )]
+    async fn dokploy(
+        &self,
+        Parameters(args): Parameters<OpsArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.operate(&parts, ops::DOKPLOY, args).await
+    }
+
+    /// One provider call end to end: the session, the request checks, the
+    /// access check, the call, the log row and the activity note. `Ok` is
+    /// the answer to show the agent; `Err` is why it did not happen.
+    async fn operate(
+        &self,
+        parts: &Parts,
+        provider: ops::Provider,
+        args: OpsArgs,
+    ) -> Result<String, String> {
+        let agent = agent_of(parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let request = ops::OpsRequest {
+            provider,
+            method: args.method,
+            path: args.path,
+            query: args.query,
+            body: args.body,
+        };
+        let this = self.clone();
+        // The session, the request shape and the access check run off the
+        // async runtime; a refused call is logged right there and its
+        // credential is never even decrypted. Every row of this call is
+        // logged under the same name: the session's agent, with the token's
+        // agent added when they differ.
+        let (session, label, method, path, granted) = {
+            let (agent, session_id, request) = (agent.clone(), session_id.clone(), request.clone());
+            blocking(move || {
+                let session = this.require_session(&session_id, &agent, shared)?;
+                let actor = session_agent(&agent, &session).to_string();
+                let label = ops::acting_as(&agent, &actor);
+                // The request is checked before the credential is touched.
+                let method = match ops::normalize_method(&request.method) {
+                    Ok(method) => method,
+                    Err(error) => {
+                        this.log_op_call(
+                            &label,
+                            &actor,
+                            Some(&session.id),
+                            provider,
+                            &request.method,
+                            &request.path,
+                            "error",
+                            error.message(),
+                            0,
+                            0,
+                        );
+                        return Err(error.message().to_string());
+                    }
+                };
+                let path = match ops::validate(&request) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        this.log_op_call(
+                            &label,
+                            &actor,
+                            Some(&session.id),
+                            provider,
+                            &method,
+                            &request.path,
+                            "error",
+                            error.message(),
+                            0,
+                            0,
+                        );
+                        return Err(error.message().to_string());
+                    }
+                };
+                match ops::authorize(
+                    &this.db,
+                    this.vault.as_ref(),
+                    &agent,
+                    &actor,
+                    provider,
+                    &method,
+                ) {
+                    Ok(granted) => Ok((session, label, method, path, granted)),
+                    Err(denied) => {
+                        this.log_op_call(
+                            &label,
+                            &actor,
+                            Some(&session.id),
+                            provider,
+                            &method,
+                            &path,
+                            "denied",
+                            &denied.reason,
+                            0,
+                            0,
+                        );
+                        Err(denied.reason)
+                    }
+                }
+            })
+            .await?
+        };
+        let actor = session_agent(&agent, &session).to_string();
+        let started = Instant::now();
+        let outcome = ops::call(&self.http, &granted.api_base, &granted.secret, &request).await;
+        let (status, went, detail, answer) = match outcome {
+            Ok(response) => (
+                response.status as i64,
+                "ok",
+                String::new(),
+                Ok(render_ops_response(&response)),
+            ),
+            Err(error) => {
+                let message = match &error {
+                    ops::OpsError::Invalid(reason) => reason.clone(),
+                    ops::OpsError::Transport(reason) => {
+                        format!("{} could not be reached: {reason}", provider.label)
+                    }
+                };
+                (0, "error", error.message().to_string(), Err(message))
+            }
+        };
+        let this = self.clone();
+        let session_id = session.id.clone();
+        let log = blocking(move || {
+            let duration = started.elapsed().as_millis() as i64;
+            this.log_op_call(
+                &label,
+                &actor,
+                Some(&session_id),
+                provider,
+                &method,
+                &path,
+                went,
+                &detail,
+                status,
+                duration,
+            );
+            Ok(())
+        });
+        let _ = log.await;
+        answer
+    }
+
+    /// Writes one operations log row and the activity note for a provider
+    /// call. Bookkeeping only: a failure here never fails the call, and
+    /// the note is one line — method, path, how it went — never a query, a
+    /// body or a response.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per column of the ops_log row"
+    )]
+    fn log_op_call(
+        &self,
+        label: &str,
+        actor: &str,
+        session_id: Option<&str>,
+        provider: ops::Provider,
+        method: &str,
+        path: &str,
+        outcome: &str,
+        detail: &str,
+        status: i64,
+        duration_ms: i64,
+    ) {
+        // What the agent sent may be anything: the log keeps a bounded,
+        // single-line copy.
+        let method = log_text(method, 10);
+        let path = log_text(path, 1000);
+        if let Err(error) = self.db.log_op(
+            label,
+            session_id,
+            provider.id,
+            &method,
+            &path,
+            status,
+            outcome,
+            detail,
+            duration_ms,
+        ) {
+            tracing::warn!(%error, "writing the ops log failed");
+        }
+        let went = if outcome == "ok" {
+            status.to_string()
+        } else {
+            outcome.to_string()
+        };
+        self.note(
+            actor,
+            provider.tool,
+            "",
+            session_id,
+            None,
+            &[],
+            &format!("{method} {path} → {went}"),
+        );
+    }
+
+    /// The services this agent may operate, as the briefing names them:
+    /// `cloudflare (full), github (read)`. Empty when there are none, so
+    /// the briefing leaves the line out.
+    fn usable_services(&self, token_agent: &str, agent: &str) -> Result<String, String> {
+        if self.vault.is_none() {
+            return Ok(String::new());
+        }
+        if !self.db.ops_enabled().map_err(internal)? {
+            return Ok(String::new());
+        }
+        let status = self.db.vault_status().map_err(internal)?;
+        let mut usable = Vec::new();
+        for (provider, row) in ops::ALL.iter().zip(status.iter()) {
+            if !row.configured {
+                continue;
+            }
+            let level = ops::effective_level(&self.db, token_agent, agent, provider.id)
+                .map_err(internal)?;
+            if level == "off" {
+                continue;
+            }
+            usable.push(format!("{} ({})", provider.id, level));
+        }
+        Ok(usable.join(", "))
+    }
+
     /// Records what an agent just did and pushes it to open admin pages.
     /// Bookkeeping only: a failure here never fails the tool call.
     #[expect(
@@ -1718,13 +2119,62 @@ impl ServerHandler for Lore {
     }
 }
 
-async fn blocking<F>(work: F) -> Result<String, String>
+/// Runs database work on the blocking pool, where every SQLite call of
+/// this server happens.
+async fn blocking<F, T>(work: F) -> Result<T, String>
 where
-    F: FnOnce() -> Result<String, String> + Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
 {
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|error| format!("internal error: {error}"))?
+}
+
+/// Agent-supplied text as the log keeps it: one line, at most `max`
+/// characters.
+fn log_text(text: &str, max: usize) -> String {
+    text.chars()
+        .take(max)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// The host agents reach lore at, for the clone URL: the request's `Host`
+/// header when it is a plain host name, else a placeholder.
+fn public_host(parts: &Parts) -> String {
+    parts
+        .headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| {
+            !host.is_empty()
+                && host.len() <= 255
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| "<this lore host>".to_string())
+}
+
+/// One provider answer as the tools return it: `HTTP <status>` on the
+/// first line, then the body, with a note when it was cut.
+fn render_ops_response(response: &ops::OpsResponse) -> String {
+    let mut out = format!("HTTP {}", response.status);
+    if response.truncated {
+        out.push_str(&format!(
+            "\n(truncated: the first {} characters of a longer response)",
+            ops::MAX_BODY_CHARS
+        ));
+    }
+    out.push('\n');
+    out.push_str(&response.body);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// The agent the request was authenticated as.
@@ -1867,6 +2317,8 @@ struct BriefingBoard<'a> {
     file_count: usize,
     /// The newest of them, newest first.
     latest_files: &'a [FileInfo],
+    /// The services this agent can operate, as `integrations` names them.
+    services: &'a str,
 }
 
 /// The text `hello` returns: the session, the profile, the rules, the board,
@@ -1978,6 +2430,12 @@ fn briefing(
             "Files kept for {}: {} (latest: {latest}). List them with `files`, read one with \
              `file_get`.",
             session.project, board.file_count
+        ));
+    }
+    if !board.services.is_empty() {
+        sections.push(format!(
+            "Services you can operate through lore: {}. See `integrations`.",
+            board.services
         ));
     }
     if !others.is_empty() {
@@ -2161,4 +2619,38 @@ fn render(entry: &Entry, matched: Option<&str>, preview: bool) -> String {
     }
     out.push('\n');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logged_agent_text_is_one_bounded_line() {
+        assert_eq!(log_text("GET", 10), "GET");
+        assert_eq!(log_text(&"X".repeat(5000), 10).chars().count(), 10);
+        assert_eq!(log_text("/a\nb\r\u{7}", 1000), "/a?b??");
+    }
+
+    #[test]
+    fn the_clone_host_comes_from_a_plain_host_header() {
+        let parts = |host: Option<&str>| {
+            let mut request = axum::http::Request::builder();
+            if let Some(host) = host {
+                request = request.header(axum::http::header::HOST, host);
+            }
+            request.body(()).unwrap().into_parts().0
+        };
+        assert_eq!(
+            public_host(&parts(Some("lore.example.com"))),
+            "lore.example.com"
+        );
+        assert_eq!(
+            public_host(&parts(Some("localhost:8080"))),
+            "localhost:8080"
+        );
+        for odd in [None, Some("evil.example/x"), Some("a b"), Some("")] {
+            assert_eq!(public_host(&parts(odd)), "<this lore host>", "{odd:?}");
+        }
+    }
 }
