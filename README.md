@@ -602,7 +602,7 @@ can read everything the viewer reads.
 | `restore` | import and restore JSON backups. Restoring a **full database** needs every permission, not just this one |
 | `settings` | edit the profile and the rules |
 | `integrations` | store, test and remove service credentials, set the per-agent service levels and the kill switch |
-| `agents` | manage agents (avatar, note, disable, revoke, delete an authorization) and approve new ones on the OAuth consent page. Approving gives the agent the shared memory, the board and the files; service access only when the approver also holds `integrations` (see *Without a token*) |
+| `agents` | manage agents (avatar, note, disable, revoke, delete an authorization) and approve new ones on the OAuth consent page; sign the built-in agents in and out and set their model, switches, daily cap and active hours. Approving gives the agent the shared memory, the board and the files; service access only when the approver also holds `integrations` (see *Without a token*) |
 | `users` | add, change and delete users, within the limits below |
 
 A user can be edited (e-mail, permissions, disabled, a new password) or deleted;
@@ -634,6 +634,10 @@ Every admin route is mapped to exactly one access level in a table in
 | `POST` | `/admin/api/oauth/requests/{id}/approve` | `agents` |
 | `PUT`, `DELETE` | `/admin/api/agents/{name}` | `agents` |
 | `POST` | `/admin/api/agents/{name}/revoke` | `agents` |
+| `GET` | `/admin/builtin.js`, `/admin/builtin.css` | nothing |
+| `GET` | `/admin/api/builtin` (the built-in agents; sign-in prompts only with `agents`) | signed in |
+| `PUT` | `/admin/api/builtin/{name}` (model, enabled, available, daily cap, active hours) | `agents` |
+| `POST` | `/admin/api/builtin/{name}/refresh`, `/login`, `/login/code`, `/login/cancel`, `/credential`, `/logout` | `agents` |
 | `POST` | `/admin/api/tasks` | `write` |
 | `PUT` | `/admin/api/tasks/{id}` | `write` |
 | `POST` | `/admin/api/messages` | `write` |
@@ -674,11 +678,18 @@ LORE_TOKENS=claude:<secret>,codex:<secret>,opencode:<secret>
 LORE_ADMIN_PASSWORD=<at least 12 characters>
 ```
 
-Then start it:
+Then create the data volume (once; compose never creates it, see
+[Moving an existing install to compose](#moving-an-existing-install-to-compose))
+and start lore:
 
 ```bash
+docker volume create project-lore-data
 docker compose up -d --build
 ```
+
+The built-in coding agents are optional and start only with their profile
+(`docker compose --profile agents up -d --build`); see
+[Built-in coding agents](#built-in-coding-agents).
 
 The MCP endpoint is `http://localhost:8080/mcp` and the admin view is
 `http://localhost:8080/admin`. On first start the embedding model (about 2 GB) is
@@ -795,6 +806,210 @@ meaningful change, decision or bug fix. Every `log` call includes `path`
 (`git rev-parse HEAD`, read right before logging).
 ```
 
+## Built-in coding agents
+
+Next to the `lore` service, the compose stack can run one container per built-in
+coding agent: `agent-claude` (Claude Code), `agent-codex` (the Codex CLI) and
+`agent-deepseek` (opencode pointed at DeepSeek). You sign each one in once, from the
+admin page, with your own subscription or key, and pick its default model. Taking
+idle board tasks, helping other agents, the live terminal and the graph animation
+come in later parts; this part brings the containers, their link to lore, the
+sign-in and the model choice.
+
+### How it is put together
+
+- **No Docker socket anywhere.** lore never starts, stops or inspects a container.
+  Each agent container runs `lore runner` (the same binary, so one build), which
+  dials *out* to lore over the compose network: a WebSocket to `/runner/ws` on lore's
+  internal listener (`LORE_RUNNER_BIND`, `0.0.0.0:8081`), which is not published and
+  refuses any request that came through a proxy. The runner authenticates with its own
+  secret (`LORE_RUNNER_TOKENS` on lore's side, `LORE_RUNNER_TOKEN` on the runner's;
+  compared in constant time; ten wrong attempts lock an address out for fifteen
+  minutes) and reconnects by itself, waiting up to 30 seconds between attempts.
+- **The runner is the only thing that knows the CLIs.** lore sends commands (report
+  status, list models, start a sign-in, pass on a code, store a pasted credential,
+  sign out; later: start a run, send input, stop, open a terminal) and the runner
+  answers and reports (sign-in state and when it ends, CLI version, resource
+  readings). The protocol is versioned JSON; lore refuses a runner that speaks
+  another version.
+- **Every CLI runs with a cleared environment**: `PATH`, `HOME`, the locale, its own
+  state directory and the credential stored for it. The runner's secret never
+  reaches a CLI, and the runner removes every stored secret from what a CLI prints
+  before anything goes to lore.
+- **Images** (`Dockerfile.agent`, build argument `AGENT=claude|codex|deepseek`):
+  Debian (trixie) slim with Node 22, git, the pinned CLI (`CLAUDE_CODE_VERSION`,
+  `CODEX_VERSION`, `OPENCODE_VERSION` build arguments; auto-update off), python3 with
+  `graphifyy[solidity,sql]` through pipx, the non-root user `agent` (uid 10002), the
+  home `/home/agent` on a named volume, and `/work` for clones on a size-limited
+  tmpfs.
+- **Compose** (`docker-compose.yml`): `lore` as before; `agent-claude`,
+  `agent-codex` and `agent-deepseek` under the profile `agents` (and one profile
+  each, such as `agent-claude`), so `docker compose up` without a profile runs lore
+  alone, exactly as before. The agents get `cpus` (`LORE_AGENT_CPUS`, 2), `mem_limit`
+  (`LORE_AGENT_MEMORY`, 4g), `pids_limit` 512, `no-new-privileges`, every capability
+  dropped, a read-only root file system with tmpfs for `/tmp` and `/work`
+  (`LORE_AGENT_WORK_SIZE`, 2g, counted against the memory limit), their own home
+  volume, no access to lore's data volume and none of lore's `.env`: each gets only
+  its own runner secret. They share the `agents` network with lore and reach the
+  internet through it.
+- **Each built-in agent is an agent in lore's registry** (kind `builtin`, with an
+  avatar you can change in the Agents panel), so its work shows up like any other
+  agent's. It has no standing token for `/mcp` or the git proxy; it will use
+  run-scoped tokens that lore mints per run (next part). A name in
+  `LORE_RUNNER_TOKENS` may not also be in `LORE_TOKENS`, nor belong to an existing
+  token or OAuth agent; lore refuses to start otherwise.
+
+### Setting it up
+
+1. Make one secret per agent (`openssl rand -hex 32`, three times) and put them in
+   `.env`, each twice: once in lore's list and once for the agent's container.
+
+   ```dotenv
+   LORE_RUNNER_TOKENS=claude-builtin:<secret-1>,codex-builtin:<secret-2>,deepseek-builtin:<secret-3>
+   LORE_RUNNER_TOKEN_CLAUDE=<secret-1>
+   LORE_RUNNER_TOKEN_CODEX=<secret-2>
+   LORE_RUNNER_TOKEN_DEEPSEEK=<secret-3>
+   ```
+
+   List only the agents you want; an agent not in `LORE_RUNNER_TOKENS` is refused.
+2. Start the stack with the profile: `docker compose --profile agents up -d --build`
+   (or `--profile agent-claude` and so on for just one).
+3. Open **Agents** in the admin page (permission `agents`). The section *Built-in
+   agents* shows each one: whether its container is connected, its CLI version,
+   whether it is signed in and until when, and its settings.
+
+### Signing in
+
+The credential never passes through lore's database, logs, activity feed or backups:
+the page sends it to lore, lore hands it over the runner link to the agent's
+container, and the runner writes it into the agent's own volume with mode `0600`.
+The page clears the field at once and never shows the value again.
+
+**Claude Code** (`agent-claude`), either of:
+
+- *Paste a token from `claude setup-token`* (preferred, lasts a year): on your own
+  computer, where you are signed in to Claude Code with your subscription, run
+  `claude setup-token`, follow the browser sign-in it opens, and copy the token it
+  prints. In the admin page press **Paste setup token** on `claude-builtin`, paste
+  it, press **Store**. The runner keeps it as `CLAUDE_CODE_OAUTH_TOKEN` in
+  `/home/agent/.lore-runner/secrets.env` and passes it only to `claude`
+  (`ANTHROPIC_API_KEY` is never set, so the subscription is used). The page shows
+  *signed in with setup-token* and the end date, a year from when you stored it.
+- *Sign in with claude.ai*: press **Sign in with claude.ai**. The runner starts
+  `claude auth login --claudeai` and the page shows its URL. Open it, sign in with
+  your own account, copy the code the page shows at the end, paste it into the field
+  under the URL and press **Send code**; the runner types it into the CLI. The CLI
+  stores its own credentials in `/home/agent/.claude/.credentials.json`.
+
+**Codex** (`agent-codex`), one of:
+
+- *Sign in with ChatGPT (device code)*: first allow device code sign-in in your
+  ChatGPT account's security settings. Press **Sign in with ChatGPT (device code)**.
+  The runner starts `codex login --device-auth` and the page shows the URL and a
+  one-time code. Open the URL, sign in with your own account, enter the code; the
+  page notices by itself when the sign-in is done. Codex keeps `auth.json` in
+  `/home/agent/.codex` (the runner sets `cli_auth_credentials_store = "file"`) and
+  refreshes it there; that volume belongs to this one runner only.
+- *Paste auth.json*: if device sign-in is not possible, sign Codex in on your own
+  computer (`codex login`) and paste the contents of its `~/.codex/auth.json`. Never
+  put that file in a repository or a log.
+- *Paste API key* (`codex login --with-api-key`), or set `LORE_AGENT_CODEX_API_KEY` in
+  `.env` (passed to the container as `CODEX_API_KEY`): OpenAI recommends API keys for
+  automation.
+
+**DeepSeek** (`agent-deepseek`): press **Paste API key**, paste a key from the
+DeepSeek platform and press **Store**. The runner keeps it as `DEEPSEEK_API_KEY` in
+the agent's volume and passes it only to `opencode`. DeepSeek offers API keys only;
+there is no subscription sign-in.
+
+**Check** asks the runner again for the sign-in state and the models; **Sign out**
+removes the stored sign-in from the volume (and runs the CLI's own logout).
+
+### Models and settings
+
+- *Default model*: Claude takes the aliases `opus`, `sonnet`, `haiku`, `fable` and
+  `default` (it has no list command) or a full model name; Codex offers what
+  `codex debug models` lists (`--bundled` when the catalog cannot be refreshed);
+  DeepSeek offers what `opencode models` lists for the provider `deepseek`, else
+  `deepseek-v4-pro` and `deepseek-flash`. Free text is always accepted. Empty means
+  the CLI's default.
+- *Works on idle board tasks* (enabled), *Available to help other agents*, *Board
+  tasks a day* (0 to 100) and *Active hours* (`HH:MM-HH:MM`, UTC; empty for always)
+  are stored now and used from the next part on.
+
+### Why DeepSeek runs through opencode
+
+DeepSeek has no first-party coding CLI. opencode (2.3.2 here) can do everything a
+built-in agent needs: run unattended (`opencode run --auto`), stream JSON events
+(`--format json`), use a remote HTTP MCP server with a bearer header
+(`"mcp": {"servers": {"lore": {"type": "remote", "url": …, "oauth": false,
+"headers": {"Authorization": "Bearer {env:LORE_AGENT_TOKEN}"}}}}`), and take the
+model per run (`--model deepseek/<model>`). The runner's kind is `opencode` with a
+configurable provider (`deepseek` for `agent-deepseek`), so another provider can be
+added later without a new kind. DeepSeek's API is at `https://api.deepseek.com`
+(OpenAI-compatible; `https://api.deepseek.com/anthropic` is Anthropic-compatible).
+
+### Policy
+
+- **Claude**: a Claude subscription's sign-in is for the subscriber's own ordinary
+  use of the unmodified Claude Code. lore only ever runs the unmodified `claude`
+  binary, with credentials this instance's own owner supplied, for that owner's own
+  tasks. Do not offer a claude.ai sign-in to other people through lore, and do not
+  route anyone else's requests through your plan.
+- **Codex**: OpenAI recommends API keys for automation and calls automating a
+  ChatGPT sign-in an advanced workflow for trusted private runners. Use one
+  `auth.json` per runner and never put it in a repository or a log. `CODEX_API_KEY`
+  is supported as the alternative.
+- Unattended runs (next part) use the CLIs' documented modes for isolated
+  containers (Claude Code's `--permission-mode bypassPermissions`, which refuses to
+  run as root, and Codex's `--sandbox danger-full-access`). Neither protects against
+  prompt injection: the container's limits, the run-scoped token and the scope
+  checks in lore are what contain an agent.
+
+### Moving an existing install to compose
+
+Production data must survive the move, so the data volume is declared
+`external: true` under its existing name: compose never creates it, never deletes it
+(not even `docker compose down -v`), and refuses to start when the name is wrong
+instead of starting lore on an empty database. Nothing in the move touches the
+volume's contents.
+
+1. **Take a full backup first.** In the admin page, **Backup → Full database →
+   Download**, and keep the `.sqlite` file somewhere safe (it holds every password
+   hash and the encrypted credentials). Note `LORE_VAULT_KEY` too.
+2. **Find the volume's name.** `docker volume ls`. A Dokploy application with a
+   volume mount `project-lore-data` → `/data` uses `project-lore-data`, the default.
+   A stack started from an older copy of this repository's `docker-compose.yml`
+   uses `<folder>_lore-data`, usually `project-lore_lore-data`. Check it is the right
+   one: `docker run --rm -v <name>:/data debian:trixie-slim ls -la /data` must list
+   `lore.db`.
+3. **Name it in `.env`** if it is not the default: `LORE_DATA_VOLUME=<name>`.
+4. **Stop the old container** so the database file is complete and only one lore
+   uses it (in Dokploy: stop the application; with an older compose file:
+   `docker compose stop lore`).
+5. **Start the stack**: `docker compose up -d --build` (lore alone) and check the
+   admin page shows your memories. Then add the agents (`LORE_RUNNER_TOKENS` and the
+   `LORE_RUNNER_TOKEN_*` lines, `docker compose --profile agents up -d --build`).
+6. **On Dokploy**, create a *Compose* service from the repository instead of the
+   application, put the `.env` lines in its environment, set
+   `LORE_DATA_VOLUME=project-lore-data`, add the domain for the service `lore`, port
+   `8080`, and keep the old application stopped (do not delete it, or its volume,
+   until the new one has run for a while). If Dokploy's *isolated deployment* option
+   is on, check with `docker volume ls` that no second, empty data volume appears;
+   with `external: true` compose stops with an error rather than create one.
+7. If anything is off, stop the stack and start the old application again: the
+   volume is unchanged. A database from before this version opens unchanged; lore
+   only adds its new tables (`builtin_agents`, `agent_runs`, `agent_run_events`).
+
+### What a runner is told to use
+
+The runner reads its configuration from the environment the image and compose set:
+`LORE_RUNNER_TOKEN` (required), `LORE_RUNNER_URL` (`ws://lore:8081/runner/ws`),
+`LORE_RUNNER_AGENT` (`claude-builtin`, `codex-builtin`, `deepseek-builtin`),
+`LORE_RUNNER_KIND` (`claude`, `codex`, `opencode`; by default from the image),
+`LORE_RUNNER_PROVIDER` (`anthropic`, `openai`, `deepseek`), `LORE_RUNNER_HOME`
+(`/home/agent`), `LORE_RUNNER_WORK` (`/work`) and `LORE_RUNNER_CLI` (the CLI's path).
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -815,6 +1030,8 @@ meaningful change, decision or bug fix. Every `log` call includes `path`
 | `LORE_TRUST_PROXY` | `on` in Docker | Read the client address from `X-Forwarded-For`. Turn off if the port is exposed directly. |
 | `LORE_DATA_DIR` | `/data` in Docker | Where the database and model cache live. |
 | `LORE_BIND` | `0.0.0.0:8080` | Listen address. |
+| `LORE_RUNNER_TOKENS` | | The built-in agents: `agent:secret` pairs (`claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>`), each secret 24 characters or longer. Unset: no built-in agent, no runner listener, nothing changes. A name may not also be in `LORE_TOKENS` or belong to another agent. |
+| `LORE_RUNNER_BIND` | `0.0.0.0:8081` | Where lore listens for the built-in agents' runners (only with `LORE_RUNNER_TOKENS`). Internal network only: never publish this port. Must differ from `LORE_BIND`. |
 
 At least one of `LORE_TOKENS` and `LORE_TOKEN` is required, and every secret must be
 24 characters or longer.
@@ -827,6 +1044,11 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
 
 ## Security
 
+- **Built-in agents** connect only on the internal runner listener, with a
+  per-agent secret compared in constant time; lore never mounts a Docker socket and
+  never reaches into their containers. Their sign-in credentials stay in their own
+  volumes and pass through lore only on the way there, never stored or logged; the
+  runner secrets are redacted from provider responses like lore's other secrets.
 - **Tokens** are compared in constant time. Every request is authenticated on its
   own; the server keeps no MCP sessions.
 - **Failed tokens** are throttled per client address: after 20 failures in five
@@ -911,14 +1133,16 @@ The admin view offers two kinds of backup (permission `backup` to download,
   board, and every version of every kept file. It is portable: it can be restored
   into any project-lore instance or merged into one that already has data. It holds
   no credential, no service level, no operations log, no user and nothing of the
-  agent registry or OAuth (restoring one leaves those untouched).
+  agent registry, OAuth or the built-in agents (restoring one leaves those
+  untouched).
 - **Full database** (**Backup → Full database → Download**): a consistent snapshot of
   the whole SQLite database taken with the SQLite online backup API, exactly as
   stored: entries, links, sessions, activity, the board, every file version, the
   profile and rules, the vault (still encrypted with `LORE_VAULT_KEY`), the service
   levels, the operations log, the users with their password hashes, the agent
   registry and the OAuth clients and authorizations (codes and tokens only as
-  hashes), and every other table. **The file hands out every user's password hash
+  hashes), the built-in agents' settings and last reported state, and every other
+  table. **The file hands out every user's password hash
   and every encrypted credential: keep it private.** Whoever holds it and
   `LORE_VAULT_KEY` holds the credentials.
 
@@ -952,6 +1176,11 @@ database was replaced and names the safety copy that holds the previous one. Upl
 are capped at 2 GiB, and an upload the client abandons leaves no temporary file
 behind. Signed-in users stay signed in, except stored users the restored database no
 longer has (or has disabled, or with other permissions).
+
+Neither kind of backup holds a built-in agent's sign-in: the Claude token, the
+Codex `auth.json` and the DeepSeek key live only in each agent's own volume
+(`agent-*-home`), never in lore's database. Back those volumes up yourself if you
+want to keep a sign-in, or simply sign in again.
 
 Restoring a full backup taken with a different `LORE_VAULT_KEY` leaves the stored
 service credentials unreadable: the Integrations panel says so, and they have to be

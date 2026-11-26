@@ -3,6 +3,7 @@
 mod admin;
 mod auth;
 mod avatars;
+mod builtin;
 mod db;
 mod embed;
 mod events;
@@ -10,6 +11,7 @@ mod gitproxy;
 mod mail;
 mod oauth;
 mod ops;
+mod runner;
 mod server;
 mod users;
 mod vault;
@@ -53,8 +55,23 @@ async fn main() -> Result<()> {
         use tracing_subscriber::util::SubscriberInitExt;
         log_subscriber(filter, std::io::stderr).init();
     }
+    // `lore runner`: the supervisor inside a built-in agent's container.
+    if std::env::args().nth(1).as_deref() == Some("runner") {
+        return runner::main_from_env().await;
+    }
 
     let tokens = auth::load_tokens(&env_or("LORE_TOKEN", ""), &env_or("LORE_TOKENS", ""))?;
+    let runner_tokens = builtin::parse_runner_tokens(&env_or("LORE_RUNNER_TOKENS", ""))?;
+    if let Some(shared) = runner_tokens
+        .iter()
+        .find(|runner| tokens.iter().any(|token| token.agent == runner.agent))
+    {
+        bail!(
+            "\"{}\" is named in both LORE_TOKENS and LORE_RUNNER_TOKENS; a built-in agent has no \
+             standing token",
+            shared.agent
+        );
+    }
     let data_dir = PathBuf::from(env_or("LORE_DATA_DIR", "./data"));
     let bind: SocketAddr = env_or("LORE_BIND", "0.0.0.0:8080")
         .parse()
@@ -98,6 +115,7 @@ async fn main() -> Result<()> {
         let own_secrets: Vec<String> = tokens
             .iter()
             .map(|token| token.secret().to_string())
+            .chain(runner_tokens.iter().map(|token| token.secret().to_string()))
             .chain(
                 [
                     "LORE_ADMIN_PASSWORD",
@@ -135,6 +153,21 @@ async fn main() -> Result<()> {
     // Every env-token agent has a registry row, so it can be given an
     // avatar and a note, or be disabled, before it first connects.
     db.register_token_agents(&tokens.iter().map(|t| t.agent.clone()).collect::<Vec<_>>())?;
+    // Built-in agents: a registry row each, and the internal listener their
+    // runners dial in to. Nothing of it without LORE_RUNNER_TOKENS.
+    let hub = if runner_tokens.is_empty() {
+        None
+    } else {
+        let named: Vec<(String, String, &str)> = runner_tokens
+            .iter()
+            .map(|token| {
+                let (kind, avatar) = builtin::kind_and_avatar(&token.agent);
+                (token.agent.clone(), kind.to_string(), avatar)
+            })
+            .collect();
+        db.register_builtin_agents(&named)?;
+        Some(Arc::new(builtin::Hub::new(db.clone(), runner_tokens)))
+    };
     let mut auth = McpAuth::new(tokens, db.clone(), trust_proxy);
     auth.allowed_hosts = allowed_hosts;
 
@@ -184,6 +217,37 @@ async fn main() -> Result<()> {
     };
     if admin.is_some() {
         tracing::info!("admin view enabled at /admin; agents may also authorize through OAuth");
+    }
+    let admin = match (admin, &hub) {
+        (Some(admin), Some(hub)) => Some(admin.with_builtin(hub.clone())),
+        (admin, _) => admin,
+    };
+    if let Some(hub) = &hub {
+        let runner_bind: SocketAddr = env_or("LORE_RUNNER_BIND", "0.0.0.0:8081")
+            .parse()
+            .context("LORE_RUNNER_BIND must be an address like 0.0.0.0:8081")?;
+        if runner_bind.port() == bind.port() {
+            bail!("LORE_RUNNER_BIND must use another port than LORE_BIND");
+        }
+        let listener = tokio::net::TcpListener::bind(runner_bind)
+            .await
+            .with_context(|| format!("binding {runner_bind}"))?;
+        tracing::info!(
+            %runner_bind,
+            agents = %hub.agents().join(", "),
+            "listening for built-in agent runners (internal network only; never publish this port)"
+        );
+        let router = hub.clone().router();
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!(%error, "the runner listener stopped");
+            }
+        });
     }
     for warning in startup_warnings(
         &db,

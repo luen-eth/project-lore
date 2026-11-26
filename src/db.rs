@@ -15,6 +15,8 @@ use crate::users::Perms;
 
 mod agents;
 pub use agents::*;
+mod builtin;
+pub use builtin::*;
 
 pub const KINDS: &[&str] = &["update", "decision", "bug", "note", "todo"];
 
@@ -322,8 +324,9 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// is recognised and refused instead of loaded half-understood.
 ///
 /// 1: users. 2: the agent registry and the OAuth tables. 3: the mailbox
-/// columns of `vault` (host, port, account).
-pub const SCHEMA_VERSION: i64 = 3;
+/// columns of `vault` (host, port, account). 4: the built-in agents
+/// (`builtin_agents`, `agent_runs`, `agent_run_events`).
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Columns every database lore ever created has in `entries`: a full
 /// backup without them is not a lore database.
@@ -4333,6 +4336,7 @@ fn validate_backup(backup: &Backup) -> Result<()> {
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(agents::SCHEMA)?;
+    conn.execute_batch(builtin::SCHEMA)?;
     add_missing_columns(conn)?;
     migrate_fts(conn)?;
     // A database from before the registry: every agent it has seen gets a

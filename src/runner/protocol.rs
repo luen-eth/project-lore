@@ -1,0 +1,612 @@
+//! The runner link: what lore and a built-in agent's runner say to each
+//! other over the WebSocket at `/runner/ws`.
+//!
+//! Every frame is one JSON text message, an object whose `type` names the
+//! message. The runner opens with [`FromRunner::Hello`]; lore answers
+//! [`ToRunner::Welcome`] or [`ToRunner::Refused`] and closes. After that
+//! lore sends commands and the runner answers and streams events. A command
+//! that expects an answer carries an `id`, and the answer repeats it.
+//!
+//! The protocol is versioned by [`PROTOCOL_VERSION`]: a new message or a
+//! new optional field keeps the number; a change an older peer would
+//! misread raises it, and lore refuses a runner that speaks another one.
+//! Unknown fields are ignored on both sides, so optional fields can be
+//! added without breaking an older peer.
+//!
+//! Secrets cross the link only inside [`Secret`], whose `Debug` output is
+//! `[redacted]`, so a message can be logged with `{:?}` without leaking
+//! one. lore never stores or logs what a `Secret` holds.
+
+use serde::{Deserialize, Serialize};
+
+/// The version of this protocol. Both sides must speak the same one.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Largest frame either side accepts, in bytes.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// The CLI a runner drives. lore itself never runs one: it only shows the
+/// kind and passes it on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// Claude Code (`claude`).
+    Claude,
+    /// The Codex CLI (`codex`).
+    Codex,
+    /// opencode (`opencode`), pointed at a provider such as DeepSeek.
+    Opencode,
+}
+
+impl Kind {
+    pub fn id(self) -> &'static str {
+        match self {
+            Kind::Claude => "claude",
+            Kind::Codex => "codex",
+            Kind::Opencode => "opencode",
+        }
+    }
+
+    pub fn parse(id: &str) -> Option<Self> {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(Kind::Claude),
+            "codex" => Some(Kind::Codex),
+            "opencode" => Some(Kind::Opencode),
+            _ => None,
+        }
+    }
+
+    /// The executable on the image's `PATH`.
+    pub fn program(self) -> &'static str {
+        self.id()
+    }
+
+    /// How the owner may sign this kind in from the admin page.
+    pub fn login_methods(self) -> &'static [LoginMethod] {
+        match self {
+            Kind::Claude => &[LoginMethod::Interactive],
+            Kind::Codex => &[LoginMethod::Device],
+            Kind::Opencode => &[],
+        }
+    }
+
+    /// Which credentials the owner may paste for this kind.
+    pub fn credentials(self) -> &'static [CredentialKind] {
+        match self {
+            Kind::Claude => &[CredentialKind::SetupToken],
+            Kind::Codex => &[CredentialKind::AuthJson, CredentialKind::ApiKey],
+            Kind::Opencode => &[CredentialKind::ApiKey],
+        }
+    }
+}
+
+/// A value that must never be printed: a token, a key, an `auth.json`, a
+/// login code. Serialized as the plain string; `Debug` shows nothing.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+/// An interactive sign-in the runner drives and the page relays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginMethod {
+    /// `codex login --device-auth`: a URL and a one-time code to enter there.
+    Device,
+    /// `claude auth login`: a URL; the code the browser shows is pasted back.
+    Interactive,
+}
+
+impl LoginMethod {
+    pub fn id(self) -> &'static str {
+        match self {
+            LoginMethod::Device => "device",
+            LoginMethod::Interactive => "interactive",
+        }
+    }
+}
+
+/// A credential the owner pastes in the admin page. The runner writes it
+/// into the agent's own volume (mode 0600); lore only passes it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    /// A token made with `claude setup-token` (`CLAUDE_CODE_OAUTH_TOKEN`).
+    SetupToken,
+    /// The contents of a Codex `auth.json` made elsewhere.
+    AuthJson,
+    /// A provider API key: `codex login --with-api-key`, or the key of an
+    /// opencode provider (`DEEPSEEK_API_KEY` for DeepSeek).
+    ApiKey,
+}
+
+impl CredentialKind {
+    pub fn id(self) -> &'static str {
+        match self {
+            CredentialKind::SetupToken => "setup_token",
+            CredentialKind::AuthJson => "auth_json",
+            CredentialKind::ApiKey => "api_key",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CredentialKind::SetupToken => "setup token",
+            CredentialKind::AuthJson => "auth.json",
+            CredentialKind::ApiKey => "API key",
+        }
+    }
+}
+
+/// What a run is for (used from part 6b on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunKind {
+    /// A board task, ending in a push to the task's repository.
+    Task,
+    /// A task another agent handed over.
+    Help,
+    /// A conversation; no push rights.
+    Chat,
+}
+
+/// What a terminal shows (used from part 6d on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMode {
+    /// The CLI's own interactive interface.
+    Cli,
+    /// A shell as the agent user.
+    Shell,
+}
+
+/// Everything a runner needs to start a run (part 6b). The token is the
+/// run-scoped lore token: it reaches lore's MCP endpoint and git proxy for
+/// this run only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunSpec {
+    pub run_id: String,
+    pub kind: RunKind,
+    /// `https://lore/git/<route>/<owner>/<repo>.git`, cloned into
+    /// `/work/<run id>`.
+    pub clone_url: String,
+    /// lore's MCP endpoint as the CLI reaches it.
+    pub mcp_url: String,
+    pub token: Secret,
+    pub model: String,
+    pub prompt: String,
+    /// A CLI session to resume, for a follow-up.
+    #[serde(default)]
+    pub resume: Option<String>,
+    pub wall_clock_secs: u64,
+    pub output_cap_bytes: u64,
+}
+
+/// lore to runner.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToRunner {
+    /// The hello was accepted.
+    Welcome { protocol: u32 },
+    /// The hello was refused; lore closes the link after this.
+    Refused { reason: String },
+    /// Report the sign-in state (answered with `Status`).
+    Status { id: u64 },
+    /// List the models the CLI offers (answered with `Models`).
+    ListModels { id: u64 },
+    /// Start an interactive sign-in (answered with `LoginPrompt`, later
+    /// followed by `LoginDone`).
+    LoginStart { id: u64, method: LoginMethod },
+    /// The code the browser showed, for `claude auth login` (answered with
+    /// `Done`).
+    LoginCode { id: u64, code: Secret },
+    /// Abandon a running sign-in (answered with `Done`).
+    LoginCancel { id: u64 },
+    /// Store a pasted credential in the agent's volume (answered with
+    /// `Done`, then an unsolicited `Status`).
+    SetCredential {
+        id: u64,
+        credential: CredentialKind,
+        value: Secret,
+    },
+    /// Remove the stored sign-in (answered with `Done`).
+    Logout { id: u64 },
+    /// Liveness check (answered with `Pong`).
+    Ping { id: u64 },
+    /// Part 6b: start a run.
+    #[allow(dead_code, reason = "sent from part 6b on")]
+    RunStart { spec: RunSpec },
+    /// Part 6b/6c: a follow-up message to a running CLI.
+    #[allow(dead_code, reason = "sent from part 6b on")]
+    RunInput { run_id: String, text: String },
+    /// Part 6b: interrupt the CLI, then kill it if it does not stop.
+    #[allow(dead_code, reason = "sent from part 6b on")]
+    RunStop { run_id: String },
+    /// Part 6b: delete `/work/<run id>` (the runner also does it by itself
+    /// when a run ends).
+    #[allow(dead_code, reason = "sent from part 6b on")]
+    CleanWorkdir { run_id: String },
+    /// Part 6d: open a terminal.
+    #[allow(dead_code, reason = "sent from part 6d on")]
+    TerminalOpen {
+        term_id: String,
+        mode: TerminalMode,
+        cols: u16,
+        rows: u16,
+    },
+    /// Part 6d: bytes typed into a terminal, base64.
+    #[allow(dead_code, reason = "sent from part 6d on")]
+    TerminalInput { term_id: String, data: String },
+    /// Part 6d: the terminal's size changed.
+    #[allow(dead_code, reason = "sent from part 6d on")]
+    TerminalResize {
+        term_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// Part 6d: close a terminal.
+    #[allow(dead_code, reason = "sent from part 6d on")]
+    TerminalClose { term_id: String },
+}
+
+/// The resources an agent container uses, as the runner reads them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Resources {
+    /// One-minute load average of the host.
+    #[serde(default)]
+    pub load: Option<f64>,
+    /// Memory the container uses and may use, from its cgroup.
+    #[serde(default)]
+    pub mem_used_bytes: Option<u64>,
+    #[serde(default)]
+    pub mem_limit_bytes: Option<u64>,
+    /// Free space where runs clone their repositories.
+    #[serde(default)]
+    pub work_free_bytes: Option<u64>,
+}
+
+/// Runner to lore.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FromRunner {
+    /// The first message on a link.
+    Hello {
+        protocol: u32,
+        agent: String,
+        kind: Kind,
+        /// The model provider (`anthropic`, `openai`, `deepseek`, …).
+        provider: String,
+        runner_version: String,
+        #[serde(default)]
+        cli_version: Option<String>,
+    },
+    /// The sign-in state, as an answer (`id`) or on its own (no `id`).
+    Status {
+        #[serde(default)]
+        id: Option<u64>,
+        signed_in: bool,
+        /// How it is signed in (`setup-token`, `ChatGPT`, `API key`, …).
+        #[serde(default)]
+        method: Option<String>,
+        /// When the sign-in ends, ISO 8601, when the runner knows.
+        #[serde(default)]
+        login_ends: Option<String>,
+        #[serde(default)]
+        cli_version: Option<String>,
+        /// What the CLI said, shortened and with every stored secret
+        /// removed.
+        #[serde(default)]
+        detail: String,
+    },
+    /// What the owner must do to finish an interactive sign-in.
+    LoginPrompt {
+        id: u64,
+        #[serde(default)]
+        url: Option<String>,
+        /// The one-time code to enter at the URL (device login).
+        #[serde(default)]
+        code: Option<String>,
+        /// The owner must paste a code back (`LoginCode`).
+        needs_code: bool,
+        #[serde(default)]
+        message: String,
+    },
+    /// An interactive sign-in ended.
+    LoginDone {
+        id: u64,
+        ok: bool,
+        #[serde(default)]
+        message: String,
+    },
+    /// The models the CLI offers.
+    Models {
+        id: u64,
+        models: Vec<String>,
+        /// `cli` (asked the CLI), `fixed` (the CLI has no list), or
+        /// `fallback` (the CLI could not be asked).
+        source: String,
+    },
+    /// A command without a richer answer finished.
+    Done {
+        id: u64,
+        ok: bool,
+        #[serde(default)]
+        message: String,
+    },
+    /// A command failed.
+    Error {
+        #[serde(default)]
+        id: Option<u64>,
+        message: String,
+    },
+    /// A command this runner does not implement.
+    Unsupported {
+        command: String,
+        #[serde(default)]
+        target: Option<String>,
+    },
+    Pong {
+        id: u64,
+    },
+    /// Sent every minute.
+    Resources(Resources),
+    /// Part 6b: a run started.
+    RunStarted {
+        run_id: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// Part 6b: one line of a run's output, parsed from the CLI's JSON
+    /// stream (`text`, `tool`, `result`, `error` or `raw`).
+    RunOutput {
+        run_id: String,
+        seq: u64,
+        stream: String,
+        line: String,
+    },
+    /// Part 6b: a run ended and its work area was deleted.
+    RunExit {
+        run_id: String,
+        #[serde(default)]
+        code: Option<i32>,
+        pushed: bool,
+        #[serde(default)]
+        head: Option<String>,
+        #[serde(default)]
+        work_free_bytes: Option<u64>,
+    },
+    /// Part 6d: terminal bytes, base64.
+    TerminalOutput {
+        term_id: String,
+        data: String,
+    },
+    /// Part 6d: a terminal closed.
+    TerminalExit {
+        term_id: String,
+        #[serde(default)]
+        code: Option<i32>,
+    },
+}
+
+impl FromRunner {
+    /// The `id` of the command this answers, if it answers one.
+    pub fn answers(&self) -> Option<u64> {
+        match self {
+            FromRunner::Status { id, .. } | FromRunner::Error { id, .. } => *id,
+            FromRunner::LoginPrompt { id, .. }
+            | FromRunner::LoginDone { id, .. }
+            | FromRunner::Models { id, .. }
+            | FromRunner::Done { id, .. }
+            | FromRunner::Pong { id } => Some(*id),
+            _ => None,
+        }
+    }
+}
+
+/// Encodes a message as one text frame.
+pub fn encode<T: Serialize>(message: &T) -> String {
+    serde_json::to_string(message).expect("protocol messages always serialize")
+}
+
+/// Decodes one text frame.
+pub fn decode<'a, T: Deserialize<'a>>(text: &'a str) -> Result<T, serde_json::Error> {
+    serde_json::from_str(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_message_round_trips_with_a_stable_shape() {
+        let spec = RunSpec {
+            run_id: "r1".into(),
+            kind: RunKind::Task,
+            clone_url: "http://lore:8080/git/github/o/r.git".into(),
+            mcp_url: "http://lore:8080/mcp".into(),
+            token: Secret::new("run-token"),
+            model: "sonnet".into(),
+            prompt: "do it".into(),
+            resume: None,
+            wall_clock_secs: 2700,
+            output_cap_bytes: 1 << 20,
+        };
+        let to: Vec<ToRunner> = vec![
+            ToRunner::Welcome { protocol: 1 },
+            ToRunner::Refused { reason: "x".into() },
+            ToRunner::Status { id: 1 },
+            ToRunner::ListModels { id: 2 },
+            ToRunner::LoginStart {
+                id: 3,
+                method: LoginMethod::Device,
+            },
+            ToRunner::LoginCode {
+                id: 4,
+                code: Secret::new("abc"),
+            },
+            ToRunner::LoginCancel { id: 5 },
+            ToRunner::SetCredential {
+                id: 6,
+                credential: CredentialKind::SetupToken,
+                value: Secret::new("sk-ant-oat01-secret"),
+            },
+            ToRunner::Logout { id: 7 },
+            ToRunner::Ping { id: 8 },
+            ToRunner::RunStart { spec },
+            ToRunner::RunInput {
+                run_id: "r1".into(),
+                text: "more".into(),
+            },
+            ToRunner::RunStop {
+                run_id: "r1".into(),
+            },
+            ToRunner::CleanWorkdir {
+                run_id: "r1".into(),
+            },
+            ToRunner::TerminalOpen {
+                term_id: "t1".into(),
+                mode: TerminalMode::Cli,
+                cols: 80,
+                rows: 24,
+            },
+            ToRunner::TerminalInput {
+                term_id: "t1".into(),
+                data: "bHM=".into(),
+            },
+            ToRunner::TerminalResize {
+                term_id: "t1".into(),
+                cols: 100,
+                rows: 30,
+            },
+            ToRunner::TerminalClose {
+                term_id: "t1".into(),
+            },
+        ];
+        for message in to {
+            let text = encode(&message);
+            assert_eq!(decode::<ToRunner>(&text).unwrap(), message, "{text}");
+        }
+        let from: Vec<FromRunner> = vec![
+            FromRunner::Hello {
+                protocol: 1,
+                agent: "codex-builtin".into(),
+                kind: Kind::Codex,
+                provider: "openai".into(),
+                runner_version: "0.1.0".into(),
+                cli_version: Some("codex-cli 0.166.0".into()),
+            },
+            FromRunner::Status {
+                id: None,
+                signed_in: true,
+                method: Some("ChatGPT".into()),
+                login_ends: None,
+                cli_version: None,
+                detail: "Logged in".into(),
+            },
+            FromRunner::LoginPrompt {
+                id: 3,
+                url: Some("https://auth.openai.com/codex/device".into()),
+                code: Some("ABCD-12345".into()),
+                needs_code: false,
+                message: String::new(),
+            },
+            FromRunner::LoginDone {
+                id: 3,
+                ok: true,
+                message: String::new(),
+            },
+            FromRunner::Models {
+                id: 2,
+                models: vec!["gpt-5.5".into()],
+                source: "cli".into(),
+            },
+            FromRunner::Done {
+                id: 6,
+                ok: true,
+                message: String::new(),
+            },
+            FromRunner::Error {
+                id: Some(9),
+                message: "no".into(),
+            },
+            FromRunner::Unsupported {
+                command: "run_start".into(),
+                target: Some("r1".into()),
+            },
+            FromRunner::Pong { id: 8 },
+            FromRunner::Resources(Resources {
+                load: Some(0.5),
+                ..Resources::default()
+            }),
+            FromRunner::RunStarted {
+                run_id: "r1".into(),
+                session_id: None,
+            },
+            FromRunner::RunOutput {
+                run_id: "r1".into(),
+                seq: 1,
+                stream: "text".into(),
+                line: "hi".into(),
+            },
+            FromRunner::RunExit {
+                run_id: "r1".into(),
+                code: Some(0),
+                pushed: true,
+                head: Some("abc".into()),
+                work_free_bytes: Some(1),
+            },
+            FromRunner::TerminalOutput {
+                term_id: "t1".into(),
+                data: "aGk=".into(),
+            },
+            FromRunner::TerminalExit {
+                term_id: "t1".into(),
+                code: None,
+            },
+        ];
+        for message in from {
+            let text = encode(&message);
+            assert_eq!(decode::<FromRunner>(&text).unwrap(), message, "{text}");
+        }
+        // The wire shape is part of the protocol.
+        assert_eq!(
+            encode(&ToRunner::LoginStart {
+                id: 3,
+                method: LoginMethod::Interactive
+            }),
+            r#"{"type":"login_start","id":3,"method":"interactive"}"#
+        );
+        // Unknown fields are ignored, so optional ones can be added.
+        let status: FromRunner =
+            decode(r#"{"type":"status","signed_in":false,"later":"field"}"#).unwrap();
+        assert_eq!(status.answers(), None);
+    }
+
+    #[test]
+    fn secrets_never_show_in_debug_output() {
+        let message = ToRunner::SetCredential {
+            id: 1,
+            credential: CredentialKind::AuthJson,
+            value: Secret::new("{\"tokens\":\"very-secret\"}"),
+        };
+        let shown = format!("{message:?}");
+        assert!(!shown.contains("very-secret"), "{shown}");
+        assert!(shown.contains("[redacted]"));
+        assert!(encode(&message).contains("very-secret"));
+    }
+}

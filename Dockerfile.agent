@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+#
+# A built-in coding agent next to lore: one image per agent, chosen with the
+# build argument AGENT:
+#   claude    Claude Code (@anthropic-ai/claude-code)
+#   codex     the Codex CLI (@openai/codex)
+#   deepseek  opencode 2.x (@opencode/cli) pointed at DeepSeek
+# The container runs `lore runner`, which dials out to lore and drives the
+# CLI. It never runs as root, keeps its sign-in in /home/agent (a named
+# volume) and clones repositories into /work (a size-limited tmpfs).
+
+FROM rust:1-trixie AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY assets ./assets
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked && cp target/release/lore /lore
+
+FROM node:22-trixie-slim
+ARG AGENT=claude
+# Pinned CLI versions: raise them on purpose, after reading the changelog.
+ARG CLAUDE_CODE_VERSION=2.1.328
+ARG CODEX_VERSION=0.166.0
+ARG OPENCODE_VERSION=2.3.2
+ARG GRAPHIFY_SPEC="graphifyy[solidity,sql]"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
+       python3 pipx procps \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN case "$AGENT" in \
+      claude)   npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" ;; \
+      codex)    npm install -g "@openai/codex@${CODEX_VERSION}" ;; \
+      deepseek) npm install -g "@opencode/cli@${OPENCODE_VERSION}" ;; \
+      *) echo "AGENT must be claude, codex or deepseek" >&2; exit 1 ;; \
+    esac \
+    && npm cache clean --force
+
+# graphify, for the graph update the owner's procedure asks for.
+RUN PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install "${GRAPHIFY_SPEC}" \
+    && rm -rf /root/.cache
+
+# The node image's own user has uid 1000; the agent gets its own.
+RUN useradd --uid 10002 --user-group --create-home --home-dir /home/agent --shell /bin/bash agent \
+    && mkdir -p /work && chown agent:agent /work && chmod 0700 /home/agent
+
+COPY --from=build /lore /usr/local/bin/lore
+
+ENV HOME=/home/agent \
+    LORE_RUNNER_HOME=/home/agent \
+    LORE_RUNNER_WORK=/work \
+    LORE_RUNNER_IMAGE_AGENT=${AGENT} \
+    CLAUDE_CONFIG_DIR=/home/agent/.claude \
+    CODEX_HOME=/home/agent/.codex \
+    DISABLE_AUTOUPDATER=1 \
+    OPENCODE_DISABLE_AUTOUPDATE=1 \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
+
+USER agent
+WORKDIR /home/agent
+ENTRYPOINT ["lore", "runner"]

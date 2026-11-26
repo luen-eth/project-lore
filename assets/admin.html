@@ -8,6 +8,7 @@
 <title>project-lore</title>
 <link rel="icon" type="image/svg+xml" href="/admin/icon.svg">
 <link rel="stylesheet" href="/admin/app.css">
+<link rel="stylesheet" href="/admin/builtin.css">
 </head>
 <body>
 <div class="scene" aria-hidden="true">
@@ -217,6 +218,15 @@
     <p class="muted small-text">Agents connect with a token from the server environment, or by authorizing through OAuth: add this server's <code>/mcp</code> URL to the client without a token and approve it in the browser page that opens.</p>
     <p id="agents-status" class="small-text" role="status"></p>
     <div class="board-scroll">
+      <section id="builtin-section" class="builtin-section" aria-labelledby="builtin-title" hidden>
+        <div class="board-head">
+          <h3 id="builtin-title">Built-in agents</h3>
+          <span id="builtin-count" class="muted small-text"></span>
+        </div>
+        <p class="muted small-text">Claude Code, Codex and DeepSeek (through opencode) in their own containers next to lore. Sign each in once with your own subscription or key; the credential stays in that agent's volume and never reaches lore's database.</p>
+        <p id="builtin-status" class="small-text" role="status"></p>
+        <ul id="builtin-list" class="board-list"></ul>
+      </section>
       <ul id="agent-list" class="board-list"></ul>
     </div>
   </div>
@@ -556,5 +566,6 @@
 </div>
 
 <script src="/admin/app.js"></script>
+<script src="/admin/builtin.js"></script>
 </body>
 </html>

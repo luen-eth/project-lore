@@ -16,6 +16,7 @@ use std::{
 use std::convert::Infallible;
 
 mod agents;
+mod builtin;
 
 use axum::{
     Extension, Json, Router,
@@ -284,6 +285,7 @@ fn access(method: &axum::http::Method, pattern: &str) -> Option<Access> {
     };
     ROUTES
         .iter()
+        .chain(builtin::ROUTES)
         .find(|(m, path, _)| *m == method && *path == pattern)
         .map(|(_, _, access)| *access)
 }
@@ -323,6 +325,9 @@ pub struct Admin {
     /// The OAuth authorization server, whose consent requests the page
     /// answers; `None` when it is not mounted.
     oauth: Option<Arc<OAuth>>,
+    /// The built-in agents' runner links; `None` without
+    /// `LORE_RUNNER_TOKENS`.
+    builtin: Option<Arc<crate::builtin::Hub>>,
 }
 
 /// Clears `Admin::busy` when the work that set it ends, however it ends.
@@ -379,7 +384,14 @@ impl Admin {
                 .expect("building the HTTP client"),
             ops_http: ops::client(),
             oauth: None,
+            builtin: None,
         }
+    }
+
+    /// Lets the page show and sign in the built-in agents.
+    pub fn with_builtin(mut self, hub: Arc<crate::builtin::Hub>) -> Self {
+        self.builtin = Some(hub);
+        self
     }
 
     /// Lets the page answer the consent requests of this authorization
@@ -577,6 +589,7 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
                 .delete(delete_user),
         )
+        .merge(builtin::routes())
         .merge(extra)
         .route_layer(middleware::from_fn_with_state(admin.clone(), guard))
         .layer(middleware::from_fn(security_headers))
@@ -589,7 +602,7 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
 fn build_id() -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (PAGE, SCRIPT, STYLE).hash(&mut hasher);
+    (PAGE, SCRIPT, STYLE, builtin::SCRIPT, builtin::STYLE).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 

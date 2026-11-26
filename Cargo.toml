@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 argon2 = "0.5"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 fastembed = "7"
@@ -25,13 +25,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2"
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "fs", "io-util", "process", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
 mail-parser = "1.0.2"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+# Already built as part of tokio-tungstenite; named here for its Sink/Stream helpers.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [profile.release]
 opt-level = 3

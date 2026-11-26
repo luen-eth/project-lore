@@ -3431,7 +3431,7 @@ function agentCard(agent, manage) {
   const item = el("li", "board-item agent-card" + (agent.disabled ? " disabled" : ""));
   const head = el("div", "board-item-head agent-head");
   head.append(avatarNode(agent.name, "large", agent.avatar), el("span", "board-title", agent.name));
-  head.append(el("span", "pill " + (agent.kind === "oauth" ? "oauth" : "token"), agent.kind === "oauth" ? "OAuth" : "env token"));
+  head.append(el("span", "pill " + (agent.kind === "oauth" ? "oauth" : "token"), agent.kind === "oauth" ? "OAuth" : agent.kind === "builtin" ? "built-in" : "env token"));
   if (agent.disabled) head.append(el("span", "pill cancelled", "disabled"));
   item.append(head);
   if (agent.note) item.append(el("p", "board-body agent-note", agent.note));

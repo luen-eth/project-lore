@@ -1,3 +1,37 @@
+# project-lore as a compose stack.
+#
+#   docker compose up -d --build                      lore alone, as before
+#   docker compose --profile agents up -d --build     lore and the three built-in agents
+#   docker compose --profile agent-claude up -d       lore and one of them
+#
+# The data volume is EXTERNAL: compose never creates it and never deletes it
+# (not even with `down -v`). If the volume named below does not exist, compose
+# stops with an error instead of starting lore on an empty one. Create it once
+# for a new install (`docker volume create project-lore-data`), or set
+# LORE_DATA_VOLUME to the name of the volume an existing install already uses
+# (see "Moving to compose" in the README).
+
+x-agent: &agent
+  restart: unless-stopped
+  depends_on:
+    - lore
+  # The agents never see lore's .env: each gets only its own runner secret.
+  read_only: true
+  tmpfs:
+    - /tmp:size=512m,mode=1777
+    - /work:size=${LORE_AGENT_WORK_SIZE:-2g},mode=1777
+  cpus: ${LORE_AGENT_CPUS:-2}
+  mem_limit: ${LORE_AGENT_MEMORY:-4g}
+  pids_limit: 512
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  # The runner dials lore over this network; it also reaches the internet.
+  # Neither the data volume nor a Docker socket is mounted.
+  networks:
+    - agents
+
 services:
   lore:
     build: .
@@ -6,8 +40,73 @@ services:
     env_file: .env
     ports:
       - "${LORE_PORT:-8080}:8080"
+    # The runner listener (LORE_RUNNER_BIND, 0.0.0.0:8081) is reachable on
+    # the agents network only: it is never published.
     volumes:
       - lore-data:/data
+    networks:
+      - default
+      - agents
+
+  agent-claude:
+    <<: *agent
+    profiles: ["agents", "agent-claude"]
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        AGENT: claude
+    image: project-lore-agent-claude:latest
+    environment:
+      LORE_RUNNER_URL: ws://lore:8081/runner/ws
+      LORE_RUNNER_AGENT: claude-builtin
+      LORE_RUNNER_TOKEN: ${LORE_RUNNER_TOKEN_CLAUDE:-}
+    volumes:
+      - agent-claude-home:/home/agent
+
+  agent-codex:
+    <<: *agent
+    profiles: ["agents", "agent-codex"]
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        AGENT: codex
+    image: project-lore-agent-codex:latest
+    environment:
+      LORE_RUNNER_URL: ws://lore:8081/runner/ws
+      LORE_RUNNER_AGENT: codex-builtin
+      LORE_RUNNER_TOKEN: ${LORE_RUNNER_TOKEN_CODEX:-}
+      # Optional: an OpenAI API key instead of the ChatGPT sign-in.
+      CODEX_API_KEY: ${LORE_AGENT_CODEX_API_KEY:-}
+    volumes:
+      - agent-codex-home:/home/agent
+
+  agent-deepseek:
+    <<: *agent
+    profiles: ["agents", "agent-deepseek"]
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        AGENT: deepseek
+    image: project-lore-agent-deepseek:latest
+    environment:
+      LORE_RUNNER_URL: ws://lore:8081/runner/ws
+      LORE_RUNNER_AGENT: deepseek-builtin
+      LORE_RUNNER_TOKEN: ${LORE_RUNNER_TOKEN_DEEPSEEK:-}
+    volumes:
+      - agent-deepseek-home:/home/agent
+
+networks:
+  default:
+  agents:
 
 volumes:
   lore-data:
+    external: true
+    name: ${LORE_DATA_VOLUME:-project-lore-data}
+  # Each agent's home: its CLI's state and its sign-in, nothing else.
+  agent-claude-home:
+  agent-codex-home:
+  agent-deepseek-home:
