@@ -12,7 +12,15 @@
    CLI's own interface, or (behind "More") a shell. It is shown in an
    overlay holding /admin/terminal in a frame, a document with its own
    policy because xterm.js writes inline styles; the frame asks to be closed
-   with a message, since every key, Escape too, belongs to the terminal. */
+   with a message, since every key, Escape too, belongs to the terminal.
+
+   On a wide screen (where the Live activity column shows) the terminal
+   docks in that column instead: Live activity takes the top half and the
+   terminal the bottom half (the whole column when Live activity is
+   hidden), beside the graph, which keeps its size. The frame's Expand
+   button switches to the large overlay and Dock back; the choice is
+   remembered per browser. On medium widths and phones it always opens as
+   the overlay (a full-screen sheet on phones). */
 (() => {
   "use strict";
 
@@ -454,7 +462,9 @@
     const save = el("button", "ghost small", "Save settings");
     save.type = "submit";
     actions.append(save);
-    form.append(modelField, checks, row, actions);
+    const helpNote = el("p", "muted small-text builtin-help-note",
+      "Available to help: while it is idle, your other agents may hand it a task (delegate) or ask it a question (ask, read-only) through lore. Off: it only works on board tasks.");
+    form.append(modelField, checks, helpNote, row, actions);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const payload = {
@@ -503,35 +513,82 @@
     return row;
   }
 
+  /* Docked in the side column, or the large overlay: the owner's last
+     choice; docking needs a screen wide enough for the side column. */
+  const TERMINAL_MODE_KEY = "lore.terminal.mode";
+  const wideScreen = window.matchMedia("(min-width: 1181px)");
+  let terminalMode = "docked";
+  try {
+    if (localStorage.getItem(TERMINAL_MODE_KEY) === "expanded") terminalMode = "expanded";
+  } catch { /* private mode */ }
+
   function openTerminal(agent, mode) {
     closeTerminal();
     overlay = el("div", "terminal-overlay");
-    overlay.setAttribute("role", "dialog");
-    overlay.setAttribute("aria-modal", "true");
     overlay.setAttribute("aria-label", `${mode === "shell" ? "Shell" : "Terminal"} of ${agent.name}`);
     const frame = el("iframe", "terminal-frame");
     frame.title = `${mode === "shell" ? "Shell" : "Terminal"} of ${agent.name}`;
     const query = new URLSearchParams({ agent: agent.name, mode, avatar: agent.avatar || "" });
     frame.src = "/admin/terminal?" + query.toString();
-    frame.addEventListener("load", () => frame.focus());
+    frame.addEventListener("load", () => {
+      tellLayout();
+      frame.focus();
+    });
     overlay.append(frame);
     document.body.append(overlay);
-    document.documentElement.classList.add("terminal-open");
+    applyLayout();
   }
+
+  /* Puts the open terminal where it belongs now. Only classes change: the
+     column's own size and the graph's are left alone. */
+  function applyLayout() {
+    if (!overlay) return;
+    const docked = wideScreen.matches && terminalMode === "docked";
+    overlay.classList.toggle("docked", docked);
+    overlay.setAttribute("role", docked ? "region" : "dialog");
+    if (docked) overlay.removeAttribute("aria-modal");
+    else overlay.setAttribute("aria-modal", "true");
+    document.documentElement.classList.toggle("terminal-open", !docked);
+    document.documentElement.classList.toggle("terminal-docked", docked);
+    tellLayout();
+  }
+
+  /* The frame shows Expand or Dock, and no such button where docking is
+     not possible. */
+  function tellLayout() {
+    const frame = overlay && overlay.querySelector("iframe");
+    if (!frame || !frame.contentWindow) return;
+    const docked = overlay.classList.contains("docked");
+    frame.contentWindow.postMessage({
+      type: "lore-terminal-layout",
+      mode: docked ? "docked" : "expanded",
+      canDock: wideScreen.matches,
+    }, location.origin);
+  }
+
+  wideScreen.addEventListener("change", applyLayout);
 
   /* Removing the frame closes its socket, which closes the terminal. */
   function closeTerminal() {
     if (!overlay) return;
     overlay.remove();
     overlay = null;
-    document.documentElement.classList.remove("terminal-open");
+    document.documentElement.classList.remove("terminal-open", "terminal-docked");
   }
 
   window.addEventListener("message", (event) => {
     if (!overlay || event.origin !== location.origin) return;
     const frame = overlay.querySelector("iframe");
     if (!frame || event.source !== frame.contentWindow) return;
-    if (event.data && event.data.type === "lore-terminal-close") closeTerminal();
+    const data = event.data || {};
+    if (data.type === "lore-terminal-close") closeTerminal();
+    else if (data.type === "lore-terminal-ready") tellLayout();
+    else if (data.type === "lore-terminal-mode" && (data.mode === "docked" || data.mode === "expanded")) {
+      terminalMode = data.mode;
+      try { localStorage.setItem(TERMINAL_MODE_KEY, terminalMode); } catch { /* private mode */ }
+      applyLayout();
+      frame.focus();
+    }
   });
 
   /* ---------- Task runner ---------- */
@@ -547,7 +604,7 @@
   const OUTPUT_KEEP = 400;
   const STATUS_LABEL = {
     starting: "starting", running: "running", pushed: "pushed", done: "done", failed: "failed",
-    stopped: "stopped", timeout: "timed out", interrupted: "interrupted",
+    stopped: "stopped", timeout: "timed out", interrupted: "interrupted", answered: "answered",
   };
 
   async function loadRunner() {
@@ -597,6 +654,15 @@
     return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
   }
 
+  /* What a run is, in a few words: a board task, a task another agent
+     handed over, or a question another agent asked. */
+  function runWhat(run) {
+    const by = run.requested_by ? ` · asked by ${run.requested_by}` : "";
+    if (run.kind === "chat") return `question${run.requested_by ? ` from ${run.requested_by}` : ""}`;
+    if (run.kind === "help") return `task #${run.task_id} (help)${by}`;
+    return `task #${run.task_id}`;
+  }
+
   function renderRunner() {
     const data = runner.data;
     if (!data) return;
@@ -608,11 +674,12 @@
       const image = el("img", "builtin-avatar");
       image.src = `/admin/avatars/${encodeURIComponent(run.avatar || "orbit")}.svg`;
       image.alt = "";
-      head.append(image, el("span", "board-title", `${run.agent} · task #${run.task_id}`),
+      head.append(image, el("span", "board-title", `${run.agent} · ${runWhat(run)}`),
         pill(run.stopping ? "stopping" : STATUS_LABEL[run.status] || run.status, "open"));
       item.append(head);
       item.append(el("div", "board-meta",
-        `${run.task_title} · ${run.repo} · ${run.model || "default model"} · ${minutes(run.started_at)}`));
+        [run.task_title, run.repo || (run.kind === "chat" ? "no checkout, read-only" : ""),
+          run.model || "default model", minutes(run.started_at)].filter(Boolean).join(" · ")));
       item.append(outputBox(run.id));
       if (data.manage && !run.stopping) {
         const row = el("div", "board-actions");
@@ -647,7 +714,7 @@
     if (!ended.length) history.append(el("li", "runner-why", "No runs yet."));
     for (const run of ended) {
       const item = el("li");
-      const line = `${run.agent} · task #${run.task_id} · ${STATUS_LABEL[run.status] || run.status}`
+      const line = `${run.agent} · ${runWhat(run)} · ${STATUS_LABEL[run.status] || run.status}`
         + ` · ${minutes(run.started_at, run.ended_at)}` + (run.commit ? ` · ${run.commit.slice(0, 10)}` : "");
       item.append(el("span", "runner-line", line), el("span", "runner-why", `${day(run.created_at)} · ${run.summary}`));
       const show = button(runner.open.has(run.id) ? "Hide output" : "Show output", "", async () => {
@@ -662,7 +729,10 @@
   }
 
   async function stopRun(run) {
-    if (!window.confirm(`Stop ${run.agent}'s run on task #${run.task_id}?\n\nIts token stops working at once; the task is released with a note.`)) return;
+    const after = run.kind === "chat"
+      ? "the agent that asked is told there is no answer"
+      : "the task is released with a note";
+    if (!window.confirm(`Stop ${run.agent}'s run (${runWhat(run)})?\n\nIts token stops working at once; ${after}.`)) return;
     const result = await post(url(run.agent, "/stop")).catch(() => null);
     if (!result || !result.ok) {
       status((result && result.body.error) || "The run could not be stopped.", "bad");

@@ -335,7 +335,14 @@ pub struct Admin {
     builtin: Option<Arc<crate::builtin::Hub>>,
     /// The task runner, with the built-in agents.
     task_runner: Option<Arc<crate::taskrunner::TaskRunner>>,
+    /// How often an open terminal's session and permission are checked
+    /// again.
+    terminal_recheck: Duration,
 }
+
+/// How often lore checks that the page holding an open terminal is still
+/// signed in and still has the `agents` permission.
+const TERMINAL_RECHECK: Duration = Duration::from_secs(30);
 
 /// Clears `Admin::busy` when the work that set it ends, however it ends.
 struct BusyGuard<'a>(&'a AtomicBool);
@@ -393,6 +400,31 @@ impl Admin {
             oauth: None,
             builtin: None,
             task_runner: None,
+            terminal_recheck: TERMINAL_RECHECK,
+        }
+    }
+
+    /// A shorter terminal re-check, for the tests.
+    #[cfg(test)]
+    pub fn with_terminal_recheck(mut self, every: Duration) -> Self {
+        self.terminal_recheck = every;
+        self
+    }
+
+    /// Whether the session `token` names is still live and still has the
+    /// `agents` permission; otherwise why an open terminal must close.
+    fn terminal_access(&self, token: &str) -> Result<(), &'static str> {
+        let mut sessions = self.sessions();
+        sessions.retain(|_, session| session.expires > Instant::now());
+        match sessions.get(token) {
+            None => Err(
+                "the terminal was closed: your session has ended (signed out, expired, or \
+                 ended by an administrator). Sign in again to open it",
+            ),
+            Some(session) if !session.user.perms.contains(Perm::Agents) => {
+                Err("the terminal was closed: your account no longer has the agents permission")
+            }
+            Some(_) => Ok(()),
         }
     }
 

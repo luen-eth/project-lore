@@ -1441,6 +1441,11 @@ esac
 
     /// The admin routes with this hub, on a free port.
     async fn admin_server(pair: &Pair) -> String {
+        admin_server_with(pair, None).await
+    }
+
+    /// The same, with a shorter re-check of open terminals.
+    async fn admin_server_with(pair: &Pair, recheck: Option<Duration>) -> String {
         let admin = crate::admin::Admin::new(
             pair.db.clone(),
             "admin-password-long".into(),
@@ -1457,6 +1462,10 @@ esac
             crate::ops::Guard::default(),
         )
         .with_builtin(pair.hub.clone());
+        let admin = match recheck {
+            Some(every) => admin.with_terminal_recheck(every),
+            None => admin,
+        };
         let router = crate::admin::router(Arc::new(admin));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1865,6 +1874,159 @@ esac
             let bytes = std::fs::read(pair.dir.join(file)).unwrap_or_default();
             assert!(!String::from_utf8_lossy(&bytes).contains("typed-but-never-stored"));
         }
+    }
+
+    /// An open terminal does not outlive the sign-in or the permission it
+    /// was opened with: lore looks again while it is open and closes it
+    /// with a sentence saying why.
+    #[tokio::test]
+    async fn an_open_terminal_closes_when_the_session_or_the_permission_goes() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as Ws;
+        let pair = listen().await;
+        let base = admin_server_with(&pair, Some(Duration::from_millis(150))).await;
+        let mut config = config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET);
+        let program = pair.dir.join("claude-waits");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ncase \"$1\" in --version) echo \"2.1.328 (Claude Code)\"; exit 0;; \
+             auth) echo \"Not logged in\"; exit 1;; esac\necho ready; read line; exit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        config.settings.program = program;
+        start(config);
+        connected(&pair.hub, "claude-builtin").await;
+        let operator = pair
+            .db
+            .add_user(&crate::db::NewUser {
+                username: "operator".into(),
+                email: None,
+                password_hash: crate::users::hash_password("operator-password").unwrap(),
+                permissions: crate::users::Perms::parse(&["agents", "users"]).unwrap(),
+                created_by: "admin".into(),
+            })
+            .unwrap();
+        let http = reqwest::Client::new();
+        let origin = base.clone();
+
+        /// Opens a terminal and waits until the program in it has printed.
+        async fn open(
+            base: &str,
+            cookie: &str,
+            origin: &str,
+        ) -> tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        > {
+            let mut socket = terminal_socket(base, Some(cookie), Some(origin))
+                .await
+                .unwrap();
+            socket
+                .send(Ws::text(
+                    r#"{"type":"open","mode":"cli","cols":80,"rows":24}"#,
+                ))
+                .await
+                .unwrap();
+            let mut text = String::new();
+            while !text.contains("ready") {
+                let frame = tokio::time::timeout(Duration::from_secs(15), socket.next())
+                    .await
+                    .expect("the terminal never printed")
+                    .unwrap()
+                    .unwrap();
+                if let Ws::Binary(bytes) = frame {
+                    text.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+            socket
+        }
+        /// The `exit` frame lore sends, then the socket's end.
+        async fn closed(
+            socket: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> serde_json::Value {
+            let mut exit = None;
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(15), socket.next())
+                    .await
+                    .expect("the terminal stayed open");
+                match frame {
+                    Some(Ok(Ws::Text(json))) => {
+                        exit = Some(serde_json::from_str(json.as_str()).unwrap());
+                    }
+                    Some(Ok(Ws::Close(_))) | Some(Err(_)) | None => {
+                        return exit.expect("the socket closed without a reason");
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+        async fn none_left(hub: &Hub) {
+            for _ in 0..250 {
+                if hub.terminal_count() == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("the terminal was not closed in the container");
+        }
+
+        // Still signed in, still allowed: several checks pass, it stays.
+        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let mut socket = open(&base, &admin, &origin).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(pair.hub.terminal_count(), 1);
+        // Signing out ends the session: the terminal goes with it.
+        let out = http
+            .post(format!("{base}/admin/api/logout"))
+            .header(header::COOKIE, &admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(out.status(), 200);
+        let exit = closed(&mut socket).await;
+        assert_eq!(exit["type"], "exit");
+        assert!(
+            exit["message"]
+                .as_str()
+                .unwrap()
+                .contains("your session has ended"),
+            "{exit}"
+        );
+        none_left(&pair.hub).await;
+
+        // The permission is removed while the session stays.
+        let cookie = sign_in(&http, &base, "operator", "operator-password").await;
+        let mut socket = open(&base, &cookie, &origin).await;
+        assert_eq!(pair.hub.terminal_count(), 1);
+        let changed = http
+            .put(format!("{base}/admin/api/users/{}", operator.id))
+            .header(header::COOKIE, &cookie)
+            .json(&serde_json::json!({ "permissions": ["users"] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(changed.status(), 200, "{}", changed.text().await.unwrap());
+        let exit = closed(&mut socket).await;
+        assert!(
+            exit["message"]
+                .as_str()
+                .unwrap()
+                .contains("no longer has the agents permission"),
+            "{exit}"
+        );
+        none_left(&pair.hub).await;
+        // And it cannot be opened again.
+        assert_eq!(
+            terminal_socket(&base, Some(&cookie), Some(&origin))
+                .await
+                .err(),
+            Some(403)
+        );
     }
 
     #[test]

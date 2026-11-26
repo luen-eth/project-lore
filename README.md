@@ -91,6 +91,7 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `dokploy` | Call the Dokploy API of the deployment server (projects, applications, deployments, …) |
 | `repo_tree`, `repo_read`, `repo_search`, `repo_commit` | List, read, search and commit files of a GitHub repository without a checkout (see [Reading and changing code without a checkout](#reading-and-changing-code-without-a-checkout)) |
 | `mail` | Look at the stored mailbox, read-only: `folders`, `list` (newest first, with filters) and `read` one message |
+| `assistants`, `delegate`, `ask` | Only with built-in agents: see them, hand one a task, or ask one a question (see [Asking a built-in agent for help](#asking-a-built-in-agent-for-help)) |
 
 Every tool except `hello` takes the `session_id` that `hello` returned and
 refuses to work without a live session (the seven original tools fall back to an
@@ -1074,9 +1075,16 @@ With the `agents` permission, a connected built-in agent's card has **Open
 terminal**, which shows the CLI's own interactive interface (Claude Code, Codex or
 opencode, signed in with the agent's stored credentials and started with the model
 chosen below), and, under **More**, **Shell**: `bash` as the agent user in its home.
-The terminal opens in a large overlay (a full-screen sheet on a phone), follows the
-window's size, says clearly when it is disconnected or has ended, and closes only
-with its **Close** button: every key, Escape included, goes to the terminal.
+On a wide screen (where the Live activity column is shown) the terminal **docks in
+that column**: Live activity keeps the top half and the terminal takes the bottom
+half, beside the graph, which keeps its size; with Live activity hidden the terminal
+uses the whole column, and closing it gives Live activity its full height back. The
+terminal's **Expand** button switches to the large overlay and **Dock** back; the
+choice is remembered per browser. On medium widths (Live activity behind the
+Activity button) the terminal opens as the large overlay, and on a phone as a
+full-screen sheet. It follows every size change, says clearly when it is
+disconnected or has ended, and closes only with its **Close** button: every key,
+Escape included, goes to the terminal.
 
 **Whoever can open the terminal has a shell in that agent's container, with its
 credentials** (the CLI's sign-in, the stored token or key). That is why only the
@@ -1088,7 +1096,10 @@ only who opened which kind of terminal in which agent.
 How it works: the page opens a WebSocket to `/admin/api/builtin/{name}/terminal`
 (the session cookie and the `agents` permission are checked on the upgrade request,
 and its `Origin` must be the request's own origin, so another site cannot open one
-with your cookie). lore relays it over the runner link to a PTY the runner opens in
+with your cookie). While it is open lore checks both again every 30 seconds: when
+the session has ended (signed out, expired, ended by an administrator) or the
+`agents` permission was taken away, it closes the terminal with a message saying
+why. lore relays it over the runner link to a PTY the runner opens in
 the container, with the same cleared environment as every other CLI command (the
 runner's link secret never reaches it) and `TERM=xterm-256color`. Each terminal runs
 in a session of its own; closing it, the page going away, or the runner's link
@@ -1193,7 +1204,11 @@ runner deletes `/work/<run id>` and reports whether the default branch moved (as
 through lore with the token) and the free space left.
 
 **The end.** If the default branch moved, lore marks the task done with the new
-commit (unless the agent already did). Anything else (a failure, a timeout, a stop,
+commit (unless the agent already did). A run that was stopped (by you, or by the
+hard limit) has lost its token by then and cannot ask, so lore reads the branch
+itself with the stored credential: a commit the agent pushed before the stop is
+noted on the task and in the history, and the task is still released, because a
+stopped run is not "done". Anything else (a failure, a timeout, a stop,
 a run that pushed nothing) releases the task with a note saying why, with the CLI's
 last words, and the task is not taken again until someone touches it (any change:
 a note, an edit of where it goes, a reopen). Runs a previous lore process left open
@@ -1228,6 +1243,8 @@ a run token, in one place per surface:
 - `github` and `github_org` let it GET anywhere, and make any other call only under
   `/repos/{owner}/{repo}/…` of the task's repository, through the task's account (not
   on the repository itself: renaming, settings and deletion stay with you);
+- `repo_tree`, `repo_read` and `repo_search` read anywhere like GET; `repo_commit`
+  commits only to the task's repository, through the task's account;
 - `dokploy` is read-only unless the task names a Dokploy project; then a write must
   name only that project's own ids or those of its resources (lore reads them with
   `project.one`); `cloudflare` is read-only unless the task names a zone, then writes
@@ -1250,6 +1267,71 @@ and the run token while the run lasts. Review what the agents push.
 and `lore:8080` to it, or the MCP endpoint refuses the agents' requests. Give the
 GitHub credential that should push `full` access for the built-in agent (no row means
 `full`), enable the agent, and add tasks.
+
+### Asking a built-in agent for help
+
+Your other agents (the Claude Code, Codex or opencode on your desk) can use a
+built-in agent as a helper, through three MCP tools that exist only when lore has
+built-in agents. A built-in agent helps **only when you switched "Available to help
+other agents" on** in its settings (off by default) **and only while it is idle**:
+connected, signed in, and not in a run. The board switch ("Works on idle board
+tasks"), the daily cap and the active hours are about board tasks and do not apply
+to help. The hello briefing tells an agent in one line that assistants exist when at
+least one is available.
+
+| Tool | What it does |
+|---|---|
+| `assistants` | Lists the built-in agents with their model and state: `idle`, `busy` (and with what) or `off` (and why), and how to use them. |
+| `delegate` | `project`, `title`, optional `details`, `repo`, `agent`. Creates a board task assigned to the chosen (or any available) built-in agent and starts it at once when that agent is available and idle, without waiting for the idle time; otherwise the task is queued for that agent and the answer says so. |
+| `ask` | `message`, optional `agent`, `project`, `conversation`. Asks a question. The answer (the CLI's final message) is returned when it comes within 120 seconds; otherwise the tool returns at once and the answer arrives in the caller's lore inbox as a message from the built-in agent. |
+
+**A delegated task** is an ordinary task run (kind `help` in the history): the same
+clone through lore, the same prompt, the same scope (the task's repository only), the
+same limits and the same end as a board run, started through the same code. The task
+is created by the delegating agent (`created_by`), its delegation is recorded, and
+the activity feed says who handed what to whom. It does not count against the daily
+cap.
+
+**A question** is a run of kind `chat`. It has **no write rights anywhere**: no
+push, no call other than GET on any service, no `repo_commit`. Without `project` it
+runs in an empty directory; with a `project` whose repository lore knows it gets a
+read-only clone (when the asking agent may read that account; otherwise the answer
+says there is no checkout and why). The message goes to the CLI between two random
+markers, labelled as untrusted text from another agent, after lore's own rules. The
+wall clock is `LORE_ASK_WALL_CLOCK_MINUTES` (5). Every `ask` returns a
+`conversation` id: pass it to a later `ask` to follow up. The follow-up resumes the
+CLI's own session (`claude --resume <id>`, `codex exec resume <id>`,
+`opencode run --session <id>`) when the last turn is younger than
+`LORE_ASK_RESUME_MINUTES` (60) and the CLI reported a session; otherwise it starts
+fresh and says so. Only the agent that started a conversation can continue it.
+
+**Never more than the asker could do itself.** A helper must not become a way around
+an agent's own access levels, so the run is capped by the *calling* agent's levels
+(the stricter of its token's and its session name's, as everywhere):
+
+- `delegate` is refused, with a sentence saying why, unless the caller has `full`
+  on the GitHub account the push goes through; a queued task is checked again when
+  it starts;
+- a run started for another agent reads only the services that agent may read
+  (`read` or `full`): the provider tools, the repository tools, `mail` and fetching
+  through the git proxy all refuse the rest, GET included;
+- it changes a Dokploy project or a Cloudflare zone only where the caller has `full`
+  (a task made with `delegate` names neither).
+
+**Limits.** Per calling agent (by its token) at most `LORE_ASK_PER_HOUR` (6)
+questions and `LORE_DELEGATE_PER_HOUR` (3) delegations an hour. A built-in agent
+cannot call these tools, so there is no self- or cross-delegation among them. They
+need a real session (`hello`); an implicit session is refused.
+
+**In the admin view** the task runner's history shows help and chat runs with who
+asked, and a running one can be stopped like any run (the asker is then told there
+is no answer).
+
+**Honest limits.** The message and the task text are still untrusted input to a
+model: the scope limits what a misled run can do, it does not prevent it being
+misled. An answer is the model's own words, redacted against every credential lore
+holds and the run token, and may be wrong. A conversation's history stays in the
+CLI's own session store in the agent's volume.
 
 ### Policy
 
@@ -1352,6 +1434,10 @@ documentation for adding a remote MCP server.
 | `LORE_RUN_WALL_CLOCK_MINUTES` | `45` | The runner interrupts a run's CLI after this long. Must be below the hard limit. |
 | `LORE_RUN_HARD_LIMIT_MINUTES` | `90` | A run's token dies and lore stops the run after this long. |
 | `LORE_RUN_OUTPUT_CAP_MIB` | `4` | The runner stops a CLI that printed more than this. |
+| `LORE_ASK_WALL_CLOCK_MINUTES` | `5` | The wall clock of a question another agent asks a built-in agent (`ask`). |
+| `LORE_ASK_RESUME_MINUTES` | `60` | How long after its last turn a conversation can be resumed in the CLI's own session. |
+| `LORE_ASK_PER_HOUR` | `6` | Questions one calling agent may ask the built-in agents per hour. |
+| `LORE_DELEGATE_PER_HOUR` | `3` | Tasks one calling agent may delegate to the built-in agents per hour. |
 | `LORE_RUNNER_LORE_URL` | `http://lore:8080` | lore as the agents' containers reach it: their clone URL and MCP endpoint. |
 | `LORE_RUNNER_BIND` | `0.0.0.0:8081` | Where lore listens for the built-in agents' runners (only with `LORE_RUNNER_TOKENS`). Internal network only: never publish this port. Must differ from `LORE_BIND`. |
 

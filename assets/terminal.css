@@ -60,3 +60,11 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .title .muted { display: none; }
   .state { max-width: 38%; }
 }
+
+/* Docked in the admin page's side column: a narrow bar, so the state keeps
+   only its dot (its words stay in the tooltip). */
+body.docked .title .muted { display: none; }
+body.docked .state { font-size: 0; max-width: none; }
+body.docked .state::before { margin-right: 0; }
+body.docked .bar { gap: 6px; padding-left: 10px; }
+body.docked button { padding: 6px 9px; }

@@ -71,6 +71,16 @@ CREATE TABLE IF NOT EXISTS agent_run_events (
     body   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS agent_run_events_run ON agent_run_events (run_id, seq);
+-- A board task another agent handed to a built-in agent (`delegate`,
+-- schema 6): who asked, through which token, and for which agent. The
+-- task itself is an ordinary board task.
+CREATE TABLE IF NOT EXISTS delegations (
+    task_id      INTEGER PRIMARY KEY,
+    agent        TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    via          TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
 "#;
 
 /// Board tasks a built-in agent may take a day, at most.
@@ -297,7 +307,7 @@ const RUNS_WITH_EVENTS: i64 = 200;
 /// The columns of a run row, in the order `Run::from_row` reads them.
 const RUN_COLUMNS: &str = "id, agent, task_id, kind, project, repo, provider, status, \
      started_at, ended_at, exit_code, summary, commit_hash, model, task_title, pushed, \
-     work_free_bytes, output_lines, created_at, scope";
+     work_free_bytes, output_lines, created_at, scope, requested_by, conversation";
 
 /// One run of a built-in agent, as the admin page and the runner see it.
 /// The token is never part of it, not even hashed.
@@ -328,6 +338,11 @@ pub struct Run {
     /// The JSON scope (provider, repository, Dokploy project, zone).
     #[serde(skip)]
     pub scope: String,
+    /// The agent that delegated the task or asked the question; empty for
+    /// the scheduler's own board runs.
+    pub requested_by: String,
+    /// The conversation a chat run belongs to; empty for other runs.
+    pub conversation: String,
 }
 
 impl Run {
@@ -353,6 +368,8 @@ impl Run {
             output_lines: row.get(17)?,
             created_at: row.get(18)?,
             scope: row.get(19)?,
+            requested_by: row.get(20)?,
+            conversation: row.get(21)?,
         })
     }
 }
@@ -372,6 +389,30 @@ pub struct NewRun {
     pub token_hash: String,
     pub token_expires_at: i64,
     pub scope: String,
+    pub requested_by: String,
+    pub conversation: String,
+}
+
+/// A task another agent delegated to a built-in agent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Delegation {
+    pub task_id: i64,
+    pub agent: String,
+    /// The agent that delegated it (its session's name).
+    pub requested_by: String,
+    /// The token it called with, when that names another agent.
+    pub via: String,
+    pub created_at: String,
+}
+
+/// The latest run of a conversation, for a follow-up `ask`.
+#[derive(Debug, Clone)]
+pub struct ConversationRun {
+    pub run: Run,
+    /// The CLI's own session id, when the runner reported one.
+    pub cli_session: String,
+    /// Seconds since the run ended (or started, while it runs).
+    pub age_secs: i64,
 }
 
 /// How a run ended.
@@ -507,9 +548,9 @@ impl Db {
         conn.execute(
             "INSERT INTO agent_runs (id, agent, task_id, kind, project, repo, provider, status,
                                      started_at, token_hash, token_expires_at, scope, model,
-                                     task_title)
+                                     task_title, requested_by, conversation)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'starting',
-                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?8, ?9, ?10, ?11, ?12)",
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 new.id,
                 new.agent,
@@ -522,7 +563,9 @@ impl Db {
                 new.token_expires_at,
                 new.scope,
                 new.model,
-                new.task_title
+                new.task_title,
+                new.requested_by,
+                new.conversation
             ],
         )?;
         get_run(&conn, &new.id)?.context("run vanished after insert")
@@ -671,6 +714,89 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Records that `requested_by` (through the token of `via`) handed
+    /// task `task_id` to the built-in agent `agent`.
+    pub fn add_delegation(
+        &self,
+        task_id: i64,
+        agent: &str,
+        requested_by: &str,
+        via: &str,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO delegations (task_id, agent, requested_by, via)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, agent, requested_by, via],
+        )?;
+        Ok(())
+    }
+
+    /// The delegation of a task, when it was delegated.
+    pub fn delegation(&self, task_id: i64) -> Result<Option<Delegation>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT task_id, agent, requested_by, via, created_at FROM delegations
+                 WHERE task_id = ?1",
+                params![task_id],
+                delegation_row,
+            )
+            .optional()?)
+    }
+
+    /// Delegated tasks that wait for their agent: open, unclaimed, and
+    /// not taken or skipped since they were last touched. Oldest first.
+    pub fn waiting_delegations(&self) -> Result<Vec<(super::Task, Delegation)>> {
+        let conn = self.lock();
+        let columns: Vec<String> = super::TASK_COLUMNS
+            .split(',')
+            .map(|column| format!("t.{}", column.trim()))
+            .collect();
+        let sql = format!(
+            "SELECT {}, d.task_id, d.agent, d.requested_by, d.via, d.created_at
+             FROM delegations d JOIN tasks t ON t.id = d.task_id
+             WHERE t.status = 'open' AND t.claimed_by = ''
+               AND (t.auto_last_at IS NULL OR t.auto_last_at < t.updated_at)
+             ORDER BY d.created_at, t.id",
+            columns.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                super::Task::from_row(row)?,
+                Delegation {
+                    task_id: row.get(18)?,
+                    agent: row.get(19)?,
+                    requested_by: row.get(20)?,
+                    via: row.get(21)?,
+                    created_at: row.get(22)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The latest run of a conversation.
+    pub fn conversation_run(&self, conversation: &str) -> Result<Option<ConversationRun>> {
+        let sql = format!(
+            "SELECT {RUN_COLUMNS}, cli_session,
+                    CAST(strftime('%s', 'now') - strftime('%s', COALESCE(ended_at, started_at,
+                         created_at)) AS INTEGER)
+             FROM agent_runs WHERE conversation = ?1 AND conversation != ''
+             ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        );
+        Ok(self
+            .lock()
+            .query_row(&sql, params![conversation], |row| {
+                Ok(ConversationRun {
+                    run: Run::from_row(row)?,
+                    cli_session: row.get(22)?,
+                    age_secs: row.get::<_, Option<i64>>(23)?.unwrap_or(i64::MAX),
+                })
+            })
+            .optional()?)
+    }
+
     /// Drops the output of all but the newest runs.
     pub fn prune_run_events(&self) -> Result<()> {
         self.lock().execute(
@@ -692,6 +818,16 @@ impl Db {
             |row| row.get(0),
         )?)
     }
+}
+
+fn delegation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Delegation> {
+    Ok(Delegation {
+        task_id: row.get(0)?,
+        agent: row.get(1)?,
+        requested_by: row.get(2)?,
+        via: row.get(3)?,
+        created_at: row.get(4)?,
+    })
 }
 
 fn get_run(conn: &rusqlite::Connection, id: &str) -> Result<Option<Run>> {
@@ -814,6 +950,70 @@ mod tests {
             db.builtin_agent("claude-builtin").unwrap().unwrap().model,
             "opus"
         );
+    }
+
+    #[test]
+    fn a_database_of_schema_5_opens_with_every_row_and_gains_the_help_fields() {
+        let (db, path) = temp_db("schema5");
+        // What a database of schema 5 looks like: the task runner's columns,
+        // but no delegations and no help columns on the runs.
+        db.execute_for_test(
+            "DROP TABLE delegations;
+             ALTER TABLE agent_runs DROP COLUMN requested_by;
+             ALTER TABLE agent_runs DROP COLUMN conversation;
+             UPDATE meta SET value = '5' WHERE key = 'schema_version';
+             INSERT INTO entries (project, kind, title, body, agent)
+               VALUES ('lore', 'note', 'kept', 'body', 'claude');
+             INSERT INTO tasks (project, title, body, status, created_by, repo, created_at, updated_at)
+               VALUES ('shop', 'a task', 'details', 'open', 'codex', 'github.com/me/shop',
+                       '2025-01-01T00:00:00Z', '2025-01-02T00:00:00Z');
+             INSERT INTO builtin_agents (name, kind, model, available) VALUES ('claude-builtin', 'claude', 'opus', 1);
+             INSERT INTO agent_runs (id, agent, kind, status, summary, commit_hash, pushed, cli_session)
+               VALUES ('old-run', 'claude-builtin', 'task', 'pushed', 'it went', 'abc1234', 1, 'sess-9');",
+        );
+        let before: HashMap<String, i64> = db.table_counts().unwrap().into_iter().collect();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let after: HashMap<String, i64> = db.table_counts().unwrap().into_iter().collect();
+        for (table, count) in &before {
+            assert_eq!(after.get(table), Some(count), "{table}");
+        }
+        assert_eq!(after["delegations"], 0);
+        assert_eq!(
+            super::super::schema_version(&db.lock()).unwrap(),
+            super::super::SCHEMA_VERSION
+        );
+        let run = db.run("old-run").unwrap().unwrap();
+        assert_eq!(
+            (
+                run.status.as_str(),
+                run.summary.as_str(),
+                run.commit_hash.as_str(),
+                run.pushed
+            ),
+            ("pushed", "it went", "abc1234", true)
+        );
+        assert!(run.requested_by.is_empty() && run.conversation.is_empty());
+        let task = &db.tasks(None, &[], 10).unwrap()[0];
+        assert_eq!(
+            (task.title.as_str(), task.repo.as_str()),
+            ("a task", "github.com/me/shop")
+        );
+        assert!(db.delegation(task.id).unwrap().is_none());
+        assert!(
+            db.builtin_agent("claude-builtin")
+                .unwrap()
+                .unwrap()
+                .available
+        );
+        // The new fields work on the old rows.
+        db.add_delegation(task.id, "claude-builtin", "codex", "")
+            .unwrap();
+        let waiting = db.waiting_delegations().unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].1.requested_by, "codex");
+        assert_eq!(waiting[0].0.id, task.id);
+        assert!(db.conversation_run("").unwrap().is_none());
     }
 
     #[test]

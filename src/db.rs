@@ -328,8 +328,9 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// columns of `vault` (host, port, account). 4: the built-in agents
 /// (`builtin_agents`, `agent_runs`, `agent_run_events`). 5: the task
 /// runner's task columns (`repo`, `dokploy_project_id`, `cloudflare_zone`,
-/// `auto_attempts`, `auto_last_at`) and run columns.
-pub const SCHEMA_VERSION: i64 = 5;
+/// `auto_attempts`, `auto_last_at`) and run columns. 6: help for other
+/// agents (`delegations`; `agent_runs.requested_by`, `conversation`).
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Columns every database lore ever created has in `entries`: a full
 /// backup without them is not a lore database.
@@ -389,6 +390,10 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("agent_runs", "work_free_bytes", "INTEGER"),
     ("agent_runs", "cli_session", "TEXT NOT NULL DEFAULT ''"),
     ("agent_runs", "output_lines", "INTEGER NOT NULL DEFAULT 0"),
+    // Help for other agents (schema 6): who asked for a run (`delegate`,
+    // `ask`), and the conversation a chat run belongs to.
+    ("agent_runs", "requested_by", "TEXT NOT NULL DEFAULT ''"),
+    ("agent_runs", "conversation", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -125,6 +125,31 @@
     connect();
   });
 
+  /* Docked in the side column or expanded: the admin page says which, and
+     whether docking is possible at its width; Expand / Dock asks it to
+     switch. The terminal refits through the ResizeObserver above. */
+  let layout = "expanded";
+  window.addEventListener("message", (event) => {
+    if (event.origin !== location.origin || event.source !== window.parent) return;
+    const data = event.data || {};
+    if (data.type !== "lore-terminal-layout") return;
+    layout = data.mode === "docked" ? "docked" : "expanded";
+    document.body.classList.toggle("docked", layout === "docked");
+    const button = $("layout");
+    button.hidden = !data.canDock;
+    button.textContent = layout === "docked" ? "Expand" : "Dock";
+    button.title = layout === "docked"
+      ? "Show the terminal large, over the page"
+      : "Put the terminal in the side column, under Live activity";
+  });
+  $("layout").addEventListener("click", () => {
+    if (window.parent === window) return;
+    window.parent.postMessage({
+      type: "lore-terminal-mode", mode: layout === "docked" ? "expanded" : "docked",
+    }, location.origin);
+  });
+  if (window.parent !== window) window.parent.postMessage({ type: "lore-terminal-ready" }, location.origin);
+
   $("close").addEventListener("click", () => {
     send(JSON.stringify({ type: "close" }));
     if (socket) socket.close();

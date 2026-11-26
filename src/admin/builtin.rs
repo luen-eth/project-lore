@@ -302,6 +302,11 @@ async fn terminal(
         Ok(upgrade) => upgrade,
         Err(rejection) => return rejection.into_response(),
     };
+    // The session this page is signed in with: looked at again while
+    // the terminal is open. The guard has just accepted it.
+    let Some(session) = super::cookie(&headers, super::COOKIE) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let state = admin.clone();
     let agent = name.clone();
     let model = tokio::task::spawn_blocking(move || state.db.builtin_agent(&agent))
@@ -314,7 +319,7 @@ async fn terminal(
     upgrade
         .max_message_size(TERMINAL_FRAME_BYTES)
         .max_frame_size(TERMINAL_FRAME_BYTES)
-        .on_upgrade(move |socket| relay(admin, hub, name, me.username, model, socket))
+        .on_upgrade(move |socket| relay(admin, hub, name, me.username, session, model, socket))
 }
 
 /// Sends one small JSON frame to the page.
@@ -326,11 +331,15 @@ async fn tell(socket: &mut WebSocket, value: serde_json::Value) -> bool {
 }
 
 /// One page and one terminal, from the page's `open` to either side's end.
+/// While it is open, the page's session and its `agents` permission are
+/// checked again every `terminal_recheck` (30 seconds): a terminal does
+/// not outlive the sign-in or the permission it was opened with.
 async fn relay(
     admin: Arc<Admin>,
     hub: Arc<Hub>,
     agent: String,
     who: String,
+    session: String,
     model: Option<String>,
     mut socket: WebSocket,
 ) {
@@ -379,9 +388,21 @@ async fn relay(
     );
     tracing::info!(%agent, user = %who, %term_id, ?mode, "a terminal opened");
     let mut ended = false;
+    let mut recheck = tokio::time::interval_at(
+        tokio::time::Instant::now() + admin.terminal_recheck,
+        admin.terminal_recheck,
+    );
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     if tell(&mut socket, json!({ "type": "opened" })).await {
         loop {
             tokio::select! {
+                _ = recheck.tick() => {
+                    if let Err(why) = admin.terminal_access(&session) {
+                        tracing::info!(%agent, user = %who, %term_id, "a terminal was closed: its session or permission is gone");
+                        tell(&mut socket, json!({ "type": "exit", "code": null, "message": why })).await;
+                        break;
+                    }
+                }
                 frame = socket.recv() => {
                     let command = match frame {
                         Some(Ok(WsMessage::Binary(bytes))) => ToRunner::TerminalInput {

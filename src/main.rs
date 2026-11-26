@@ -234,6 +234,12 @@ async fn main() -> Result<()> {
         )?),
         None => None,
     };
+    // Other agents may ask the built-in agents for help (`assistants`,
+    // `delegate`, `ask`) only when there are some.
+    let lore = match &task_runner {
+        Some(runner) => lore.with_task_runner(runner.clone()),
+        None => lore,
+    };
     let admin = match (admin, &hub, &task_runner) {
         (Some(admin), Some(hub), Some(runner)) => Some(
             admin

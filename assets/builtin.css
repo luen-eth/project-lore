@@ -37,6 +37,7 @@
 .builtin-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .builtin-check { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); }
 .builtin-actions { justify-content: flex-start; }
+.builtin-help-note { margin: 0; }
 
 
 /* The task runner: its runs with their live output, the queue, history. */
@@ -83,6 +84,23 @@
   box-shadow: 0 24px 70px rgba(0, 0, 0, 0.65);
 }
 html.terminal-open, html.terminal-open body { overflow: hidden; }
+
+/* Docked: in the Live activity column on wide screens. The column runs from
+   68px below the top to 16px above the bottom (see .feed in admin.css);
+   Live activity keeps its top half, the terminal takes the bottom half, or
+   the whole column when Live activity is hidden. Nothing else moves, so the
+   graph keeps its size. It stays above the panels (z-index 6) that open
+   over the column, the Agents panel it is opened from among them. */
+@media (min-width: 1181px) {
+  .terminal-overlay.docked {
+    inset: auto 16px 16px auto; top: calc((100vh - 84px) / 2 + 74px);
+    width: var(--feed); padding: 0; z-index: 7;
+    background: none; backdrop-filter: none;
+  }
+  #app.feed-hidden ~ .terminal-overlay.docked { top: 68px; }
+  html.terminal-docked #app:not(.feed-hidden) .feed { bottom: calc((100vh - 84px) / 2 + 22px); }
+  .terminal-overlay.docked .terminal-frame { box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45); }
+}
 
 @media (max-width: 760px) {
   .builtin-row { grid-template-columns: minmax(0, 1fr); }

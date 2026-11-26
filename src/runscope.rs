@@ -9,7 +9,15 @@
 //! - the provider tools ask `check_call` before every call (GET is
 //!   allowed anywhere; the existing levels, the denylist, the leak scan
 //!   and `LORE_DOKPLOY_PROTECTED` still apply on top), and for a Dokploy
-//!   write `check_dokploy` with the ids the task's project holds.
+//!   write `check_dokploy` with the ids the task's project holds;
+//! - the repository tools (`repo_tree`, `repo_read`, `repo_search`,
+//!   `repo_commit`) ask `check_repository_tool`: reading like GET, a
+//!   commit only to the run's own repository through its own provider;
+//! - `mail` and the git proxy's fetch ask `check_read`.
+//!
+//! A run another agent asked for (`delegate`, `ask`) carries what that
+//! agent may do: `readable` lists the services it may read, and a
+//! conversation (`ask`) is `read_only` everywhere.
 //!
 //! Outside a run a built-in agent has no lore credential at all: its
 //! runner's link secret reaches only the internal runner listener.
@@ -42,7 +50,7 @@ pub fn looks_like_token(value: &str) -> bool {
 }
 
 /// The scope of one run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunScope {
     /// The run the token belongs to.
     #[serde(default)]
@@ -60,6 +68,19 @@ pub struct RunScope {
     /// A Cloudflare zone id the run may change; none for read-only.
     #[serde(default)]
     pub cloudflare_zone: Option<String>,
+    /// A conversation (`ask`): no write rights anywhere, whatever the
+    /// fields above say. No push, no non-GET call, no `repo_commit`.
+    #[serde(default)]
+    pub read_only: bool,
+    /// The services the run may read at all (provider ids, and `mail`);
+    /// `None` for every one. A run another agent asked for may read no
+    /// more than that agent could read itself.
+    #[serde(default)]
+    pub readable: Option<Vec<String>>,
+    /// The agent that delegated the task or asked the question; empty
+    /// for the scheduler's own board runs.
+    #[serde(default)]
+    pub requested_by: String,
 }
 
 /// What `check_call` decided.
@@ -88,9 +109,68 @@ impl RunScope {
             && repo.eq_ignore_ascii_case(&self.repo)
     }
 
+    /// Whether the run may read `service` (a provider id, or `mail`) at
+    /// all. Every read surface asks this: the provider tools, the
+    /// repository tools, `mail` and the git proxy's fetch.
+    pub fn check_read(&self, service: &str) -> Result<(), String> {
+        match &self.readable {
+            Some(allowed) if !allowed.iter().any(|id| id == service) => Err(format!(
+                "this run may not read {service}: {} asked for it and has no access to {service} \
+                 itself, and a built-in agent never does more for another agent than that agent \
+                 could do",
+                if self.requested_by.is_empty() {
+                    "the agent that"
+                } else {
+                    self.requested_by.as_str()
+                }
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// The refusal of any write in a conversation.
+    fn read_only_refusal(&self) -> String {
+        "this run is a conversation and may only read: a built-in agent answering a question \
+         changes nothing (no push, no commit, no write call on any service)"
+            .to_string()
+    }
+
+    /// The repository tools' check before a call (`repo_tree`,
+    /// `repo_read`, `repo_search` read like GET; `repo_commit` writes):
+    /// reading anywhere the run may read, a commit only to the run's own
+    /// repository through the run's own provider.
+    pub fn check_repository_tool(
+        &self,
+        provider: &Provider,
+        write: bool,
+        owner: &str,
+        repo: &str,
+    ) -> Result<(), String> {
+        self.check_read(provider.id)?;
+        if !write {
+            return Ok(());
+        }
+        if self.read_only {
+            return Err(self.read_only_refusal());
+        }
+        if self.is_own_repository(provider, owner, repo) {
+            Ok(())
+        } else {
+            Err(format!(
+                "this run may commit only to {} through `{}`: it works on one task, and that \
+                 task's repository is the only one it may change",
+                self.repository(),
+                self.provider
+            ))
+        }
+    }
+
     /// The git proxy's check before a push (`git-receive-pack`, either
     /// half): only to the run's repository, through the run's provider.
     pub fn check_push(&self, provider: &Provider, repo_path: &str) -> Result<(), String> {
+        if self.read_only {
+            return Err(self.read_only_refusal());
+        }
         let mut parts = repo_path.split('/');
         let (owner, repo, rest) = (parts.next(), parts.next(), parts.next());
         match (owner, repo, rest) {
@@ -109,8 +189,14 @@ impl RunScope {
     /// The provider tools' check before a call. `method` is normalised
     /// and `path` is the path the service will see (`ops::validate`).
     pub fn check_call(&self, provider: &Provider, method: &str, path: &str) -> Decision {
+        if let Err(reason) = self.check_read(provider.id) {
+            return Decision::Deny(reason);
+        }
         if method == "GET" {
             return Decision::Allow;
+        }
+        if self.read_only {
+            return Decision::Deny(self.read_only_refusal());
         }
         let segments: Vec<String> = path
             .split('/')
@@ -256,7 +342,77 @@ mod tests {
             repo: "shop".into(),
             dokploy_project_id: None,
             cloudflare_zone: None,
+            read_only: false,
+            readable: None,
+            requested_by: String::new(),
         }
+    }
+
+    #[test]
+    fn repository_tools_commit_only_to_the_task_s_repository() {
+        let scope = scope();
+        assert!(
+            scope
+                .check_repository_tool(&ops::GITHUB, true, "LUEN-ETH", "Shop")
+                .is_ok()
+        );
+        for (provider, owner, repo) in [
+            (ops::GITHUB, "luen-eth", "other"),
+            (ops::GITHUB, "someone", "shop"),
+            (ops::GITHUB_ORG, "luen-eth", "shop"),
+        ] {
+            let refused = scope
+                .check_repository_tool(&provider, true, owner, repo)
+                .unwrap_err();
+            assert!(
+                refused.contains("may commit only to Luen-Eth/shop"),
+                "{refused}"
+            );
+            // Reading is like GET: anywhere.
+            assert!(
+                scope
+                    .check_repository_tool(&provider, false, owner, repo)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn a_conversation_writes_nowhere_and_reads_only_what_its_asker_may() {
+        let scope = RunScope {
+            read_only: true,
+            readable: Some(vec!["github".into()]),
+            requested_by: "codex".into(),
+            ..scope()
+        };
+        assert!(scope.check_push(&ops::GITHUB, "luen-eth/shop").is_err());
+        assert!(
+            scope
+                .check_repository_tool(&ops::GITHUB, true, "luen-eth", "shop")
+                .is_err()
+        );
+        assert!(matches!(
+            scope.check_call(&ops::GITHUB, "POST", "/repos/luen-eth/shop/pulls"),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            scope.check_call(&ops::GITHUB, "GET", "/repos/x/y"),
+            Decision::Allow
+        );
+        // Services the asker cannot read are closed even for GET.
+        for provider in [ops::GITHUB_ORG, ops::DOKPLOY, ops::CLOUDFLARE] {
+            let Decision::Deny(why) = scope.check_call(&provider, "GET", "/x") else {
+                panic!("{}", provider.id)
+            };
+            assert!(why.contains("codex asked for it"), "{why}");
+        }
+        assert!(scope.check_read("mail").is_err());
+        assert!(scope.check_read("github").is_ok());
+        // An old scope (no new fields) reads everywhere and writes as before.
+        let old: RunScope =
+            serde_json::from_str(r#"{"provider":"github","owner":"me","repo":"shop"}"#).unwrap();
+        assert!(!old.read_only && old.readable.is_none());
+        assert!(old.check_push(&ops::GITHUB, "me/shop").is_ok());
     }
 
     #[test]

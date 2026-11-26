@@ -7,7 +7,10 @@
 //! `repo_commit`), the credential added here on the server side, every
 //! stored secret redacted from the answer, one `ops_log` row and one
 //! activity note per tool call. Every upstream request goes through
-//! `ops::call_with_limit`.
+//! `ops::call_with_limit`. A built-in agent's run token is held to its
+//! task's scope here too (`RunScope::check_repository_tool`): the three
+//! read tools read like GET, `repo_commit` only to the run's own
+//! repository through the run's own account.
 //!
 //! `repo_commit` writes through the Git Data API. When the repository is
 //! public (or its visibility cannot be read) every change is scanned by the
@@ -24,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Lore, agent_of, blocking, internal, session_agent};
-use crate::{auth::SHARED_AGENT, leakscan, ops};
+use crate::{auth::SHARED_AGENT, leakscan, ops, runscope::RunScope};
 
 /// The longest path `repo_tree`, `repo_read` and `repo_commit` accept.
 const MAX_PATH_CHARS: usize = 4096;
@@ -818,12 +821,18 @@ impl Lore {
     pub(super) async fn repo_tool(&self, parts: &Parts, call: RepoCall) -> Result<String, String> {
         let agent = agent_of(parts);
         let shared = agent == SHARED_AGENT;
+        // A built-in agent's run token carries the scope of its task: the
+        // same rules as for the provider tools (`operate`), checked here,
+        // where every call of the four tools passes.
+        let scope = parts.extensions.get::<RunScope>().cloned();
         let method = call.method();
         let log_path = call.log_path();
         let this = self.clone();
         let token_agent = agent.clone();
         let refused_path = log_path.clone();
+        let checked_scope = scope.clone();
         let prepared = blocking(move || {
+            let scope = checked_scope;
             let log_path = refused_path;
             let (session_id, repo, account_name) = call.common();
             let session = this.require_session(session_id, &token_agent, shared)?;
@@ -853,6 +862,26 @@ impl Lore {
                     return Err(error);
                 }
             };
+            // A run token: the one check of what its task allows, before
+            // the credential is touched. Logged like every other refusal.
+            if let Some(scope) = &scope
+                && let Err(reason) =
+                    scope.check_repository_tool(&provider, method != "GET", &owner, &name)
+            {
+                this.log_op_call(
+                    &label,
+                    &actor,
+                    Some(&session.id),
+                    provider,
+                    method,
+                    &log_path,
+                    "denied",
+                    &reason,
+                    0,
+                    0,
+                );
+                return Err(reason);
+            }
             match ops::authorize(
                 &this.db,
                 this.vault.as_ref(),
@@ -989,7 +1018,14 @@ impl Lore {
             },
         };
         let outcome = match outcome {
-            Err(mut failure) if failure.not_found && !named && provider.id == ops::GITHUB.id => {
+            Err(mut failure)
+                if failure.not_found
+                    && !named
+                    && provider.id == ops::GITHUB.id
+                    && scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.check_read(ops::GITHUB_ORG.id).is_ok()) =>
+            {
                 if let Some(hint) = self
                     .organization_hint(&mut upstream, &agent, &actor, &label, &session_id)
                     .await
@@ -2909,6 +2945,158 @@ mod tests {
             assert!(required.iter().any(|field| field == "session_id"), "{name}");
             assert!(required.iter().any(|field| field == "repo"), "{name}");
         }
+    }
+
+    /// A built-in agent's run token (part 6b) is held to its task's
+    /// scope here as on `github`: `repo_commit` only to the run's own
+    /// repository through the run's own account, the read tools anywhere;
+    /// every refusal is logged and nothing is sent upstream.
+    #[tokio::test]
+    async fn a_run_token_commits_only_to_its_task_s_repository() {
+        let (lore, log, _) = setup("run-scope").await;
+        let agent = "claude-builtin";
+        let session = lore
+            .db
+            .open_session(&NewSession {
+                agent: agent.into(),
+                project: "shop".into(),
+                path: "/work/run-1/repo".into(),
+                repo: String::new(),
+                commit: String::new(),
+                branch: String::new(),
+                title: "Task #1".into(),
+                implicit: false,
+            })
+            .unwrap()
+            .id;
+        let scope = RunScope {
+            run_id: "run-1".into(),
+            agent: agent.into(),
+            provider: "github".into(),
+            owner: "me".into(),
+            repo: "shop".into(),
+            ..RunScope::default()
+        };
+        let as_run = |scope: &RunScope| {
+            let mut parts = axum::http::Request::builder()
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            parts.extensions.insert(Agent(agent.into()));
+            parts.extensions.insert(scope.clone());
+            Extension(parts)
+        };
+        let commit = |repo: &str, account: &str| {
+            args::<RepoCommitArgs>(
+                &session,
+                json!({
+                    "repo": repo, "account": account, "branch": "main", "message": "Change",
+                    "changes": [{"path": "a.txt", "content": "a\n"}]
+                }),
+            )
+        };
+        // Another repository, through the run's own account: refused.
+        let refused = lore
+            .repo_commit(commit("me/other", "personal"), as_run(&scope))
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("this run may commit only to me/shop through `github`"),
+            "{refused}"
+        );
+        // Its own repository through the other account: refused too.
+        let refused = lore
+            .repo_commit(commit("me/shop", "organization"), as_run(&scope))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("may commit only to me/shop"), "{refused}");
+        assert!(log.lock().unwrap().is_empty(), "nothing was sent upstream");
+        let rows = lore.db.ops_log(2).unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| row.outcome == "denied" && row.method == "POST"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|row| row.provider == "github_org"));
+        // A conversation (read-only) may not commit even to its own one.
+        let refused = lore
+            .repo_commit(
+                commit("me/shop", "personal"),
+                as_run(&RunScope {
+                    read_only: true,
+                    ..scope.clone()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("is a conversation and may only read"),
+            "{refused}"
+        );
+        assert!(log.lock().unwrap().is_empty());
+        // Its own repository through its own account: allowed.
+        let answer = lore
+            .repo_commit(commit("ME/Shop", "personal"), as_run(&scope))
+            .await
+            .unwrap();
+        assert!(
+            answer.starts_with("Committed 1 change to ME/Shop"),
+            "{answer}"
+        );
+        assert!(lines(&log).contains(&"PATCH /repos/ME/Shop/git/refs/heads/main".to_string()));
+        // The read tools read anywhere, through either account.
+        log.lock().unwrap().clear();
+        lore.repo_tree(
+            args(&session, json!({"repo": "someone/else"})),
+            as_run(&scope),
+        )
+        .await
+        .unwrap();
+        lore.repo_read(
+            args(
+                &session,
+                json!({"repo": "me/hidden-x", "account": "organization", "paths": ["README.md"]}),
+            ),
+            as_run(&scope),
+        )
+        .await
+        .unwrap();
+        lore.repo_search(
+            args(&session, json!({"repo": "other/thing", "query": "main"})),
+            as_run(&scope),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            lore.db
+                .ops_log(3)
+                .unwrap()
+                .iter()
+                .filter(|r| r.outcome == "ok")
+                .count(),
+            3
+        );
+        // A run another agent asked for reads only through the accounts
+        // that agent may read.
+        let refused = lore
+            .repo_tree(
+                args(
+                    &session,
+                    json!({"repo": "me/shop", "account": "organization"}),
+                ),
+                as_run(&RunScope {
+                    readable: Some(vec!["github".into()]),
+                    requested_by: "codex".into(),
+                    ..scope.clone()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("this run may not read github_org"),
+            "{refused}"
+        );
     }
 
     #[test]

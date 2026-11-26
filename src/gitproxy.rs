@@ -463,10 +463,16 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
     // A built-in agent's run token pushes only to its task's repository,
     // through its task's provider; it fetches from anywhere the
     // credential can read. This is the one place the git proxy checks it.
-    if let Some(scope) = &scope
-        && is_push(git.endpoint, query)
-        && let Err(reason) = scope.check_push(&git.provider, &git.repo)
-    {
+    let scoped = scope.as_ref().and_then(|scope| {
+        if is_push(git.endpoint, query) {
+            scope.check_push(&git.provider, &git.repo).err()
+        } else {
+            // A run another agent asked for fetches only through the
+            // accounts that agent may read itself.
+            scope.check_read(git.provider.id).err()
+        }
+    });
+    if let Some(reason) = scoped {
         conclude(
             &state,
             &agent,
@@ -1578,6 +1584,7 @@ mod tests {
             repo: "shop".into(),
             dokploy_project_id: None,
             cloudflare_zone: None,
+            ..Default::default()
         };
         db.insert_run(&crate::db::NewRun {
             id: run_id.into(),

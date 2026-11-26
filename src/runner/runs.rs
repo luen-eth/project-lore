@@ -36,7 +36,7 @@ use tokio::{
 
 use super::{
     drivers::{Driver, redact_with, shorten},
-    protocol::{FromRunner, Kind, RunSpec, ToRunner},
+    protocol::{FromRunner, Kind, RunKind, RunSpec, ToRunner},
 };
 
 /// How long the clone may take.
@@ -53,6 +53,8 @@ const RAW_LINE_BYTES: usize = 1024 * 1024;
 const CLAUDE_MAX_TURNS: u32 = 200;
 /// The `nice` increment of a run's CLI.
 const NICE: i32 = 10;
+/// Longest final answer sent back for a conversation.
+const ANSWER_CHARS: usize = 32_000;
 
 /// The runs of one link: at most one at a time.
 pub struct Runs {
@@ -113,7 +115,8 @@ impl Runs {
 
     fn start(&self, spec: RunSpec) {
         let run_id = spec.run_id.clone();
-        let refusal = if !valid_run_id(&run_id) {
+        let dir_name = spec.workdir.clone().unwrap_or_else(|| run_id.clone());
+        let refusal = if !valid_run_id(&run_id) || !valid_run_id(&dir_name) {
             Some("the run id is not a plain name".to_string())
         } else if !self.active().is_empty() {
             Some("another run is still going in this container".to_string())
@@ -131,6 +134,7 @@ impl Runs {
                         head: None,
                         work_free_bytes: None,
                         reason: Some(format!("failed: {reason}")),
+                        answer: None,
                     })
                     .await;
             });
@@ -141,13 +145,14 @@ impl Runs {
         let run = Run {
             driver: self.driver.clone(),
             out: self.out.clone(),
-            dir: self.work.join(&run_id),
+            dir: self.work.join(&dir_name),
             work: self.work.clone(),
             git: self.git.clone(),
             agent: self.agent.clone(),
             secrets: Vec::new(),
             seq: 0,
             sent_bytes: 0,
+            answer: None,
             spec,
         };
         let active = self.active.clone();
@@ -193,6 +198,8 @@ struct Run {
     secrets: Vec<String>,
     seq: u64,
     sent_bytes: u64,
+    /// The CLI's final message so far (a conversation's answer).
+    answer: Option<String>,
     spec: RunSpec,
 }
 
@@ -231,6 +238,11 @@ impl Run {
         }
         let free = super::read_resources(&self.work).await.work_free_bytes;
         let reason = ended.reason.map(|reason| self.redact(&reason));
+        let answer = self
+            .answer
+            .take()
+            .map(|answer| shorten(&self.redact(&answer), ANSWER_CHARS))
+            .filter(|answer| !answer.trim().is_empty());
         let _ = self
             .out
             .send(FromRunner::RunExit {
@@ -240,6 +252,7 @@ impl Run {
                 head,
                 work_free_bytes: free,
                 reason,
+                answer,
             })
             .await;
     }
@@ -284,6 +297,17 @@ impl Run {
             .await
             .context("lore's MCP server is required for a run and did not answer")?;
 
+        // A conversation without a project has no checkout: the CLI works
+        // in an empty directory and only talks.
+        if self.spec.clone_url.trim().is_empty() {
+            let chat = self.dir.join("chat");
+            create_private_dir(&chat)?;
+            self.say("lore", "a conversation without a checkout").await;
+            let (program, args, env) = self.cli_command(&chat, &conf)?;
+            let command = self.cli_process(&program, &args, env, &chat);
+            let ended = self.run_cli(command, stop, None).await?;
+            return Ok((ended, false, None));
+        }
         self.say("lore", "cloning the repository through lore")
             .await;
         let clone = self
@@ -339,29 +363,15 @@ impl Run {
         .await;
 
         let (program, args, env) = self.cli_command(&repo, &conf)?;
-        let mut command = self.driver.run_command(&program, &args, &repo);
-        command
-            .env("LORE_AGENT_TOKEN", self.spec.token.expose())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (name, value) in self.git_env() {
-            command.env(name, value);
-        }
-        for (name, value) in env {
-            command.env(name, value);
-        }
-        // SAFETY: between fork and exec only two system calls run, through
-        // rustix, which neither allocates nor takes locks.
-        unsafe {
-            command.pre_exec(|| {
-                rustix::process::setsid().map_err(std::io::Error::from)?;
-                let _ = rustix::process::nice(NICE);
-                Ok(())
-            });
-        }
-        let ended = self.run_cli(command, stop).await?;
+        let command = self.cli_process(&program, &args, env, &repo);
+        let base_sent = (base.len() >= 40).then(|| base.clone());
+        let ended = self.run_cli(command, stop, base_sent).await?;
 
+        // A conversation pushes nothing (lore refuses it), so there is
+        // nothing to look at.
+        if self.spec.kind == RunKind::Chat {
+            return Ok((ended, false, None));
+        }
         // Did the default branch move? Asked through lore, with the token.
         let head = if branch == "HEAD" {
             None
@@ -398,6 +408,33 @@ impl Run {
             }
         }
         Ok((ended, pushed, head))
+    }
+
+    /// The CLI's process: its environment (the token, git's settings,
+    /// what the CLI needs), its own session, `nice`d.
+    fn cli_process(&self, program: &Path, args: &[String], env: Env, cwd: &Path) -> Command {
+        let mut command = self.driver.run_command(program, args, cwd);
+        command
+            .env("LORE_AGENT_TOKEN", self.spec.token.expose())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, value) in self.git_env() {
+            command.env(name, value);
+        }
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        // SAFETY: between fork and exec only two system calls run, through
+        // rustix, which neither allocates nor takes locks.
+        unsafe {
+            command.pre_exec(|| {
+                rustix::process::setsid().map_err(std::io::Error::from)?;
+                let _ = rustix::process::nice(NICE);
+                Ok(())
+            });
+        }
+        command
     }
 
     /// What git needs for the run: the token as a header for lore's own
@@ -452,6 +489,12 @@ impl Run {
         let program = self.driver.settings.program.clone();
         let model = self.spec.model.trim();
         let model = (!model.is_empty() && !model.starts_with('-')).then_some(model);
+        let resume = self
+            .spec
+            .resume
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| valid_session_id(id));
         let (args, env) = cli_arguments(
             kind,
             &self.driver.settings.provider,
@@ -461,6 +504,10 @@ impl Run {
             &self.spec.run_id,
             repo,
             conf,
+            &Turn {
+                chat: self.spec.kind == RunKind::Chat,
+                resume,
+            },
         )?;
         // `ionice -c 3` when the image has it: the CLI's disk use waits for
         // everything else.
@@ -481,6 +528,7 @@ impl Run {
         &mut self,
         mut command: Command,
         stop: &mut watch::Receiver<Option<String>>,
+        base: Option<String>,
     ) -> Result<Ended> {
         let mut child = command.spawn().context("starting the CLI")?;
         let session = child.id().and_then(|pid| Pid::from_raw(pid as i32));
@@ -489,6 +537,7 @@ impl Run {
             .send(FromRunner::RunStarted {
                 run_id: self.spec.run_id.clone(),
                 session_id: None,
+                base,
             })
             .await;
         self.say("lore", "the CLI started").await;
@@ -553,7 +602,11 @@ impl Run {
                             let _ = self.out.send(FromRunner::RunStarted {
                                 run_id: self.spec.run_id.clone(),
                                 session_id: Some(self.redact(&session_id)),
+                                base: None,
                             }).await;
+                        }
+                        if let Some(answer) = parsed.answer {
+                            self.answer = Some(answer);
                         }
                         for (stream, text) in parsed.lines {
                             self.say(&stream, &text).await;
@@ -588,6 +641,9 @@ impl Run {
                                         } else {
                                             parse_event(kind, &line)
                                         };
+                                        if let Some(answer) = parsed.answer {
+                                            self.answer = Some(answer);
+                                        }
                                         for (stream, text) in parsed.lines {
                                             self.say(&stream, &text).await;
                                         }
@@ -628,6 +684,26 @@ impl Run {
 
 /// Extra environment variables, as `(name, value)`.
 type Env = Vec<(String, String)>;
+
+/// What kind of turn a run is, for its command line.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Turn<'a> {
+    /// A conversation (`ask`): it may run outside a git checkout.
+    pub chat: bool,
+    /// The CLI session to resume, for a follow-up question.
+    pub resume: Option<&'a str>,
+}
+
+/// A CLI session id as lore passes it on: letters, digits, `-`, `_`
+/// and `.`, at most 200 characters.
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 200
+        && !id.starts_with('-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
 
 type CliCommand = (PathBuf, Vec<String>, Env);
 
@@ -693,6 +769,12 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// configuration it reads, written to `conf`. The prompt is the last
 /// argument (or the first, for Claude, whose `--mcp-config` takes several
 /// values).
+///
+/// A follow-up resumes the CLI's own session (each verified against the
+/// CLI's `--help`): `claude -p … --resume <id>`, `codex exec resume
+/// [options] <id> <prompt>` (which takes no `-C` or `-s`: the working
+/// directory is the process's, the sandbox a `-c` setting), and
+/// `opencode run --session <id>`.
 #[expect(
     clippy::too_many_arguments,
     reason = "everything a command line is made of"
@@ -706,6 +788,7 @@ pub fn cli_arguments(
     run_id: &str,
     repo: &Path,
     conf: &Path,
+    turn: &Turn<'_>,
 ) -> Result<(Vec<String>, Env)> {
     let mut args: Vec<String> = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
@@ -741,15 +824,33 @@ pub fn cli_arguments(
             if let Some(model) = model {
                 args.extend(["--model".into(), model.into()]);
             }
+            if let Some(session) = turn.resume {
+                args.extend(["--resume".into(), session.into()]);
+            }
         }
         Kind::Codex => {
+            if turn.resume.is_some() {
+                args.extend([
+                    "exec".into(),
+                    "resume".into(),
+                    "--json".into(),
+                    "-c".into(),
+                    "sandbox_mode=\"danger-full-access\"".into(),
+                ]);
+            } else {
+                args.extend([
+                    "exec".into(),
+                    "--json".into(),
+                    "-C".into(),
+                    repo.display().to_string(),
+                    "-s".into(),
+                    "danger-full-access".into(),
+                ]);
+            }
+            if turn.chat {
+                args.push("--skip-git-repo-check".into());
+            }
             args.extend([
-                "exec".into(),
-                "--json".into(),
-                "-C".into(),
-                repo.display().to_string(),
-                "-s".into(),
-                "danger-full-access".into(),
                 "-c".into(),
                 "approval_policy=\"never\"".into(),
                 "-c".into(),
@@ -761,6 +862,9 @@ pub fn cli_arguments(
             ]);
             if let Some(model) = model {
                 args.extend(["-m".into(), model.into()]);
+            }
+            if let Some(session) = turn.resume {
+                args.push(session.into());
             }
             args.push(prompt.into());
         }
@@ -807,6 +911,9 @@ pub fn cli_arguments(
                     format!("{provider}/{model}")
                 };
                 args.extend(["--model".into(), model]);
+            }
+            if let Some(session) = turn.resume {
+                args.extend(["--session".into(), session.into()]);
             }
             args.push(prompt.into());
         }
@@ -905,6 +1012,9 @@ pub struct Parsed {
     pub session: Option<String>,
     /// A reason to end the run at once (lore's MCP server failed).
     pub fatal: Option<String>,
+    /// The CLI's message to the user, when this line holds one: the last
+    /// one is a conversation's answer.
+    pub answer: Option<String>,
 }
 
 impl Parsed {
@@ -988,7 +1098,13 @@ fn parse_claude(event: &Value) -> Parsed {
         "assistant" => {
             for block in event["message"]["content"].as_array().into_iter().flatten() {
                 match block["type"].as_str().unwrap_or_default() {
-                    "text" => parsed.lines.push(("text".into(), text(&block["text"]))),
+                    "text" => {
+                        let said = text(&block["text"]);
+                        if !said.trim().is_empty() {
+                            parsed.answer = Some(said.clone());
+                        }
+                        parsed.lines.push(("text".into(), said));
+                    }
                     "tool_use" => parsed.lines.push((
                         "tool".into(),
                         format!("{} {}", text(&block["name"]), brief(&block["input"])),
@@ -1025,6 +1141,9 @@ fn parse_claude(event: &Value) -> Parsed {
             if let Some(result) = event["result"].as_str() {
                 line.push_str(": ");
                 line.push_str(result);
+                if !result.trim().is_empty() {
+                    parsed.answer = Some(result.to_string());
+                }
             }
             parsed.lines.push((stream.into(), line));
         }
@@ -1064,7 +1183,13 @@ fn parse_codex(event: &Value) -> Parsed {
         "item.completed" => {
             let item = &event["item"];
             match item["type"].as_str().unwrap_or_default() {
-                "agent_message" => parsed.lines.push(("text".into(), text(&item["text"]))),
+                "agent_message" => {
+                    let said = text(&item["text"]);
+                    if !said.trim().is_empty() {
+                        parsed.answer = Some(said.clone());
+                    }
+                    parsed.lines.push(("text".into(), said));
+                }
                 "command_execution" => parsed.lines.push((
                     "tool".into(),
                     format!(
@@ -1124,7 +1249,13 @@ fn parse_opencode(event: &Value) -> Parsed {
     };
     let part = &event["part"];
     match event["type"].as_str().unwrap_or_default() {
-        "text" => parsed.lines.push(("text".into(), text(&part["text"]))),
+        "text" => {
+            let said = text(&part["text"]);
+            if !said.trim().is_empty() {
+                parsed.answer = Some(said.clone());
+            }
+            parsed.lines.push(("text".into(), said));
+        }
         "tool_use" => {
             let state = &part["state"];
             let status = text(&state["status"]);
@@ -1248,6 +1379,7 @@ mod tests {
                 "r1",
                 Path::new("/work/r1/repo"),
                 &dir,
+                &Turn::default(),
             )
             .unwrap();
             let joined = args.join(" ");
@@ -1282,5 +1414,91 @@ mod tests {
             "http://lore:8080"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A follow-up question resumes the CLI's own session, in the form
+    /// each CLI's `--help` documents; a conversation may run outside a git
+    /// checkout.
+    #[test]
+    fn a_follow_up_resumes_each_cli_s_session() {
+        let dir = std::env::temp_dir().join(format!("lore-runs-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let turn = Turn {
+            chat: true,
+            resume: Some("sess-42"),
+        };
+        let run = |kind| {
+            cli_arguments(
+                kind,
+                "deepseek",
+                Some("m1"),
+                "the question",
+                "http://lore:8080/mcp",
+                "r2",
+                Path::new("/work/conv-1/chat"),
+                &dir,
+                &turn,
+            )
+            .unwrap()
+            .0
+        };
+        let claude = run(Kind::Claude);
+        assert!(claude.join(" ").contains("--resume sess-42"));
+        let codex = run(Kind::Codex);
+        assert_eq!(&codex[..3], ["exec", "resume", "--json"]);
+        assert!(!codex.contains(&"-C".to_string()) && !codex.contains(&"-s".to_string()));
+        assert!(codex.contains(&"--skip-git-repo-check".to_string()));
+        assert!(codex.contains(&"sandbox_mode=\"danger-full-access\"".to_string()));
+        // The session id, then the prompt, last.
+        assert_eq!(&codex[codex.len() - 2..], ["sess-42", "the question"]);
+        let opencode = run(Kind::Opencode);
+        assert!(opencode.join(" ").contains("--session sess-42"));
+        assert_eq!(opencode.last().unwrap(), "the question");
+        // A fresh conversation: Codex skips its git check, nothing resumes.
+        let fresh = cli_arguments(
+            Kind::Codex,
+            "openai",
+            None,
+            "q",
+            "http://lore:8080/mcp",
+            "r3",
+            Path::new("/work/conv-1/chat"),
+            &dir,
+            &Turn {
+                chat: true,
+                resume: None,
+            },
+        )
+        .unwrap()
+        .0;
+        assert_eq!(&fresh[..2], ["exec", "--json"]);
+        assert!(fresh.contains(&"--skip-git-repo-check".to_string()));
+        assert!(!valid_session_id("--dangerous") && !valid_session_id("a b"));
+        assert!(valid_session_id("ses_01JX.abc-1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_last_message_is_the_answer() {
+        let claude = parse_event(
+            Kind::Claude,
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"It lives in src/db.rs.","session_id":"s"}"#,
+        );
+        assert_eq!(claude.answer.as_deref(), Some("It lives in src/db.rs."));
+        let codex = parse_event(
+            Kind::Codex,
+            r#"{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"Yes."}}"#,
+        );
+        assert_eq!(codex.answer.as_deref(), Some("Yes."));
+        let opencode = parse_event(
+            Kind::Opencode,
+            r#"{"type":"text","sessionID":"s","part":{"type":"text","text":"No."}}"#,
+        );
+        assert_eq!(opencode.answer.as_deref(), Some("No."));
+        assert!(
+            parse_event(Kind::Codex, r#"{"type":"turn.started"}"#)
+                .answer
+                .is_none()
+        );
     }
 }

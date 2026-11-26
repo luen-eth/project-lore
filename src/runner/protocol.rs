@@ -193,6 +193,11 @@ pub struct RunSpec {
     /// A CLI session to resume, for a follow-up.
     #[serde(default)]
     pub resume: Option<String>,
+    /// The name of the run's directory under `/work`, when it is not the
+    /// run id: a conversation keeps one name for every turn, because a
+    /// CLI finds the session it resumes by its working directory.
+    #[serde(default)]
+    pub workdir: Option<String>,
     pub wall_clock_secs: u64,
     pub output_cap_bytes: u64,
 }
@@ -230,8 +235,12 @@ pub enum ToRunner {
     Ping { id: u64 },
     /// Part 6b: start a run.
     RunStart { spec: RunSpec },
-    /// Part 6b/6c: a follow-up message to a running CLI.
-    #[allow(dead_code, reason = "sent from part 6b on")]
+    /// Part 6b/6c: a follow-up message to a running CLI (a follow-up
+    /// question resumes the CLI's session in a new run instead).
+    #[allow(
+        dead_code,
+        reason = "reserved: follow-ups resume the session in a new run"
+    )]
     RunInput { run_id: String, text: String },
     /// Part 6b: interrupt the CLI, then kill it if it does not stop.
     RunStop { run_id: String },
@@ -372,6 +381,10 @@ pub enum FromRunner {
         run_id: String,
         #[serde(default)]
         session_id: Option<String>,
+        /// The commit the default branch was at when the checkout was
+        /// made, so lore can tell later whether the run moved it.
+        #[serde(default)]
+        base: Option<String>,
     },
     /// Part 6b: one line of a run's output, parsed from the CLI's JSON
     /// stream (`text`, `tool`, `result`, `error` or `raw`).
@@ -396,6 +409,9 @@ pub enum FromRunner {
         /// around it (`failed: …`). None when the CLI exited on its own.
         #[serde(default)]
         reason: Option<String>,
+        /// The CLI's final message (redacted), for a conversation.
+        #[serde(default)]
+        answer: Option<String>,
     },
     /// Terminal bytes, base64.
     TerminalOutput {
@@ -453,6 +469,7 @@ mod tests {
             model: "sonnet".into(),
             prompt: "do it".into(),
             resume: None,
+            workdir: None,
             wall_clock_secs: 2700,
             output_cap_bytes: 1 << 20,
         };
@@ -567,6 +584,7 @@ mod tests {
             FromRunner::RunStarted {
                 run_id: "r1".into(),
                 session_id: None,
+                base: Some("abc".into()),
             },
             FromRunner::RunOutput {
                 run_id: "r1".into(),
@@ -581,6 +599,7 @@ mod tests {
                 head: Some("abc".into()),
                 work_free_bytes: Some(1),
                 reason: Some("timeout".into()),
+                answer: Some("It is in src/main.rs.".into()),
             },
             FromRunner::TerminalOutput {
                 term_id: "t1".into(),
@@ -620,6 +639,12 @@ mod tests {
             exit,
             FromRunner::TerminalExit { message: None, .. }
         ));
+        // The help-mode fields (part 6c) are optional too.
+        let started: FromRunner = decode(r#"{"type":"run_started","run_id":"r1"}"#).unwrap();
+        assert!(matches!(started, FromRunner::RunStarted { base: None, .. }));
+        let ended: FromRunner =
+            decode(r#"{"type":"run_exit","run_id":"r1","pushed":false}"#).unwrap();
+        assert!(matches!(ended, FromRunner::RunExit { answer: None, .. }));
     }
 
     #[test]
