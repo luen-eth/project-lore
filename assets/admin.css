@@ -292,6 +292,11 @@ button:focus-visible, [tabindex]:focus-visible {
 .avatar.small::after { display: none; }
 .avatar.online::after { background: var(--ok); animation: ping 2s infinite; }
 .avatar.recent::after { background: var(--warn); }
+/* Agent avatars are pictures: round, on no background of their own. */
+.avatar.pic { background: transparent; border-radius: 50%; }
+.avatar.pic img { width: 100%; height: 100%; display: block; border-radius: 50%; }
+.avatar.large { width: 40px; height: 40px; grid-row: auto; flex: none; align-self: center; }
+.avatar.large::after { display: none; }
 .agents li.flash { animation: flash 1.4s ease-out; }
 @keyframes flash {
   0% { background: rgba(255, 255, 255, 0.16); }
@@ -624,6 +629,36 @@ button:focus-visible, [tabindex]:focus-visible {
   color: var(--danger);
 }
 .board button.danger:hover { background: rgba(255, 122, 144, 0.2); }
+
+/* The Agents panel: the Board panel's frame, one card per agent with its
+   connection, its numbers and, for the agents permission, its actions. */
+#agents-status { margin: 0; min-height: 1.4em; color: var(--muted); }
+#agents-status:empty { display: none; }
+#agents-status.ok { color: var(--ok); }
+#agents-status.bad { color: var(--danger); }
+.agents-panel > p.muted { margin: 0; }
+.agents-panel code { font-family: var(--mono); font-size: 12px; }
+.agent-head { align-items: center; }
+.agent-card.disabled { opacity: 0.72; }
+.agent-note { margin: 0; }
+.pill.oauth { color: var(--violet); }
+.pill.token { color: var(--accent); }
+.agent-stats {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px;
+  margin: 4px 0 0; padding: 8px 10px; border-radius: 10px; background: rgba(0, 0, 0, 0.18);
+  font-size: 12px;
+}
+.agent-stats dt { color: var(--muted); }
+.agent-stats dd { margin: 0; overflow-wrap: anywhere; }
+.agent-editor { margin-top: 6px; background: rgba(0, 0, 0, 0.18); }
+.avatar-row { display: grid; grid-template-columns: repeat(10, minmax(0, 1fr)); gap: 6px; }
+.avatar-row .avatar-choice {
+  display: grid; place-items: center; padding: 4px; border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04); border: 1px solid var(--line);
+  backdrop-filter: none;
+}
+.avatar-row .avatar-choice img { width: 100%; max-width: 40px; aspect-ratio: 1; display: block; }
+.avatar-row .avatar-choice.picked { border-color: var(--accent); background: rgba(111, 182, 255, 0.16); }
 
 /* Board status pills, next to the open/closed ones of the sessions */
 .pill.claimed { color: var(--warn); }
@@ -965,6 +1000,10 @@ a.button-link:hover { background: rgba(255, 255, 255, 0.11); }
   .board-form-row, .board-form-row.three, .board-form-row.even, .board-form-row.three:has(#message-to-field[hidden]) { grid-template-columns: 1fr; }
   .board-field input[type="text"], .board-field input[type="email"], .board-field input[type="password"], .board-field select { padding: 8px 10px; }
   .perm-check { min-height: 44px; align-items: center; font-size: 13px; }
+  .avatar-row { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .avatar-row .avatar-choice { min-height: 52px; }
+  .agent-stats { grid-template-columns: minmax(0, 1fr); }
+  .agent-stats dd { margin-bottom: 4px; }
   .full-restore input { min-height: 44px; }
   .board-form-actions > button { width: 100%; }
   .board-item-head { flex-wrap: wrap; }

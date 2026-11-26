@@ -15,6 +15,8 @@ use std::{
 
 use std::convert::Infallible;
 
+mod agents;
+
 use axum::{
     Extension, Json, Router,
     body::{Body, Bytes},
@@ -44,6 +46,7 @@ use crate::{
     },
     embed::Embedder,
     events::Events,
+    oauth::OAuth,
     ops,
     users::{self, ADMIN_USER, Perm, Perms, VIEWER_USER},
     vault::{Secret, VaultKey},
@@ -75,8 +78,11 @@ const BACKDROP: &[u8] = include_bytes!("../assets/backdrop.jpg");
 const PAGE: &str = include_str!("../assets/admin.html");
 const SCRIPT: &str = include_str!("../assets/admin.js");
 const STYLE: &str = include_str!("../assets/admin.css");
+const CONSENT_SCRIPT: &str = include_str!("../assets/consent.js");
+const CONSENT_STYLE: &str = include_str!("../assets/consent.css");
 
-const CSP: &str = "default-src 'none'; script-src 'self' https://www.google.com/recaptcha/ \
+/// The page's Content Security Policy; the OAuth consent page uses it too.
+pub(crate) const CSP: &str = "default-src 'none'; script-src 'self' https://www.google.com/recaptcha/ \
 https://www.gstatic.com/recaptcha/; style-src 'self'; img-src 'self' data:; connect-src 'self'; \
 frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/; \
 base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -151,6 +157,9 @@ const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/admin/app.css", Access::Public),
     ("GET", "/admin/icon.svg", Access::Public),
     ("GET", "/admin/backdrop.jpg", Access::Public),
+    ("GET", "/admin/consent.js", Access::Public),
+    ("GET", "/admin/consent.css", Access::Public),
+    ("GET", "/admin/avatars/{file}", Access::Public),
     ("GET", "/admin/api/session", Access::Public),
     ("POST", "/admin/api/login", Access::Public),
     ("POST", "/admin/api/logout", Access::Public),
@@ -166,7 +175,36 @@ const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/admin/api/files/{id}", Access::SignedIn),
     ("GET", "/admin/api/files/{id}/download", Access::SignedIn),
     ("GET", "/admin/api/integrations", Access::SignedIn),
+    ("GET", "/admin/api/agents", Access::SignedIn),
     ("PUT", "/admin/api/password", Access::SignedIn),
+    // The consent page: anyone signed in sees the request (and is told
+    // when they lack `agents`) and may deny it; approving needs `agents`.
+    ("GET", "/admin/api/oauth/requests/{id}", Access::SignedIn),
+    (
+        "POST",
+        "/admin/api/oauth/requests/{id}/deny",
+        Access::SignedIn,
+    ),
+    (
+        "POST",
+        "/admin/api/oauth/requests/{id}/approve",
+        Access::Needs(Perm::Agents),
+    ),
+    (
+        "PUT",
+        "/admin/api/agents/{name}",
+        Access::Needs(Perm::Agents),
+    ),
+    (
+        "DELETE",
+        "/admin/api/agents/{name}",
+        Access::Needs(Perm::Agents),
+    ),
+    (
+        "POST",
+        "/admin/api/agents/{name}/revoke",
+        Access::Needs(Perm::Agents),
+    ),
     ("POST", "/admin/api/tasks", Access::Needs(Perm::Write)),
     ("PUT", "/admin/api/tasks/{id}", Access::Needs(Perm::Write)),
     ("POST", "/admin/api/messages", Access::Needs(Perm::Write)),
@@ -273,6 +311,9 @@ pub struct Admin {
     http: reqwest::Client,
     /// The client provider calls go through: no redirects, 60 s timeout.
     ops_http: reqwest::Client,
+    /// The OAuth authorization server, whose consent requests the page
+    /// answers; `None` when it is not mounted.
+    oauth: Option<Arc<OAuth>>,
 }
 
 /// Clears `Admin::busy` when the work that set it ends, however it ends.
@@ -327,7 +368,15 @@ impl Admin {
                 .build()
                 .expect("building the HTTP client"),
             ops_http: ops::client(),
+            oauth: None,
         }
+    }
+
+    /// Lets the page answer the consent requests of this authorization
+    /// server.
+    pub fn with_oauth(mut self, oauth: Arc<OAuth>) -> Self {
+        self.oauth = Some(oauth);
+        self
     }
 
     fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, AdminSession>> {
@@ -392,6 +441,38 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
         .route(
             "/admin/backdrop.jpg",
             get(|| async { ([(header::CONTENT_TYPE, "image/jpeg")], BACKDROP) }),
+        )
+        .route(
+            "/admin/consent.js",
+            get(|| async { asset("text/javascript; charset=utf-8", CONSENT_SCRIPT) }),
+        )
+        .route(
+            "/admin/consent.css",
+            get(|| async { asset("text/css; charset=utf-8", CONSENT_STYLE) }),
+        )
+        .route("/admin/avatars/{file}", get(agents::avatar))
+        .route("/admin/api/agents", get(agents::list_agents))
+        .route(
+            "/admin/api/agents/{name}",
+            put(agents::update_agent)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
+                .delete(agents::delete_agent),
+        )
+        .route(
+            "/admin/api/agents/{name}/revoke",
+            post(agents::revoke_agent),
+        )
+        .route(
+            "/admin/api/oauth/requests/{id}",
+            get(agents::consent_request),
+        )
+        .route(
+            "/admin/api/oauth/requests/{id}/approve",
+            post(agents::consent_approve).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/oauth/requests/{id}/deny",
+            post(agents::consent_deny).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
         )
         .route("/admin/api/session", get(session))
         .route("/admin/api/login", post(login))
@@ -522,7 +603,10 @@ async fn security_headers(request: Request, next: Next) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    // Nothing is stored, except what says otherwise (the avatars).
+    headers
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
     response
 }
 
@@ -4113,6 +4197,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn avatars_are_served_and_agents_are_managed_with_the_agents_permission() {
+        let (base, admin) = serve().await;
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("{base}/admin/avatars/nova.svg"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        assert!(
+            response.headers()[header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("max-age=31536000")
+        );
+        assert!(response.text().await.unwrap().starts_with("<svg"));
+        for missing in ["nope.svg", "nova", "nova.png", "..%2Fadmin.svg"] {
+            let response = client
+                .get(format!("{base}/admin/avatars/{missing}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 404, "{missing}");
+        }
+        // Other pages are still never cached.
+        let response = client.get(format!("{base}/admin")).send().await.unwrap();
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
+        let call = |method: reqwest::Method, path: &str, token: &str| {
+            client
+                .request(method, format!("{base}{path}"))
+                .header(header::COOKIE, format!("{COOKIE}={token}"))
+        };
+        admin.db.execute_for_test(
+            "INSERT INTO sessions (id, agent, project, title, status, started_at, last_seen_at)
+                 VALUES ('s1', 'claude', 'p', 't', 'open', '2026-01-01T00:00:00Z',
+                         '2026-01-01T00:00:00Z');",
+        );
+        // Reading: any signed-in user.
+        let list: serde_json::Value =
+            call(reqwest::Method::GET, "/admin/api/agents", "viewer-token")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(list["manage"], false);
+        assert_eq!(list["avatars"].as_array().unwrap().len(), 10);
+        let claude = &list["agents"][0];
+        assert_eq!(claude["name"], "claude");
+        assert_eq!(claude["env_token"], true);
+        assert_eq!(claude["stats"]["open_sessions"], 1);
+        // Changing: `agents` only.
+        let change = json!({ "avatar": "wave", "note": "laptop", "disabled": true });
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/agents/claude",
+            "viewer-token",
+        )
+        .json(&change)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 403);
+        for bad in [
+            json!({ "avatar": "nope" }),
+            json!({ "note": "x".repeat(301) }),
+        ] {
+            let response = call(
+                reqwest::Method::PUT,
+                "/admin/api/agents/claude",
+                "admin-token",
+            )
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), 400, "{bad}");
+        }
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/agents/nobody",
+            "admin-token",
+        )
+        .json(&change)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 404);
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/agents/claude",
+            "admin-token",
+        )
+        .json(&change)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let row = admin.db.registry_agent("claude").unwrap().unwrap();
+        assert_eq!(
+            (row.avatar.as_str(), row.note.as_str(), row.disabled),
+            ("wave", "laptop", true)
+        );
+        // Disabling closed the open session and left a note in the feed.
+        let open = admin.db.sessions(Some("open"), None, 10).unwrap();
+        assert!(open.is_empty());
+        let feed = admin.db.activity(5).unwrap();
+        assert!(
+            feed.iter()
+                .any(|a| a.tool == "disable" && a.summary.contains("disabled the agent claude"))
+        );
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/agents/claude",
+            "admin-token",
+        )
+        .json(&json!({ "disabled": false }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            admin
+                .db
+                .activity(5)
+                .unwrap()
+                .iter()
+                .any(|a| a.tool == "enable")
+        );
+        // The brain's agent list carries the chosen avatar.
+        let brain: serde_json::Value =
+            call(reqwest::Method::GET, "/admin/api/pulse", "viewer-token")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(brain["agents"][0]["avatar"], "wave");
+        // An env-token agent has no OAuth authorization to delete.
+        let response = call(
+            reqwest::Method::DELETE,
+            "/admin/api/agents/claude",
+            "admin-token",
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/agents/claude/revoke",
+            "viewer-token",
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 403);
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/agents/claude/revoke",
+            "admin-token",
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            admin
+                .db
+                .activity(5)
+                .unwrap()
+                .iter()
+                .any(|a| a.tool == "revoke")
+        );
+    }
+
+    #[tokio::test]
     async fn every_permission_guards_its_routes() {
         let extra = Router::new().route("/admin/api/unlisted", get(|| async { "open?" }));
         let (base, admin) = serve_router(Some(test_vault_key()), extra).await;
@@ -4161,6 +4426,12 @@ mod tests {
                 Some(json!({ "enabled": true })),
             ),
             ("users", reqwest::Method::GET, "/admin/api/users", None),
+            (
+                "agents",
+                reqwest::Method::PUT,
+                "/admin/api/agents/claude",
+                Some(json!({ "note": "the laptop" })),
+            ),
         ];
         for (perm, method, path, body) in &cases {
             for other in Perm::ALL.map(Perm::id).iter().chain(["reader"].iter()) {

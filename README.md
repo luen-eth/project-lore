@@ -446,6 +446,26 @@ off entirely, and the log of the most recent calls. A viewer sees all of it
 read-only, with no inputs and no buttons. When `LORE_VAULT_KEY` is not set the panel
 says so, and nothing can be stored.
 
+The **Agents** button (with the `agents` permission) opens one card per agent:
+its avatar, name, kind (env token or OAuth), note and status; how it connects (a
+token in the environment, or the OAuth client it was authorized for, by whom, when,
+and when it was last used); and what it did: memories logged in total and by kind,
+sessions (total and open), tool calls in the last 24 hours, 7 days and 30 days
+(counted from the activity feed, which keeps its newest 2000 actions), service calls
+by provider and outcome (from the operations log), tasks completed, files saved,
+first and last seen. From the card the avatar and the note are changed, the agent is
+disabled or enabled (disabling refuses its tokens and closes its open sessions), an
+OAuth agent's authorization is revoked (it has to authorize again) or deleted
+entirely (what it wrote stays), and **Service levels** opens its row in the
+Integrations panel. Every signed-in user still sees the read-only Connected models
+list.
+
+Every agent has one of ten built-in avatars (`orbit`, `comet`, `nova`, `prism`,
+`wave`, `ember`, `lattice`, `crescent`, `pulsar`, `hexa`), served from the binary at
+`/admin/avatars/<id>.svg` and shown in Connected models, Sessions, the activity feed,
+the Agents panel and the consent page. An agent without a chosen one gets a stable
+default derived from its name. The graph draws agents as before.
+
 ![An open entry with its commit, tags and related memories](docs/memory.jpg)
 
 ### Backup and restore
@@ -504,7 +524,7 @@ can read everything the viewer reads.
 | `restore` | import and restore backups (JSON and full) |
 | `settings` | edit the profile and the rules |
 | `integrations` | store, test and remove service credentials, set the per-agent service levels and the kill switch |
-| `agents` | manage agents (reserved for the agent registry) |
+| `agents` | manage agents (avatar, note, disable, revoke, delete an authorization) and approve new ones on the OAuth consent page |
 | `users` | add, change and delete users |
 
 A user can be edited (e-mail, permissions, disabled, a new password) or deleted;
@@ -519,11 +539,17 @@ Every admin route is mapped to exactly one access level in a table in
 
 | Method | Route | Needs |
 |---|---|---|
-| `GET` | `/admin`, `/admin/app.js`, `/admin/app.css`, `/admin/icon.svg`, `/admin/backdrop.jpg` | nothing |
+| `GET` | `/admin`, `/admin/app.js`, `/admin/app.css`, `/admin/icon.svg`, `/admin/backdrop.jpg`, `/admin/consent.js`, `/admin/consent.css`, `/admin/avatars/{file}` | nothing |
 | `GET` | `/admin/api/session` | nothing |
 | `POST` | `/admin/api/login`, `/admin/api/logout` | nothing |
 | `GET` | `/admin/api/brain`, `/pulse`, `/events`, `/entries/{id}`, `/profile`, `/sessions`, `/sessions/{id}`, `/board`, `/files`, `/files/{id}`, `/files/{id}/download`, `/integrations` | signed in |
 | `PUT` | `/admin/api/password` (own password, stored users) | signed in |
+| `GET` | `/admin/api/agents` | signed in |
+| `GET` | `/admin/api/oauth/requests/{id}` (the consent page; says so when `agents` is missing) | signed in |
+| `POST` | `/admin/api/oauth/requests/{id}/deny` | signed in |
+| `POST` | `/admin/api/oauth/requests/{id}/approve` | `agents` |
+| `PUT`, `DELETE` | `/admin/api/agents/{name}` | `agents` |
+| `POST` | `/admin/api/agents/{name}/revoke` | `agents` |
 | `POST` | `/admin/api/tasks` | `write` |
 | `PUT` | `/admin/api/tasks/{id}` | `write` |
 | `POST` | `/admin/api/messages` | `write` |
@@ -612,6 +638,49 @@ codex mcp add lore --url https://lore.example.com/mcp --bearer-token-env-var LOR
 Any other client that speaks MCP over streamable HTTP and can send an
 `Authorization` header works the same way.
 
+### Without a token: authorize in the browser (OAuth)
+
+When the admin view is on (`LORE_ADMIN_PASSWORD` set), lore is also an OAuth 2.1
+authorization server as the MCP authorization specification (2025-06-18) describes,
+so a client can be added by URL alone:
+
+```bash
+claude mcp add --transport http --scope user lore https://lore.example.com/mcp
+codex mcp add lore --url https://lore.example.com/mcp
+```
+
+The client finds out how to sign in by itself (a `401` from `/mcp` names the
+protected resource metadata), registers, and opens lore's consent page in the
+browser. There you sign in with a user name and password (the user needs the
+`agents` permission), see the name the application **claims** to have and the exact
+address the answer goes back to, name the agent (`[a-z0-9][a-z0-9_-]{1,31}`;
+`admin`, `viewer`, `shared` and the names of env-token agents are refused), or pick
+an existing OAuth agent to re-authorize, choose an avatar, and approve. The client
+receives its own access token (one hour) and refresh token (90 days from its last
+use, rotated on every use) and from then on is that agent.
+
+Approval grants what every agent can do: read and write the shared memory, the
+board and the files, and full access to every configured service, because a new
+agent has no row in the service-level table and the default is `full`. Lower its
+levels in the Integrations panel. Agents with a token in `LORE_TOKENS` / `LORE_TOKEN`
+keep working exactly as before, and an env token is always checked first.
+
+| Route | Purpose | Authentication |
+|---|---|---|
+| `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata: the resource `<origin>/mcp` and its authorization server | none |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata: the endpoints below, `S256` only, public clients only | none |
+| `POST /oauth/register` | RFC 7591 dynamic registration of a public client (1 to 5 redirect URIs: `https://`, `http://` on a loopback host, or a private-use scheme such as `cursor://`; no fragment). Ten per address in ten minutes; at most 200 clients, the oldest never-authorized go first | none |
+| `GET /oauth/authorize` | Checks the request and serves the consent page. An unknown client or a redirect URI that does not match exactly shows an error page and never redirects; PKCE `S256` is required | none (the page signs in) |
+| `POST /oauth/token` | `authorization_code` (single use, five minutes, bound to the client, the redirect URI and the PKCE verifier; a code used twice revokes what it issued) and `refresh_token` (rotating; one used twice revokes the whole authorization) | none (public client: `client_id`) |
+| `POST /oauth/revoke` | RFC 7009 revocation of an access or refresh token | none |
+
+The origin in the metadata comes from the request's `Host` header (which must be one
+of `LORE_ALLOWED_HOSTS` when that is set) with `https`, or `http` for a loopback host;
+behind a trusted proxy (`LORE_TRUST_PROXY`) `X-Forwarded-Proto` decides the scheme.
+Codes and tokens are 32 random bytes, stored only as SHA-256 hashes. Approving is a
+same-origin request that carries a one-time token bound to the consent page and the
+sign-in; every answer is `no-store` and refuses framing.
+
 To make agents use the memory consistently, add a line to your global agent
 instructions (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and so on):
 
@@ -663,6 +732,13 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
 - **Failed tokens** are throttled per client address: after 20 failures in five
   minutes, further bad attempts get `429`. A valid token is never locked out.
 - **Each agent** is limited to 600 requests a minute, which contains a runaway loop.
+- **OAuth** (see *Without a token*): PKCE `S256` only, public clients only, exact
+  redirect URI match, single-use five-minute codes, rotating refresh tokens whose
+  reuse revokes the whole authorization, and only SHA-256 hashes of codes and tokens
+  in the database. A client's name is shown as what it *claims* to be, only ever as
+  text. Registration, token requests and the sign-in are throttled per address. A
+  disabled agent is refused at the bearer check: `403` with a sentence for an
+  env-token agent, `401` for an OAuth token.
 - **Admin sign-in** locks an address out for 15 minutes after five wrong passwords,
   and with reCAPTCHA configured, refuses requests Google scores as automated. If
   Google cannot be reached the sign-in fails closed. Stored users' passwords are
@@ -670,7 +746,8 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
   name is verified against a dummy hash, so names cannot be probed by timing.
 - **The admin view** cannot edit individual entries. Its only write actions are
   backup import and restore, the profile and rules, the board, adding and
-  deleting files, the integrations and the users, each of which needs a signed-in
+  deleting files, the integrations, the agents and the users, and approving an
+  agent on the OAuth consent page, each of which needs a signed-in
   session (a `SameSite=Strict` cookie) holding the route's permission. It is served with a strict Content-Security-Policy and uses no third-party
   scripts apart from reCAPTCHA on the sign-in form. JSON bodies are limited to 64 KB,
   except a file upload (4 MiB, room for a 2 MiB file as base64).
@@ -722,13 +799,15 @@ The admin view offers two kinds of backup (permission `backup` to download,
   activity log, the agent records, the sessions, the profile and the rules, the
   board, and every version of every kept file. It is portable: it can be restored
   into any project-lore instance or merged into one that already has data. It holds
-  no credential, no service level, no operations log and no user.
+  no credential, no service level, no operations log, no user and nothing of the
+  agent registry or OAuth (restoring one leaves those untouched).
 - **Full database** (**Backup → Full database → Download**): a consistent snapshot of
   the whole SQLite database taken with the SQLite online backup API, exactly as
   stored: entries, links, sessions, activity, the board, every file version, the
   profile and rules, the vault (still encrypted with `LORE_VAULT_KEY`), the service
-  levels, the operations log, the users with their password hashes, and every other
-  table. **The file contains encrypted credentials and password hashes: keep it
+  levels, the operations log, the users with their password hashes, the agent
+  registry and the OAuth clients and authorizations (codes and tokens only as
+  hashes), and every other table. **The file contains encrypted credentials and password hashes: keep it
   private.**
 
 Restoring a full backup (**Full database → Restore**, after typing `RESTORE`)
@@ -770,11 +849,15 @@ Rust 1.85 or newer. The source is small:
 | File | Role |
 |---|---|
 | `src/main.rs` | Configuration and HTTP wiring |
-| `src/auth.rs` | Bearer tokens and rate limiting |
+| `src/auth.rs` | Bearer tokens (env tokens, then OAuth access tokens) and rate limiting |
+| `src/oauth.rs` | The OAuth authorization server: metadata, registration, the consent page, tokens, revocation |
+| `src/avatars.rs` | The ten built-in agent avatars |
 | `src/server.rs` | The MCP tools |
 | `src/db.rs` | SQLite schema, full-text and hybrid search |
+| `src/db/agents.rs` | The agent registry, the OAuth tables and the per-agent statistics |
 | `src/embed.rs` | Local embedding models |
 | `src/admin.rs` | Admin sign-in, the route permission table, users, the graph API, live events, backup and restore |
+| `src/admin/agents.rs` | The agents panel's API, the consent page's approve and deny, the avatar files |
 | `src/users.rs` | Permissions, user name and password rules, Argon2id hashing |
 | `src/events.rs` | Fan-out of agent activity to open admin pages |
 | `assets/` | The admin page (plain HTML, CSS and canvas JavaScript, no build step) |

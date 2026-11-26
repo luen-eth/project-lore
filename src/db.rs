@@ -13,6 +13,9 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::V
 
 use crate::users::Perms;
 
+mod agents;
+pub use agents::*;
+
 pub const KINDS: &[&str] = &["update", "decision", "bug", "note", "todo"];
 
 const SCHEMA: &str = r#"
@@ -304,7 +307,9 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// `schema_version`. A database without the key predates it (0). Raise it
 /// whenever a table or column is added, so a full backup from a newer build
 /// is recognised and refused instead of loaded half-understood.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// 1: users. 2: the agent registry and the OAuth tables.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Columns every database lore ever created has in `entries`: a full
 /// backup without them is not a lore database.
@@ -1085,6 +1090,8 @@ pub struct AgentSummary {
     pub seconds_since_seen: Option<i64>,
     pub requests: i64,
     pub entries: i64,
+    /// The avatar id the page shows for the agent.
+    pub avatar: String,
 }
 
 /// An entry as drawn in the admin graph (no body).
@@ -3779,14 +3786,26 @@ impl Db {
                     requests: row.get(4)?,
                     seconds_since_seen: row.get(5)?,
                     entries: 0,
+                    avatar: String::new(),
                 })
             })?;
             for row in rows {
                 agents.push(row?);
             }
         }
+        // Every registry row too, so an OAuth agent approved but not yet
+        // connected can have its service levels lowered.
+        let avatars: HashMap<String, String> = {
+            let mut stmt = conn.prepare("SELECT name, avatar FROM agent_registry")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
         let known: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
-        for name in configured.iter().chain(written.keys()) {
+        for name in configured
+            .iter()
+            .chain(written.keys())
+            .chain(avatars.keys())
+        {
             if !known.contains(name) && !agents.iter().any(|a| &a.name == name) {
                 agents.push(AgentSummary {
                     name: name.clone(),
@@ -3796,11 +3815,14 @@ impl Db {
                     seconds_since_seen: None,
                     requests: 0,
                     entries: 0,
+                    avatar: String::new(),
                 });
             }
         }
         for agent in &mut agents {
             agent.entries = written.get(&agent.name).copied().unwrap_or(0);
+            let chosen = avatars.get(&agent.name).map(String::as_str).unwrap_or("");
+            agent.avatar = crate::avatars::effective(&agent.name, chosen).to_string();
         }
         agents.sort_by_key(|a| (a.seconds_since_seen.unwrap_or(i64::MAX), a.name.clone()));
         Ok(agents)
@@ -4156,8 +4178,14 @@ fn validate_backup(backup: &Backup) -> Result<()> {
 /// the schema version. Additive only, and safe to run again.
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
+    conn.execute_batch(agents::SCHEMA)?;
     add_missing_columns(conn)?;
     migrate_fts(conn)?;
+    // A database from before the registry: every agent it has seen gets a
+    // registry row, once, so it can have an avatar and be disabled.
+    if schema_version(conn)? < 2 {
+        agents::backfill_registry(conn)?;
+    }
     // Never lowered: a database a newer build wrote keeps its number.
     if schema_version(conn)? < SCHEMA_VERSION {
         set_meta(conn, "schema_version", &SCHEMA_VERSION.to_string())?;

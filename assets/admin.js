@@ -46,6 +46,10 @@ const TOOLS = {
   git_fetch: { verb: "fetched a repository", tone: "read" },
   git_push: { verb: "pushed to a repository", tone: "write" },
   users: { verb: "changed the users", tone: "write" },
+  authorize: { verb: "authorized an agent", tone: "write" },
+  revoke: { verb: "revoked an authorization", tone: "remove" },
+  disable: { verb: "disabled an agent", tone: "remove" },
+  enable: { verb: "enabled an agent", tone: "write" },
 };
 const WRITES = new Set([
   "hello", "checkin", "bye", "log", "amend", "forget", "profile", "rules", "import", "restore", "reindex",
@@ -65,6 +69,35 @@ const el = (tag, className, text) => {
   if (text !== undefined) node.textContent = text;
   return node;
 };
+
+/* The ten built-in avatars, in the server's order. An agent without a
+   chosen one shows the one its name derives: FNV-1a over the name's UTF-8
+   bytes, as the server computes it. */
+const AVATAR_IDS = ["orbit", "comet", "nova", "prism", "wave", "ember", "lattice", "crescent", "pulsar", "hexa"];
+
+function defaultAvatar(name) {
+  let hash = 0x811c9dc5;
+  for (const byte of new TextEncoder().encode(name)) {
+    hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+  }
+  return AVATAR_IDS[hash % AVATAR_IDS.length];
+}
+
+function avatarOf(name) {
+  const known = state.agents.find((agent) => agent.name === name);
+  return (known && known.avatar) || defaultAvatar(name);
+}
+
+/* An agent's avatar picture; `className` adds "small" and the like. */
+function avatarNode(name, className, id) {
+  const holder = el("span", "avatar pic" + (className ? " " + className : ""));
+  const image = el("img");
+  image.src = `/admin/avatars/${id || avatarOf(name)}.svg`;
+  image.alt = "";
+  image.decoding = "async";
+  holder.append(image);
+  return holder;
+}
 
 /* ---------- Graph ---------- */
 
@@ -773,6 +806,8 @@ function showLogin() {
   resetBackup();
   closeUsers();
   resetUsers();
+  closeAgentsPanel();
+  resetAgentsPanel();
   closeBoard();
   Object.assign(board, { data: null, tab: "tasks", filter: "open", project: "" });
   closeFiles();
@@ -873,6 +908,8 @@ function applySession(session) {
   $("more-backup").hidden = !backupMenu;
   $("users-toggle").hidden = !can("users");
   $("more-users").hidden = !can("users");
+  $("agents-toggle").hidden = !can("agents");
+  $("more-agents").hidden = !can("agents");
   // The badge next to the brand names who is signed in.
   for (const badge of [$("role"), $("more-role")]) {
     badge.textContent = state.username;
@@ -897,6 +934,7 @@ function applySession(session) {
     $("backup-toggle").setAttribute("aria-expanded", "false");
   }
   if (!can("users")) closeUsers();
+  if (!can("agents")) closeAgentsPanel();
 }
 
 async function enter(session) {
@@ -1059,8 +1097,7 @@ function renderSessions() {
   for (const session of state.sessions) {
     const open = session.status === "open";
     const item = el("li", open ? "session" : "session closed");
-    const avatar = el("span", "avatar small", (session.agent || "?").slice(0, 1));
-    avatar.style.background = agentColor(session.agent || "unknown");
+    const avatar = avatarNode(session.agent || "unknown", "small");
     const name = el("span", "name", session.agent || "unknown agent");
     const when = el("span", "count", relative(secondsSince(session.last_seen_at)));
     const sub = el("span", "sub");
@@ -1157,7 +1194,7 @@ async function onActivity(activity) {
     agent.seconds_since_seen = 0;
     agent.requests += 1;
   } else if (activity.agent !== "admin") {
-    state.agents.unshift({ name: activity.agent, client: "", seconds_since_seen: 0, requests: 1, entries: 0 });
+    state.agents.unshift({ name: activity.agent, client: "", seconds_since_seen: 0, requests: 1, entries: 0, avatar: defaultAvatar(activity.agent) });
   }
   renderAgents(activity.agent);
   renderStats();
@@ -1186,8 +1223,7 @@ function addToFeed(activity, live) {
   item.dataset.at = activity.at;
   item.style.borderLeftColor = agentColor(activity.agent);
 
-  const avatar = el("span", "avatar small", activity.agent.slice(0, 1));
-  avatar.style.background = agentColor(activity.agent);
+  const avatar = avatarNode(activity.agent, "small");
   const line = el("div", "line");
   line.append(el("span", "who", activity.agent), el("span", "verb", tool.verb),
     el("span", "when", relative(secondsSince(activity.at))));
@@ -1271,8 +1307,7 @@ function renderAgents(flash) {
     (a.seconds_since_seen ?? Infinity) - (b.seconds_since_seen ?? Infinity) || a.name.localeCompare(b.name));
   for (const agent of ordered) {
     const seen = agent.seconds_since_seen;
-    const avatar = el("span", "avatar", agent.name.slice(0, 1));
-    avatar.style.background = agentColor(agent.name);
+    const avatar = avatarNode(agent.name, "", agent.avatar);
     if (seen !== null && seen < 300) avatar.classList.add("online");
     else if (seen !== null && seen < 86400) avatar.classList.add("recent");
 
@@ -1415,6 +1450,7 @@ $("backup-toggle").addEventListener("click", () => {
     closeFiles();
     closeIntegrations();
     closeUsers();
+    closeAgentsPanel();
   } else {
     resetBackup();
   }
@@ -1578,6 +1614,7 @@ $("profile-toggle").addEventListener("click", () => {
     closeFiles();
     closeIntegrations();
     closeUsers();
+    closeAgentsPanel();
     profileStatus("");
     loadProfile();
   } else {
@@ -1803,6 +1840,7 @@ $("board-toggle").addEventListener("click", () => {
   panel.hidden = false;
   $("board-toggle").setAttribute("aria-expanded", "true");
   closeUsers();
+  closeAgentsPanel();
   $("backup").hidden = true;
   $("backup-toggle").setAttribute("aria-expanded", "false");
   $("profile").hidden = true;
@@ -2174,6 +2212,7 @@ $("files-toggle").addEventListener("click", () => {
   panel.hidden = false;
   $("files-toggle").setAttribute("aria-expanded", "true");
   closeUsers();
+  closeAgentsPanel();
   $("backup").hidden = true;
   $("backup-toggle").setAttribute("aria-expanded", "false");
   $("profile").hidden = true;
@@ -2599,6 +2638,7 @@ $("integrations-toggle").addEventListener("click", () => {
   panel.hidden = false;
   $("integrations-toggle").setAttribute("aria-expanded", "true");
   closeUsers();
+  closeAgentsPanel();
   $("backup").hidden = true;
   $("backup-toggle").setAttribute("aria-expanded", "false");
   $("profile").hidden = true;
@@ -2996,6 +3036,7 @@ $("users-toggle").addEventListener("click", () => {
   if (!panel.hidden) { closeUsers(); return; }
   panel.hidden = false;
   $("users-toggle").setAttribute("aria-expanded", "true");
+  closeAgentsPanel();
   $("backup").hidden = true;
   $("backup-toggle").setAttribute("aria-expanded", "false");
   $("profile").hidden = true;
@@ -3236,6 +3277,259 @@ $("user-form").addEventListener("submit", async (event) => {
   }
 });
 
+/* ---------- Agents ---------- */
+
+/* Every agent lore knows, how it is connected and what it did. The panel
+   is for users with the agents permission; the server refuses changes
+   from anyone else. */
+const agentsPanel = { data: null, editing: null };
+
+function agentsStatus(text, tone) {
+  const node = $("agents-status");
+  node.textContent = text;
+  node.className = "small-text" + (tone ? " " + tone : "");
+}
+
+function closeAgentsPanel() {
+  $("agents-panel").hidden = true;
+  $("agents-toggle").setAttribute("aria-expanded", "false");
+  agentsPanel.editing = null;
+}
+
+function resetAgentsPanel() {
+  agentsPanel.data = null;
+  agentsPanel.editing = null;
+  $("agent-list").replaceChildren();
+  $("agents-count").textContent = "";
+  agentsStatus("");
+}
+
+$("agents-toggle").addEventListener("click", () => {
+  const panel = $("agents-panel");
+  if (!panel.hidden) { closeAgentsPanel(); return; }
+  panel.hidden = false;
+  $("agents-toggle").setAttribute("aria-expanded", "true");
+  $("backup").hidden = true;
+  $("backup-toggle").setAttribute("aria-expanded", "false");
+  $("profile").hidden = true;
+  $("profile-toggle").setAttribute("aria-expanded", "false");
+  closeUsers();
+  closeBoard();
+  closeFiles();
+  closeIntegrations();
+  agentsStatus("");
+  loadAgentsPanel();
+});
+
+async function loadAgentsPanel() {
+  try {
+    const response = await api("/admin/api/agents");
+    if (!response.ok) throw new Error("failed");
+    agentsPanel.data = await response.json();
+  } catch (_) {
+    agentsStatus("The agents could not be loaded.", "bad");
+    return;
+  }
+  renderAgentsPanel();
+}
+
+function renderAgentsPanel() {
+  const data = agentsPanel.data;
+  if (!data) return;
+  const list = $("agent-list");
+  list.replaceChildren();
+  if (!data.agents.length) list.append(el("li", "none", "No agent yet."));
+  const order = (agent) => (agent.last_seen ? -Date.parse(agent.last_seen) : Infinity);
+  const agents = data.agents.slice().sort((a, b) => order(a) - order(b) || a.name.localeCompare(b.name));
+  for (const agent of agents) list.append(agentCard(agent, data.manage));
+  const oauth = data.agents.filter((agent) => agent.kind === "oauth").length;
+  $("agents-count").textContent = `${data.agents.length} agent${data.agents.length === 1 ? "" : "s"}, ${oauth} through OAuth`;
+}
+
+function statRow(box, label, value) {
+  box.append(el("dt", "", label), el("dd", "", String(value)));
+}
+
+function agentCard(agent, manage) {
+  const item = el("li", "board-item agent-card" + (agent.disabled ? " disabled" : ""));
+  const head = el("div", "board-item-head agent-head");
+  head.append(avatarNode(agent.name, "large", agent.avatar), el("span", "board-title", agent.name));
+  head.append(el("span", "pill " + (agent.kind === "oauth" ? "oauth" : "token"), agent.kind === "oauth" ? "OAuth" : "env token"));
+  if (agent.disabled) head.append(el("span", "pill cancelled", "disabled"));
+  item.append(head);
+  if (agent.note) item.append(el("p", "board-body agent-note", agent.note));
+
+  // How it connects.
+  const how = [];
+  if (agent.env_token) how.push("Connects with a token from the server environment.");
+  else if (agent.kind === "token" && agent.registered_by === "environment") how.push("Its token is no longer in the server environment.");
+  const live = agent.authorizations.filter((grant) => !grant.revoked);
+  for (const grant of live) {
+    how.push(`OAuth: ${grant.client_name || "an unnamed client"} · authorized by ${grant.authorized_by} ${ago(grant.authorized_at)} · ` +
+      (grant.last_used_at ? `last used ${ago(grant.last_used_at)}` : "not used yet"));
+  }
+  if (agent.kind === "oauth" && !live.length) how.push("OAuth: no active authorization; it has to authorize again.");
+  for (const line of how) item.append(el("div", "board-meta", line));
+  const seen = [agent.first_seen ? `first seen ${ago(agent.first_seen)}` : "never connected"];
+  if (agent.last_seen) seen.push(`last seen ${ago(agent.last_seen)}`);
+  if (agent.requests) seen.push(`${agent.requests} requests`);
+  if (agent.client) seen.push(agent.client);
+  item.append(el("div", "board-meta", seen.join(" · ")));
+
+  // What it did.
+  const stats = agent.stats;
+  const box = el("dl", "agent-stats");
+  const kinds = Object.entries(stats.memories_by_kind).map(([kind, count]) => `${count} ${kind}`).join(", ");
+  statRow(box, "Memories", stats.memories + (kinds ? ` (${kinds})` : ""));
+  statRow(box, "Sessions", `${stats.sessions} (${stats.open_sessions} open)`);
+  statRow(box, "Tool calls", `${stats.tool_calls_24h} / ${stats.tool_calls_7d} / ${stats.tool_calls_30d} in 24 h / 7 d / 30 d`);
+  const services = stats.service_calls.map((call) => `${call.provider} ${call.outcome} ${call.count}`).join(", ");
+  statRow(box, "Service calls", services || "none");
+  statRow(box, "Tasks done", stats.tasks_done);
+  statRow(box, "Files saved", stats.files_saved);
+  item.append(box);
+
+  if (!manage) return item;
+  if (agentsPanel.editing === agent.name) {
+    item.append(agentEditor(agent));
+    return item;
+  }
+  const actions = el("div", "board-actions");
+  const button = (text, className, onClick) => {
+    const node = el("button", "ghost small" + (className ? " " + className : ""), text);
+    node.type = "button";
+    node.addEventListener("click", onClick);
+    actions.append(node);
+  };
+  button("Avatar and note", "", () => { agentsPanel.editing = agent.name; renderAgentsPanel(); });
+  button("Service levels", "", () => {
+    closeAgentsPanel();
+    $("integrations-toggle").click();
+    setTimeout(() => {
+      const section = document.querySelector(".integrations-perms");
+      if (section) section.scrollIntoView({ block: "start" });
+    }, 400);
+  });
+  button(agent.disabled ? "Enable" : "Disable", agent.disabled ? "" : "danger", () => setAgentDisabled(agent, !agent.disabled));
+  if (agent.kind === "oauth") {
+    if (live.length) button("Revoke authorization", "danger", () => revokeAgent(agent));
+    button("Delete authorization", "danger", () => deleteAgent(agent));
+  }
+  item.append(actions);
+  return item;
+}
+
+/* The avatar picker and the note of one agent. */
+function agentEditor(agent) {
+  const form = el("form", "board-form agent-editor");
+  form.autocomplete = "off";
+  let picked = agent.avatar_chosen ? agent.avatar : "";
+  const picker = el("div", "avatar-row");
+  const draw = () => {
+    picker.replaceChildren();
+    for (const id of agentsPanel.data.avatars) {
+      const choice = el("button", "avatar-choice" + (id === (picked || agent.avatar) ? " picked" : ""));
+      choice.type = "button";
+      choice.title = id;
+      choice.setAttribute("aria-label", id);
+      choice.setAttribute("aria-pressed", String(id === (picked || agent.avatar)));
+      const image = el("img");
+      image.src = `/admin/avatars/${id}.svg`;
+      image.alt = "";
+      choice.append(image);
+      choice.addEventListener("click", () => { picked = id; draw(); });
+      picker.append(choice);
+    }
+  };
+  draw();
+  const note = el("input");
+  note.type = "text";
+  note.maxLength = 300;
+  note.value = agent.note;
+  note.placeholder = "What this agent is, where it runs";
+  const noteField = el("label", "board-field");
+  noteField.append(el("span", "", "Note"), note);
+  const actions = el("div", "board-actions");
+  const reset = el("button", "ghost small", "Default avatar");
+  reset.type = "button";
+  reset.addEventListener("click", () => { picked = ""; agent.avatar = defaultAvatar(agent.name); draw(); });
+  const cancel = el("button", "ghost small", "Cancel");
+  cancel.type = "button";
+  cancel.addEventListener("click", () => { agentsPanel.editing = null; loadAgentsPanel(); });
+  const save = el("button", "ghost small", "Save");
+  save.type = "submit";
+  actions.append(reset, cancel, save);
+  form.append(picker, noteField, actions);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    save.disabled = true;
+    const ok = await changeAgent(agent, { avatar: picked, note: note.value });
+    save.disabled = false;
+    if (ok) {
+      agentsPanel.editing = null;
+      agentsStatus(`Saved ${agent.name}.`, "ok");
+      await loadAgentsPanel();
+      refresh(false).catch(() => {});
+    }
+  });
+  return form;
+}
+
+async function changeAgent(agent, payload) {
+  try {
+    const response = await api("/admin/api/agents/" + encodeURIComponent(agent.name), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      agentsStatus(result.error || `${agent.name} could not be changed.`, "bad");
+      return false;
+    }
+    return true;
+  } catch (_) {
+    agentsStatus(`${agent.name} could not be changed.`, "bad");
+    return false;
+  }
+}
+
+async function setAgentDisabled(agent, disabled) {
+  if (disabled && !window.confirm(`Disable ${agent.name}?\n\nIts tokens are refused and its open sessions are closed until it is enabled again.`)) return;
+  if (await changeAgent(agent, { disabled })) {
+    agentsStatus(`${agent.name} is ${disabled ? "disabled" : "enabled"}.`, "ok");
+    await loadAgentsPanel();
+  }
+}
+
+async function revokeAgent(agent) {
+  if (!window.confirm(`Revoke every authorization of ${agent.name}?\n\nAll its OAuth tokens stop working; it has to be authorized again.`)) return;
+  try {
+    const response = await api(`/admin/api/agents/${encodeURIComponent(agent.name)}/revoke`, { method: "POST" });
+    if (!response.ok) throw new Error("failed");
+    agentsStatus(`The authorization of ${agent.name} is revoked.`, "ok");
+    await loadAgentsPanel();
+  } catch (_) {
+    agentsStatus("The authorization could not be revoked.", "bad");
+  }
+}
+
+async function deleteAgent(agent) {
+  if (!window.confirm(`Delete the authorization of ${agent.name} entirely?\n\nIts tokens and its entry in this list go; what it wrote stays. The name becomes free again.`)) return;
+  try {
+    const response = await api("/admin/api/agents/" + encodeURIComponent(agent.name), { method: "DELETE" });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      agentsStatus(result.error || "The authorization could not be deleted.", "bad");
+      return;
+    }
+    agentsStatus(`The authorization of ${agent.name} is deleted.`, "ok");
+    await loadAgentsPanel();
+  } catch (_) {
+    agentsStatus("The authorization could not be deleted.", "bad");
+  }
+}
+
 /* ---------- Tooltip and entry drawer ---------- */
 
 graph.onHover = (node, x, y) => {
@@ -3283,6 +3577,8 @@ document.addEventListener("keydown", (event) => {
     closeIntegrations();
   } else if (!$("users").hidden) {
     closeUsers();
+  } else if (!$("agents-panel").hidden) {
+    closeAgentsPanel();
   } else if (!$("board").hidden) {
     closeBoard();
   } else if (!$("backup").hidden) {
@@ -3408,14 +3704,19 @@ const DESTINATIONS = {
     open: () => $("users-toggle").click(),
     close: () => closeUsers(),
   },
+  agents: {
+    shown: () => !$("agents-panel").hidden,
+    open: () => $("agents-toggle").click(),
+    close: () => closeAgentsPanel(),
+  },
   backup: {
     shown: () => !$("backup").hidden,
     open: () => $("backup-toggle").click(),
     close: () => { $("backup").hidden = true; $("backup-toggle").setAttribute("aria-expanded", "false"); resetBackup(); },
   },
 };
-/* Profile, Users, Integrations and Backup live behind the More tab. */
-const TAB_OF = { side: "side", feed: "feed", board: "board", files: "files", integrations: "more", profile: "more", users: "more", backup: "more" };
+/* Profile, Users, Agents, Integrations and Backup live behind the More tab. */
+const TAB_OF = { side: "side", feed: "feed", board: "board", files: "files", integrations: "more", profile: "more", users: "more", agents: "more", backup: "more" };
 
 function moreOpen() { return !$("more").hidden; }
 
@@ -3432,7 +3733,7 @@ function closeMore() {
 }
 
 function currentDestination() {
-  for (const name of ["integrations", "profile", "users", "backup", "board", "files", "side", "feed"]) {
+  for (const name of ["integrations", "profile", "users", "agents", "backup", "board", "files", "side", "feed"]) {
     if (DESTINATIONS[name].shown()) return name;
   }
   return "graph";
@@ -3456,7 +3757,7 @@ function showDestination(name) {
     if (other !== name && destination.shown()) destination.close();
   }
   if (name !== "graph" && !DESTINATIONS[name].shown()) DESTINATIONS[name].open();
-  for (const sheet of [$("side"), $("feed"), $("board"), $("files"), $("integrations"), $("profile"), $("users"), $("backup")]) sheet.scrollTop = 0;
+  for (const sheet of [$("side"), $("feed"), $("board"), $("files"), $("integrations"), $("profile"), $("users"), $("agents-panel"), $("backup")]) sheet.scrollTop = 0;
   syncTabs();
 }
 
@@ -3476,13 +3777,14 @@ $("more-scrim").addEventListener("click", closeMore);
 $("more-integrations").addEventListener("click", () => showDestination("integrations"));
 $("more-profile").addEventListener("click", () => showDestination("profile"));
 $("more-users").addEventListener("click", () => showDestination("users"));
+$("more-agents").addEventListener("click", () => showDestination("agents"));
 $("more-backup").addEventListener("click", () => showDestination("backup"));
 $("more-logout").addEventListener("click", () => { closeMore(); $("logout").click(); });
 
 /* On a phone only one panel shows at a time: whichever opened last wins,
    whatever code path opened it. */
 {
-  const panels = { side: $("side"), feed: $("feed"), board: $("board"), files: $("files"), integrations: $("integrations"), profile: $("profile"), users: $("users"), backup: $("backup") };
+  const panels = { side: $("side"), feed: $("feed"), board: $("board"), files: $("files"), integrations: $("integrations"), profile: $("profile"), users: $("users"), agents: $("agents-panel"), backup: $("backup") };
   const observer = new MutationObserver((records) => {
     if (isPhone()) {
       // The last record is the newest change; the panel it opened stays.

@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="dark">
+<meta name="lore-request" content="{{REQUEST}}">
+<title>project-lore: authorize an agent</title>
+<link rel="icon" type="image/svg+xml" href="/admin/icon.svg">
+<link rel="stylesheet" href="/admin/app.css">
+<link rel="stylesheet" href="/admin/consent.css">
+</head>
+<body class="consent-page">
+<div class="scene" aria-hidden="true">
+  <div class="backdrop"></div>
+  <div class="aurora one"></div>
+  <div class="aurora two"></div>
+  <div class="vignette"></div>
+</div>
+
+<main class="consent">
+  <p id="consent-loading" class="muted">Loading…</p>
+
+  <form id="consent-login" class="login-card" autocomplete="off" hidden>
+    <div class="mark" aria-hidden="true"><span></span><span></span><span></span></div>
+    <h1>Authorize an agent</h1>
+    <p class="muted">An application wants to connect to lore as an agent. Sign in to decide.</p>
+    <label class="field">
+      <span class="sr-only">Username</span>
+      <input id="username" type="text" placeholder="Username" autocomplete="username" autocapitalize="none" spellcheck="false">
+    </label>
+    <label class="field">
+      <span class="sr-only">Password</span>
+      <input id="password" type="password" placeholder="Password" autocomplete="current-password" required>
+    </label>
+    <button id="login-button" type="submit">Sign in</button>
+    <p id="login-error" class="error" role="alert"></p>
+    <p id="captcha-note" class="fine" hidden>Protected by reCAPTCHA. Google's
+      <a href="https://policies.google.com/privacy" target="_blank" rel="noopener noreferrer">Privacy Policy</a> and
+      <a href="https://policies.google.com/terms" target="_blank" rel="noopener noreferrer">Terms of Service</a> apply.</p>
+  </form>
+
+  <form id="consent-card" class="login-card consent-card" autocomplete="off" hidden>
+    <div class="mark" aria-hidden="true"><span></span><span></span><span></span></div>
+    <h1>Authorize an agent</h1>
+    <p class="muted small-text">Signed in as <b id="consent-user"></b></p>
+
+    <section class="consent-block">
+      <p>An application that <b>claims to be</b> <span id="client-name" class="client-name"></span> asks to connect to lore.</p>
+      <p class="muted small-text">The name is what the application says about itself; lore cannot check it. On approval the browser goes back to:</p>
+      <code id="redirect-uri" class="redirect-uri"></code>
+    </section>
+
+    <section class="consent-block">
+      <h2>Approving lets this agent</h2>
+      <ul id="grant-list" class="grant-list"></ul>
+    </section>
+
+    <fieldset class="consent-block consent-mode">
+      <legend>Agent</legend>
+      <label class="choice"><input type="radio" name="mode" value="new" checked> <span>A new agent</span></label>
+      <label class="choice" id="mode-existing-choice"><input type="radio" name="mode" value="existing"> <span>Re-authorize an existing agent</span></label>
+      <label id="name-field" class="board-field"><span>Agent name (2 to 32 of a-z 0-9 _ -)</span>
+        <input id="agent-name" type="text" maxlength="32" autocapitalize="none" spellcheck="false" required>
+      </label>
+      <label id="existing-field" class="board-field" hidden><span>Existing agent</span>
+        <select id="existing-agent"></select>
+      </label>
+    </fieldset>
+
+    <fieldset class="consent-block">
+      <legend>Avatar</legend>
+      <div id="avatar-picker" class="avatar-picker" role="radiogroup" aria-label="Avatar"></div>
+    </fieldset>
+
+    <p id="consent-error" class="error" role="alert"></p>
+    <div class="consent-actions">
+      <button id="deny" class="ghost" type="button">Deny</button>
+      <button id="approve" type="submit">Approve</button>
+    </div>
+  </form>
+
+  <section id="consent-message" class="login-card consent-card" hidden>
+    <div class="mark" aria-hidden="true"><span></span><span></span><span></span></div>
+    <h1 id="message-title"></h1>
+    <p id="message-text" class="muted"></p>
+    <button id="message-signout" class="ghost" type="button" hidden>Sign in as someone else</button>
+    <button id="message-deny" class="ghost" type="button" hidden>Deny and return to the application</button>
+  </section>
+</main>
+
+<script src="/admin/consent.js"></script>
+</body>
+</html>

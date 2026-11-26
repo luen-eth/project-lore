@@ -23,7 +23,7 @@ use axum::{
 use base64::Engine;
 
 use crate::{
-    auth::{McpAuth, client_ip, match_token, too_many_requests},
+    auth::{McpAuth, Refused, client_ip, too_many_requests},
     db::Db,
     events::Events,
     ops::{self, transport_reason},
@@ -352,20 +352,31 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
 
     // Authentication: the same token table and the same constant-time
     // comparison as `/mcp`, with the same throttling for failures.
+    // An OAuth access token works as well, as on `/mcp`; a disabled
+    // agent is refused either way.
     let presented = presented_token(&parts.headers);
-    let Some(token) = match_token(&state.auth.tokens, &presented) else {
-        let peer = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|info| info.0);
-        let ip = client_ip(&parts.headers, peer, state.auth.trust_proxy);
-        if let Some(retry_after) = state.auth.failures.hit(&ip) {
-            tracing::warn!(%ip, "too many failed token attempts");
-            return too_many_requests(retry_after);
+    let agent = match state.auth.authenticate(&presented).await {
+        Ok(found) => found.agent().to_string(),
+        Err(Refused::Disabled { agent, env: true }) => {
+            return plain(
+                StatusCode::FORBIDDEN,
+                &format!("the agent \"{agent}\" is disabled in the lore admin view"),
+            );
         }
-        return unauthorized();
+        Err(Refused::Disabled { .. }) => return unauthorized(),
+        Err(Refused::Invalid) => {
+            let peer = parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0);
+            let ip = client_ip(&parts.headers, peer, state.auth.trust_proxy);
+            if let Some(retry_after) = state.auth.failures.hit(&ip) {
+                tracing::warn!(%ip, "too many failed token attempts");
+                return too_many_requests(retry_after);
+            }
+            return unauthorized();
+        }
     };
-    let agent = token.agent.clone();
     // The same per-agent request budget as `/mcp`, and the same record of
     // when the agent was last seen.
     if let Some(retry_after) = state.auth.requests.hit(&agent) {
@@ -765,7 +776,7 @@ fn unauthorized() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{RateLimiter, load_tokens};
+    use crate::auth::load_tokens;
     use std::sync::Mutex;
 
     /// A lore token long enough for `load_tokens` to accept.
@@ -871,13 +882,11 @@ mod tests {
             db.set_vault("gitlab", upstream, &nonce, &secret, "-eam")
                 .unwrap();
         }
-        let auth = Arc::new(McpAuth {
-            tokens: load_tokens("", &format!("claude:{TOKEN}")).unwrap(),
-            db: db.clone(),
-            trust_proxy: false,
-            failures: RateLimiter::new(20, Duration::from_secs(5 * 60)),
-            requests: RateLimiter::new(600, Duration::from_secs(60)),
-        });
+        let auth = Arc::new(McpAuth::new(
+            load_tokens("", &format!("claude:{TOKEN}")).unwrap(),
+            db.clone(),
+            false,
+        ));
         let state = Arc::new(GitProxy {
             auth,
             vault,
@@ -1033,6 +1042,85 @@ mod tests {
     /// `read` lets the fetch pair through and refuses the push pair,
     /// `full` lets all four through; the kill switch and a provider
     /// without a credential refuse with their own sentences.
+    /// An OAuth access token for a new agent, written straight into the
+    /// store the way an approval and a code exchange would.
+    fn oauth_token(db: &Db, agent: &str) -> String {
+        db.register_oauth_client(&crate::db::OAuthClient {
+            client_id: format!("client-{agent}"),
+            client_name: "Test".into(),
+            redirect_uris: vec!["http://127.0.0.1:9/cb".into()],
+        })
+        .unwrap();
+        let grant = db
+            .approve(&crate::db::Approval {
+                agent: agent.into(),
+                new_agent: true,
+                avatar: String::new(),
+                client_id: format!("client-{agent}"),
+                client_name: "Test".into(),
+                redirect_uri: "http://127.0.0.1:9/cb".into(),
+                authorized_by: "admin".into(),
+                reserved: vec!["claude".into()],
+                code_hash: format!("code-{agent}"),
+                code_challenge: "c".repeat(43),
+                code_expires_at: crate::db::unix_now() + 300,
+            })
+            .unwrap();
+        let access = crate::oauth::random_token().unwrap();
+        let now = crate::db::unix_now();
+        db.issue_tokens(
+            grant,
+            &crate::oauth::token_hash(&access),
+            now + 3600,
+            &format!("refresh-{agent}"),
+            now + 7200,
+        )
+        .unwrap();
+        access
+    }
+
+    #[tokio::test]
+    async fn oauth_tokens_work_and_disabled_agents_are_refused() {
+        let (base, db, _log) = working_proxy().await;
+        let client = reqwest::Client::new();
+        let path = "/git/github/owner/repo.git/info/refs?service=git-upload-pack";
+        let access = oauth_token(&db, "cursor");
+        let with = |secret: &str| {
+            client.get(format!("{base}{path}")).header(
+                header::AUTHORIZATION,
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(format!("lore:{secret}"))
+                ),
+            )
+        };
+        // An OAuth access token is a lore token too; its agent's level
+        // applies (no row: full).
+        assert_eq!(with(&access).send().await.unwrap().status(), StatusCode::OK);
+
+        // A disabled env-token agent: 403 with a sentence.
+        db.set_agent_disabled("claude", true, "admin").unwrap();
+        let response = with(TOKEN).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("\"claude\" is disabled")
+        );
+        // A disabled OAuth agent: its token no longer counts.
+        db.set_agent_disabled("cursor", true, "admin").unwrap();
+        let response = with(&access).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            REALM
+        );
+        db.set_agent_disabled("claude", false, "admin").unwrap();
+        assert_eq!(with(TOKEN).send().await.unwrap().status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn the_levels_gate_fetch_and_push() {
         let (base, db, _log) = working_proxy().await;

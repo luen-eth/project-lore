@@ -64,6 +64,7 @@
       <button id="board-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="board">Board</button>
       <button id="integrations-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="integrations">Integrations</button>
       <button id="profile-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="profile">Profile</button>
+      <button id="agents-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="agents-panel" hidden>Agents</button>
       <button id="users-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="users" hidden>Users</button>
       <button id="backup-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="backup">Backup</button>
       <button id="logout" class="ghost" type="button">Sign out</button>
@@ -205,6 +206,18 @@
         </form>
         <ul id="user-list" class="board-list"></ul>
       </section>
+    </div>
+  </div>
+
+  <div id="agents-panel" class="board agents-panel" hidden>
+    <div class="board-head">
+      <h2>Agents</h2>
+      <span id="agents-count" class="muted small-text"></span>
+    </div>
+    <p class="muted small-text">Agents connect with a token from the server environment, or by authorizing through OAuth: add this server's <code>/mcp</code> URL to the client without a token and approve it in the browser page that opens.</p>
+    <p id="agents-status" class="small-text" role="status"></p>
+    <div class="board-scroll">
+      <ul id="agent-list" class="board-list"></ul>
     </div>
   </div>
 
@@ -492,6 +505,7 @@
     <span id="more-role" class="role" hidden>Viewer</span>
     <button id="more-integrations" class="ghost" type="button" role="menuitem">Integrations</button>
     <button id="more-profile" class="ghost" type="button" role="menuitem">Profile and rules</button>
+    <button id="more-agents" class="ghost" type="button" role="menuitem" hidden>Agents</button>
     <button id="more-users" class="ghost" type="button" role="menuitem" hidden>Users</button>
     <button id="more-backup" class="ghost" type="button" role="menuitem">Backup and restore</button>
     <button id="more-logout" class="ghost" type="button" role="menuitem">Sign out</button>

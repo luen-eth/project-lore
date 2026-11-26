@@ -173,6 +173,113 @@ pub struct McpAuth {
     pub failures: RateLimiter,
     /// Requests per authenticated agent, to contain runaway loops.
     pub requests: RateLimiter,
+    /// Whether lore's OAuth authorization server is mounted; a 401 then
+    /// points the client at the protected resource metadata.
+    pub oauth: bool,
+    /// `LORE_ALLOWED_HOSTS`, which the public origin must match when set.
+    pub allowed_hosts: Vec<String>,
+}
+
+/// Who a presented bearer token belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Authenticated {
+    /// A token from `LORE_TOKEN` / `LORE_TOKENS`.
+    Env(String),
+    /// An OAuth access token lore issued.
+    OAuth(String),
+}
+
+impl Authenticated {
+    pub fn agent(&self) -> &str {
+        match self {
+            Authenticated::Env(agent) | Authenticated::OAuth(agent) => agent,
+        }
+    }
+}
+
+/// Why a presented bearer token was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// Missing, unknown, expired or revoked.
+    Invalid,
+    /// The token is known, but its agent is disabled in the agents panel.
+    Disabled { agent: String, env: bool },
+}
+
+impl McpAuth {
+    /// The authentication as `main` builds it, with the standard limits:
+    /// 20 failed attempts per address in 5 minutes, 600 requests per agent
+    /// per minute.
+    pub fn new(tokens: Vec<Token>, db: Db, trust_proxy: bool) -> Self {
+        Self {
+            tokens,
+            db,
+            trust_proxy,
+            failures: RateLimiter::new(20, Duration::from_secs(5 * 60)),
+            requests: RateLimiter::new(600, Duration::from_secs(60)),
+            oauth: false,
+            allowed_hosts: Vec::new(),
+        }
+    }
+
+    /// Checks a presented bearer token: an env token first (constant
+    /// time, as always), then an unexpired, unrevoked OAuth access token.
+    /// Either way the agent must not be disabled. Shared by `/mcp` and
+    /// the git proxy.
+    pub async fn authenticate(&self, presented: &str) -> Result<Authenticated, Refused> {
+        if presented.is_empty() {
+            return Err(Refused::Invalid);
+        }
+        if let Some(token) = match_token(&self.tokens, presented) {
+            let agent = token.agent.clone();
+            let db = self.db.clone();
+            let name = agent.clone();
+            let disabled =
+                tokio::task::spawn_blocking(move || db.token_agent_disabled(&name)).await;
+            return match disabled {
+                Ok(Ok(true)) => Err(Refused::Disabled { agent, env: true }),
+                Ok(Ok(false)) => Ok(Authenticated::Env(agent)),
+                // The env tokens worked before the registry existed; a
+                // registry that cannot be read does not lock them out.
+                other => {
+                    tracing::warn!(?other, "reading the agent registry failed");
+                    Ok(Authenticated::Env(agent))
+                }
+            };
+        }
+        if !crate::oauth::looks_like_token(presented) {
+            return Err(Refused::Invalid);
+        }
+        let db = self.db.clone();
+        let hash = crate::oauth::token_hash(presented);
+        match tokio::task::spawn_blocking(move || db.access_token_agent(&hash)).await {
+            Ok(Ok(Some(found))) if found.disabled => Err(Refused::Disabled {
+                agent: found.agent,
+                env: false,
+            }),
+            Ok(Ok(Some(found))) => Ok(Authenticated::OAuth(found.agent)),
+            Ok(Ok(None)) => Err(Refused::Invalid),
+            other => {
+                tracing::error!(?other, "checking an OAuth token failed");
+                Err(Refused::Invalid)
+            }
+        }
+    }
+
+    /// The `WWW-Authenticate` value of a 401: with OAuth mounted it names
+    /// the protected resource metadata (RFC 9728), as the MCP
+    /// authorization specification asks.
+    pub fn challenge(&self, headers: &HeaderMap) -> String {
+        if !self.oauth {
+            return "Bearer".into();
+        }
+        match crate::oauth::public_origin(headers, self.trust_proxy, &self.allowed_hosts) {
+            Some(origin) => format!(
+                "Bearer resource_metadata=\"{origin}/.well-known/oauth-protected-resource\""
+            ),
+            None => "Bearer".into(),
+        }
+    }
 }
 
 /// The token a presented secret matches, if any. Every token is compared
@@ -190,6 +297,8 @@ pub fn match_token<'a>(tokens: &'a [Token], presented: &str) -> Option<&'a Token
 
 /// Rejects requests without a known `Authorization: Bearer <token>`, throttles
 /// repeated failures per address, and tags the rest with the token's agent.
+/// A disabled env-token agent gets a 403 with a sentence; a disabled OAuth
+/// agent's token is refused like an invalid one.
 pub async fn require_token(
     State(auth): State<Arc<McpAuth>>,
     mut request: Request,
@@ -205,27 +314,43 @@ pub async fn require_token(
                 .or_else(|| value.strip_prefix("bearer "))
         })
         .map(str::trim)
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
-    let Some(token) = match_token(&auth.tokens, presented) else {
-        let peer = request
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|info| info.0);
-        let ip = client_ip(request.headers(), peer, auth.trust_proxy);
-        if let Some(retry_after) = auth.failures.hit(&ip) {
-            tracing::warn!(%ip, "too many failed token attempts");
-            return too_many_requests(retry_after);
+    let agent = match auth.authenticate(&presented).await {
+        Ok(found) => found.agent().to_string(),
+        Err(Refused::Disabled { agent, env: true }) => {
+            tracing::warn!(%agent, "a disabled agent was refused");
+            return (
+                StatusCode::FORBIDDEN,
+                format!("the agent \"{agent}\" is disabled in the lore admin view\n"),
+            )
+                .into_response();
         }
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            "missing or invalid bearer token\n",
-        )
-            .into_response();
+        Err(refused) => {
+            if let Refused::Disabled { agent, .. } = &refused {
+                tracing::warn!(%agent, "a disabled OAuth agent was refused");
+            } else {
+                let peer = request
+                    .extensions()
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .map(|info| info.0);
+                let ip = client_ip(request.headers(), peer, auth.trust_proxy);
+                if let Some(retry_after) = auth.failures.hit(&ip) {
+                    tracing::warn!(%ip, "too many failed token attempts");
+                    return too_many_requests(retry_after);
+                }
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, auth.challenge(request.headers()))],
+                "missing or invalid bearer token\n",
+            )
+                .into_response();
+        }
     };
 
-    if let Some(retry_after) = auth.requests.hit(&token.agent) {
+    if let Some(retry_after) = auth.requests.hit(&agent) {
         return too_many_requests(retry_after);
     }
 
@@ -238,14 +363,14 @@ pub async fn require_token(
         .take(120)
         .collect::<String>();
     let db = auth.db.clone();
-    let agent = token.agent.clone();
+    let name = agent.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(error) = db.touch_agent(&agent, &client) {
+        if let Err(error) = db.touch_agent(&name, &client) {
             tracing::warn!(%error, "recording agent activity failed");
         }
     });
 
-    request.extensions_mut().insert(Agent(token.agent.clone()));
+    request.extensions_mut().insert(Agent(agent));
     next.run(request).await
 }
 
@@ -275,6 +400,67 @@ mod tests {
         let tokens = load_tokens(&long, &format!("Claude:{long}, codex:{long}")).unwrap();
         let names: Vec<_> = tokens.iter().map(|t| t.agent.as_str()).collect();
         assert_eq!(names, ["shared", "claude", "codex"]);
+    }
+
+    #[tokio::test]
+    async fn env_tokens_are_checked_before_oauth_tokens() {
+        let dir = std::env::temp_dir().join(format!("lore-auth-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        // An env token shaped exactly like an OAuth token, and an OAuth
+        // access token with the same value for another agent.
+        let secret = crate::oauth::random_token().unwrap();
+        let auth = McpAuth::new(
+            load_tokens("", &format!("claude:{secret}")).unwrap(),
+            db.clone(),
+            false,
+        );
+        db.register_oauth_client(&crate::db::OAuthClient {
+            client_id: "c".into(),
+            client_name: String::new(),
+            redirect_uris: vec!["http://127.0.0.1:9/cb".into()],
+        })
+        .unwrap();
+        let grant = db
+            .approve(&crate::db::Approval {
+                agent: "cursor".into(),
+                new_agent: true,
+                avatar: String::new(),
+                client_id: "c".into(),
+                client_name: String::new(),
+                redirect_uri: "http://127.0.0.1:9/cb".into(),
+                authorized_by: "admin".into(),
+                reserved: vec![],
+                code_hash: "h".into(),
+                code_challenge: "c".repeat(43),
+                code_expires_at: crate::db::unix_now() + 300,
+            })
+            .unwrap();
+        let now = crate::db::unix_now();
+        db.issue_tokens(
+            grant,
+            &crate::oauth::token_hash(&secret),
+            now + 60,
+            "r",
+            now + 60,
+        )
+        .unwrap();
+        assert_eq!(
+            auth.authenticate(&secret).await,
+            Ok(Authenticated::Env("claude".into()))
+        );
+        assert_eq!(auth.authenticate("").await, Err(Refused::Invalid));
+        assert_eq!(auth.authenticate("nope").await, Err(Refused::Invalid));
+        // Without OAuth mounted the challenge stays plain.
+        assert_eq!(auth.challenge(&HeaderMap::new()), "Bearer");
+        db.set_agent_disabled("claude", true, "admin").unwrap();
+        assert_eq!(
+            auth.authenticate(&secret).await,
+            Err(Refused::Disabled {
+                agent: "claude".into(),
+                env: true
+            })
+        );
     }
 
     #[test]

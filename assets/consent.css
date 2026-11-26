@@ -1,0 +1,58 @@
+/* The consent page: the admin sign-in's card and scene, made taller and
+   scrollable, with the choices an approval needs. Loaded after app.css. */
+
+html:has(body.consent-page), body.consent-page { overflow: auto; height: auto; min-height: 100%; }
+
+.consent {
+  position: relative; z-index: 1;
+  min-height: 100vh;
+  display: grid; place-items: center;
+  padding: 24px 16px;
+}
+.consent > p { text-align: center; }
+.consent-card {
+  width: min(520px, 100%);
+  text-align: left;
+  gap: 14px;
+}
+.consent-card h1 { text-align: center; }
+.consent-card > p.muted { text-align: center; }
+.consent-card h2 { margin: 0 0 6px; }
+.consent-block { display: grid; gap: 6px; margin: 0; padding: 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.04); border: 0; min-width: 0; }
+.consent-block legend { padding: 0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); font-weight: 600; float: left; width: 100%; margin-bottom: 6px; }
+.consent-block p { margin: 0; }
+.client-name { font-weight: 600; color: var(--accent); overflow-wrap: anywhere; }
+.redirect-uri {
+  display: block; padding: 8px 10px; border-radius: 9px;
+  background: rgba(0, 0, 0, 0.28); border: 1px solid var(--line);
+  font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap;
+}
+.grant-list { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 13px; }
+.grant-list .services b { color: var(--warn); font-weight: 600; }
+.choice { display: flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
+.consent-card .choice input { accent-color: var(--accent); width: auto; flex: none; margin: 0; padding: 0; min-height: 0; }
+.consent-card .board-field input, .consent-card .board-field select { width: 100%; padding: 8px 10px; font-size: 14px; color: var(--text); text-align: left; letter-spacing: normal; }
+
+.avatar-picker { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+.avatar-choice {
+  display: grid; place-items: center; padding: 6px; border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04); border: 1px solid var(--line);
+  backdrop-filter: none;
+}
+.avatar-choice:hover { background: rgba(255, 255, 255, 0.1); }
+.avatar-choice img { width: 44px; height: 44px; display: block; }
+.avatar-choice.picked { border-color: var(--accent); background: rgba(111, 182, 255, 0.16); box-shadow: 0 0 16px rgba(111, 182, 255, 0.35); }
+
+.consent-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.consent-actions button { min-width: 120px; }
+#consent-message button { justify-self: center; }
+
+@media (max-width: 760px) {
+  .consent { padding: max(16px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); place-items: start center; }
+  .consent-card { padding: 24px 16px 18px; }
+  .consent-card .board-field input, .consent-card .board-field select { font-size: 16px; min-height: 44px; }
+  .choice { min-height: 44px; font-size: 15px; }
+  .avatar-choice { min-height: 56px; }
+  .consent-actions { flex-direction: column-reverse; }
+  .consent-actions button { width: 100%; min-height: 48px; }
+}
