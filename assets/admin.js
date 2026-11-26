@@ -250,6 +250,9 @@ class Graph {
       n.vx -= n.x * gravity; n.vy -= n.y * gravity;
       if (n.fixed) { n.vx = 0; n.vy = 0; continue; }
       n.vx *= 0.82; n.vy *= 0.82;
+      // A crowded start can throw nodes far out; cap the speed so the layout cannot explode.
+      const speed = Math.hypot(n.vx, n.vy);
+      if (speed > 60) { n.vx *= 60 / speed; n.vy *= 60 / speed; }
       n.x += n.vx * this.alpha; n.y += n.vy * this.alpha;
     }
     this.alpha *= 0.992;
@@ -300,7 +303,11 @@ class Graph {
     requestAnimationFrame((t) => this.frame(t));
     const dt = Math.min((time - (this.last || time)) / 1000, 0.05);
     this.last = time;
-    if (this.alpha > 0.02) this.tick();
+    if (this.alpha > 0.02) {
+      this.tick();
+      // Until the user moves the camera, keep the whole graph framed while it settles.
+      if (!this.touched) this.fit();
+    }
 
     const ctx = this.ctx, { x, y, k } = this.view;
     this.onCamera(x, y, k);
