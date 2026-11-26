@@ -729,6 +729,8 @@ a.button-link:hover { background: rgba(255, 255, 255, 0.11); }
 .key.ring { border: 1.5px solid var(--violet); width: 11px; height: 11px; }
 .key.agent { border-radius: 3px; background: #ffd479; transform: rotate(45deg); }
 
+.labels-toggle { position: fixed; left: calc(var(--side) + 36px); bottom: 44px; z-index: 1; }
+
 .only-narrow, .only-medium { display: none; }
 
 @media (max-width: 1180px) {
@@ -857,6 +859,7 @@ a.button-link:hover { background: rgba(255, 255, 255, 0.11); }
   .board-scroll { flex: 1; overscroll-behavior: contain; }
   .detail { z-index: 7; padding-top: 0; }
   .legend, .tooltip { display: none !important; }
+  .labels-toggle { left: 12px; bottom: calc(var(--tab-h) + 12px); min-height: 36px; }
 
   /* Overview: the stat cards as a tidy grid of solid tiles */
   .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }

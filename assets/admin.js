@@ -403,6 +403,8 @@ class Graph {
     for (const node of this.nodes) {
       const lit = !dimming || this.bright(node);
       if (!node.label) continue;
+      // With labels hidden only the agents keep their names.
+      if (!this.showLabels && node.kind !== "agent") continue;
       if (node.kind === "hub") {
         ctx.globalAlpha = lit ? 0.94 : 0.15;
         ctx.fillStyle = "#e9eefb";
@@ -698,6 +700,22 @@ window.addEventListener("resize", drawStars);
 /* ---------- App ---------- */
 
 const graph = new Graph($("graph"));
+
+// Project and memory labels can be hidden; the choice is remembered per browser.
+const LABELS_KEY = "lore.graph.labels";
+function setLabels(show, remember) {
+  graph.showLabels = show;
+  const button = $("labels-toggle");
+  button.textContent = show ? "Hide labels" : "Show labels";
+  button.setAttribute("aria-pressed", String(show));
+  if (remember) { try { localStorage.setItem(LABELS_KEY, show ? "1" : "0"); } catch { /* private mode */ } }
+}
+{
+  let stored = null;
+  try { stored = localStorage.getItem(LABELS_KEY); } catch { /* private mode */ }
+  setLabels(stored !== "0", false);
+}
+$("labels-toggle").addEventListener("click", () => setLabels(!graph.showLabels, true));
 
 /* The scene follows the camera: far layers move less than near ones. */
 {
