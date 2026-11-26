@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS files_project_path ON files (project, path, version DESC);
 
 CREATE TABLE IF NOT EXISTS vault (
-    provider   TEXT PRIMARY KEY,            -- cloudflare | github | gitlab | dokploy
+    provider   TEXT PRIMARY KEY,            -- cloudflare | github | github_org | gitlab | dokploy
     base_url   TEXT NOT NULL DEFAULT '',    -- gitlab and dokploy only
     nonce      BLOB NOT NULL,
     secret     BLOB NOT NULL,               -- ciphertext
@@ -288,7 +288,7 @@ pub const FILE_DESCRIPTION_MAX_CHARS: usize = 1000;
 pub const FILE_PATH_MAX_CHARS: usize = 300;
 
 /// The services whose credentials lore can keep, with fixed ids.
-pub const PROVIDERS: &[&str] = &["cloudflare", "github", "gitlab", "dokploy"];
+pub const PROVIDERS: &[&str] = &["cloudflare", "github", "github_org", "gitlab", "dokploy"];
 
 /// What an agent may do with a provider: off, read or full. No permission
 /// row means full.
@@ -7037,6 +7037,66 @@ mod tests {
             .unwrap()
     }
 
+    /// A database that already holds a `github` credential and its
+    /// levels opens with the organization provider added and nothing
+    /// changed: same rows, same schema version, the credential still
+    /// decrypts, and `github_org` is simply not configured.
+    #[test]
+    fn a_stored_github_credential_survives_the_organization_provider() {
+        let dir = std::env::temp_dir().join(format!("lore-github-org-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("lore.db");
+        let key = vault_key();
+        let dump = |db: &Db| -> (i64, Vec<String>) {
+            let conn = db.lock();
+            let version = schema_version(&conn).unwrap();
+            let mut rows: Vec<String> = Vec::new();
+            for sql in [
+                "SELECT provider || '|' || base_url || '|' || hex(nonce) || '|' || hex(secret) \
+                 || '|' || hint || '|' || updated_at FROM vault ORDER BY provider",
+                "SELECT agent || '|' || provider || '|' || level FROM ops_permissions \
+                 ORDER BY agent, provider",
+            ] {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let found = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+                rows.extend(found.map(Result::unwrap));
+            }
+            (version, rows)
+        };
+        let before = {
+            let db = Db::open(&path).unwrap();
+            let (nonce, secret) = key.encrypt("github", "", "ghp_personal-token-42");
+            db.set_vault("github", "", &nonce, &secret, "n-42").unwrap();
+            db.set_ops_level("claude", "github", "off").unwrap();
+            db.set_ops_level("codex", "github", "read").unwrap();
+            dump(&db)
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(dump(&db), before);
+        let stored = db.vault("github").unwrap().unwrap();
+        assert_eq!(
+            key.decrypt("github", "", &stored.nonce, &stored.secret)
+                .unwrap()
+                .expose(),
+            "ghp_personal-token-42"
+        );
+        assert_eq!(db.ops_level("claude", "github").unwrap(), "off");
+        assert_eq!(db.ops_level("codex", "github").unwrap(), "read");
+        // The organization account starts unconfigured with the default
+        // level, and its rows are its own.
+        assert!(db.vault("github_org").unwrap().is_none());
+        let status = db.vault_status().unwrap();
+        let org = status
+            .iter()
+            .find(|row| row.provider == "github_org")
+            .unwrap();
+        assert!(!org.configured);
+        assert_eq!(db.ops_level("claude", "github_org").unwrap(), "full");
+        db.set_ops_level("claude", "github_org", "read").unwrap();
+        assert_eq!(db.ops_level("claude", "github").unwrap(), "off");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn vault_rows_round_trip_and_delete() {
         let db = temp_db();
@@ -7068,21 +7128,26 @@ mod tests {
             assert!(db.delete_vault(bad).is_err(), "{bad:?}");
         }
 
-        // The status lists all four providers, in the fixed order, and
-        // never carries a nonce or a secret.
+        // The status lists every provider, in the fixed order, and never
+        // carries a nonce or a secret. The organization account has no
+        // row and is simply not configured.
         let status = db.vault_status().unwrap();
         let ids: Vec<&str> = status.iter().map(|row| row.provider.as_str()).collect();
-        assert_eq!(ids, ["cloudflare", "github", "gitlab", "dokploy"]);
+        assert_eq!(
+            ids,
+            ["cloudflare", "github", "github_org", "gitlab", "dokploy"]
+        );
         let github = &status[1];
         assert!(github.configured && github.hint == "d-42");
         assert!(status[0].hint.is_empty() && !status[0].configured);
+        assert!(!status[2].configured && status[2].hint.is_empty());
 
         // gitlab keeps the admin-entered server URL.
         let (nonce, secret) = key.encrypt("gitlab", "https://git.example.com", "glpat-1234");
         db.set_vault("gitlab", "https://git.example.com", &nonce, &secret, "1234")
             .unwrap();
         assert_eq!(
-            db.vault_status().unwrap()[2].base_url,
+            db.vault_status().unwrap()[3].base_url,
             "https://git.example.com"
         );
 
@@ -7298,7 +7363,7 @@ mod tests {
             .unwrap();
         db.set_ops_level("claude", "dokploy", "read").unwrap();
         assert_eq!(db.ops_level("claude", "dokploy").unwrap(), "read");
-        assert!(db.vault_status().unwrap()[3].configured);
+        assert!(db.vault_status().unwrap()[4].configured);
         db.log_op(
             "claude",
             None,

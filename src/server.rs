@@ -66,7 +66,8 @@ agents can find it with `files` and read it with `file_get`. Saving the same pat
 makes a new version. Do not store source code that lives in git, and never store secrets.
 
 When the briefing lists services you can operate, call them through their tools — \
-`cloudflare`, `github`, `git_server` for the self-hosted GitLab, `dokploy` — and check \
+`cloudflare`, `github` for the personal GitHub account, `github_org` for the GitHub \
+organization account, `git_server` for the self-hosted GitLab, `dokploy` — and check \
 `integrations` first to see what you may do and how to address each one. The \
 credentials are stored by the administrator and added by lore on the server side: \
 never ask the user for one, and never send one yourself.";
@@ -1871,7 +1872,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "List the services you may operate through lore — Cloudflare, GitHub, a self-hosted GitLab, Dokploy — with your access level on each, the API base to address them and a link to each API reference. The credentials are stored by the administrator and added by lore on the server side; you never see them."
+        description = "List the services you may operate through lore — Cloudflare, GitHub (the personal account and the organization account), a self-hosted GitLab, Dokploy — with your access level on each, the API base to address them and a link to each API reference. The credentials are stored by the administrator and added by lore on the server side; you never see them."
     )]
     async fn integrations(
         &self,
@@ -1912,7 +1913,9 @@ impl Lore {
                             "full access".to_string()
                         }
                     };
-                    let called_as = if provider.tool != provider.id {
+                    // Named whenever the label alone does not say which
+                    // tool it is: the two GitHub accounts, GitLab.
+                    let called_as = if provider.tool != provider.label.to_lowercase() {
                         format!(" (called with `{}`)", provider.tool)
                     } else {
                         String::new()
@@ -1931,15 +1934,17 @@ impl Lore {
                 // public origin or the placeholder in it, and which token
                 // is the password. The code knows no public origin, so
                 // the placeholder stands in for it.
-                if row.configured && matches!(provider.id, "github" | "gitlab") && level != "off" {
-                    let depth = if provider.id == "github" {
+                if let Some(route) = provider.git_route()
+                    && row.configured
+                    && level != "off"
+                {
+                    let depth = if provider.service() == "github" {
                         "<owner>/<repo>"
                     } else {
                         "<group>/<sub>/<repo>"
                     };
                     out.push_str(&format!(
-                        "  git clone https://lore:<your lore token>@{host}/git/{}/{}.git\n",
-                        provider.id, depth
+                        "  git clone https://lore:<your lore token>@{host}/git/{route}/{depth}.git\n"
                     ));
                     out.push_str(
                         "  Use your own lore token as the password; never print it. `read` \
@@ -1977,7 +1982,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Call the GitHub REST API through lore: repositories, pull requests, issues and anything else the account's token allows. Examples: `GET /user/repos?per_page=10` lists your repositories; `POST /repos/{owner}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The GitHub credential is added by lore on the server side: never ask the user for it, and never send one yourself."
+        description = "Call the GitHub REST API through lore with the user's personal GitHub account: repositories, pull requests, issues and anything else the personal account's token allows. For repositories that belong to the GitHub organization, use `github_org` instead. Examples: `GET /user/repos?per_page=10` lists your repositories; `POST /repos/{owner}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The GitHub credential is added by lore on the server side: never ask the user for it, and never send one yourself."
     )]
     async fn github(
         &self,
@@ -1985,6 +1990,17 @@ impl Lore {
         Extension(parts): Extension<Parts>,
     ) -> Result<String, String> {
         self.operate(&parts, ops::GITHUB, args).await
+    }
+
+    #[tool(
+        description = "Call the GitHub REST API through lore with the GitHub organization account's token (kept apart from the personal account). Prefer it for repositories, pull requests, issues, teams and settings that belong to the organization; use `github` for the user's personal repositories. Same arguments as `github`. Examples: `GET /orgs/{org}/repos?per_page=10` lists the organization's repositories; `POST /repos/{org}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The credential is added by lore on the server side: never ask the user for it, and never send one yourself."
+    )]
+    async fn github_org(
+        &self,
+        Parameters(args): Parameters<OpsArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.operate(&parts, ops::GITHUB_ORG, args).await
     }
 
     #[tool(
@@ -3218,6 +3234,105 @@ mod tests {
         assert_eq!(row.path, "/application.saveEnvironment");
         assert_eq!(row.outcome, "error");
         assert_eq!(row.detail, refused);
+    }
+
+    /// The organization account is a tool and a service of its own:
+    /// listed by `integrations` with its own clone URL, named in the
+    /// briefing, and logged under its own provider id.
+    #[tokio::test]
+    async fn the_github_organization_account_is_its_own_service() {
+        let mut lore = test_lore("github-org");
+        let key = VaultKey::from_env_value(&"cd".repeat(32)).unwrap().unwrap();
+        for (provider, credential) in [
+            ("github", "ghp_personal-credential"),
+            ("github_org", "ghp_organization-credential"),
+        ] {
+            let (nonce, secret) = key.encrypt(provider, "", credential);
+            lore.db
+                .set_vault(provider, "", &nonce, &secret, "tial")
+                .unwrap();
+        }
+        lore.vault = Some(key);
+        let tools: Vec<String> = Lore::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(tools.iter().any(|name| name == "github"));
+        assert!(tools.iter().any(|name| name == "github_org"));
+
+        let first = lore
+            .recent(args(json!({})), as_agent(Some("claude")))
+            .await
+            .unwrap();
+        let session = notice_id(&first);
+        lore.db
+            .set_ops_level("claude", "github_org", "read")
+            .unwrap();
+        let listed = lore
+            .integrations(
+                args(json!({ "session_id": session })),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.contains("- GitHub (personal) (full access)")
+                && listed.contains("(called with `github`)"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("- GitHub (organization) (read-only)")
+                && listed.contains("(called with `github_org`)"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("/git/github/<owner>/<repo>.git"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("/git/github-org/<owner>/<repo>.git"),
+            "{listed}"
+        );
+        assert_eq!(
+            lore.usable_services("claude", "claude").unwrap(),
+            "github (full), github_org (read)"
+        );
+
+        // A refused call is logged under the organization provider, and
+        // the GitHub denylist applies to it.
+        let refused = lore
+            .github_org(
+                args(json!({
+                    "session_id": session, "method": "POST", "path": "/user/keys"
+                })),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("creates, rotates or reveals credentials"),
+            "{refused}"
+        );
+        let row = &lore.db.ops_log(1).unwrap()[0];
+        assert_eq!(row.provider, "github_org");
+        assert_eq!(row.outcome, "error");
+        // The read-only level holds for writes, and only there.
+        let denied = lore
+            .github_org(
+                args(json!({
+                    "session_id": session, "method": "POST", "path": "/orgs/acme/repos"
+                })),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(denied, "you have read-only access to github_org");
+        let row = &lore.db.ops_log(1).unwrap()[0];
+        assert_eq!(
+            (row.provider.as_str(), row.outcome.as_str()),
+            ("github_org", "denied")
+        );
     }
 
     #[tokio::test]

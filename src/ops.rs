@@ -41,9 +41,10 @@ pub enum Auth {
 /// the administrator enters.
 #[derive(Clone, Copy, Debug)]
 pub struct Provider {
-    /// cloudflare | github | gitlab | dokploy.
+    /// cloudflare | github | github_org | gitlab | dokploy.
     pub id: &'static str,
-    /// Cloudflare, GitHub, GitLab (self-hosted), Dokploy.
+    /// Cloudflare, GitHub (personal), GitHub (organization), GitLab
+    /// (self-hosted), Dokploy.
     pub label: &'static str,
     /// The MCP tool that calls it.
     pub tool: &'static str,
@@ -71,8 +72,22 @@ pub const CLOUDFLARE: Provider = Provider {
 
 pub const GITHUB: Provider = Provider {
     id: "github",
-    label: "GitHub",
+    label: "GitHub (personal)",
     tool: "github",
+    fixed_base: "https://api.github.com",
+    url_suffix: "",
+    needs_url: false,
+    auth: Auth::BearerGithub,
+    api_docs: "https://docs.github.com/rest",
+};
+
+/// The organization account's GitHub token: the same API, headers,
+/// denylist and redaction as `GITHUB`, with its own credential, levels and
+/// log rows, so the personal and the organization account stay apart.
+pub const GITHUB_ORG: Provider = Provider {
+    id: "github_org",
+    label: "GitHub (organization)",
+    tool: "github_org",
     fixed_base: "https://api.github.com",
     url_suffix: "",
     needs_url: false,
@@ -102,14 +117,39 @@ pub const DOKPLOY: Provider = Provider {
     api_docs: "https://docs.dokploy.com/docs/core-api/introduction",
 };
 
-/// The four services, in the order they are listed everywhere.
-pub const ALL: &[Provider] = &[CLOUDFLARE, GITHUB, GITLAB, DOKPLOY];
+/// The services, in the order they are listed everywhere.
+pub const ALL: &[Provider] = &[CLOUDFLARE, GITHUB, GITHUB_ORG, GITLAB, DOKPLOY];
 
 impl Provider {
     /// The provider with this id, when there is one.
     pub fn find(id: &str) -> Option<Self> {
         let id = id.trim().to_lowercase();
         ALL.iter().find(|provider| provider.id == id).copied()
+    }
+
+    /// The service behind the provider: `github` for both GitHub
+    /// accounts, the id itself otherwise. API rules that belong to the
+    /// service (the credential denylist, the git endpoint, the repository
+    /// path shape) are looked up by this; the credential, the levels and
+    /// the log rows stay with the id.
+    pub fn service(&self) -> &'static str {
+        if self.id == GITHUB_ORG.id {
+            GITHUB.id
+        } else {
+            self.id
+        }
+    }
+
+    /// The segment after `/git/` that clones through this provider's
+    /// credential (`/git/<segment>/<repo path>.git`), for the providers
+    /// that host git repositories; `None` for the others.
+    pub fn git_route(&self) -> Option<&'static str> {
+        match self.id {
+            "github" => Some("github"),
+            "github_org" => Some("github-org"),
+            "gitlab" => Some("gitlab"),
+            _ => None,
+        }
     }
 
     /// The API base: the fixed one, or the admin-entered server URL with
@@ -509,7 +549,7 @@ pub fn denied_path(provider: &Provider, path: &str) -> Option<String> {
     let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
     let patterns = DENIED_PATHS
         .iter()
-        .find(|(id, _)| *id == provider.id)
+        .find(|(id, _)| *id == provider.service())
         .map(|(_, patterns)| *patterns)
         .unwrap_or(&[]);
     for pattern in patterns {
@@ -1107,7 +1147,13 @@ mod tests {
         let client = client();
         let secret = Secret::new("test-credential-value");
 
-        let cases: [(Provider, String, Expected); 4] = [
+        let github_headers = headers(&[
+            ("user-agent", USER_AGENT),
+            ("authorization", "Bearer test-credential-value"),
+            ("accept", "application/vnd.github+json"),
+            ("x-github-api-version", "2022-11-28"),
+        ]);
+        let cases: [(Provider, String, Expected); 5] = [
             (
                 CLOUDFLARE,
                 format!("{base}/client/v4"),
@@ -1118,16 +1164,9 @@ mod tests {
                     ("accept", "*/*"),
                 ]),
             ),
-            (
-                GITHUB,
-                base.clone(),
-                headers(&[
-                    ("user-agent", USER_AGENT),
-                    ("authorization", "Bearer test-credential-value"),
-                    ("accept", "application/vnd.github+json"),
-                    ("x-github-api-version", "2022-11-28"),
-                ]),
-            ),
+            (GITHUB, base.clone(), github_headers.clone()),
+            // The organization account speaks to GitHub exactly the same way.
+            (GITHUB_ORG, base.clone(), github_headers),
             (
                 GITLAB,
                 format!("{base}/api/v4"),
@@ -1161,7 +1200,7 @@ mod tests {
             assert_eq!(seen.method, "GET", "{}", provider.id);
             assert_eq!(seen.headers, headers, "{}", provider.id);
         }
-        // The four ids are exactly the fixed list.
+        // The ids are exactly the fixed list.
         let ids: Vec<&str> = ALL.iter().map(|provider| provider.id).collect();
         assert_eq!(ids, PROVIDERS);
     }
@@ -1556,6 +1595,124 @@ mod tests {
         assert!(denied.reason.contains("server URL"), "{}", denied.reason);
     }
 
+    /// The personal and the organization GitHub account are two separate
+    /// providers: each call carries its own credential and never the
+    /// other one, the levels are set apart, and removing one leaves the
+    /// other working.
+    #[tokio::test]
+    async fn the_two_github_accounts_stay_apart() {
+        let dir =
+            std::env::temp_dir().join(format!("lore-ops-github-org-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        let key = key();
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(recording_router(&log, StatusCode::OK, "{}")).await;
+        let client = client();
+        const PERSONAL: &str = "ghp_personal-credential-1";
+        const ORGANIZATION: &str = "ghp_organization-credential-2";
+
+        // Only the personal one is stored: the organization account is not
+        // configured and refuses on its own.
+        let (nonce, secret) = key.encrypt("github", "", PERSONAL);
+        db.set_vault("github", "", &nonce, &secret, "al-1").unwrap();
+        assert_eq!(
+            authorize(&db, Some(&key), "claude", "claude", GITHUB_ORG, "GET")
+                .unwrap_err()
+                .reason,
+            "no github_org credential is stored"
+        );
+        // The personal row copied under the organization id does not
+        // decrypt: the provider id is part of the vault AAD.
+        db.set_vault("github_org", "", &nonce, &secret, "al-1")
+            .unwrap();
+        assert!(authorize(&db, Some(&key), "claude", "claude", GITHUB_ORG, "GET").is_err());
+
+        let (nonce, secret) = key.encrypt("github_org", "", ORGANIZATION);
+        db.set_vault("github_org", "", &nonce, &secret, "on-2")
+            .unwrap();
+
+        // Each provider's call carries its own credential and only that.
+        for (provider, expected, other) in [
+            (GITHUB, PERSONAL, ORGANIZATION),
+            (GITHUB_ORG, ORGANIZATION, PERSONAL),
+        ] {
+            let granted = authorize(&db, Some(&key), "claude", "claude", provider, "GET").unwrap();
+            assert_eq!(granted.api_base, "https://api.github.com");
+            call(
+                &client,
+                &base,
+                &granted.secret,
+                &Guard::default(),
+                &request(provider, "GET", "/user"),
+            )
+            .await
+            .unwrap();
+            let seen = last(&log);
+            let authorization = seen
+                .headers
+                .iter()
+                .find(|(name, _)| name == "authorization")
+                .map(|(_, value)| value.clone())
+                .unwrap();
+            assert_eq!(
+                authorization,
+                format!("Bearer {expected}"),
+                "{}",
+                provider.id
+            );
+            assert!(!authorization.contains(other), "{}", provider.id);
+        }
+
+        // The levels are independent: restricting one leaves the other.
+        db.set_ops_level("claude", "github_org", "read").unwrap();
+        assert_eq!(
+            authorize(&db, Some(&key), "claude", "claude", GITHUB_ORG, "POST")
+                .unwrap_err()
+                .reason,
+            "you have read-only access to github_org"
+        );
+        assert!(authorize(&db, Some(&key), "claude", "claude", GITHUB, "POST").is_ok());
+        db.set_ops_level("claude", "github", "off").unwrap();
+        assert_eq!(db.ops_level("claude", "github_org").unwrap(), "read");
+        assert!(authorize(&db, Some(&key), "claude", "claude", GITHUB_ORG, "GET").is_ok());
+        assert!(authorize(&db, Some(&key), "claude", "claude", GITHUB, "GET").is_err());
+        db.set_ops_level("claude", "github", "full").unwrap();
+
+        // Removing the organization credential leaves the personal one.
+        assert!(db.delete_vault("github_org").unwrap());
+        assert!(authorize(&db, Some(&key), "claude", "claude", GITHUB_ORG, "GET").is_err());
+        let granted = authorize(&db, Some(&key), "claude", "claude", GITHUB, "GET").unwrap();
+        assert_eq!(granted.secret.expose(), PERSONAL);
+        // And the reverse.
+        let (nonce, secret) = key.encrypt("github_org", "", ORGANIZATION);
+        db.set_vault("github_org", "", &nonce, &secret, "on-2")
+            .unwrap();
+        assert!(db.delete_vault("github").unwrap());
+        assert!(authorize(&db, Some(&key), "claude", "claude", GITHUB, "GET").is_err());
+        let granted = authorize(&db, Some(&key), "claude", "claude", GITHUB_ORG, "GET").unwrap();
+        assert_eq!(granted.secret.expose(), ORGANIZATION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The organization account answers to the same rules as the personal
+    /// one wherever a rule belongs to the GitHub service.
+    #[test]
+    fn the_organization_account_is_a_github_service() {
+        assert_eq!(GITHUB.service(), "github");
+        assert_eq!(GITHUB_ORG.service(), "github");
+        assert_eq!(GITLAB.service(), "gitlab");
+        assert_eq!(GITHUB.git_route(), Some("github"));
+        assert_eq!(GITHUB_ORG.git_route(), Some("github-org"));
+        assert_eq!(GITLAB.git_route(), Some("gitlab"));
+        assert_eq!(CLOUDFLARE.git_route(), None);
+        assert_eq!(DOKPLOY.git_route(), None);
+        assert_eq!(Provider::find(" GitHub_Org ").unwrap().id, "github_org");
+        assert_eq!(GITHUB_ORG.tool, "github_org");
+        assert_eq!(GITHUB.label, "GitHub (personal)");
+        assert_eq!(GITHUB_ORG.label, "GitHub (organization)");
+    }
+
     #[test]
     fn the_level_is_the_stricter_of_token_and_session() {
         let db = temp_db();
@@ -1608,6 +1765,11 @@ mod tests {
             (GITHUB, "/repos/owner/repo/keys"),
             (GITHUB, "/user/keys"),
             (GITHUB, "/orgs/acme/actions/runners/registration-token"),
+            // The organization account shares the GitHub denylist.
+            (GITHUB_ORG, "/repos/acme/repo/keys"),
+            (GITHUB_ORG, "/user/keys"),
+            (GITHUB_ORG, "/orgs/acme/actions/runners/registration-token"),
+            (GITHUB_ORG, "/authorizations"),
             (GITLAB, "/personal_access_tokens/self/rotate"),
             (GITLAB, "/projects/group%2Fproject/access_tokens"),
             (GITLAB, "/users/7/impersonation_tokens"),
@@ -1640,6 +1802,7 @@ mod tests {
             (CLOUDFLARE, "/user"),
             (GITHUB, "/repos/owner/repo/pulls"),
             (GITHUB, "/user/repos"),
+            (GITHUB_ORG, "/orgs/acme/repos"),
             (GITLAB, "/projects/group%2Fproject/merge_requests"),
             (DOKPLOY, "/application.deploy"),
         ] {
@@ -1880,6 +2043,7 @@ mod tests {
             Value::from(1)
         );
         assert_eq!(GITHUB.test_request().path, "/user");
+        assert_eq!(GITHUB_ORG.test_request().path, "/user");
         assert_eq!(GITLAB.test_request().path, "/user");
         assert_eq!(DOKPLOY.test_request().path, "/project.all");
         for provider in ALL {

@@ -366,12 +366,31 @@
         </li>
         <li class="board-item integration" data-provider="github">
           <div class="board-item-head">
-            <span class="board-title">GitHub</span>
+            <span class="board-title">GitHub (personal)</span>
             <span class="board-id int-status">Not set</span>
           </div>
           <p class="int-url-view muted small-text"></p>
           <form class="integration-form" autocomplete="off" data-provider="github" hidden>
             <label class="board-field"><span>Credential (token)</span>
+              <input class="int-secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" placeholder="Paste once; lore stores it encrypted" spellcheck="false">
+            </label>
+            <div class="board-actions">
+              <button class="ghost small int-save" type="submit">Save</button>
+              <button class="ghost small int-test" type="button">Test</button>
+              <button class="ghost small danger int-remove" type="button">Remove</button>
+            </div>
+          </form>
+          <p class="int-result small-text" role="status"></p>
+        </li>
+        <li class="board-item integration" data-provider="github_org">
+          <div class="board-item-head">
+            <span class="board-title">Organization token</span>
+            <span class="board-id int-status">Not set</span>
+          </div>
+          <p class="muted small-text">GitHub (organization): kept apart from the personal token, used by the github_org tool and by clones through /git/github-org/.</p>
+          <p class="int-url-view muted small-text"></p>
+          <form class="integration-form" autocomplete="off" data-provider="github_org" hidden>
+            <label class="board-field"><span>Credential (organization account token)</span>
               <input class="int-secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" placeholder="Paste once; lore stores it encrypted" spellcheck="false">
             </label>
             <div class="board-actions">

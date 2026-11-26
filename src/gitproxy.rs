@@ -1,7 +1,8 @@
 //! The git proxy: clone, fetch and push through lore. An agent runs plain
-//! `git` against `/git/<provider>/<owner>/<repo>.git`, authenticates with
-//! its own lore token (the password of a Basic header, or a Bearer token),
-//! and lore forwards the smart-HTTP request upstream with the stored
+//! `git` against `/git/<provider>/<owner>/<repo>.git` (`github`,
+//! `github-org` for the organization account's credential, or `gitlab`),
+//! authenticates with its own lore token (the password of a Basic header,
+//! or a Bearer token), and lore forwards the smart-HTTP request upstream with the stored
 //! credential. The credential never reaches the agent's machine, and the
 //! agent's lore token never travels upstream.
 
@@ -172,7 +173,7 @@ impl Endpoint {
 /// agent asked for it (no `.git` added), and the endpoint.
 #[derive(Clone)]
 struct GitRequest {
-    /// github or gitlab; `parse` lets nothing else through.
+    /// github, github_org or gitlab; `parse` lets nothing else through.
     provider: ops::Provider,
     repo: String,
     endpoint: Endpoint,
@@ -180,10 +181,11 @@ struct GitRequest {
 
 /// Splits the path after `/git/` into provider, repository path and
 /// endpoint. `None` when this is not one of the three requests — a
-/// provider other than github or gitlab, a path that ends in anything but
-/// the three tails, or a method that does not belong to the shape: the
-/// caller answers 404, because no such request exists. The repository path
-/// rules are checked later, once the agent is authenticated.
+/// provider other than github, github-org or gitlab, a path that ends in
+/// anything but the three tails, or a method that does not belong to the
+/// shape: the caller answers 404, because no such request exists. The
+/// repository path rules are checked later, once the agent is
+/// authenticated.
 fn parse(rest: &str, method: &Method) -> Option<GitRequest> {
     let segments: Vec<&str> = rest.split('/').collect();
     let count = segments.len();
@@ -198,12 +200,12 @@ fn parse(rest: &str, method: &Method) -> Option<GitRequest> {
         } else {
             return None;
         };
-    // Only these two providers exist; nothing else is a request.
-    let provider = match segments[0] {
-        "github" => ops::GITHUB,
-        "gitlab" => ops::GITLAB,
-        _ => return None,
-    };
+    // Only these providers exist; nothing else is a request. The
+    // organization account's segment is `github-org`, its provider id
+    // `github_org`.
+    let provider = *ops::ALL
+        .iter()
+        .find(|provider| provider.git_route() == Some(segments[0]))?;
     if method != endpoint.method() {
         return None;
     }
@@ -244,7 +246,7 @@ fn validate_repo(provider: &ops::Provider, repo: &str) -> Result<(), String> {
         }
     }
     let count = repo.split('/').count();
-    match provider.id {
+    match provider.service() {
         "github" if count != 2 => {
             Err("a github repository path is <owner>/<repo>, exactly two segments".into())
         }
@@ -441,7 +443,7 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
                     // Where the git endpoint lives: GitHub's web base, or
                     // the stored server URL for GitLab, which authorize
                     // already checked is there.
-                    let base = if git.provider.id == "github" {
+                    let base = if git.provider.service() == "github" {
                         github_base
                     } else {
                         granted.server_url
@@ -498,7 +500,7 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
         .await;
         return plain(StatusCode::BAD_REQUEST, reason);
     }
-    let user = if git.provider.id == "github" {
+    let user = if git.provider.service() == "github" {
         "x-access-token"
     } else {
         "oauth2"
@@ -1589,6 +1591,132 @@ mod tests {
             !all.contains(GITHUB_CREDENTIAL),
             "the credential was logged"
         );
+    }
+
+    /// `/git/github-org/…` rides the organization account's credential
+    /// and level, `/git/github/…` the personal one, and neither ever
+    /// carries the other's credential.
+    #[tokio::test]
+    async fn the_organization_route_uses_its_own_credential_and_level() {
+        const ORG_CREDENTIAL: &str = "ghp_test-organization-credential";
+        let (base, db, log) = working_proxy().await;
+        let client = reqwest::Client::new();
+        let org_path = "/git/github-org/acme/repo.git/info/refs?service=git-upload-pack";
+        let personal_path = "/git/github/owner/repo.git/info/refs?service=git-upload-pack";
+        let expected = |credential: &str| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("x-access-token:{credential}"))
+            )
+        };
+        let authorization = |seen: &Seen| {
+            seen.headers
+                .iter()
+                .find(|(name, _)| name == "authorization")
+                .map(|(_, value)| value.clone())
+                .unwrap()
+        };
+
+        // Not configured yet: refused, and nothing goes upstream.
+        let response = call(&client, &base, Method::GET, org_path)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.text().await.unwrap(),
+            "no github_org credential is stored\n"
+        );
+        assert!(log.lock().unwrap().is_empty());
+
+        let key = key();
+        let (nonce, secret) = key.encrypt("github_org", "", ORG_CREDENTIAL);
+        db.set_vault("github_org", "", &nonce, &secret, "tial")
+            .unwrap();
+        let response = call(&client, &base, Method::GET, org_path)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = last(&log);
+        assert_eq!(seen.path, "/acme/repo.git/info/refs");
+        assert_eq!(authorization(&seen), expected(ORG_CREDENTIAL));
+        let response = call(&client, &base, Method::GET, personal_path)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(authorization(&last(&log)), expected(GITHUB_CREDENTIAL));
+
+        // The organization path keeps GitHub's shape rules.
+        let response = call(
+            &client,
+            &base,
+            Method::GET,
+            "/git/github-org/acme/repo/extra/info/refs?service=git-upload-pack",
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // `github_org` is the provider id, not a route segment.
+        let response = call(
+            &client,
+            &base,
+            Method::GET,
+            "/git/github_org/acme/repo.git/info/refs?service=git-upload-pack",
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // The levels are independent.
+        db.set_ops_level("claude", "github_org", "off").unwrap();
+        let response = call(&client, &base, Method::GET, org_path)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.text().await.unwrap(),
+            "you have no access to github_org\n"
+        );
+        let response = call(&client, &base, Method::GET, personal_path)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        db.set_ops_level("claude", "github_org", "full").unwrap();
+        db.set_ops_level("claude", "github", "off").unwrap();
+        let response = call(&client, &base, Method::GET, personal_path)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = call(&client, &base, Method::GET, org_path)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Its own rows in the ops log, and neither credential in them.
+        let rows = db.ops_log(20).unwrap();
+        assert_eq!(rows[0].provider, "github_org");
+        assert_eq!(rows[0].path, "git:acme/repo.git:info-refs");
+        assert_eq!(rows[1].provider, "github");
+        assert_eq!(rows[1].outcome, "denied");
+        let all = format!("{rows:?}{:?}", db.activity(20).unwrap());
+        assert!(!all.contains(ORG_CREDENTIAL) && !all.contains(GITHUB_CREDENTIAL));
+        // Every upstream request carried exactly one of the two.
+        for seen in log.lock().unwrap().iter() {
+            let value = authorization(seen);
+            assert!(
+                value == expected(ORG_CREDENTIAL) || value == expected(GITHUB_CREDENTIAL),
+                "{value}"
+            );
+        }
     }
 
     /// The token helper reads both schemes git may send.

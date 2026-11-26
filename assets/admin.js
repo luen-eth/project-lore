@@ -39,7 +39,8 @@ const TOOLS = {
   file_delete: { verb: "deleted a file", tone: "remove" },
   integrations: { verb: "looked at the integrations", tone: "read" },
   cloudflare: { verb: "called Cloudflare", tone: "write" },
-  github: { verb: "called GitHub", tone: "write" },
+  github: { verb: "called GitHub (personal)", tone: "write" },
+  github_org: { verb: "called GitHub (organization)", tone: "write" },
   git_server: { verb: "called the git server", tone: "write" },
   dokploy: { verb: "called Dokploy", tone: "write" },
   git_fetch: { verb: "fetched a repository", tone: "read" },
@@ -49,7 +50,7 @@ const TOOLS = {
 const WRITES = new Set([
   "hello", "checkin", "bye", "log", "amend", "forget", "profile", "rules", "import", "restore", "reindex",
   "task_add", "task_update", "send", "handoff", "file_save", "file_delete",
-  "cloudflare", "github", "git_server", "dokploy", "git_push", "users",
+  "cloudflare", "github", "github_org", "git_server", "dokploy", "git_push", "users",
 ]);
 /* The permission ids the server knows; a signed-in user holds some of them. */
 const ALL_PERMISSIONS = ["write", "backup", "restore", "settings", "integrations", "agents", "users"];
@@ -2549,7 +2550,7 @@ $("file-form").addEventListener("submit", async (event) => {
    refresh while the admin is pasting a credential only replaces the
    status lines, the permission table and the operations log. */
 const LEVELS = [["off", "Off"], ["read", "Read"], ["full", "Full"]];
-const OPS_TOOLS = new Set(["integrations", "cloudflare", "github", "git_server", "dokploy"]);
+const OPS_TOOLS = new Set(["integrations", "cloudflare", "github", "github_org", "git_server", "dokploy"]);
 const integrationsState = {
   data: null, loading: null, again: false, timer: null,
 };

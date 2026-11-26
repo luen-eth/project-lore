@@ -83,9 +83,10 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `files` | The files kept, newest first, or a search over their paths and descriptions |
 | `file_get` | One file with its description, its other versions and its content, by id or by project and path |
 | `file_delete` | Delete one version of a file |
-| `integrations` | The services you may operate through lore (Cloudflare, GitHub, a self-hosted GitLab, Dokploy): which are configured, your own access level on each, and how to address them |
+| `integrations` | The services you may operate through lore (Cloudflare, GitHub personal and organization, a self-hosted GitLab, Dokploy): which are configured, your own access level on each, and how to address them |
 | `cloudflare` | Call the Cloudflare API (zones, DNS records, …) |
-| `github` | Call the GitHub REST API (repositories, pull requests, issues, …) |
+| `github` | Call the GitHub REST API with the personal account's token (repositories, pull requests, issues, …) |
+| `github_org` | Call the GitHub REST API with the organization account's token; preferred for repositories that belong to the organization |
 | `git_server` | Call the REST API of the self-hosted GitLab server (projects, merge requests, issues, …) |
 | `dokploy` | Call the Dokploy API of the deployment server (projects, applications, deployments, …) |
 
@@ -249,7 +250,7 @@ Details:
 
 ## Operating services through lore
 
-lore can hold the credentials of four services and let agents call those services
+lore can hold the credentials of five services and let agents call those services
 *through* it. An agent never sees a credential: it names a method and a path, lore adds
 the credential on the server side, checks what that agent is allowed to do, and returns
 the answer with the credential redacted out.
@@ -257,12 +258,13 @@ the answer with the credential redacted out.
 | Provider | Tool | API base | Credential |
 |---|---|---|---|
 | Cloudflare | `cloudflare` | `https://api.cloudflare.com/client/v4` | API token |
-| GitHub | `github` | `https://api.github.com` | token |
+| GitHub (personal) | `github` | `https://api.github.com` | token |
+| GitHub (organization) | `github_org` | `https://api.github.com` | token of the organization account |
 | GitLab (self-hosted) | `git_server` | `<your server>/api/v4` | access token |
 | Dokploy | `dokploy` | `<your server>/api` | API key |
 
 `integrations` lists which providers are configured, your own access level on each, and
-the API base with a link to each API reference. The four call tools take a `method`
+the API base with a link to each API reference. The five call tools take a `method`
 (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`), a `path` after the API base, optional `query`
 parameters and an optional JSON `body` (never with `GET`), and answer `HTTP <status>`
 followed by the response body. A path cannot reach another host or climb out of the
@@ -277,6 +279,15 @@ and so hold one after all. lore keeps a fixed list of those endpoints per provid
 `/repos/{owner}/{repo}/keys`, GitLab `/personal_access_tokens` and
 `/projects/{id}/access_tokens`, Dokploy `/user.createApiKey`) and refuses them on every
 method, whatever the encoding of the path. Do those by hand.
+
+**Two GitHub accounts.** A personal account and an organization account are kept
+apart: `github` (provider id `github`, card "GitHub (personal)") and `github_org`
+(provider id `github_org`, card "Organization token") are two independent providers
+with the same API base, headers, denylist and redaction, each with its own encrypted
+credential, its own column in the permissions table (default **full**, like every
+provider) and its own rows in the operations log. Neither ever sends the other's
+credential. A database without a `github_org` credential simply shows it as not
+configured; the stored `github` credential and its levels are unchanged.
 
 **How a credential is stored.** The administrator enters it once, on the **Integrations**
 panel of the admin view; the server encrypts it immediately (XChaCha20-Poly1305, a fresh
@@ -297,7 +308,7 @@ occurrence of the credential in a response with `[redacted]` before the agent se
 
 **lore's own secrets are redacted too.** When lore runs on Dokploy, reading its own
 application returns its environment, and with it every secret lore was started with.
-So every provider response, from all four services, is also cleaned of the values of
+So every provider response, from all five services, is also cleaned of the values of
 `LORE_TOKENS` (each token), `LORE_TOKEN`, `LORE_ADMIN_PASSWORD`, `LORE_VIEWER_PASSWORD`,
 `LORE_RECAPTCHA_SECRET_KEY` and `LORE_VAULT_KEY`, in the same plain, JSON-escaped,
 percent-encoded and base64 forms as the credential. Values shorter than 8 characters
@@ -336,14 +347,18 @@ not part of a backup; exporting, restoring or merging one never moves a credenti
 
 ### Cloning and pushing through lore
 
-The two git providers also speak plain `git`. An agent clones through lore with its
+The git providers also speak plain `git`. An agent clones through lore with its
 own lore token as the password, and lore forwards the request to GitHub or the
 GitLab server with the stored credential:
 
 ```bash
 git clone https://lore:<its own lore token>@lore.example.com/git/github/<owner>/<repo>.git
+git clone https://lore:<its own lore token>@lore.example.com/git/github-org/<owner>/<repo>.git
 git clone https://lore:<its own lore token>@lore.example.com/git/gitlab/<group>/<sub>/<repo>.git
 ```
+
+`/git/github/…` uses the personal GitHub credential and the `github` level;
+`/git/github-org/…` uses the organization credential and the `github_org` level.
 
 The three requests of the git smart-HTTP protocol are proxied — the ref
 advertisement (`info/refs`), fetch (`git-upload-pack`) and push

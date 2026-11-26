@@ -3506,7 +3506,7 @@ mod tests {
         let first: serde_json::Value = response.json().await.unwrap();
         assert_eq!(first["vault_enabled"], true);
         assert_eq!(first["enabled"], true);
-        assert_eq!(first["providers"].as_array().unwrap().len(), 4);
+        assert_eq!(first["providers"].as_array().unwrap().len(), 5);
         assert!(first["permissions"].as_array().unwrap().is_empty());
         assert!(first["log"].as_array().unwrap().is_empty());
         let names: Vec<&str> = first["agents"]
@@ -3596,6 +3596,65 @@ mod tests {
                 .as_str()
                 .is_some_and(|at| !at.is_empty())
         );
+        // The organization account is a provider of its own: not configured
+        // by the personal credential, stored and removed on its own.
+        let organization = |shown: &serde_json::Value| {
+            shown["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|provider| provider["id"] == "github_org")
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(organization(&shown)["configured"], false);
+        assert_eq!(organization(&shown)["label"], "GitHub (organization)");
+        assert_eq!(github["label"], "GitHub (personal)");
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/github_org".into(),
+            Some("admin-token"),
+        )
+        .json(&json!({ "secret": "ghp_organization-not-real-7777" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let response = call(
+            reqwest::Method::DELETE,
+            "/admin/api/integrations/github_org".into(),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let shown: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/integrations".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert!(
+            !serde_json::to_string(&shown)
+                .unwrap()
+                .contains("organization-not-real")
+        );
+        assert_eq!(organization(&shown)["configured"], false);
+        let still = shown["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "github")
+            .cloned()
+            .unwrap();
+        assert_eq!(still["configured"], true);
+        assert_eq!(still["hint"], "9999");
 
         // A gitlab credential with its server URL; the pasted /api/v4 form
         // is accepted. The URL alone cannot move the stored credential to
