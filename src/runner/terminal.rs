@@ -36,9 +36,9 @@ use rustix::{
 use tokio::{io::unix::AsyncFd, process::Child, sync::mpsc, time::Instant};
 
 use super::{
-    drivers::{CliHome, Driver},
+    drivers::{CliHome, Driver, Source},
     protocol::{FromRunner, TerminalMode, ToRunner},
-    sandbox::{self, Occupancy},
+    sandbox::Occupancy,
 };
 
 /// Terminals one runner keeps open at once.
@@ -96,23 +96,29 @@ pub struct Terminals {
     out: mpsc::Sender<FromRunner>,
     limits: Limits,
     open: Open,
-    /// Shared with the runs: a terminal does not open during a run.
+    /// The runner process's: a terminal does not open during a run or a
+    /// sign-in.
     occupancy: Arc<Occupancy>,
+    /// Held while a terminal opens or closes, so the sweep before the
+    /// first one and after the last one never meets another starting.
+    turnstile: Arc<tokio::sync::Mutex<()>>,
+    /// Homes of terminals that closed while another was still open: what
+    /// the owner signed in there is taken back once the last one closes
+    /// and nothing of the agent user is left.
+    pending: Arc<Mutex<Vec<CliHome>>>,
 }
 
 impl Terminals {
-    pub fn new(
-        driver: Arc<Driver>,
-        out: mpsc::Sender<FromRunner>,
-        limits: Limits,
-        occupancy: Arc<Occupancy>,
-    ) -> Self {
+    pub fn new(driver: Arc<Driver>, out: mpsc::Sender<FromRunner>, limits: Limits) -> Self {
+        let occupancy = driver.occupancy().clone();
         Self {
             driver,
             out,
             limits,
             open: Arc::default(),
             occupancy,
+            turnstile: Arc::default(),
+            pending: Arc::default(),
         }
     }
 
@@ -211,50 +217,77 @@ impl Terminals {
             );
             return;
         }
-        if !self.occupancy.open_terminal() {
-            drop(open);
-            self.exit(
-                term_id,
-                None,
-                Some("a run is going in this container; watch its output, or stop it first".into()),
-            );
-            return;
-        }
-        let spawned = self.driver.home().and_then(|home| {
-            let (child, master) = spawn(
-                &self.driver,
-                mode,
-                model.as_deref(),
-                &self.limits.shell,
-                size(cols, rows),
-                &home,
-            )?;
-            Ok((child, master, home))
-        });
-        let (child, master, home) = match spawned {
-            Ok(spawned) => spawned,
-            Err(error) => {
+        let first = match self.occupancy.open_terminal() {
+            Ok(first) => first,
+            Err(why) => {
                 drop(open);
-                self.occupancy.close_terminal();
-                let message = self.driver.redact(&format!("{error:#}"));
-                tracing::warn!(%term_id, %message, "a terminal could not be opened");
-                self.exit(term_id, None, Some(message));
+                self.exit(term_id, None, Some(why.into()));
                 return;
             }
         };
+        // Input typed while the terminal starts waits for it.
         let (tx, rx) = mpsc::channel(INPUT_QUEUE);
         open.insert(term_id.clone(), tx);
         drop(open);
-        tracing::info!(%term_id, mode = ?mode, "a terminal opened");
-        let (out, registry, idle) = (self.out.clone(), self.open.clone(), self.limits.idle);
-        let (driver, occupancy) = (self.driver.clone(), self.occupancy.clone());
+        let (out, registry, idle, shell) = (
+            self.out.clone(),
+            self.open.clone(),
+            self.limits.idle,
+            self.limits.shell.clone(),
+        );
+        let (driver, occupancy, turnstile, pending) = (
+            self.driver.clone(),
+            self.occupancy.clone(),
+            self.turnstile.clone(),
+            self.pending.clone(),
+        );
         tokio::spawn(async move {
+            let spawned = {
+                let _turn = turnstile.lock().await;
+                // The first terminal finds no process of the agent user:
+                // nothing a run or a sign-in left can watch it.
+                if first {
+                    driver.sweep().await;
+                }
+                driver.home().and_then(|home| {
+                    let (child, master) = spawn(
+                        &driver,
+                        mode,
+                        model.as_deref(),
+                        &shell,
+                        size(cols, rows),
+                        &home,
+                    )?;
+                    Ok((child, master, home))
+                })
+            };
+            let (child, master, home) = match spawned {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&term_id);
+                    occupancy.close_terminal();
+                    let message = driver.redact(&format!("{error:#}"));
+                    tracing::warn!(%term_id, %message, "a terminal could not be opened");
+                    let _ = out
+                        .send(FromRunner::TerminalExit {
+                            term_id,
+                            code: None,
+                            message: Some(message),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            tracing::info!(%term_id, mode = ?mode, "a terminal opened");
             let (code, message) = run(&term_id, child, master, rx, &out, idle).await;
             registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&term_id);
-            finish(&driver, &occupancy, home).await;
+            finish(&driver, &occupancy, &turnstile, &pending, home).await;
             tracing::info!(%term_id, ?code, "a terminal closed");
             let _ = out
                 .send(FromRunner::TerminalExit {
@@ -284,24 +317,39 @@ fn size(cols: u16, rows: u16) -> Winsize {
     }
 }
 
-/// After a terminal: when it was the last one and no run is going, every
-/// process of the agent user ends (what the owner left running in it
-/// included); a sign-in the owner made in it is kept; its home goes.
-async fn finish(driver: &Driver, occupancy: &Occupancy, home: CliHome) {
-    let left = occupancy.close_terminal();
-    if left == 0
-        && !occupancy.run_going()
-        && let Some(user) = driver.user()
-        && let Err(error) = sandbox::sweep(user).await
-    {
-        tracing::warn!(%error, "after a terminal, the agent user's processes did not all end");
+/// After a terminal. While another is still open its home waits; when it
+/// is the last one, still counted (so no run can start in between), every
+/// process of the agent user ends (the runner exits when they cannot), a
+/// sign-in the owner made in any of the waiting homes is kept, and the
+/// homes go. Nothing is read from a home while a process of the agent
+/// user is alive.
+async fn finish(
+    driver: &Arc<Driver>,
+    occupancy: &Occupancy,
+    turnstile: &tokio::sync::Mutex<()>,
+    pending: &Mutex<Vec<CliHome>>,
+    home: CliHome,
+) {
+    let _turn = turnstile.lock().await;
+    if occupancy.terminals_open() > 1 {
+        pending.lock().unwrap_or_else(|e| e.into_inner()).push(home);
+        occupancy.close_terminal();
+        return;
     }
-    match driver.harvest(&home, true) {
-        Ok(true) => tracing::info!("a sign-in made in a terminal was stored"),
-        Ok(false) => {}
-        Err(error) => tracing::warn!(%error, "a sign-in made in a terminal could not be stored"),
+    driver.sweep().await;
+    let mut homes = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+    homes.push(home);
+    for home in homes {
+        match driver.harvest(&home, Source::Owner) {
+            Ok(true) => tracing::info!("a sign-in made in a terminal was stored"),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "a sign-in made in a terminal could not be stored")
+            }
+        }
     }
-    drop(home);
+    driver.clean_now();
+    occupancy.close_terminal();
 }
 
 /// Opens a PTY and starts the program on it, in a session of its own.
@@ -313,8 +361,11 @@ fn spawn(
     winsize: Winsize,
     home: &CliHome,
 ) -> Result<(Child, AsyncFd<OwnedFd>)> {
-    let master = rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)
-        .context("opening a pseudo-terminal")?;
+    // Close-on-exec from the start: a process another task starts at the
+    // same moment never inherits the master.
+    let master =
+        rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
+            .context("opening a pseudo-terminal")?;
     rustix::pty::grantpt(&master).context("granting the pseudo-terminal")?;
     rustix::pty::unlockpt(&master).context("unlocking the pseudo-terminal")?;
     let name = rustix::pty::ptsname(&master, Vec::new()).context("naming the pseudo-terminal")?;
@@ -574,7 +625,7 @@ mod tests {
         }));
         let (tx, rx) = mpsc::channel(256);
         Bench {
-            terminals: Terminals::new(driver, tx, limits, Arc::default()),
+            terminals: Terminals::new(driver, tx, limits),
             rx,
             home,
         }
@@ -829,10 +880,10 @@ mod tests {
             }),
         ));
         driver.prepare().unwrap();
-        let occupancy = Arc::new(Occupancy::default());
+        let occupancy = driver.occupancy().clone();
         occupancy.start_run().unwrap();
         let (tx, mut rx) = mpsc::channel(256);
-        let terminals = Terminals::new(driver, tx, sh(), occupancy.clone());
+        let terminals = Terminals::new(driver, tx, sh());
         terminals.handle(open("f1", TerminalMode::Shell, 80, 24));
         let (_, exit) = collect(&mut rx, "f1", "").await;
         assert!(exit.unwrap().1.unwrap().contains("a run is going"));

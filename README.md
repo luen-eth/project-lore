@@ -844,8 +844,8 @@ docker volume create project-lore-data
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
 ```
 
-The built-in coding agents are optional and start only with their profile
-(`COMPOSE_PROFILES=agents`); see [Built-in coding agents](#built-in-coding-agents).
+The built-in coding agents are optional and start only with their own compose file
+(`docker-compose.agents.yml`); see [Built-in coding agents](#built-in-coding-agents).
 
 The MCP endpoint is `http://localhost:8080/mcp` and the admin view is
 `http://localhost:8080/admin`. On first start the embedding model (about 2 GB) is
@@ -993,7 +993,11 @@ is working on. Helping other agents on request comes in a later part.
   with DeepSeek; or named in the entry, `agent:kind:secret` or
   `agent:opencode/<provider>:secret`), and a runner whose hello claims anything
   else is refused. A link that sends more than 500 frames or 8 MiB a second (beyond
-  a burst), or more run output than lore can store, is closed.
+  a burst) is closed. A run's output travels in batches of up to 200 lines per
+  frame, so a CLI that prints thousands of short lines stays far below that; when
+  lines come faster than lore can store them, the ones past lore's queue are left
+  out and one line says how many, while the link and the run go on (the run still
+  ends at lore's per-run output cap).
 - **The runner is the only thing that knows the CLIs.** lore sends commands (report
   status, list models, start a sign-in, pass on a code, store a pasted credential,
   sign out, start and stop a run, open a terminal) and the runner answers and
@@ -1007,10 +1011,16 @@ is working on. Helping other agents on request comes in a later part.
   the runner's own directory `/var/lib/lore-runner` on a named volume, and `/work`
   on a size-limited tmpfs. Every base image is pinned by digest (*Updating the
   pinned versions* below).
-- **Compose** (`docker-compose.yml`): `lore` as before; the egress proxy `egress`
-  and `agent-claude`, `agent-codex` and `agent-deepseek` under the profile `agents`
-  (and one profile per agent, such as `agent-claude`), so `docker compose up`
-  without a profile runs lore alone, exactly as before. lore publishes no port
+- **Compose**: `docker-compose.yml` is lore alone, exactly as before: no agent
+  network, no fixed subnet, no runner listener (it sets `LORE_RUNNER_TOKENS` empty
+  for lore whatever `.env` says). `docker-compose.agents.yml` is a complete file of
+  its own: it takes `lore` from `docker-compose.yml` (`extends`) and adds the egress
+  proxy `egress`, `agent-claude`, `agent-codex` and `agent-deepseek`, their networks,
+  and lore's attachments to them. Use it with `docker compose -f
+  docker-compose.agents.yml …`, or `COMPOSE_FILE=docker-compose.agents.yml` in `.env`
+  (`docker-compose.agents.yml:docker-compose.local.yml` on a plain docker host), or
+  as the compose path of a Dokploy compose service; name services to start only
+  some (`… up -d lore egress agent-claude`). lore publishes no port
   (`expose` only; see *Moving a single-container install to compose* for Dokploy and
   for a plain docker host). The agents get `cpus` (`LORE_AGENT_CPUS`, 2),
   `mem_limit` (`LORE_AGENT_MEMORY`, 4g), `pids_limit` 512, `init: true` (docker-init
@@ -1062,32 +1072,67 @@ list it. For every run, terminal, sign-in and status check the runner makes a
 **fresh home** under `/work/.homes/<random>`, writes a known-good configuration for
 the CLI into it (Claude's `settings.json`, Codex's `config.toml`, opencode's
 `opencode.json`), copies in only the credential that CLI needs, and gives it to the
-agent user; `TMPDIR` points inside it. Afterwards the home is deleted. Of everything
-the CLI wrote there, only two things are kept, both checked by the runner, which
-never follows a symbolic link: a credential the CLI refreshed (Codex rewrites
-`auth.json` as its tokens renew; an interactive Claude sign-in renews
-`.credentials.json`), taken back only when it is a regular file of at most 64 KiB
-holding JSON of the expected shape, and, for a run, only when it is the same ChatGPT
-account as before; and, for a conversation (`ask`), the CLI's session transcripts
-so a follow-up can resume. Those are treated as data only: just regular `.jsonl` and
+agent user; `TMPDIR` points inside it. Afterwards the home is deleted.
+
+**A run never changes the stored sign-in.** Whatever a run leaves in its home,
+including a credential file the CLI rewrote, is thrown away with the home: the CLI
+is hostile during a run and could have written any account's credentials there. A
+credential is taken back into the store only after something the owner did: a
+sign-in from the page, or a sign-in in the owner's terminal (*Terminal* below); and
+then only as the one file that CLI keeps it in, a regular file of at most 64 KiB
+holding JSON of the expected shape, never through a symbolic link, after every
+process of the agent user has ended. Besides that, every six hours, in a clean
+moment (no run, no terminal, no sign-in, no process of the agent user), the runner
+itself runs the CLI's status command (`claude auth status`, `codex login status`)
+with the stored credential in a fresh home and no task text, and keeps a renewed
+credential if that command wrote one, but only as a renewal of what is stored: a
+stored file must exist, and for Codex its ChatGPT account (`tokens.account_id`, read
+from the stored file) must be the same. A Codex token's signature cannot be checked
+offline without a new dependency, so nothing a run wrote is ever trusted instead.
+See *Signing in* for what this means for how long an interactive sign-in lasts.
+
+For a conversation (`ask`), the CLI's session transcripts are kept so a follow-up
+can resume. Those are treated as data only: just regular `.jsonl` and
 `.json` files under `.claude/projects`, `.codex/sessions` or opencode's `storage`
 (no Markdown memory or instructions, no scripts, no settings, never a symbolic
-link), copied without any execute bit (mode 0600), at most 50 MiB per
-conversation, kept seven days in the runner's directory, and put back only into
-the next turn of the same conversation. Settings, hooks,
+link), copied without any execute bit (mode 0600), at most 50 MiB and 2,000 files
+and directories per conversation (every entry counts at least 4 KiB, so empty files
+cannot pile up), 512 MiB and 20,000 entries for all conversations together (the
+oldest go first, checked every time one is kept), kept seven days in the runner's
+directory, and put back only into the next turn of the same conversation. The size
+of the runner's directory the page shows is measured off the runner's link loop, in
+a bounded walk. Settings, hooks,
 plugins, shell start-up files and git configuration the CLI wrote are gone.
 `secrets.env` accepts only the variable names that CLI uses
 (`CLAUDE_CODE_OAUTH_TOKEN`, `DEEPSEEK_API_KEY`, …); anything else in it is ignored.
 Stored credentials are written through a new, randomly named file (`O_EXCL`,
 `O_NOFOLLOW`) and renamed into place.
 
-**Nothing outlives a run.** Before a run starts, after it ends, and when the last
-terminal closes, the runner ends every process of the agent user (a `kill(-1, SIGKILL)`
-run as that user: the kernel signals them all in one pass, so a process that forked
-or left its session cannot slip away), waits until none is left, and removes what
-that user left in `/tmp` and `/dev/shm`. A run does not start while any such process
-survives (it answers `busy: …`, which lore takes as "try again later"), nor while a
-terminal is open; a terminal does not open while a run goes.
+**Nothing outlives a run.** Before a run starts, after it ends, before the first
+terminal opens and after the last one closes, and before and after every sign-in or
+credential change, the runner ends every process of the agent user. It does so
+itself, without starting any process or thread (so a process that holds every pid
+the container's `pids_limit` allows cannot stop it): with `CAP_KILL` it stops every
+running process of that user (`SIGSTOP`, which cannot be caught, blocked or ignored;
+a stopped process cannot fork), pass after pass, until a pass finds all of them
+stopped, then kills them all, and waits until none is left. Then it removes what that
+user left in `/tmp`, `/dev/shm` and `/dev/mqueue` (POSIX message queues) and, with
+`ipcrm --all` run as that user, its System V shared memory, queues and semaphores. If
+the processes still cannot be ended, the runner exits with an error instead of
+reading or reclaiming anything of the agent user's: compose restarts the container
+(`restart: unless-stopped`), which ends every process in it, and lore marks the run
+interrupted when the link drops. This was proven in a container against a process
+that re-forks into every pid freed, at the pids limit.
+
+**A run, a terminal and a sign-in never overlap.** While a run goes, signing in,
+pasting a credential and signing out are refused with a message on the page ("a run
+is going in this agent's container: wait until it ends (or stop it), then try
+again"), and no terminal opens; while a sign-in, a credential change or a terminal is
+going, a run is refused with `busy: …`, which lore takes as "try again later". So no
+process of a run is ever alive while a fresh sign-in or a pasted key is in the
+container, and none can plant a credential in a sign-in's home. All of this is held
+for the whole runner process, not per link: after a reconnect, nothing new starts
+until the earlier run has been cleaned up.
 
 **Runner git is hermetic.** The clone, and the before/after check of the default
 branch, run as the runner with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
@@ -1107,11 +1152,22 @@ agent's identity.
 runner itself would give that much. It is root of the host's user namespace too
 unless the Docker daemon uses `userns-remap`, which you may turn on for more
 distance. During a run the CLI holds the run token and a copy of its CLI's
-credential, by design; it can use both until the run ends, and it can make a Codex
-refresh store a valid token of the same account. The agent user can still use the
-CPU, memory and `/work` space the container allows. A terminal is the owner's: it
-runs as the agent user with the credential, and what the owner signs in there is
-kept.
+credential, by design; it can use both until the run ends. The agent user can still
+use the CPU, memory and `/work` space the container allows. A terminal is the
+owner's: it runs as the agent user with the credential, and what the owner signs in
+there is kept.
+
+**What a run can still send out.** The egress proxy restricts where the agents can
+connect, not what they send: it never sees inside the HTTPS tunnels. A hostile run
+can therefore upload anything it can read, including its copy of the CLI's
+credential (for an interactive sign-in that copy holds a long-lived refresh token)
+and the run token, to the model providers' own APIs, for example as the text of a
+request made with an API key of its own. Nothing in lore can tell such a request
+from a legitimate one. So: prefer credentials you can limit and revoke on their own
+(a Claude setup token, an OpenAI or DeepSeek API key with a spend limit, rather
+than your main account's interactive sign-in), and after a suspicious run revoke
+the agent's credential at the provider and sign it in again; the run token dies
+with the run (at most `LORE_RUN_HARD_LIMIT_MINUTES`).
 
 ### Network: one internal network per agent, and an egress proxy
 
@@ -1120,15 +1176,42 @@ not to the internet, not to the host's LAN or the Docker host's published ports,
 not to cloud metadata, not to the other agents). On it are only the agent, lore (at a
 fixed address: `172.31.250.2`, `.18` and `.34`; the runner listener binds to exactly
 these, so the network a reverse proxy attaches to lore never reaches it) and the
-egress proxy. If those subnets clash with networks on your host, change them in
-`docker-compose.yml` and `LORE_RUNNER_BIND` together.
+egress proxy. If those subnets clash with networks on your host, set
+`LORE_AGENT_SUBNET_CLAUDE`, `LORE_AGENT_RANGE_CLAUDE` and `LORE_AGENT_IP_CLAUDE`
+(and the same for `CODEX` and `DEEPSEEK`); `LORE_RUNNER_BIND` follows the three
+`LORE_AGENT_IP_*` by default. These networks exist only when
+`docker-compose.agents.yml` is used. Check before the first `up` that no network on
+the host overlaps them (an overlap makes `up` fail, so lore would not start):
+
+```sh
+docker network inspect $(docker network ls -q) \
+  --format '{{.Name}} {{range .IPAM.Config}}{{.Subnet}} {{end}}' | grep -E ' 172\.31\.250\.'
+```
+
+Nothing may be printed (or, with your own subnets, grep for those). Also look for a
+wider network that contains them, such as `172.31.0.0/16` or `172.16.0.0/12`:
+`docker network inspect $(docker network ls -q) --format '{{.Name}} {{range
+.IPAM.Config}}{{.Subnet}} {{end}}'` lists them all.
+
+lore listens on its public port (`LORE_BIND`, `0.0.0.0:8080` in the image) on every
+network it is on, the agent networks included, but closes at once every connection
+that arrives at one of its agent-network addresses: from an agent container the admin
+page, the sign-in and OAuth do not answer at all, so a run can neither guess the admin
+password nor lock the owner out. Only the runner listener answers there (`/runner/ws`,
+and `/mcp` and `/git` for a run's token), where a request is always attributed to its
+direct peer address: proxy headers are removed, and `X-Forwarded-For` is never
+believed. On the public port, `X-Forwarded-For` is believed only from the peers
+`LORE_TRUSTED_PROXIES` names (*Configuration*), never from an agent network.
 
 The proxy (`egress`, the lore image running `lore proxy`) is the agents' only way to
 the internet. It accepts only `CONNECT host:443` (HTTPS tunnels; it never sees
 inside them), only for host names on its allowlist, and refuses a name that resolves
 to any private, loopback, link-local, shared or otherwise non-public address, so the
 allowlist cannot be bent toward the host or the LAN; plain HTTP and IP literals are
-refused. The default allowlist is what each CLI needs, from its documentation:
+refused. One agent cannot hold the proxy for the others: at most 64 tunnels are open
+from one container (256 in all), and a tunnel closes after 15 minutes without a byte
+passing, or after 3 hours whatever passes. The default allowlist is what each CLI
+needs, from its documentation:
 `api.anthropic.com`, `claude.ai`, `console.anthropic.com`, `platform.claude.com`
 (Claude Code and its sign-in), `api.openai.com`, `auth.openai.com`, `chatgpt.com`
 (Codex with an API key or the ChatGPT sign-in), `api.deepseek.com` and `models.dev`
@@ -1163,9 +1246,11 @@ out.
 
    List only the agents you want; an agent not in `LORE_RUNNER_TOKENS` is refused.
    An agent whose name does not say its CLI names it: `helper:opencode/qwen:<secret>`.
-2. Start the stack with the profile: `COMPOSE_PROFILES=agents docker compose up -d
-   --build` (or `COMPOSE_PROFILES=agent-claude` and so on for just one; on Dokploy,
-   put `COMPOSE_PROFILES=agents` in the compose service's environment).
+2. Check the subnets (*Network* above), then start the stack with the agents file:
+   `docker compose -f docker-compose.agents.yml up -d --build` (or put
+   `COMPOSE_FILE=docker-compose.agents.yml` in `.env`; for just one agent, `… up -d
+   lore egress agent-claude`; on Dokploy, set the compose service's compose path to
+   `./docker-compose.agents.yml`, see *Moving a single-container install to compose*).
 3. Open **Agents** in the admin page (permission `agents`). The section *Built-in
    agents* shows each one: whether its container is connected, its CLI version,
    whether it is signed in and until when, how much its volume holds, and its
@@ -1182,7 +1267,25 @@ shows the value again. A sign-in link is shown only when it parses, is `https`, 
 no user name or password and goes to a host that CLI signs in at (Claude Code:
 `claude.ai`, `claude.com`, `console.anthropic.com`, `platform.claude.com`; Codex:
 `auth.openai.com`, `chatgpt.com`); the page shows that host on its own line above
-the link.
+the link. A link to anywhere else is not shown at all, not even inside the text the
+CLI printed. Should a CLI move its sign-in, list its hosts yourself in
+`LORE_SIGN_IN_HOSTS_CLAUDE` or `LORE_SIGN_IN_HOSTS_CODEX` (comma separated; replaces
+the built-in list).
+
+Signing in, pasting a credential and signing out are refused while a run goes in
+that agent's container (the page says so: wait until it ends, or stop it), and a run
+does not start while a sign-in is in progress or a terminal is open.
+
+**How long a sign-in lasts unattended.** A setup token (Claude, a year) and API keys
+(Codex, DeepSeek) never change and are what to use for agents that run on their own.
+An interactive sign-in (claude.ai, ChatGPT) holds a short-lived access token and a
+refresh token that the CLI renews from time to time. Since a run never gives a
+renewed credential back (*How a built-in agent is kept apart*), such a sign-in lasts
+until the first renewal happens inside a run; if the provider then invalidates the
+stored refresh token (both rotate them), later runs fail to authenticate and the
+page shows the agent as signed out: sign in again. The runner's own clean status
+check every six hours keeps a renewal when the CLI's status command makes one; that
+those commands renew at all was not verified here (it needs a real sign-in).
 
 **Claude Code** (`agent-claude`), either of:
 
@@ -1209,9 +1312,9 @@ the link.
   one-time code. Open the URL, sign in with your own account, enter the code; the
   page notices by itself when the sign-in is done. The runner keeps the `auth.json`
   Codex wrote (it sets `cli_auth_credentials_store = "file"`) as
-  `/var/lib/lore-runner/codex-auth.json`; Codex refreshes its copy during a run and
-  the runner takes the refreshed one back after checking it (same account, valid
-  JSON). That volume belongs to this one runner only.
+  `/var/lib/lore-runner/codex-auth.json`. A run gets a copy; what Codex renews in
+  that copy is not taken back (see *How long a sign-in lasts unattended* above).
+  That volume belongs to this one runner only.
 - *Paste auth.json*: if device sign-in is not possible, sign Codex in on your own
   computer (`codex login`) and paste the contents of its `~/.codex/auth.json`. Never
   put that file in a repository or a log.
@@ -1238,9 +1341,11 @@ terminal**, which shows the CLI's own interactive interface (Claude Code, Codex 
 opencode, signed in with the agent's stored credentials and started with the model
 chosen below), and, under **More**, **Shell**: `bash` as the agent user, in a fresh
 home of its own that is deleted when the terminal closes. A terminal does not open
-while a run goes (and a run waits while a terminal is open); when the last terminal
-closes, every process of the agent user ends. A sign-in you make in a terminal
-(`claude auth login`, `codex login`) is kept, as the credential file only.
+while a run or a sign-in goes (and a run waits while a terminal is open); before the
+first terminal opens, and when the last one closes, every process of the agent user
+ends. A sign-in you make in a terminal (`claude auth login`, `codex login`) is kept,
+as the credential file only, once the last terminal has closed and nothing of the
+agent user is left.
 On a wide screen (where the Live activity column is shown) the terminal **docks in
 that column**: Live activity keeps the top half and the terminal takes the bottom
 half, beside the graph, which keeps its size; with Live activity hidden the terminal
@@ -1433,27 +1538,60 @@ agents reach it at `LORE_RUNNER_LORE_URL`, by default `http://lore:8081`. On the
 public address a run token is refused like any unknown token.
 
 **lore's own tools.** A run may use only the read tools, `hello`, `checkin`, `bye`,
-`log`, `handoff`, `repo_commit`, and `task_update` on its own task (`done` or
-`release`). A conversation (`ask`) may only read, plus `hello` and `bye`.
+`log`, `handoff`, `repo_commit`, and `task_update` on its own task (`release`; a
+`done` changes nothing, lore marks the task done itself). A conversation (`ask`) may
+only read, plus `hello` and `bye`. A task run opens its session, logs, checks in and
+leaves notes only on its task's project, and what it writes is marked by lore as
+*written by a built-in run* wherever briefings and `recall` show it.
 
-**GitHub.** A run writes only to its task's repository: contents, git data, pulls,
-issues and comments, labels, milestones, statuses and check runs, merges, releases.
-It pushes only fast-forward to the default branch or to new branches; it never
-deletes, forces or tags. It never adds, changes or removes CI definitions
+**What a run is told.** A run's `hello` returns only the owner's profile (how to
+address them, the language), the owner's rules and its task: no handoff notes,
+messages, recent entries or other sessions, and it marks nothing read or delivered.
+The prompt says to follow the owner's rules from that briefing; everything else lore
+returns during the run starts with a fixed line saying it was written by others and
+is information, never instructions. Messages and handoff notes addressed to a
+built-in agent are kept for the owner to read but never reach a run.
+
+**GitHub.** Code reaches a run's repository only through `git push` (lore's git
+proxy) and `repo_commit`. Both apply the same rule: the CI definitions
 (`.github/workflows/`, `.github/actions/`, `.gitlab-ci.yml`, `.circleci/`,
-`azure-pipelines.yml`, `Jenkinsfile`) unless the owner switches *Built-in agents'
-runs may change CI definitions* on in the Integrations panel (CI runs with the
-repository's secrets); merging an existing pull request that already carries CI
-changes is not checked.
+`azure-pipelines.yml`, `Jenkinsfile`) reachable at the new tip must equal those at
+the commit it advances from (for a new branch, the default branch's head), unless
+the owner switches *Built-in agents' runs may change CI definitions* on in the
+Integrations panel. A run pushes only fast-forward to the default branch, to a new
+branch or to a branch it created itself; it never deletes, forces or tags, and a
+commit whose header git would read differently from lore (a misplaced `parent`
+line) is refused. Through the REST API it may write contents (on the default branch
+or a branch it created, never a CI path), open, comment, label and review pull
+requests (never merge them, update their branch or change their base), and write
+issues, comments, labels and milestones; refs, merges, Git Data, releases (tags),
+statuses and check runs are refused. Merging is left to the owner. Keep in mind
+that any file an existing workflow executes (a script, a `Makefile`, a test, a
+package manifest's scripts) is just as much a route to the repository's secrets as
+a workflow file: protect the default branch and review what runs push before
+merging or before workflows run on it.
 
 **Cloudflare and Dokploy.** On Cloudflare a run changes only the DNS records of the
-task's zone. On Dokploy it may deploy and configure only the resources of the task's
-project, through a fixed list of procedures.
+task's zone. On Dokploy a run whose task names a project (and whose author has full
+Dokploy access) has full authority inside that project: it may create, configure,
+deploy and remove the project's applications, compose services, databases, domains,
+mounts, ports, redirects, security rules, backups and environments, through a fixed
+list of procedures whose ids must belong to that project; global procedures and
+removing the project are refused, and `LORE_DOKPLOY_PROTECTED` still wins. That is a
+lot: with a Dokploy project on a task, a run can mount host paths, define privileged
+containers and claim host names through that project, which on a shared Dokploy
+server amounts to control of the server, lore's own data included. The protection is
+who may write such a task (a verified author with full Dokploy access) and the
+owner's choice to name a project at all; the task's claim note and the activity feed
+say *this run may change Dokploy project …* whenever a run starts with these rights.
 
 **What a run reads.** Only its task's GitHub account and the services its task
 names. The owner can let an agent read more during runs with its switch *May read
 other services during runs* (in the agent's settings); it then reads only what the
-task's author may read.
+task's author may read. Reading is decided per service, not per repository or
+project: a run that may read a GitHub account reads every repository it covers, one
+that may read Dokploy reads every project's settings, and every run reads all of
+lore's memory.
 
 **Who a task runs for.** The scheduler takes a task only when its author could have
 done the work: the author is the token lore verified when the task was added (for the
@@ -1465,8 +1603,16 @@ on the admin page needs the integrations permission.
 
 **How often.** A task is taken at most `LORE_AUTO_TASK_MAX_ATTEMPTS` times (default
 2); after a run it waits until its author or a signed-in user touches it, and a
-user's touch starts the count over. lore marks a task done only after it has read the
-default branch itself and seen it move to the run's commit.
+user's touch starts the count over. lore reads the default branch's head itself
+before a run starts and records every ref update the git proxy and `repo_commit`
+make for the run; it marks the task done only when the default branch, read again
+with its own credential, points at a commit this run pushed. Anything else is *not
+confirmed* and the task is released with a note.
+
+**Notes.** A released task's note and the activity line say only how the run ended,
+in lore's words; the detail, with anything the run itself said, stays in the run's
+row. Answers a conversation returns to another agent pass the same redaction as run
+output.
 
 **Output.** Run output is visible only with the `agents` permission; lore redacts
 every known credential format from it, caps it per run (`LORE_RUN_OUTPUT_CAP_LINES`,
@@ -1600,41 +1746,76 @@ when the name is wrong instead of starting lore on an empty database.
 4. **Remove the domain from the old application** (its *Domains* tab: delete the
    entry). The domain must not be on both: Traefik would route to whichever it picked.
    Keep the old application itself, stopped.
-5. **Create the compose service.** Dokploy → the project → **Create Service →
-   Compose**, source: this repository and branch, compose path
-   `./docker-compose.yml`. In its *Environment*, paste the old application's
-   variables, plus `LORE_DATA_VOLUME=project-lore-data` (the default, set it anyway so
-   it is visible) and, when you want the agents, `COMPOSE_PROFILES=agents` with the
-   `LORE_RUNNER_TOKENS` and `LORE_RUNNER_TOKEN_*` lines (*Setting it up* above).
-   Without `COMPOSE_PROFILES` only lore starts, exactly as before. Leave auto-deploy
-   off for now. Deploy. If the deployment fails with *external volume … not found*,
-   the name is wrong: nothing was created, fix `LORE_DATA_VOLUME`. Afterwards
-   `docker volume ls` must show no second, empty data volume.
+5. **Create the compose service, lore alone.** Dokploy → the project → **Create
+   Service → Compose**, and choose the type **Docker Compose**, not *Stack*: a stack
+   is deployed with Docker swarm, which ignores `build`, `cap_add`, `profiles` and
+   fixed addresses, so the agents' isolation would silently not apply. Source: this
+   repository and branch, compose path `./docker-compose.yml` (lore alone: no agent,
+   no agent network). In its *Environment*, paste the old application's variables,
+   plus `LORE_DATA_VOLUME=project-lore-data` (the default, set it anyway so it is
+   visible). Do **not** add the agents' variables yet (step 9). Leave auto-deploy off
+   for now. Deploy. If the deployment fails with *external volume … not found*, the
+   name is wrong: nothing was created, fix `LORE_DATA_VOLUME`. Afterwards `docker
+   volume ls` must show no second, empty data volume.
 6. **Add the domain to the `lore` service** of the compose service (its *Domains*
    tab: service `lore`, port `8080`, HTTPS with Let's Encrypt). Dokploy attaches
    Traefik to that service; no port is published on the server
    (`docker-compose.yml` has `expose` only, so lore is not reachable past Traefik
-   in plain HTTP, and `LORE_TRUST_PROXY=on` sees only Traefik's
-   `X-Forwarded-For`).
+   in plain HTTP). Set `LORE_TRUSTED_PROXIES` to the subnet of the network Traefik
+   reaches lore on, so that only Traefik's `X-Forwarded-For` is believed:
+   `docker network inspect dokploy-network --format '{{range .IPAM.Config}}{{.Subnet}}
+   {{end}}'` (Dokploy's overlay network, usually `10.0.1.0/24`; use what it prints).
+   Without it lore keeps believing any peer, as before.
 7. **Verify.** The admin page loads at the domain with your memories, the board and
    the stored credentials (open Integrations: a provider's **Test** works, which
-   proves `LORE_VAULT_KEY` is right); an agent's `hello` works. On the server,
+   proves `LORE_VAULT_KEY` is right); an agent's `hello` works; signing in to the
+   admin page with a wrong password a few times shows your own address in the log
+   line, not Traefik's (client address detection works). On the server,
    `docker ps --filter volume=project-lore-data` lists exactly one running
    container, the compose service's `lore`.
+
+   **Downtime:** lore is down from step 3 (the old application stopped) until the
+   compose service's first deployment in step 5 is up and step 6 has given it the
+   domain: the time Dokploy takes to build the image (a few minutes; the Rust build
+   is the long part) plus your own checks. Prepare step 5's environment before step
+   3 to keep it short; nothing is lost meanwhile, agents' calls simply fail until it
+   is back.
 8. **Update `LORE_DOKPLOY_PROTECTED`** to the new compose service's ids (its
    `composeId`, and the ids of its project and environment you want protected; the
    old application's ids may stay listed). Without this step agents may change
    lore's own new deployment. Redeploy, and check the start-up log line *agents may
    not change lore's own Dokploy deployment*. Now turn auto-deploy on for the compose
    service if you want it.
-9. **Weeks later, when you are sure,** delete the old application **without its
+9. **Only now, if you want the built-in agents:** run the subnet check (*Network*
+   above) on the server, then change the compose path to
+   `./docker-compose.agents.yml` and add `LORE_RUNNER_TOKENS` and the
+   `LORE_RUNNER_TOKEN_*` lines (*Setting it up* above). Deploy. lore restarts once
+   (a few seconds; the agents' images build first, which takes several minutes, while
+   the old lore keeps serving). Then inspect what Dokploy made of the networks:
+
+   ```sh
+   docker network ls --filter name=agent
+   docker network inspect <compose-project>_agent-claude --format '{{.Internal}} {{range .IPAM.Config}}{{.Subnet}}{{end}} {{range .Containers}}{{.Name}} {{end}}'
+   docker inspect <agent-claude container> --format '{{range $n, $_ := .NetworkSettings.Networks}}{{$n}} {{end}}'
+   ```
+
+   Each agent network must say `true` (internal), carry its subnet, and hold only
+   lore, the egress proxy and that one agent; each agent container must be on its
+   own agent network only. If Dokploy attached an agent to `dokploy-network` or to
+   another non-internal network, stop the agents (`docker stop` them) and do not use
+   them on this host until that is solved: they would reach the host's other
+   services. Internal networks were verified on Docker 29.10 only; on another
+   version, also check from an agent container that the internet is not reachable
+   except through the proxy (`docker exec <agent> sh -c 'getent hosts example.com;
+   curl -m5 https://example.com'` must fail without `HTTPS_PROXY`).
+10. **Weeks later, when you are sure,** delete the old application **without its
    volumes**: in Dokploy's delete dialog leave *delete volumes* unticked (ticking
    it deletes `project-lore-data`, the data of the new service too). Before you
    press delete, run step 3's `docker ps -a --filter volume=project-lore-data`
    again: the old application's exited container is listed with the new one; that
    is expected.
 
-**Rolling back** (at any step up to 9): stop the compose service, confirm with
+**Rolling back** (at any step up to 10): stop the compose service, confirm with
 `docker ps -a --filter volume=project-lore-data` that nothing of it is running,
 remove the domain from the compose service, add it back to the old application and
 start the old application. The volume is unchanged; a database the new version
@@ -1647,17 +1828,24 @@ backup from step 1 (*Backup and restore* above) into the stopped instance.
 `docker compose stop` for the old container, step 3's check, then
 `docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build`,
 which publishes lore on `127.0.0.1:${LORE_PORT:-8080}` only, for your own reverse
-proxy on the same host. Never publish it on a public address.
+proxy on the same host (set `LORE_TRUSTED_PROXIES=127.0.0.1/32` plus the address the
+compose network's gateway has, which is where Docker's port forwarding makes host
+connections arrive from: `docker network inspect <project>_default --format
+'{{range .IPAM.Config}}{{.Gateway}}{{end}}'`). Never publish it on a public address.
+With the agents, after step 8: `docker compose -f docker-compose.agents.yml -f
+docker-compose.local.yml up -d --build`.
 
 **Not verified about Dokploy** (from its documentation and UI as of this writing,
 not tested against a live Dokploy): that turning *Autodeploy* off also ignores the
 GitHub App's push events (hence step 2's test commit); that a Compose service with
 *isolated deployments* on keeps an `external: true` volume's name unchanged (hence
-step 5's `docker volume ls`); that `COMPOSE_PROFILES` in the service's environment
-reaches `docker compose` (if the agents do not start, put
-`COMPOSE_PROFILES=agents` in the compose service's *Advanced → Command* instead);
-and which id names the compose service in the API (`composeId` in Dokploy's API at
-the time of writing).
+step 5's `docker volume ls`); that changing the compose path of an existing
+compose service redeploys from the new file without a new project name (if it
+does create a new project, its `lore` would be a second lore on the volume: check
+`docker ps --filter volume=project-lore-data` after step 9 and stop the old one);
+whether Dokploy adds its own network to every service of a compose file (hence step
+9's inspection); and which id names the compose service in the API (`composeId` in
+Dokploy's API at the time of writing).
 
 ### What a runner is told to use
 
@@ -1720,6 +1908,7 @@ documentation for adding a remote MCP server.
 | `LORE_SESSION_IDLE_HOURS` | `12` | Hours without activity after which an open session is closed. Whole number between 1 and 720. |
 | `LORE_ALLOWED_HOSTS` | any | Hostnames accepted in the `Host` header. |
 | `LORE_TRUST_PROXY` | `on` in Docker | Read the client address from `X-Forwarded-For`. Turn off if the port is exposed directly. |
+| `LORE_TRUSTED_PROXIES` | | With `LORE_TRUST_PROXY=on`: the peers whose `X-Forwarded-For` is believed, as address ranges, comma separated (`10.0.1.0/24`, `127.0.0.1`): your reverse proxy's network, for Dokploy the subnet of `dokploy-network`. Unset: any peer, as before; with built-in agents, any private or loopback peer (and a warning at start-up). Never the agent networks, and never on the runner listener. |
 | `LORE_DATA_DIR` | `/data` in Docker | Where the database and model cache live. |
 | `LORE_BIND` | `0.0.0.0:8080` | Listen address. |
 | `LORE_RUNNER_TOKENS` | | The built-in agents: `agent:secret` pairs (`claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>`), each secret 24 characters or longer. An entry may name the agent's CLI and provider, `agent:kind:secret` or `agent:opencode/<provider>:secret`, which a name not starting with `claude`, `codex` or `deepseek` must; a runner claiming anything else is refused. Unset: no built-in agent, no runner listener, nothing changes. A name may not also be in `LORE_TOKENS` or belong to another agent. |
@@ -1735,6 +1924,8 @@ documentation for adding a remote MCP server.
 | `LORE_DELEGATE_PER_HOUR` | `3` | Tasks one calling agent may delegate to the built-in agents per hour. |
 | `LORE_RUNNER_LORE_URL` | `http://lore:<port of LORE_RUNNER_BIND>` (8081) | lore as the agents' containers reach it: their clone URL and MCP endpoint. |
 | `LORE_RUNNER_BIND` | `0.0.0.0:8081`; compose: lore's address on each agent network | Where lore listens for the built-in agents' runners (only with `LORE_RUNNER_TOKENS`): one address, or several, comma separated. Internal networks only: never publish this port. Must use another port than `LORE_BIND`. |
+| `LORE_AGENT_SUBNET_*`, `LORE_AGENT_RANGE_*`, `LORE_AGENT_IP_*` (`CLAUDE`, `CODEX`, `DEEPSEEK`) | `172.31.250.0/28`, `.8/29`, `.2`; `.16/28`, `.24/29`, `.18`; `.32/28`, `.40/29`, `.34` | `docker-compose.agents.yml` only: each agent network's subnet, the range everything but lore gets addresses from, and lore's fixed address (the runner listener binds there). Check for overlaps first (*Network*). |
+| `LORE_SIGN_IN_HOSTS_CLAUDE`, `LORE_SIGN_IN_HOSTS_CODEX` | the CLIs' documented hosts | The hosts a sign-in link may point to (comma separated); replaces the built-in list, for when a CLI moves its sign-in. |
 | `LORE_PROXY_ALLOW` | the providers' hosts | The egress proxy's allowlist (compose service `egress`): host names, comma separated; `.example.com` allows every name under it. See *Network*. |
 | `LORE_PROXY_BIND`, `LORE_PROXY_PORTS` | `0.0.0.0:3128`, `443` | Where the egress proxy listens, and the ports it tunnels to. |
 | `LORE_AGENT_WORK_SIZE`, `LORE_AGENT_WORK_EXEC` | `2g`, `noexec` | Size of each agent's `/work` tmpfs; `exec` lets the agents run programs they build in a checkout. |
@@ -1767,7 +1958,15 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
   `CLAUDE_CODE_OAUTH_TOKEN` line of an environment (other names stay readable).
   The built-in agents' state-changing admin routes take JSON
   only, so a form on another site (a sibling subdomain included) cannot drive
-  them.
+  them. lore closes every connection that reaches its public port from an agent
+  network, and never believes an agent network's `X-Forwarded-For`.
+- **Cross-site writes**: every state-changing admin route (`POST`, `PUT`, `DELETE`)
+  refuses a request a browser marks as coming from another site: `Sec-Fetch-Site`
+  other than `same-origin` (or `none`), or an `Origin` that is not lore's own, a
+  sibling subdomain included. That covers the routes whose body is not JSON (a full
+  restore's upload) and those without a body (revoking an agent). Requests without
+  either header, from scripts and `curl`, carry no victim's cookie and go on to the
+  usual checks.
 - **A built-in agent's terminal** is a shell in its container with its
   credentials, relayed unfiltered: only the `agents` permission opens one, from this
   lore's own origin, and nothing it shows or receives is stored or logged (see
@@ -1823,7 +2022,17 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
   cannot change or delete lore's own Dokploy deployment: any non-GET call naming one of
   its ids is refused and logged. Full Dokploy access still means control of the host
   lore runs on, so agents that should not have that must be set to **read** or **off**
-  for Dokploy in the permissions table.
+  for Dokploy in the permissions table. The same holds for a built-in agent's run whose
+  task names a Dokploy project: inside that project it may mount host paths, define
+  privileged containers and claim host names, which on a shared Dokploy server is
+  control of the server and of lore's data. Only a verified author with full Dokploy
+  access can name such a project on a task, and the owner decides whether to.
+- **Built-in agents' runs cannot be steered by other agents' text** beyond their
+  task: a run's briefing carries only the owner's profile and rules and the task,
+  everything else it reads is marked as written by others, and it writes only on its
+  task's project, marked as a run's. Code enters a repository only by push or
+  `repo_commit` with the CI rule; refs, merges, releases and checks through the REST
+  API are refused, and a task is credited only with a commit lore saw the run push.
 - **The mailbox is read-only and untrusted.** lore only ever sends `LOGIN`, `LIST`,
   `EXAMINE`, `UID SEARCH`, `UID FETCH` (with `BODY.PEEK`) and `LOGOUT`, over TLS with
   certificate verification. Every answer with message content starts with a fixed
@@ -1852,6 +2061,34 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
 
 Agents are told not to log secrets, but the store is only as private as its tokens:
 treat them like passwords.
+
+## Nothing is left on disk
+
+Repository work and temporary files are removed when their work ends, and whatever
+an interruption left behind is swept away later:
+
+- **In a built-in agent's container**, a run's checkout (`/work/<run>`) and every
+  CLI home (`/work/.homes/<random>`) are deleted when the run, terminal, sign-in or
+  command ends. A janitor runs when the runner starts, after every run, after the
+  last terminal closes, after every sign-in, and every ten minutes while the
+  container is idle: it removes every entry under `/work` that no run, terminal,
+  sign-in or command is using, whatever its age or owner (a directory the agent
+  locked with mode 000 included; a symbolic link is unlinked, never followed), and
+  in the runner's own volume conversation transcripts past seven days or past the
+  store's bound, half-written conversation copies and half-written files. The agent's
+  card shows how many leftover items it removed, with the free space of `/work` and
+  of the volume.
+- **In lore's data directory**, the git proxy's spooled pushes (public repositories
+  and run pushes), full backups being downloaded and restores being uploaded live in
+  temporary files named `.lore-tmp-<label>-<16 hex>.<ext>` (and SQLite's
+  `-journal`/`-wal`/`-shm` next to such a file); nothing else is ever named so. They
+  are deleted when their request ends, at start-up, and every ten minutes when older
+  than an hour. The database, its `-wal`/`-shm`, backups you asked for and stored
+  files never match.
+
+Deliberately kept: the agents' stored credentials (until you sign them out), a
+conversation's transcripts for up to seven days (so a follow-up can resume), and the
+three newest safety copies a full restore makes (`pre-restore-*.sqlite`).
 
 ## Backups
 

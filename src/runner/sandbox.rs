@@ -11,9 +11,9 @@
 //!   its memory or its `/proc/<pid>/environ`, and its link secret is taken
 //!   out of its environment once read ([`take_secret`]);
 //! - nothing of the agent user outlives a run or a terminal:
-//!   [`kill_all`] ends every process of that user (a `kill(-1, SIGKILL)` made
-//!   as that user, which the kernel carries out atomically, so a process
-//!   that forks or calls `setsid` cannot slip away), and
+//!   [`kill_all`] ends every process of that user (stopping them all, then
+//!   killing them, from the runner itself, so neither a process that forks
+//!   or calls `setsid` nor one that holds every free pid can slip away), and
 //!   [`wipe_owned`] removes what it left in the shared temporary
 //!   directories;
 //! - files the agent user wrote are taken back ([`reclaim`]) before the
@@ -27,6 +27,7 @@ use std::{
     io::{self, Read},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -145,124 +146,250 @@ pub fn processes_of(uid: u32) -> Vec<i32> {
         .collect()
 }
 
-/// Ends every process of the agent user and waits until none is left.
-/// The killing is done by a `kill(-1, SIGKILL)` made as that user: the
-/// kernel signals every process the caller may signal in one pass, under
-/// the task list lock, so nothing forks its way out. Errors when some
-/// process is still alive after a few seconds.
+/// The live processes of `uid` with their state letter (`R`, `S`, `D`,
+/// `T`, `t`, …), zombies left out, this process excepted.
+fn processes_with_state(uid: u32) -> Vec<(i32, char)> {
+    let me = std::process::id() as i32;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+            if pid == me {
+                return None;
+            }
+            let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+            let mut state = '?';
+            let mut matches = false;
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("State:") {
+                    state = rest.trim_start().chars().next().unwrap_or('?');
+                } else if let Some(ids) = line.strip_prefix("Uid:") {
+                    matches = ids
+                        .split_whitespace()
+                        .take(3)
+                        .any(|id| id.parse::<u32>() == Ok(uid));
+                }
+            }
+            (matches && !matches!(state, 'Z' | 'X')).then_some((pid, state))
+        })
+        .collect()
+}
+
+/// How long [`kill_all`] keeps at it before it gives up.
+const KILL_PATIENCE: Duration = Duration::from_secs(10);
+
+/// Ends every process of the agent user and waits until none is left,
+/// without starting any process or thread: the runner signals them
+/// itself (`CAP_KILL`), so a process that holds every pid the container
+/// may have cannot stop it. First every running one is stopped
+/// (`SIGSTOP`, which no process can catch, block or ignore; a stopped
+/// process cannot fork), pass after pass, until a pass finds them all
+/// stopped; then all of them are killed. Errors when some process is
+/// still alive after [`KILL_PATIENCE`].
 pub async fn kill_all(user: AgentUser) -> Result<()> {
-    for _ in 0..3 {
-        if processes_of(user.uid).is_empty() {
+    use rustix::process::{Pid, Signal, kill_process};
+    let deadline = tokio::time::Instant::now() + KILL_PATIENCE;
+    loop {
+        let found = processes_with_state(user.uid);
+        if found.is_empty() {
             return Ok(());
         }
-        // `true`, started as the agent user, sends SIGKILL to pid -1 between
-        // fork and exec (`kill(-1, SIGKILL)`: every process that user may
-        // signal, itself excepted), then has nothing left to do.
-        let mut command = tokio::process::Command::new("true");
-        // SAFETY: two system calls between fork and exec, through rustix,
-        // which neither allocates nor takes locks.
-        unsafe {
-            command.pre_exec(|| {
-                // Only once the switch to the agent user happened: as root
-                // this would end the runner too.
-                if !rustix::process::geteuid().is_root()
-                    && let Some(all) = rustix::process::Pid::from_raw(1)
-                {
-                    let _ = rustix::process::kill_process_group(all, rustix::process::Signal::KILL);
-                }
-                Ok(())
-            });
-        }
-        command
-            .env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .uid(user.uid)
-            .gid(user.gid)
-            .current_dir("/")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // It reports an error when it found nothing to kill: that is fine.
-        let _ = tokio::time::timeout(Duration::from_secs(10), command.status()).await;
-        for _ in 0..50 {
-            if processes_of(user.uid).is_empty() {
-                return Ok(());
+        let running: Vec<i32> = found
+            .iter()
+            .filter(|(_, state)| !matches!(state, 'T' | 't'))
+            .map(|(pid, _)| *pid)
+            .collect();
+        let (targets, signal): (Vec<i32>, Signal) = if running.is_empty() {
+            (found.iter().map(|(pid, _)| *pid).collect(), Signal::KILL)
+        } else {
+            (running, Signal::STOP)
+        };
+        for pid in targets {
+            if let Some(pid) = Pid::from_raw(pid) {
+                let _ = kill_process(pid, signal);
             }
-            tokio::time::sleep(Duration::from_millis(40)).await;
         }
-    }
-    let left = processes_of(user.uid);
-    if left.is_empty() {
-        Ok(())
-    } else {
-        bail!("{} process(es) of the agent user would not end", left.len())
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "{} process(es) of the agent user would not end",
+                processes_with_state(user.uid).len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
 /// Between runs and after the last terminal: every process of the agent
-/// user ends and what it left in the shared temporary directories goes.
+/// user ends, and what it left in the shared temporary directories, in
+/// POSIX message queues and in System V shared memory, queues and
+/// semaphores goes.
 pub async fn sweep(user: AgentUser) -> Result<()> {
-    let killed = kill_all(user).await;
-    for dir in ["/tmp", "/dev/shm"] {
+    kill_all(user).await?;
+    for dir in ["/tmp", "/dev/shm", "/dev/mqueue"] {
         wipe_owned(Path::new(dir), user.uid);
     }
-    killed
+    remove_ipc(user).await;
+    // `ipcrm` was a process of the agent user: it must be gone too.
+    kill_all(user).await
 }
 
-/// What is going on in one container: a run, and how many terminals are
-/// open. A run and a terminal never overlap, so that ending every process
-/// of the agent user after one never cuts the other short.
+/// Removes every System V IPC object the agent user may remove (only its
+/// own: it has no capability). Runs only once no process of that user is
+/// left, so a pid is free for it.
+async fn remove_ipc(user: AgentUser) {
+    let mut command = tokio::process::Command::new("ipcrm");
+    command
+        .arg("--all")
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .uid(user.uid)
+        .gid(user.gid)
+        .current_dir("/")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(10), command.status()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "ipcrm could not be started"),
+        Err(_) => tracing::warn!("ipcrm took too long"),
+    }
+}
+
+/// The exit code of a runner that could not end the agent user's
+/// processes: the container restarts (compose `restart: unless-stopped`),
+/// which ends every process in it, and lore marks the run interrupted
+/// when the link drops.
+pub const SWEEP_FAILED_EXIT: i32 = 70;
+
+/// [`sweep`], and when it fails the runner exits, so that nothing is
+/// harvested, reclaimed or started while a process of the agent user
+/// survives.
+pub async fn sweep_or_exit(user: AgentUser) {
+    if let Err(error) = sweep(user).await {
+        tracing::error!(
+            %error,
+            "the agent user's processes could not be ended; exiting so the container restarts"
+        );
+        std::process::exit(SWEEP_FAILED_EXIT);
+    }
+}
+
+/// What is going on in one container: a run, how many terminals are
+/// open, and an exclusive owner action (a sign-in, a credential being
+/// stored or removed, a clean status check). None of the three overlaps
+/// another, so that ending every process of the agent user after one
+/// never cuts another short, and no run's process is alive while a
+/// credential is handled. One for the whole runner process: it outlives
+/// a link, so a run still being cleaned up after a reconnect keeps the
+/// container.
 #[derive(Debug, Default)]
 pub struct Occupancy {
-    run: std::sync::atomic::AtomicBool,
-    terminals: std::sync::atomic::AtomicUsize,
+    slots: std::sync::Mutex<Slots>,
 }
 
+#[derive(Debug, Default)]
+struct Slots {
+    run: bool,
+    terminals: usize,
+    exclusive: Option<&'static str>,
+}
+
+/// Why an exclusive action is refused while a run goes.
+pub const RUN_GOING: &str = "a run is going in this agent's container: wait until it ends (or \
+                             stop it), then try again";
+
 impl Occupancy {
-    /// Takes the run slot; false when a run or a terminal holds the
-    /// container.
+    fn slots(&self) -> std::sync::MutexGuard<'_, Slots> {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Takes the run slot; refused while a run, a terminal or an
+    /// exclusive action holds the container.
     pub fn start_run(&self) -> Result<(), &'static str> {
-        use std::sync::atomic::Ordering::SeqCst;
-        if self.terminals.load(SeqCst) > 0 {
+        let mut slots = self.slots();
+        if slots.terminals > 0 {
             return Err("a terminal is open in this container");
         }
-        if self
-            .run
-            .compare_exchange(false, true, SeqCst, SeqCst)
-            .is_err()
-        {
+        if slots.run {
             return Err("another run is still going in this container");
         }
-        if self.terminals.load(SeqCst) > 0 {
-            self.run.store(false, SeqCst);
-            return Err("a terminal is open in this container");
+        if slots.exclusive.is_some() {
+            return Err("a sign-in or a credential change is in progress in this container");
         }
+        slots.run = true;
         Ok(())
     }
 
     pub fn end_run(&self) {
-        self.run.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.slots().run = false;
     }
 
     pub fn run_going(&self) -> bool {
-        self.run.load(std::sync::atomic::Ordering::SeqCst)
+        self.slots().run
     }
 
-    /// Counts a terminal in; false while a run holds the container.
-    pub fn open_terminal(&self) -> bool {
-        use std::sync::atomic::Ordering::SeqCst;
-        self.terminals.fetch_add(1, SeqCst);
-        if self.run.load(SeqCst) {
-            self.terminals.fetch_sub(1, SeqCst);
-            return false;
+    /// Counts a terminal in; answers whether it is the first one open.
+    /// Refused while a run or an exclusive action holds the container.
+    pub fn open_terminal(&self) -> Result<bool, &'static str> {
+        let mut slots = self.slots();
+        if slots.run {
+            return Err("a run is going in this container; watch its output, or stop it first");
         }
-        true
+        if slots.exclusive.is_some() {
+            return Err("a sign-in or a credential change is in progress in this container");
+        }
+        slots.terminals += 1;
+        Ok(slots.terminals == 1)
+    }
+
+    /// How many terminals are open.
+    pub fn terminals_open(&self) -> usize {
+        self.slots().terminals
     }
 
     /// Counts a terminal out; answers how many are still open.
     pub fn close_terminal(&self) -> usize {
-        use std::sync::atomic::Ordering::SeqCst;
-        self.terminals.fetch_sub(1, SeqCst).saturating_sub(1)
+        let mut slots = self.slots();
+        slots.terminals = slots.terminals.saturating_sub(1);
+        slots.terminals
+    }
+
+    /// Takes the container for one exclusive action until the answer is
+    /// dropped.
+    pub fn exclusive(self: &Arc<Self>, what: &'static str) -> Result<Exclusive, String> {
+        let mut slots = self.slots();
+        if slots.run {
+            return Err(RUN_GOING.to_string());
+        }
+        if slots.terminals > 0 {
+            return Err(
+                "a terminal is open in this agent's container: close it first, then try again"
+                    .to_string(),
+            );
+        }
+        if let Some(busy) = slots.exclusive {
+            return Err(format!("{busy} is in progress in this agent's container"));
+        }
+        slots.exclusive = Some(what);
+        Ok(Exclusive {
+            occupancy: self.clone(),
+        })
+    }
+}
+
+/// An exclusive action's hold on the container; released when dropped.
+#[derive(Debug)]
+pub struct Exclusive {
+    occupancy: Arc<Occupancy>,
+}
+
+impl Drop for Exclusive {
+    fn drop(&mut self) {
+        self.occupancy.slots().exclusive = None;
     }
 }
 
@@ -403,63 +530,134 @@ pub fn make_dir(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// The total size of the regular files under `path`, symbolic links not
-/// followed.
-pub fn tree_size(path: &Path) -> u64 {
+/// Most entries [`tree_size`] looks at: past them it answers what it
+/// counted so far.
+pub const TREE_SIZE_ENTRIES: usize = 200_000;
+
+/// The total size of the regular files under `path` and how many entries
+/// (files and directories) it holds, symbolic links not followed, looking
+/// at no more than `max_entries` entries.
+pub fn tree_usage(path: &Path, max_entries: usize) -> (u64, usize) {
+    let mut bytes = 0;
+    let mut entries = 0;
+    usage_into(path, max_entries, &mut bytes, &mut entries, 0);
+    (bytes, entries)
+}
+
+fn usage_into(path: &Path, max: usize, bytes: &mut u64, entries: &mut usize, depth: usize) {
+    if *entries >= max || depth > 32 {
+        return;
+    }
     let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return 0;
+        return;
     };
+    *entries += 1;
     if meta.is_file() {
-        return meta.len();
+        *bytes += meta.len();
+        return;
     }
     if !meta.is_dir() {
-        return 0;
+        return;
     }
-    std::fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| tree_size(&entry.path()))
-                .sum()
-        })
-        .unwrap_or(0)
+    let Ok(list) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in list.flatten() {
+        if *entries >= max {
+            return;
+        }
+        usage_into(&entry.path(), max, bytes, entries, depth + 1);
+    }
+}
+
+/// The total size of the regular files under `path`, symbolic links not
+/// followed, bounded by [`TREE_SIZE_ENTRIES`].
+pub fn tree_size(path: &Path) -> u64 {
+    tree_usage(path, TREE_SIZE_ENTRIES).0
+}
+
+/// What a copy may use: bytes, where every entry (a file or a directory)
+/// costs at least `min_cost`, and entries.
+#[derive(Debug, Clone, Copy)]
+pub struct CopyLimits {
+    pub bytes: u64,
+    pub entries: usize,
+    pub min_cost: u64,
+    /// Every entry looked at counts here, copied or not, so a directory of
+    /// millions of skipped files cannot hold the walk up.
+    pub looked_at: usize,
+}
+
+/// What a copy used.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Copied {
+    pub bytes: u64,
+    pub entries: usize,
+    looked_at: usize,
 }
 
 /// Copies the regular files under `from` into `to`, keeping the layout,
 /// skipping symbolic links and anything else, every file `0600` and every
-/// directory `0700`, up to `budget` bytes in all. With `only`, a file is
-/// copied only when its extension is one of them. Answers what was copied.
-pub fn copy_plain_tree(from: &Path, to: &Path, budget: u64, only: &[&str]) -> io::Result<u64> {
-    let mut used = 0;
-    copy_into(from, to, budget, only, &mut used, 0)?;
+/// directory `0700`, within `limits` (an empty file or a directory costs
+/// `min_cost`: they hold inodes). With `only`, a file is copied only when
+/// its extension is one of them. With `take_back`, every entry is made
+/// this process's own before it is read (a tree the agent user wrote, once
+/// no process of that user is left), so the walk never touches more than
+/// it looks at. Answers what was copied.
+pub fn copy_plain_tree(
+    from: &Path,
+    to: &Path,
+    limits: CopyLimits,
+    only: &[&str],
+    take_back: bool,
+) -> io::Result<Copied> {
+    let mut used = Copied::default();
+    copy_into(from, to, &limits, only, take_back, &mut used, 0)?;
     Ok(used)
 }
 
 fn copy_into(
     from: &Path,
     to: &Path,
-    budget: u64,
+    limits: &CopyLimits,
     only: &[&str],
-    used: &mut u64,
+    take_back: bool,
+    used: &mut Copied,
     depth: usize,
 ) -> io::Result<()> {
-    if depth > 12 {
+    if depth > 12 || used.looked_at >= limits.looked_at {
         return Ok(());
+    }
+    used.looked_at += 1;
+    if take_back {
+        take_back_one(from)?;
     }
     let meta = std::fs::symlink_metadata(from)?;
     if meta.file_type().is_symlink() {
         return Ok(());
     }
+    let room = |used: &Copied, cost: u64| {
+        used.entries < limits.entries && used.bytes + cost <= limits.bytes
+    };
     if meta.is_dir() {
+        if !room(used, limits.min_cost) {
+            return Ok(());
+        }
         std::fs::create_dir_all(to)?;
         std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o700))?;
+        used.entries += 1;
+        used.bytes += limits.min_cost;
         for entry in std::fs::read_dir(from)? {
+            if used.looked_at >= limits.looked_at || used.entries >= limits.entries {
+                break;
+            }
             let entry = entry?;
             copy_into(
                 &entry.path(),
                 &to.join(entry.file_name()),
-                budget,
+                limits,
                 only,
+                take_back,
                 used,
                 depth + 1,
             )?;
@@ -471,13 +669,14 @@ fn copy_into(
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| only.contains(&extension));
-    if !meta.is_file() || !wanted || *used + meta.len() > budget {
+    if !meta.is_file() || !wanted || !room(used, meta.len().max(limits.min_cost)) {
         return Ok(());
     }
-    let Some(bytes) = read_regular(from, budget - *used) else {
+    let Some(bytes) = read_regular(from, limits.bytes - used.bytes) else {
         return Ok(());
     };
-    *used += bytes.len() as u64;
+    used.entries += 1;
+    used.bytes += (bytes.len() as u64).max(limits.min_cost);
     let mut options = std::fs::OpenOptions::new();
     options
         .write(true)
@@ -487,6 +686,26 @@ fn copy_into(
         .custom_flags(OFlags::NOFOLLOW.bits() as i32);
     use std::io::Write;
     options.open(to)?.write_all(&bytes)
+}
+
+/// Makes one entry this process's own (directories `0700`), without
+/// following a symbolic link and without going into a directory.
+pub fn take_back_one(path: &Path) -> io::Result<()> {
+    let (uid, gid) = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+    let meta = std::fs::symlink_metadata(path)?;
+    if (meta.uid() != uid || meta.gid() != gid)
+        && let Err(error) = lchown(path, uid, gid)
+        && meta.uid() != uid
+    {
+        return Err(error);
+    }
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// The paths a list names, for messages.
@@ -610,6 +829,117 @@ mod tests {
         assert!(processes_of(user.uid).is_empty());
     }
 
+    /// Needs root and a container whose pids limit the bomb can fill
+    /// (`LORE_TEST_PID_BOMB=1`, run in the agent image with
+    /// `--pids-limit`): skipped otherwise. A process of the agent user that
+    /// re-forks into every freed pid holds the whole pids limit, so the
+    /// runner cannot start anything; the sweep must still end it all.
+    #[tokio::test]
+    async fn kill_all_ends_a_fork_bomb_that_holds_every_pid() {
+        let limit: Option<u64> = std::fs::read_to_string("/sys/fs/cgroup/pids.max")
+            .ok()
+            .and_then(|text| text.trim().parse().ok());
+        if !can_switch_user()
+            || std::env::var("LORE_TEST_PID_BOMB").as_deref() != Ok("1")
+            || !limit.is_some_and(|limit| limit <= 4096)
+        {
+            eprintln!("skipped: needs root, LORE_TEST_PID_BOMB=1 and a pids limit");
+            return;
+        }
+        let user = AgentUser {
+            uid: 64_124,
+            gid: 64_124,
+        };
+        let bomb = "import os, time\n\
+                    os.setsid()\n\
+                    while True:\n\
+                    \x20   try:\n\
+                    \x20       if os.fork() == 0:\n\
+                    \x20           try: os.setsid()\n\
+                    \x20           except Exception: pass\n\
+                    \x20   except OSError:\n\
+                    \x20       time.sleep(0.002)\n";
+        let mut command = tokio::process::Command::new("python3");
+        command
+            .args(["-I", "-c", bomb])
+            .uid(user.uid)
+            .gid(user.gid)
+            .current_dir("/")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().unwrap();
+        // Until the container is full: nothing more can be started.
+        let full = async {
+            loop {
+                if std::process::Command::new("true").status().is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), full)
+            .await
+            .expect("the bomb never filled the pids limit");
+        assert!(processes_of(user.uid).len() > 10);
+        kill_all(user).await.unwrap();
+        assert!(processes_of(user.uid).is_empty());
+        let _ = child.wait().await;
+        assert!(std::process::Command::new("true").status().is_ok());
+    }
+
+    /// H3: empty files and directories cost entries and a minimum size, so
+    /// a tree of many empty files is cut off instead of copied whole.
+    #[test]
+    fn empty_files_and_directories_count_against_a_copy() {
+        let dir = temp("empties");
+        for d in 0..5 {
+            let sub = dir.join(format!("d{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..1000 {
+                std::fs::write(sub.join(format!("{f}.jsonl")), "").unwrap();
+            }
+        }
+        let copy = temp("empties-copy");
+        let limits = CopyLimits {
+            bytes: 50 * 1024 * 1024,
+            entries: 2000,
+            min_cost: 4096,
+            looked_at: 20_000,
+        };
+        let used = copy_plain_tree(&dir, &copy.join("x"), limits, &["jsonl"], false).unwrap();
+        assert!(used.entries <= 2000, "{used:?}");
+        let (_, kept) = tree_usage(&copy, 100_000);
+        assert!(kept <= 2001, "{kept} entries were copied");
+        // The walk stops at its bound too.
+        assert_eq!(tree_usage(&dir, 100).1, 100);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&copy);
+    }
+
+    /// H5: a run, a terminal and an exclusive action (sign-in, credential)
+    /// never overlap.
+    #[test]
+    fn runs_terminals_and_sign_ins_exclude_each_other() {
+        let occupancy = Arc::new(Occupancy::default());
+        occupancy.start_run().unwrap();
+        assert_eq!(occupancy.exclusive("a sign-in").unwrap_err(), RUN_GOING);
+        assert!(occupancy.open_terminal().is_err());
+        occupancy.end_run();
+        let held = occupancy.exclusive("a sign-in").unwrap();
+        assert!(occupancy.start_run().is_err());
+        assert!(occupancy.open_terminal().is_err());
+        assert!(occupancy.exclusive("a credential").is_err());
+        drop(held);
+        assert_eq!(occupancy.open_terminal(), Ok(true));
+        assert_eq!(occupancy.open_terminal(), Ok(false));
+        assert!(occupancy.exclusive("a sign-in").is_err());
+        assert!(occupancy.start_run().is_err());
+        occupancy.close_terminal();
+        occupancy.close_terminal();
+        occupancy.start_run().unwrap();
+    }
+
     #[test]
     fn reclaiming_never_follows_a_link_and_deletes_locked_trees() {
         let dir = temp("reclaim");
@@ -646,8 +976,14 @@ mod tests {
         assert_eq!(read_regular(&dir.join("link"), 10), None);
         assert_eq!(read_regular(&dir, 10), None);
         let copy = temp("regular-copy");
-        let used = copy_plain_tree(&dir, &copy, 50, &[]).unwrap();
-        assert_eq!(used, 4);
+        let limits = CopyLimits {
+            bytes: 50,
+            entries: 100,
+            min_cost: 0,
+            looked_at: 100,
+        };
+        let used = copy_plain_tree(&dir, &copy, limits, &[], false).unwrap();
+        assert_eq!(used.bytes, 4);
         assert!(copy.join("ok").is_file());
         assert!(!copy.join("big").exists());
         assert!(std::fs::symlink_metadata(copy.join("link")).is_err());

@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The version of this protocol. Both sides must speak the same one.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest frame either side accepts, in bytes.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -293,6 +293,23 @@ pub struct Resources {
     /// conversations' transcripts) holds.
     #[serde(default)]
     pub state_bytes: Option<u64>,
+    /// Free space on the runner's persistent volume.
+    #[serde(default)]
+    pub state_free_bytes: Option<u64>,
+    /// How many leftover entries the runner's janitor removed since the
+    /// runner started, and when it last removed some (ISO 8601).
+    #[serde(default)]
+    pub cleaned: Option<u64>,
+    #[serde(default)]
+    pub cleaned_at: Option<String>,
+}
+
+/// One output line of a run, inside [`FromRunner::RunOutputs`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunLine {
+    pub seq: u64,
+    pub stream: String,
+    pub line: String,
 }
 
 /// Runner to lore.
@@ -397,6 +414,13 @@ pub enum FromRunner {
         seq: u64,
         stream: String,
         line: String,
+    },
+    /// Several output lines of a run in one frame, in order: what a
+    /// runner sends while the CLI prints (a CLI that prints thousands of
+    /// short lines would otherwise pass the link's frame limit).
+    RunOutputs {
+        run_id: String,
+        lines: Vec<RunLine>,
     },
     /// A run ended and its work area was deleted.
     RunExit {
@@ -595,6 +619,14 @@ mod tests {
                 seq: 1,
                 stream: "text".into(),
                 line: "hi".into(),
+            },
+            FromRunner::RunOutputs {
+                run_id: "r1".into(),
+                lines: vec![RunLine {
+                    seq: 2,
+                    stream: "stderr".into(),
+                    line: "x".into(),
+                }],
             },
             FromRunner::RunExit {
                 run_id: "r1".into(),

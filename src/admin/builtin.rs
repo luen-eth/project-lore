@@ -253,6 +253,43 @@ async fn fit_file(Path(file): Path<String>) -> Response {
     }
 }
 
+/// Every state-changing admin route: a browser request from another site
+/// is refused, a sibling subdomain (same site, other origin) included. A
+/// browser says where a request comes from in `Sec-Fetch-Site` (only
+/// `same-origin` and `none`, a typed address, pass) and in `Origin` (it
+/// must be the request's own origin). A request with neither, from a
+/// script or `curl`, carries no ambient cookie of a victim and passes on
+/// to the usual checks.
+pub(super) async fn same_origin_writes(request: Request, next: Next) -> Response {
+    let changes = !matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    if changes && !written_here(request.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "this request came from another site and was refused" })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Whether a state-changing request may be one this lore's page made.
+fn written_here(headers: &HeaderMap) -> bool {
+    if let Some(site) = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        && !matches!(
+            site.trim().to_ascii_lowercase().as_str(),
+            "same-origin" | "none"
+        )
+    {
+        return false;
+    }
+    !headers.contains_key(header::ORIGIN) || same_origin(headers)
+}
+
 /// Whether a request's `Origin` is the request's own origin: its host
 /// (and port) is the `Host` the request was sent to. Browsers always send
 /// `Origin` with a WebSocket, so a missing one is refused too.
@@ -1058,6 +1095,21 @@ async fn runs(State(admin): State<Arc<Admin>>, Extension(me): Extension<SignedIn
         let readiness = runner.readiness().await?;
         let db = admin.db.clone();
         let history = tokio::task::spawn_blocking(move || db.runs(40)).await??;
+        let mut history = serde_json::to_value(history)?;
+        let mut active = serde_json::to_value(active)?;
+        if !manage {
+            // What a run said (its summary may quote output) is for the
+            // `agents` permission only.
+            for list in [&mut history, &mut active] {
+                if let Some(runs) = list.as_array_mut() {
+                    for run in runs.iter_mut().filter_map(|run| run.as_object_mut()) {
+                        for field in ["summary", "answer", "last_words", "last_text"] {
+                            run.remove(field);
+                        }
+                    }
+                }
+            }
+        }
         let settings = runner.settings();
         anyhow::Ok(json!({
             "configured": true,

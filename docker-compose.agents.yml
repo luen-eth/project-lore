@@ -1,0 +1,197 @@
+# project-lore with its built-in coding agents: a complete compose file
+# (it takes the `lore` service from docker-compose.yml with `extends`).
+#
+#   docker compose -f docker-compose.agents.yml up -d --build
+#                                  lore, the egress proxy and the three agents
+#   docker compose -f docker-compose.agents.yml up -d --build lore egress agent-claude
+#                                  lore and one of them
+#
+# Or put COMPOSE_FILE=docker-compose.agents.yml in .env (with
+# :docker-compose.local.yml on a plain docker host). On Dokploy, set the
+# compose service's compose path to ./docker-compose.agents.yml. Without
+# this file (docker-compose.yml alone) none of what follows exists.
+#
+# Networks: each built-in agent has an internal network of its own (no route
+# out), shared only with lore (at a fixed address, where the runner listener
+# binds) and with the egress proxy, the agents' only way to the internet,
+# which lets through HTTPS to the model providers' hosts and nothing else.
+# The subnets are fixed so lore's runner listener can bind to its address on
+# each; if they clash with a network on your host (check first, see the
+# README), set the LORE_AGENT_SUBNET_* / LORE_AGENT_RANGE_* / LORE_AGENT_IP_*
+# variables. lore closes every connection from these networks to its public
+# port: from an agent only the runner listener (/runner/ws, and /mcp and
+# /git for a run's token) answers.
+
+x-agent: &agent
+  restart: unless-stopped
+  # docker-init as PID 1: orphans the CLI leaves are reaped.
+  init: true
+  depends_on:
+    - lore
+    - egress
+  read_only: true
+  tmpfs:
+    - /tmp:size=512m,mode=1777,nosuid,nodev,noexec
+    # Set LORE_AGENT_WORK_EXEC=exec if the agents must run programs they
+    # build in a checkout (compiled tests); scripts run through an
+    # interpreter (`sh x.sh`, `python x.py`, `node x.js`) work either way.
+    - /work:size=${LORE_AGENT_WORK_SIZE:-2g},mode=0711,nosuid,nodev,${LORE_AGENT_WORK_EXEC:-noexec}
+  cpus: ${LORE_AGENT_CPUS:-2}
+  mem_limit: ${LORE_AGENT_MEMORY:-4g}
+  pids_limit: 512
+  security_opt:
+    - no-new-privileges:true
+  # The runner runs as root with these four only, to start every CLI
+  # process as the unprivileged user `agent` (no capabilities), to give it
+  # its checkout and home and take them back, and to end its processes
+  # (it stops and kills them itself, so a process that fills pids_limit
+  # cannot keep it from cleaning up; if it ever cannot, it exits and this
+  # container restarts).
+  cap_drop:
+    - ALL
+  cap_add:
+    - SETUID
+    - SETGID
+    - CHOWN
+    - KILL
+  # Neither the data volume nor a Docker socket is mounted.
+
+x-agent-env: &agent-env
+  LORE_RUNNER_URL: ws://lore:8081/runner/ws
+  HTTPS_PROXY: http://egress:3128
+  HTTP_PROXY: http://egress:3128
+  NO_PROXY: lore,localhost,127.0.0.1
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+
+services:
+  lore:
+    extends:
+      file: docker-compose.yml
+      service: lore
+    environment:
+      LORE_RUNNER_TOKENS: ${LORE_RUNNER_TOKENS:-}
+      # One listener per agent network, at lore's fixed address there:
+      # nothing else (not the network a reverse proxy attaches) reaches it.
+      LORE_RUNNER_BIND: ${LORE_RUNNER_BIND:-${LORE_AGENT_IP_CLAUDE:-172.31.250.2}:8081,${LORE_AGENT_IP_CODEX:-172.31.250.18}:8081,${LORE_AGENT_IP_DEEPSEEK:-172.31.250.34}:8081}
+      # Where the agents' runs reach lore's MCP endpoint and git proxy.
+      LORE_RUNNER_LORE_URL: ${LORE_RUNNER_LORE_URL:-http://lore:8081}
+    networks:
+      default:
+      agent-claude:
+        ipv4_address: ${LORE_AGENT_IP_CLAUDE:-172.31.250.2}
+      agent-codex:
+        ipv4_address: ${LORE_AGENT_IP_CODEX:-172.31.250.18}
+      agent-deepseek:
+        ipv4_address: ${LORE_AGENT_IP_DEEPSEEK:-172.31.250.34}
+
+  # The agents' only way out: `lore proxy`, HTTPS (CONNECT) to the hosts on
+  # its allowlist, never to a private, loopback or link-local address; at
+  # most 64 tunnels per agent, closed after 15 idle minutes or 3 hours.
+  egress:
+    image: project-lore:latest
+    build: .
+    restart: unless-stopped
+    command: ["proxy"]
+    environment:
+      LORE_PROXY_ALLOW: ${LORE_PROXY_ALLOW:-}
+    healthcheck:
+      disable: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - egress
+      - agent-claude
+      - agent-codex
+      - agent-deepseek
+
+  agent-claude:
+    <<: *agent
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        AGENT: claude
+    image: project-lore-agent-claude:latest
+    environment:
+      <<: *agent-env
+      LORE_RUNNER_AGENT: claude-builtin
+      LORE_RUNNER_TOKEN: ${LORE_RUNNER_TOKEN_CLAUDE:-}
+    volumes:
+      - agent-claude-state:/var/lib/lore-runner
+    networks:
+      - agent-claude
+
+  agent-codex:
+    <<: *agent
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        AGENT: codex
+    image: project-lore-agent-codex:latest
+    environment:
+      <<: *agent-env
+      LORE_RUNNER_AGENT: codex-builtin
+      LORE_RUNNER_TOKEN: ${LORE_RUNNER_TOKEN_CODEX:-}
+      # Optional: an OpenAI API key instead of the ChatGPT sign-in. It is
+      # interpolated here only; lore's own environment has it empty.
+      CODEX_API_KEY: ${LORE_AGENT_CODEX_API_KEY:-}
+    volumes:
+      - agent-codex-state:/var/lib/lore-runner
+    networks:
+      - agent-codex
+
+  agent-deepseek:
+    <<: *agent
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        AGENT: deepseek
+    image: project-lore-agent-deepseek:latest
+    environment:
+      <<: *agent-env
+      LORE_RUNNER_AGENT: deepseek-builtin
+      LORE_RUNNER_TOKEN: ${LORE_RUNNER_TOKEN_DEEPSEEK:-}
+    volumes:
+      - agent-deepseek-state:/var/lib/lore-runner
+    networks:
+      - agent-deepseek
+
+networks:
+  default:
+  egress:
+  # Internal: no route to the internet, the host's LAN, the Docker host's
+  # published ports or the other agents.
+  agent-claude:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${LORE_AGENT_SUBNET_CLAUDE:-172.31.250.0/28}
+          # Others get addresses from here, never lore's.
+          ip_range: ${LORE_AGENT_RANGE_CLAUDE:-172.31.250.8/29}
+  agent-codex:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${LORE_AGENT_SUBNET_CODEX:-172.31.250.16/28}
+          ip_range: ${LORE_AGENT_RANGE_CODEX:-172.31.250.24/29}
+  agent-deepseek:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${LORE_AGENT_SUBNET_DEEPSEEK:-172.31.250.32/28}
+          ip_range: ${LORE_AGENT_RANGE_DEEPSEEK:-172.31.250.40/29}
+
+volumes:
+  lore-data:
+    external: true
+    name: ${LORE_DATA_VOLUME:-project-lore-data}
+  # Each agent's own directory: its stored sign-in and a week of
+  # conversation transcripts, nothing else (no CLI state survives a run).
+  agent-claude-state:
+  agent-codex-state:
+  agent-deepseek-state:

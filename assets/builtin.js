@@ -179,7 +179,7 @@
     } else {
       lines.push(agent.last_seen_at
         ? `Its container was last connected ${ago(agent.last_seen_at)}.`
-        : "Its container has not connected yet: start it with docker compose --profile agents up -d.");
+        : "Its container has not connected yet: start it with docker compose -f docker-compose.agents.yml up -d.");
     }
     if (agent.signed_in) {
       let line = `Signed in${agent.login_method ? " with " + agent.login_method : ""}`;
@@ -194,6 +194,8 @@
       if (resources.mem_used_bytes) parts.push(`memory ${bytes(resources.mem_used_bytes)}` + (resources.mem_limit_bytes ? ` of ${bytes(resources.mem_limit_bytes)}` : ""));
       if (resources.work_free_bytes) parts.push(`${bytes(resources.work_free_bytes)} free for work`);
       if (resources.state_bytes !== null && resources.state_bytes !== undefined) parts.push(`volume ${bytes(resources.state_bytes)}`);
+      if (resources.state_free_bytes) parts.push(`${bytes(resources.state_free_bytes)} free on the volume`);
+      if (resources.cleaned) parts.push(`cleaned ${resources.cleaned} leftover item${resources.cleaned === 1 ? "" : "s"}`);
       if (parts.length) lines.push(parts.join(" · "));
     }
     for (const line of lines) item.append(el("div", "board-meta", line));
@@ -765,7 +767,7 @@
       const item = el("li");
       const line = `${run.agent} · ${runWhat(run)} · ${STATUS_LABEL[run.status] || run.status}`
         + ` · ${minutes(run.started_at, run.ended_at)}` + (run.commit ? ` · ${run.commit.slice(0, 10)}` : "");
-      item.append(el("span", "runner-line", line), el("span", "runner-why", `${day(run.created_at)} · ${run.summary}`));
+      item.append(el("span", "runner-line", line), el("span", "runner-why", run.summary ? `${day(run.created_at)} · ${run.summary}` : day(run.created_at)));
       if (data.manage && !runner.denied) {
         const show = button(runner.open.has(run.id) ? "Hide output" : "Show output", "", async () => {
           if (runner.open.has(run.id)) runner.open.delete(run.id);

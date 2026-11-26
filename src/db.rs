@@ -332,8 +332,9 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// agents (`delegations`; `agent_runs.requested_by`, `conversation`).
 /// 7: run hardening (`tasks.author`, `touches`, `auto_seen`;
 /// `sessions.token_agent`; `builtin_agents.read_other_services`;
-/// `agent_runs.output_bytes`).
-pub const SCHEMA_VERSION: i64 = 7;
+/// `agent_runs.output_bytes`). 8: run confirmation and provenance
+/// (`agent_run_refs`, `run_writes`; `agent_runs.base_head`).
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Columns every database lore ever created has in `entries`: a full
 /// backup without them is not a lore database.
@@ -412,6 +413,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
         "INTEGER NOT NULL DEFAULT 0",
     ),
     ("agent_runs", "output_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    // Run confirmation (schema 8): the default branch's head lore read
+    // itself before the run started.
+    ("agent_runs", "base_head", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1556,6 +1560,27 @@ impl Db {
         }
     }
 
+    /// The periodic sweep (every ten minutes): removes lore's own
+    /// temporary files ([`is_temp_name`]: spooled pushes, full backups and
+    /// restores, safety copies being written, and their SQLite journals)
+    /// older than [`TEMP_MAX_AGE`], and keeps only the newest three safety
+    /// copies. A file a live operation still has open loses only its name
+    /// (Linux keeps it readable until it is closed); none lives that long.
+    /// Nothing else in the data directory can match: not the database, its
+    /// `-wal`/`-shm`, a backup the owner asked for, or a stored file.
+    /// Answers how many files went.
+    pub fn sweep_leftovers(&self) -> usize {
+        let dir = self.data_dir();
+        let removed = sweep_temp_files(&dir, TEMP_MAX_AGE);
+        if let Err(error) = prune_snapshots(&dir, SNAPSHOTS_KEPT) {
+            tracing::warn!(%error, "old safety copies could not be removed");
+        }
+        if removed > 0 {
+            tracing::info!(removed, "removed leftover temporary files");
+        }
+        removed
+    }
+
     /// Copies the whole database, consistently, to `dest` with the SQLite
     /// online backup API. The connection is held only while the pages are
     /// copied. The copy uses a rollback journal, so it is one
@@ -2043,6 +2068,7 @@ impl Db {
         let reusable = reusable_vectors(&tx, backup)?;
         tx.execute_batch(
             "DELETE FROM entries; DELETE FROM activity; DELETE FROM agents;
+             DELETE FROM run_writes WHERE kind = 'entry';
              DELETE FROM sqlite_sequence WHERE name IN ('entries', 'activity');",
         )?;
         // Backups older than version 3 know nothing of sessions, the profile
@@ -2061,7 +2087,7 @@ impl Db {
         if replaces_board {
             tx.execute_batch(
                 "DELETE FROM message_reads; DELETE FROM messages; DELETE FROM tasks;
-                 DELETE FROM delegations;
+                 DELETE FROM delegations; DELETE FROM run_writes WHERE kind = 'message';
                  DELETE FROM sqlite_sequence WHERE name IN ('tasks', 'messages');",
             )?;
         }
@@ -4931,6 +4957,63 @@ pub fn remove_database_files(path: &Path) {
         name.push(suffix);
         let _ = std::fs::remove_file(PathBuf::from(name));
     }
+}
+
+/// How old one of lore's temporary files must be before the periodic
+/// sweep removes it.
+pub const TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Whether a file name is one of lore's temporary files, exactly as
+/// [`Db::temp_path_with`] makes them: `.lore-tmp-<label>-<16 hex>.<ext>`
+/// (label: lower-case letters and `-`; ext: lower-case letters), or one of
+/// SQLite's companions of such a file (`-journal`, `-wal`, `-shm`).
+pub fn is_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    let rest = ["-journal", "-wal", "-shm"]
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))
+        .unwrap_or(rest);
+    let Some((stem, extension)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    let Some((label, random)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    !label.is_empty()
+        && label.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+        && random.len() == 16
+        && random.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+        && !extension.is_empty()
+        && extension.chars().all(|c| c.is_ascii_lowercase())
+}
+
+/// Removes lore's temporary files in `dir` older than `age` (regular files
+/// only; a link is never followed). Answers how many went.
+fn sweep_temp_files(dir: &Path, age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for item in entries.flatten() {
+        let name = item.file_name().to_string_lossy().into_owned();
+        if !is_temp_name(&name) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(item.path()) else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|elapsed| elapsed > age);
+        if meta.is_file() && old && std::fs::remove_file(item.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Keeps the newest `keep` safety copies in `dir`, by the time each was
@@ -8527,6 +8610,61 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn the_periodic_sweep_removes_only_old_temporary_files() {
+        let dir = test_dir("sweep");
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        let age = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, "x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old_time)
+                .unwrap();
+        };
+        // Old spool and backup leftovers go.
+        age(".lore-tmp-push-0123456789abcdef.pack");
+        age(".lore-tmp-backup-0123456789abcdef.sqlite-journal");
+        // A fresh spool stays; so does everything that is not lore's
+        // temporary file, however old.
+        std::fs::write(dir.join(".lore-tmp-push-fedcba9876543210.pack"), "x").unwrap();
+        let companions: Vec<&str> = ["lore.db-wal", "lore.db-shm"]
+            .into_iter()
+            .filter(|name| dir.join(name).exists())
+            .collect();
+        for keep in [
+            "my-backup.sqlite",
+            ".lore-tmp-notes.txt",
+            ".lore-tmp-push-0123456789ABCDEF.pack",
+            ".lore-tmp-push-0123.pack",
+        ] {
+            age(keep);
+        }
+        assert_eq!(db.sweep_leftovers(), 2);
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|item| item.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.contains(&"lore.db".to_string()));
+        assert!(left.contains(&".lore-tmp-push-fedcba9876543210.pack".to_string()));
+        for keep in ["my-backup.sqlite", ".lore-tmp-notes.txt"]
+            .into_iter()
+            .chain(companions)
+        {
+            assert!(left.contains(&keep.to_string()), "{keep} was removed");
+        }
+        assert!(!left.iter().any(|name| name.contains("0123456789abcdef")));
+        assert!(is_temp_name(
+            ".lore-tmp-upload-source-0123456789abcdef.sqlite"
+        ));
+        assert!(!is_temp_name("lore.db"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

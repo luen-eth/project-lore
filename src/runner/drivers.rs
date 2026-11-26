@@ -29,7 +29,7 @@ use tokio::{
 
 use super::{
     protocol::{CredentialKind, FromRunner, Kind, LoginMethod, Secret, TerminalMode},
-    sandbox::{self, AgentUser},
+    sandbox::{self, AgentUser, CopyLimits, Exclusive, Occupancy},
 };
 
 /// The models Claude Code accepts as aliases; it has no command that lists
@@ -113,6 +113,28 @@ pub struct Output {
 pub struct CliHome {
     path: PathBuf,
     fresh: bool,
+    /// The driver's set of paths in use, which the janitor leaves alone;
+    /// this home leaves it when dropped.
+    live: Option<Live>,
+}
+
+/// Paths under `/work` in use right now (a run's directory, a CLI home):
+/// everything else there is a leftover.
+pub type Live = Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>;
+
+/// A path held in the live set until dropped.
+pub struct Held {
+    path: PathBuf,
+    live: Live,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.path);
+    }
 }
 
 impl CliHome {
@@ -160,15 +182,34 @@ impl Drop for CliHome {
         {
             tracing::warn!(path = %self.path.display(), %error, "a CLI home could not be deleted");
         }
+        if let Some(live) = &self.live {
+            live.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.path);
+        }
     }
 }
 
-/// An interactive sign-in in progress.
+/// An interactive sign-in in progress. It holds the container (`slot`):
+/// no run starts and no terminal opens until it ends.
 struct Login {
     id: u64,
     child: Child,
     stdin: Option<ChildStdin>,
     home: CliHome,
+    slot: Exclusive,
+}
+
+/// Who produced a credential the runner may take back from a CLI home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The owner: a sign-in from the page, or the owner's terminal. Any
+    /// account may be stored.
+    Owner,
+    /// The runner's own status check in a clean moment (no run, no
+    /// terminal, no process of the agent user, a fresh home): only a
+    /// renewal of the stored sign-in, judged from the stored file.
+    Clean,
 }
 
 /// One CLI and its state.
@@ -176,6 +217,13 @@ pub struct Driver {
     pub settings: Settings,
     isolation: Isolation,
     login: Mutex<Option<Login>>,
+    /// What holds the container; one for the whole runner process.
+    occupancy: Arc<Occupancy>,
+    /// Paths under `/work` in use.
+    live: Live,
+    /// Leftover entries the janitor removed, and when it last did.
+    cleaned: std::sync::atomic::AtomicU64,
+    cleaned_at: std::sync::Mutex<Option<String>>,
 }
 
 /// Largest stored credential file (`auth.json`, `.credentials.json`)
@@ -184,6 +232,29 @@ const MAX_CREDENTIAL_FILE: u64 = 64 * 1024;
 
 /// Most of one conversation's transcripts carried to its next turn.
 const MAX_TRANSCRIPT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Most files and directories one conversation keeps.
+const MAX_TRANSCRIPT_ENTRIES: usize = 2_000;
+
+/// What a file or directory costs at least against the byte budget (an
+/// empty file still holds an inode).
+const MIN_ENTRY_COST: u64 = 4096;
+
+/// Most entries one copy looks at, copied or not.
+const MAX_TRANSCRIPT_LOOKED_AT: usize = 20_000;
+
+/// Most bytes and entries all conversations together keep; the oldest go
+/// first.
+const MAX_STORE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_STORE_ENTRIES: usize = 20_000;
+
+/// The limits of one conversation's copy.
+const TRANSCRIPT_LIMITS: CopyLimits = CopyLimits {
+    bytes: MAX_TRANSCRIPT_BYTES,
+    entries: MAX_TRANSCRIPT_ENTRIES,
+    min_cost: MIN_ENTRY_COST,
+    looked_at: MAX_TRANSCRIPT_LOOKED_AT,
+};
 
 /// What a transcript is: session logs (`.jsonl`) and session records
 /// (`.json`). Nothing else under the transcript directories is carried: no
@@ -217,11 +288,154 @@ impl Driver {
             settings,
             isolation,
             login: Mutex::new(None),
+            occupancy: Arc::default(),
+            live: Arc::default(),
+            cleaned: std::sync::atomic::AtomicU64::new(0),
+            cleaned_at: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Marks a path under `/work` as in use until the answer is dropped.
+    pub fn hold(&self, path: &Path) -> Held {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf());
+        Held {
+            path: path.to_path_buf(),
+            live: self.live.clone(),
+        }
+    }
+
+    /// How many leftover entries the janitor removed so far, and when it
+    /// last removed some.
+    pub fn cleaned(&self) -> (u64, Option<String>) {
+        (
+            self.cleaned.load(std::sync::atomic::Ordering::SeqCst),
+            self.cleaned_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
+    }
+
+    /// Free space on the runner's own volume.
+    pub fn state_path(&self) -> PathBuf {
+        self.state_dir()
+    }
+
+    /// The janitor: removes every entry under `/work` that no run, terminal,
+    /// sign-in or CLI command holds (old run directories, homes, stray
+    /// files: whatever their age or owner, symbolic links unlinked, never
+    /// followed), and from the runner's own volume conversations past their
+    /// age or the store's bound, half-written conversation copies and
+    /// half-written files the runner left. Credential files are never
+    /// touched. Only when nothing holds the container and no process of
+    /// the agent user is alive; else it waits for the next turn. Answers
+    /// how many entries went.
+    pub async fn clean_leftovers(&self) -> usize {
+        let Ok(_slot) = self.occupancy.exclusive("a clean-up") else {
+            return 0;
+        };
+        self.clean_now()
+    }
+
+    /// [`Driver::clean_leftovers`] for a caller that holds the container
+    /// already (a run's end, the last terminal, a sign-in) and has ended
+    /// the agent user's processes.
+    pub fn clean_now(&self) -> usize {
+        let Isolation::Fresh(fresh) = &self.isolation else {
+            return 0;
+        };
+        if let Some(user) = fresh.user
+            && !sandbox::processes_of(user.uid).is_empty()
+        {
+            return 0;
+        }
+        let live: std::collections::HashSet<PathBuf> =
+            self.live.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut removed = 0;
+        let work = fresh.homes.parent().map(Path::to_path_buf);
+        if let Some(work) = work
+            && let Ok(entries) = std::fs::read_dir(&work)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path == fresh.homes {
+                    if let Ok(homes) = std::fs::read_dir(&path) {
+                        for home in homes.flatten() {
+                            if !live.contains(&home.path()) && remove_entry(&home.path()) {
+                                removed += 1;
+                            }
+                        }
+                    }
+                } else if !live.contains(&path)
+                    // Never the runner's own directories, should they be
+                    // configured inside the work area.
+                    && !fresh.state.starts_with(&path)
+                    && !self.settings.home.starts_with(&path)
+                    && remove_entry(&path)
+                {
+                    removed += 1;
+                }
+            }
+        }
+        if let Some(conversations) = self.conversations()
+            && let Ok(entries) = std::fs::read_dir(&conversations)
+        {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if self.conversation_store(&name).is_none() && remove_entry(&entry.path()) {
+                    removed += 1;
+                }
+            }
+            let before = sandbox::tree_usage(&conversations, MAX_STORE_ENTRIES * 2).1;
+            prune_store(&conversations);
+            let after = sandbox::tree_usage(&conversations, MAX_STORE_ENTRIES * 2).1;
+            removed += usize::from(after < before);
+        }
+        if let Ok(entries) = std::fs::read_dir(&fresh.state) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if is_half_written(&name) && remove_entry(&entry.path()) {
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            self.cleaned
+                .fetch_add(removed as u64, std::sync::atomic::Ordering::SeqCst);
+            *self.cleaned_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(add_days_iso(0));
+            tracing::info!(removed, "the janitor removed leftovers");
+        }
+        removed
     }
 
     pub fn kind(&self) -> Kind {
         self.settings.kind
+    }
+
+    /// What holds the container, shared by runs, terminals and sign-ins.
+    pub fn occupancy(&self) -> &Arc<Occupancy> {
+        &self.occupancy
+    }
+
+    /// Ends every process of the agent user (the runner exits when it
+    /// cannot). Nothing without an agent user.
+    pub async fn sweep(&self) {
+        if let Some(user) = self.user() {
+            sandbox::sweep_or_exit(user).await;
+        }
+    }
+
+    /// Takes the container for an owner's action and sweeps it first.
+    async fn exclusive(&self, what: &'static str) -> Result<Exclusive> {
+        let slot = self
+            .occupancy
+            .exclusive(what)
+            .map_err(|why| anyhow::anyhow!(why))?;
+        self.sweep().await;
+        Ok(slot)
     }
 
     /// The user CLI processes run as, when it is not the runner's own.
@@ -335,7 +549,7 @@ impl Driver {
             }
             if let Some(conversations) = self.conversations() {
                 sandbox::make_dir(&conversations, 0o700)?;
-                prune_older(&conversations, TRANSCRIPT_DAYS);
+                prune_store(&conversations);
             }
             return Ok(());
         }
@@ -343,6 +557,7 @@ impl Driver {
         let home = CliHome {
             path: self.settings.home.clone(),
             fresh: false,
+            live: None,
         };
         self.write_cli_config(&home, false)
     }
@@ -423,12 +638,19 @@ impl Driver {
             return Ok(CliHome {
                 path: self.settings.home.clone(),
                 fresh: false,
+                live: None,
             });
         };
         sandbox::make_dir(&fresh.homes, 0o711)?;
+        let path = fresh.homes.join(sandbox::random_name("h-"));
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.clone());
         let home = CliHome {
-            path: fresh.homes.join(sandbox::random_name("h-")),
+            path,
             fresh: true,
+            live: Some(self.live.clone()),
         };
         sandbox::make_dir(home.path(), 0o700)?;
         sandbox::make_dir(&home.tmp(), 0o700)?;
@@ -454,15 +676,18 @@ impl Driver {
         Ok(home)
     }
 
-    /// Takes a credential the CLI refreshed (or a sign-in made) in a fresh
+    /// Takes a credential a sign-in made (or the CLI renewed) in a fresh
     /// home back into the store: only the one file each CLI keeps it in,
     /// only a regular file (never through a link), only JSON of the
-    /// expected shape and size. Unless `may_switch` (the owner signed in,
-    /// in a terminal or from the page), a Codex sign-in of another ChatGPT
-    /// account than the stored one is refused, so a run cannot swap in an
-    /// account of its own. Answers whether something was stored. Call it
-    /// only when no process of the agent user is left.
-    pub fn harvest(&self, home: &CliHome, may_switch: bool) -> Result<bool> {
+    /// expected shape and size. A run's home is never harvested: whatever
+    /// a run leaves is the CLI's, which may be hostile. From the owner
+    /// ([`Source::Owner`]: a sign-in from the page or in a terminal) any
+    /// account is stored; from the runner's clean status check
+    /// ([`Source::Clean`]) only a renewal of what is stored: a stored file
+    /// must exist, and for Codex its ChatGPT account must be the same.
+    /// Answers whether something was stored. Call it only when no process
+    /// of the agent user is left.
+    pub fn harvest(&self, home: &CliHome, source: Source) -> Result<bool> {
         if !home.is_fresh() {
             return Ok(false);
         }
@@ -494,17 +719,23 @@ impl Driver {
         if before.as_deref() == Some(&bytes[..]) {
             return Ok(false);
         }
-        if !may_switch && self.kind() == Kind::Codex {
-            let account = |value: &serde_json::Value| {
-                value["tokens"]["account_id"].as_str().map(str::to_string)
-            };
-            let old = before
+        if source == Source::Clean {
+            let Some(old) = before
                 .as_deref()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
-            if let Some(old) = old
-                && account(&old) != account(&value)
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            else {
+                return Ok(false);
+            };
+            let account = |value: &serde_json::Value| {
+                value["tokens"]["account_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+            };
+            if self.kind() == Kind::Codex
+                && (account(&old).is_none() || account(&old) != account(&value))
             {
-                tracing::warn!("a run tried to store another account's sign-in; refused");
+                tracing::warn!("a renewed sign-in of another account was not stored");
                 return Ok(false);
             }
         }
@@ -747,6 +978,37 @@ impl Driver {
         }
     }
 
+    /// The runner's own renewal of an interactive sign-in, in a clean
+    /// moment: when nothing else holds the container, every process of
+    /// the agent user is ended, the CLI's status command runs in a fresh
+    /// home with the stored credential and no task text, everything is
+    /// ended again, and a credential the CLI renewed is taken back when it
+    /// renews the stored one ([`Source::Clean`]). Runs never give a
+    /// credential back; this is the only way a renewal reaches the store
+    /// without the owner. Answers whether one was stored.
+    pub async fn renew_sign_in(&self) -> Result<bool> {
+        let stored = match self.kind() {
+            Kind::Claude => self.claude_credentials(),
+            Kind::Codex => self.codex_auth(),
+            Kind::Opencode => return Ok(false),
+        };
+        if !self.is_fresh() || !stored.is_file() {
+            return Ok(false);
+        }
+        let Ok(_slot) = self.occupancy.exclusive("a sign-in renewal") else {
+            return Ok(false);
+        };
+        self.sweep().await;
+        let home = self.home()?;
+        let args: &[&str] = match self.kind() {
+            Kind::Claude => &["auth", "status", "--text"],
+            _ => &["login", "status"],
+        };
+        let _ = self.run_in(&home, args, None).await;
+        self.sweep().await;
+        self.harvest(&home, Source::Clean)
+    }
+
     async fn claude_status(&self) -> (bool, Option<String>, Option<String>, String) {
         let stored = self
             .stored_vars()
@@ -891,6 +1153,8 @@ impl Driver {
                 self.settings.kind.id()
             );
         }
+        // No process of a run may be alive while a credential is handled.
+        let _slot = self.exclusive("a credential change").await?;
         let value = value.expose().trim();
         if value.is_empty() {
             bail!("the {} is empty", kind.label());
@@ -942,7 +1206,8 @@ impl Driver {
                                 shorten(&output.text, DETAIL_CHARS)
                             );
                         }
-                        self.harvest(&home, true)?;
+                        self.sweep().await;
+                        self.harvest(&home, Source::Owner)?;
                         Ok("codex is signed in with the API key".into())
                     }
                     _ => {
@@ -978,6 +1243,7 @@ impl Driver {
     /// Says so only when it is gone; says what is left otherwise.
     pub async fn logout(&self) -> Result<String> {
         self.cancel_login().await;
+        let _slot = self.exclusive("a sign-out").await?;
         let mut files = vec![
             self.secrets_file(),
             self.sign_in_file(),
@@ -1049,6 +1315,10 @@ impl Driver {
             );
         }
         self.cancel_login().await;
+        // Refused while a run goes: its processes could read a fresh
+        // sign-in from this one's. Nothing of the agent user is alive
+        // when the sign-in starts.
+        let slot = self.exclusive("a sign-in").await?;
         let args: &[&str] = match method {
             LoginMethod::Device => &["login", "--device-auth"],
             LoginMethod::Interactive => &["auth", "login", "--claudeai"],
@@ -1093,6 +1363,7 @@ impl Driver {
             child,
             stdin,
             home,
+            slot,
         });
 
         let driver = self.clone();
@@ -1147,7 +1418,7 @@ impl Driver {
                 }
             }
             // The CLI closed its output or the time ran out: collect it.
-            let (status, home) = {
+            let (status, home, slot) = {
                 let mut guard = driver.login.lock().await;
                 match guard.as_mut() {
                     Some(login) if login.id == id => {
@@ -1162,18 +1433,23 @@ impl Driver {
                                 }
                             };
                         let login = guard.take().expect("the sign-in is there");
-                        (status, login.home)
+                        (status, login.home, login.slot)
                     }
                     // Cancelled, or replaced by a newer sign-in.
                     _ => return,
                 }
             };
             let mut ok = status.is_some_and(|status| status.success());
-            if ok && let Err(error) = driver.harvest(&home, true) {
+            // Whatever the sign-in left running ends before its home is
+            // read.
+            driver.sweep().await;
+            if ok && let Err(error) = driver.harvest(&home, Source::Owner) {
                 tracing::warn!(%error, "storing a new sign-in failed");
                 ok = false;
             }
             drop(home);
+            driver.clean_now();
+            drop(slot);
             if !prompted {
                 let _ = out
                     .send(FromRunner::LoginPrompt {
@@ -1245,8 +1521,9 @@ impl Driver {
                 sandbox::copy_plain_tree(
                     &from,
                     &home.path().join(relative),
-                    MAX_TRANSCRIPT_BYTES,
+                    TRANSCRIPT_LIMITS,
                     TRANSCRIPT_FILES,
+                    false,
                 )?;
             }
         }
@@ -1266,25 +1543,42 @@ impl Driver {
         if !home.is_fresh() {
             return Ok(());
         }
-        let _ = sandbox::reclaim(home.path());
         let fresh = store.with_extension("new");
         let _ = sandbox::remove_tree(&fresh);
         sandbox::make_dir(&fresh, 0o700)?;
-        let mut budget = MAX_TRANSCRIPT_BYTES;
+        let mut limits = TRANSCRIPT_LIMITS;
         for relative in CliHome::transcripts(self.kind()) {
+            // Only the way down to the transcripts is taken back, one entry
+            // at a time, never the whole home: the walk stays within the
+            // copy's bounds however many files the CLI made.
+            let mut at = home.path().to_path_buf();
+            let _ = sandbox::take_back_one(&at);
+            let mut reachable = true;
+            for part in Path::new(relative).components() {
+                at.push(part);
+                if sandbox::take_back_one(&at).is_err() {
+                    reachable = false;
+                    break;
+                }
+            }
             let from = home.path().join(relative);
-            if std::fs::symlink_metadata(&from).is_ok_and(|meta| meta.is_dir()) {
+            if reachable && std::fs::symlink_metadata(&from).is_ok_and(|meta| meta.is_dir()) {
                 let used = sandbox::copy_plain_tree(
                     &from,
                     &fresh.join(relative),
-                    budget,
+                    limits,
                     TRANSCRIPT_FILES,
+                    true,
                 )?;
-                budget = budget.saturating_sub(used);
+                limits.bytes = limits.bytes.saturating_sub(used.bytes);
+                limits.entries = limits.entries.saturating_sub(used.entries);
             }
         }
         let _ = sandbox::remove_tree(&store);
         std::fs::rename(&fresh, &store)?;
+        if let Some(conversations) = self.conversations() {
+            prune_store(&conversations);
+        }
         Ok(())
     }
 
@@ -1315,6 +1609,74 @@ fn prune_older(dir: &Path, days: u64) {
             let _ = sandbox::remove_tree(&entry.path());
         }
     }
+}
+
+/// Keeps the conversations' store within its bounds: what is older than
+/// [`TRANSCRIPT_DAYS`] goes, then the oldest conversations until all of
+/// them together hold at most [`MAX_STORE_BYTES`] (every entry counted at
+/// [`MIN_ENTRY_COST`] at least) and [`MAX_STORE_ENTRIES`]. Called on every
+/// keep; each conversation is bounded already, so the walk is too.
+fn prune_store(dir: &Path) {
+    prune_older(dir, TRANSCRIPT_DAYS);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut kept: Vec<(std::time::SystemTime, PathBuf, u64, usize)> = entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            let modified = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let (bytes, count) = sandbox::tree_usage(&path, MAX_STORE_ENTRIES + 1);
+            let cost = bytes.max(count as u64 * MIN_ENTRY_COST);
+            (modified, path, cost, count)
+        })
+        .collect();
+    // Newest first: the oldest are dropped from the end.
+    kept.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let (mut bytes, mut count) = (0u64, 0usize);
+    for (_, path, cost, entries) in kept {
+        bytes += cost;
+        count += entries;
+        if bytes > MAX_STORE_BYTES || count > MAX_STORE_ENTRIES {
+            let _ = sandbox::remove_tree(&path);
+        }
+    }
+}
+
+/// Removes one entry of whatever kind: a symbolic link or a file is
+/// unlinked (a link is never followed), a directory removed whole whatever
+/// its modes or owner. Answers whether it went.
+fn remove_entry(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let result = if meta.is_dir() {
+        sandbox::remove_tree(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "a leftover could not be removed");
+            false
+        }
+    }
+}
+
+/// A temporary file [`write_private`] leaves when it is interrupted:
+/// `.<name>.` followed by 16 hex digits. Never a stored credential.
+fn is_half_written(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((stem, random)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty() && random.len() == 16 && random.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Creates a directory readable by its owner only.
@@ -1640,7 +2002,7 @@ mod tests {
             },
             Isolation::Fresh(Fresh {
                 state: dir.join("state"),
-                homes: dir.join("homes"),
+                homes: dir.join("work/.homes"),
                 user: None,
             }),
         );
@@ -1731,17 +2093,20 @@ esac
         assert!(!look.contains("survived"), "{look}");
         assert!(look.contains("auth present"), "{look}");
         assert!(
-            look.contains(&dir.join("homes").display().to_string()),
+            look.contains(&dir.join("work/.homes").display().to_string()),
             "{look}"
         );
         // Every fresh home was deleted.
-        assert_eq!(std::fs::read_dir(dir.join("homes")).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(dir.join("work/.homes")).unwrap().count(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A refreshed credential is taken back only as the file the CLI keeps
-    /// it in, of the right shape, never through a link, and (for a run) of
-    /// the same account.
+    /// A renewed credential is taken back only as the file the CLI keeps
+    /// it in, of the right shape, never through a link, and (from the
+    /// runner's clean check) only as a renewal of the stored account.
     #[test]
     fn a_refreshed_credential_is_checked_before_it_is_kept() {
         let dir = temp("harvest");
@@ -1753,26 +2118,32 @@ esac
         )
         .unwrap();
         let auth = |home: &CliHome| home.codex_home().join("auth.json");
-        // A refresh of the same account is kept.
+        // A renewal of the same account is kept.
         let home = driver.home().unwrap();
         let refreshed =
             br#"{"tokens":{"access_token":"new-access-token-000002","account_id":"acct-1"}}"#; // lore:allow-secret (fake test value)
         std::fs::write(auth(&home), refreshed).unwrap();
-        assert!(driver.harvest(&home, false).unwrap());
+        assert!(driver.harvest(&home, Source::Clean).unwrap());
         assert_eq!(std::fs::read(&stored).unwrap(), refreshed);
         drop(home);
-        // Another account, from a run: refused.
+        // Another account, or an API-key file, from a clean check: refused.
         let home = driver.home().unwrap();
         std::fs::write(
             auth(&home),
             br#"{"tokens":{"access_token":"thief-token-000000003","account_id":"acct-thief"}}"#, // lore:allow-secret (fake test value)
         )
         .unwrap();
-        assert!(!driver.harvest(&home, false).unwrap());
+        assert!(!driver.harvest(&home, Source::Clean).unwrap());
+        std::fs::write(
+            auth(&home),
+            br#"{"OPENAI_API_KEY":"sk-thief-key-00000000004"}"#,
+        )
+        .unwrap(); // lore:allow-secret (fake test value)
+        assert!(!driver.harvest(&home, Source::Clean).unwrap());
         assert_eq!(std::fs::read(&stored).unwrap(), refreshed);
         // Not JSON of the expected shape, or a link: refused.
         std::fs::write(auth(&home), br#"{"something":"else"}"#).unwrap();
-        assert!(!driver.harvest(&home, true).unwrap());
+        assert!(!driver.harvest(&home, Source::Owner).unwrap());
         std::fs::remove_file(auth(&home)).unwrap();
         let elsewhere = dir.join("elsewhere.json");
         std::fs::write(
@@ -1781,8 +2152,155 @@ esac
         )
         .unwrap();
         std::os::unix::fs::symlink(&elsewhere, auth(&home)).unwrap();
-        assert!(!driver.harvest(&home, true).unwrap());
+        assert!(!driver.harvest(&home, Source::Owner).unwrap());
         assert_eq!(std::fs::read(&stored).unwrap(), refreshed);
+        // With nothing stored, a clean check stores nothing (only the
+        // owner signs an agent in).
+        drop(home);
+        std::fs::remove_file(&stored).unwrap();
+        let home = driver.home().unwrap();
+        std::fs::write(auth(&home), refreshed).unwrap();
+        assert!(!driver.harvest(&home, Source::Clean).unwrap());
+        assert!(!stored.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H5: while a run goes, signing in, storing a credential and signing
+    /// out are refused with a message the page shows; while a sign-in
+    /// goes, a run is refused.
+    #[tokio::test]
+    async fn sign_ins_and_credentials_wait_for_a_run_and_runs_for_a_sign_in() {
+        let dir = temp("exclusive");
+        let driver = Arc::new(fresh(
+            &dir,
+            Kind::Claude,
+            "#!/bin/sh\necho 'open https://claude.ai/oauth/x'\nsleep 30\n",
+        ));
+        driver.occupancy().start_run().unwrap();
+        let token = Secret::new("sk-ant-oat01-a-pasted-setup-token-0000"); // lore:allow-secret (fake test value)
+        let error = driver
+            .set_credential(CredentialKind::SetupToken, &token)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("a run is going"), "{error}");
+        assert!(!dir.join("state/secrets.env").exists());
+        let error = driver.logout().await.unwrap_err().to_string();
+        assert!(error.contains("a run is going"), "{error}");
+        let (tx, _rx) = mpsc::channel(8);
+        let error = driver
+            .login_start(1, LoginMethod::Interactive, tx.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("a run is going"), "{error}");
+        driver.occupancy().end_run();
+        driver
+            .login_start(2, LoginMethod::Interactive, tx)
+            .await
+            .unwrap();
+        assert!(driver.occupancy().start_run().is_err());
+        assert!(driver.cancel_login().await);
+        driver.occupancy().start_run().unwrap();
+        driver.occupancy().end_run();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The janitor removes what nothing holds under /work (old run
+    /// directories, homes, stray files, a link, never followed) and old or
+    /// half-written conversation stores, and leaves alone what a run or a
+    /// command holds, current conversations and the stored credentials.
+    #[tokio::test]
+    async fn the_janitor_removes_leftovers_and_keeps_what_is_in_use() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("janitor");
+        let driver = fresh(&dir, Kind::Claude, "#!/bin/sh\n");
+        let work = dir.join("work");
+        // In use: a run's directory and a CLI home.
+        let active_run = work.join("run-active");
+        std::fs::create_dir_all(active_run.join("repo")).unwrap();
+        let _held = driver.hold(&active_run);
+        let active_home = driver.home().unwrap();
+        // Leftovers: an old run, a stale home, a stray file, a locked
+        // directory, a link to outside.
+        let outside = dir.join("outside");
+        std::fs::write(&outside, "keep me").unwrap();
+        std::fs::create_dir_all(work.join("run-old/repo")).unwrap();
+        std::fs::create_dir_all(work.join(".homes/h-stale/.claude")).unwrap();
+        std::fs::write(work.join("stray.txt"), "x").unwrap();
+        std::fs::create_dir_all(work.join("locked/inner")).unwrap();
+        std::fs::set_permissions(work.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, work.join("link")).unwrap();
+        // The state volume: credentials, a current and an old
+        // conversation, a half-written copy and a half-written file.
+        let state = dir.join("state");
+        write_private(
+            &state.join("claude-credentials.json"),
+            br#"{"claudeAiOauth":{}}"#,
+        )
+        .unwrap();
+        driver
+            .store_var("CLAUDE_CODE_OAUTH_TOKEN", "tok-0123456789")
+            .unwrap();
+        let conversations = state.join("conversations");
+        std::fs::create_dir_all(conversations.join("current/x")).unwrap();
+        std::fs::create_dir_all(conversations.join("old/x")).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(8 * 86_400);
+        std::fs::File::open(conversations.join("old"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::create_dir_all(conversations.join("current.new")).unwrap();
+        std::fs::write(state.join(".secrets.env.0123456789abcdef"), "half").unwrap();
+        let removed = driver.clean_leftovers().await;
+        assert!(removed >= 8, "{removed}");
+        assert!(active_run.join("repo").is_dir());
+        assert!(active_home.path().is_dir());
+        for gone in ["run-old", "stray.txt", "locked", "link"] {
+            assert!(
+                std::fs::symlink_metadata(work.join(gone)).is_err(),
+                "{gone} is left"
+            );
+        }
+        assert!(!work.join(".homes/h-stale").exists());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep me");
+        assert!(conversations.join("current").is_dir());
+        assert!(!conversations.join("old").exists());
+        assert!(!conversations.join("current.new").exists());
+        assert!(!state.join(".secrets.env.0123456789abcdef").exists());
+        assert!(state.join("claude-credentials.json").is_file());
+        assert!(state.join("secrets.env").is_file());
+        assert_eq!(driver.cleaned().0, removed as u64);
+        // Nothing runs while something holds the container.
+        std::fs::write(work.join("stray2"), "x").unwrap();
+        driver.occupancy().start_run().unwrap();
+        assert_eq!(driver.clean_leftovers().await, 0);
+        assert!(work.join("stray2").exists());
+        driver.occupancy().end_run();
+        drop(active_home);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H3: a conversation that leaves many empty transcript files keeps at
+    /// most its entry budget, and the whole store stays within its bound.
+    #[test]
+    fn a_conversation_s_transcripts_are_bounded_in_entries_too() {
+        let dir = temp("bomb");
+        let driver = fresh(&dir, Kind::Claude, "#!/bin/sh\n");
+        let home = driver.home().unwrap();
+        let projects = home.path().join(".claude/projects");
+        for d in 0..6 {
+            let sub = projects.join(format!("d{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..1000 {
+                std::fs::write(sub.join(format!("{f}.jsonl")), "").unwrap();
+            }
+        }
+        driver.keep_transcripts("c1", &home).unwrap();
+        let (_, kept) = sandbox::tree_usage(&dir.join("state/conversations/c1"), 100_000);
+        assert!(kept <= MAX_TRANSCRIPT_ENTRIES + 4, "{kept} entries kept");
+        drop(home);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

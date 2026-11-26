@@ -148,10 +148,131 @@ impl RateLimiter {
     }
 }
 
+/// An address range: `10.0.1.0/24`, `fd00::/8`, or one address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cidr {
+    net: IpAddr,
+    prefix: u8,
+}
+
+impl Cidr {
+    pub fn new(net: IpAddr, prefix: u8) -> Self {
+        Self { net, prefix }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let (address, prefix) = match text.split_once('/') {
+            Some((address, prefix)) => (address, Some(prefix.parse::<u8>().ok()?)),
+            None => (text, None),
+        };
+        let net: IpAddr = address.parse().ok()?;
+        let max = if net.is_ipv4() { 32 } else { 128 };
+        let prefix = prefix.unwrap_or(max);
+        (prefix <= max).then_some(Self { net, prefix })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = unmapped(ip);
+        match (self.net, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u32::from(net) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u128::from(net) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+/// An IPv4 address written as IPv6 (`::ffff:a.b.c.d`), as the IPv4 one.
+fn unmapped(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// Which direct peers may say, in `X-Forwarded-For`, whom they forward
+/// for (only with `LORE_TRUST_PROXY=on`).
+#[derive(Debug, Clone)]
+pub enum ProxyTrust {
+    /// Every peer, as before `LORE_TRUSTED_PROXIES` existed: an instance
+    /// without built-in agents and without the variable.
+    Any,
+    /// The ranges `LORE_TRUSTED_PROXIES` names, never the agent networks.
+    Listed {
+        trusted: Vec<Cidr>,
+        never: Vec<Cidr>,
+    },
+    /// With built-in agents and without the variable: private and loopback
+    /// peers (a reverse proxy on a Docker network or the host), never the
+    /// agent networks.
+    Private { never: Vec<Cidr> },
+}
+
+static PROXY_TRUST: std::sync::OnceLock<ProxyTrust> = std::sync::OnceLock::new();
+
+/// Sets, once at start-up, which peers' `X-Forwarded-For` is believed.
+pub fn set_proxy_trust(trust: ProxyTrust) {
+    let _ = PROXY_TRUST.set(trust);
+}
+
+/// Reads `LORE_TRUSTED_PROXIES`: address ranges, comma separated.
+pub fn parse_trusted_proxies(value: &str) -> Result<Vec<Cidr>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            Cidr::parse(entry).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "LORE_TRUSTED_PROXIES must be address ranges such as 10.0.1.0/24, comma \
+                     separated (\"{entry}\" is not one)"
+                )
+            })
+        })
+        .collect()
+}
+
+/// Whether an address is private or loopback (RFC 1918, unique local,
+/// loopback).
+fn private_or_loopback(ip: IpAddr) -> bool {
+    match unmapped(ip) {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+/// Whether `peer` may speak for someone else in `X-Forwarded-For`.
+pub fn peer_may_forward(trust: &ProxyTrust, peer: Option<SocketAddr>) -> bool {
+    let Some(ip) = peer.map(|peer| unmapped(peer.ip())) else {
+        return false;
+    };
+    match trust {
+        ProxyTrust::Any => true,
+        ProxyTrust::Listed { trusted, never } => {
+            !never.iter().any(|net| net.contains(ip)) && trusted.iter().any(|net| net.contains(ip))
+        }
+        ProxyTrust::Private { never } => {
+            !never.iter().any(|net| net.contains(ip)) && private_or_loopback(ip)
+        }
+    }
+}
+
 /// The client address. Behind a reverse proxy the socket peer is the proxy, so
-/// the last `X-Forwarded-For` hop (the one our proxy appended) is used instead.
+/// the last `X-Forwarded-For` hop (the one our proxy appended) is used instead,
+/// when the peer is one that may forward ([`ProxyTrust`]).
 pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, trust_proxy: bool) -> String {
-    if trust_proxy {
+    let trusted_peer = peer_may_forward(PROXY_TRUST.get().unwrap_or(&ProxyTrust::Any), peer);
+    if trust_proxy && trusted_peer {
         let forwarded = headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
@@ -323,6 +444,8 @@ impl McpAuth {
                 return Ok(None);
             }
             // The row is the authority on whose run it is.
+            // The branches it created so far, from lore's own record.
+            scope.created_branches = db.run_created_branches(&run_id)?;
             scope.run_id = run_id;
             scope.agent = agent;
             let disabled = db
@@ -415,7 +538,9 @@ pub async fn require_token(
                     .extensions()
                     .get::<ConnectInfo<SocketAddr>>()
                     .map(|info| info.0);
-                let ip = client_ip(request.headers(), peer, auth.trust_proxy);
+                // On the internal listener the direct peer is the caller:
+                // a container's `X-Forwarded-For` is never believed.
+                let ip = client_ip(request.headers(), peer, auth.trust_proxy && !internal);
                 if let Some(retry_after) = auth.failures.hit(&ip) {
                     tracing::warn!(%ip, "too many failed token attempts");
                     return too_many_requests(retry_after);
@@ -546,6 +671,33 @@ mod tests {
                 agent: "claude".into(),
                 env: true
             })
+        );
+    }
+
+    #[test]
+    fn forwarded_addresses_are_believed_only_from_trusted_peers() {
+        let peer = |ip: &str| Some(SocketAddr::new(ip.parse().unwrap(), 4000));
+        let agents = vec![Cidr::parse("172.31.250.0/28").unwrap()];
+        let listed = ProxyTrust::Listed {
+            trusted: parse_trusted_proxies("10.0.1.0/24, 127.0.0.1").unwrap(),
+            never: agents.clone(),
+        };
+        assert!(peer_may_forward(&listed, peer("10.0.1.7")));
+        assert!(peer_may_forward(&listed, peer("127.0.0.1")));
+        assert!(!peer_may_forward(&listed, peer("10.0.2.7")));
+        assert!(!peer_may_forward(&listed, peer("172.31.250.9")));
+        let private = ProxyTrust::Private { never: agents };
+        assert!(peer_may_forward(&private, peer("10.0.1.7")));
+        assert!(peer_may_forward(&private, peer("::ffff:192.168.1.2")));
+        assert!(!peer_may_forward(&private, peer("172.31.250.9")));
+        assert!(!peer_may_forward(&private, peer("203.0.113.5")));
+        assert!(peer_may_forward(&ProxyTrust::Any, peer("203.0.113.5")));
+        assert!(parse_trusted_proxies("10.0.0.0/33").is_err());
+        assert!(parse_trusted_proxies("lore").is_err());
+        assert!(
+            Cidr::parse("fd00::/8")
+                .unwrap()
+                .contains("fd12::1".parse().unwrap())
         );
     }
 

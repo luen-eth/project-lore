@@ -96,6 +96,18 @@ pub(super) struct Caller<'a> {
     pub actor: &'a str,
     pub label: &'a str,
     pub session_id: Option<&'a str>,
+    /// A built-in agent's run: the services it may read (`RunScope::
+    /// readable`). An account outside them is never named or suggested.
+    pub readable: Option<&'a [String]>,
+}
+
+impl Caller<'_> {
+    /// Whether the caller may read `service` at all (always, outside a
+    /// run).
+    pub fn may_read(&self, service: &str) -> bool {
+        self.readable
+            .is_none_or(|readable| readable.iter().any(|id| id == service))
+    }
 }
 
 /// How a hint names the account to use instead.
@@ -408,6 +420,7 @@ impl Lore {
                 actor: &actor,
                 label: &label,
                 session_id: session_id.as_deref(),
+                readable: None,
             };
             let _ = sender.send(this.account_owners(provider, &caller).await);
         });
@@ -432,6 +445,7 @@ impl Lore {
                 actor: &actor,
                 label: &label,
                 session_id: None,
+                readable: None,
             };
             this.account_owners(provider, &caller).await;
         });
@@ -447,7 +461,11 @@ impl Lore {
         level: &str,
         caller: &Caller<'_>,
     ) -> Option<String> {
-        if !is_github(provider) || !configured || !matches!(level, "read" | "full") {
+        if !is_github(provider)
+            || !configured
+            || !matches!(level, "read" | "full")
+            || !caller.may_read(provider.id)
+        {
             return None;
         }
         self.owners_now(provider, caller)
@@ -490,7 +508,7 @@ impl Lore {
         caller: &Caller<'_>,
         style: Style,
     ) -> Option<String> {
-        if !is_github(provider) {
+        if !is_github(provider) || !caller.may_read(provider.id) {
             return None;
         }
         let owners = self.account_owners(provider, caller).await?;
@@ -514,6 +532,7 @@ impl Lore {
         .await
         .unwrap_or("off");
         if level != "off"
+            && caller.may_read(other.id)
             && let Some(others) = self.account_owners(other, caller).await
             && others.covers(owner)
         {
@@ -909,6 +928,7 @@ mod tests {
             actor: "claude",
             label: "claude",
             session_id: Some(&session),
+            readable: None,
         };
         assert_eq!(
             lore.account_owners(ops::GITHUB, &caller)

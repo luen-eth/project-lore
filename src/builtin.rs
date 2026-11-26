@@ -55,8 +55,9 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(90);
 /// Shortest runner secret accepted.
 const MIN_SECRET_LEN: usize = 24;
 
-/// Run events waiting for the task runner; a runner that floods past this
-/// loses its link.
+/// Run events waiting for the task runner. Output lines past it are left
+/// out (and counted, and said so in one line); a run's start and end
+/// always wait for room.
 const RUN_EVENTS_QUEUE: usize = 4096;
 
 /// What one runner link may send: frames and bytes per second, with a
@@ -237,7 +238,42 @@ pub fn sign_in_hosts(kind: Kind) -> &'static [&'static str] {
 /// no user name or password and no unusual port, and its host is one the
 /// agent's CLI signs in at. Answers the link and its host, for the page
 /// to show apart.
+#[cfg(test)]
 pub fn checked_sign_in_url(kind: Kind, url: &str) -> Option<(String, String)> {
+    let hosts: Vec<String> = sign_in_hosts(kind).iter().map(|h| h.to_string()).collect();
+    checked_sign_in_url_in(&hosts, url)
+}
+
+/// The sign-in hosts of each CLI: the built-in list, or the owner's own
+/// from `LORE_SIGN_IN_HOSTS_CLAUDE` / `LORE_SIGN_IN_HOSTS_CODEX` /
+/// `LORE_SIGN_IN_HOSTS_OPENCODE` (host names, comma separated), which
+/// replaces it when a CLI moves its sign-in.
+pub fn sign_in_hosts_from_env(kind: Kind) -> Result<Vec<String>> {
+    let name = format!("LORE_SIGN_IN_HOSTS_{}", kind.id().to_ascii_uppercase());
+    let value = std::env::var(&name).unwrap_or_default();
+    if value.trim().is_empty() {
+        return Ok(sign_in_hosts(kind).iter().map(|h| h.to_string()).collect());
+    }
+    value
+        .split(',')
+        .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+        .map(|host| {
+            let plain = host.contains('.')
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'));
+            if plain {
+                Ok(host)
+            } else {
+                bail!("{name} must be host names such as claude.ai, comma separated")
+            }
+        })
+        .collect()
+}
+
+/// [`checked_sign_in_url`] against a given host list.
+pub fn checked_sign_in_url_in(hosts: &[String], url: &str) -> Option<(String, String)> {
     let parsed = reqwest::Url::parse(url.trim()).ok()?;
     if parsed.scheme() != "https"
         || !parsed.username().is_empty()
@@ -247,9 +283,161 @@ pub fn checked_sign_in_url(kind: Kind, url: &str) -> Option<(String, String)> {
         return None;
     }
     let host = parsed.host_str()?.to_ascii_lowercase();
-    sign_in_hosts(kind)
-        .contains(&host.as_str())
-        .then(|| (parsed.to_string(), host))
+    hosts.contains(&host).then(|| (parsed.to_string(), host))
+}
+
+/// What a runner said about a sign-in, with every link that is not at one
+/// of `hosts` replaced: a refused link is never shown, not even as text.
+pub fn hide_other_links(text: &str, hosts: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("http") {
+        let (before, from) = rest.split_at(at);
+        out.push_str(before);
+        let end = from
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+            .unwrap_or(from.len());
+        let (word, after) = from.split_at(end);
+        let link = word.starts_with("http://") || word.starts_with("https://");
+        if link && checked_sign_in_url_in(hosts, word).is_none() {
+            out.push_str("[a link to another host, not shown]");
+        } else {
+            out.push_str(word);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// lore's public listener without the agent networks: a connection
+/// accepted on one of lore's agent-network addresses (where the runner
+/// listener lives) is closed at once, so an agent container never reaches
+/// the admin page, the sign-in or OAuth, whatever it sends. Runs reach lore
+/// on the runner listener only (`/mcp`, `/git`, `/runner/ws`).
+pub struct PublicListener {
+    inner: tokio::net::TcpListener,
+    refused: Vec<std::net::IpAddr>,
+}
+
+impl PublicListener {
+    pub fn new(inner: tokio::net::TcpListener, refused: Vec<std::net::IpAddr>) -> Self {
+        Self { inner, refused }
+    }
+
+    /// Whether a connection accepted on `local` is refused.
+    pub fn refuses(&self, local: SocketAddr) -> bool {
+        let ip = match local.ip() {
+            std::net::IpAddr::V6(v6) => {
+                v6.to_ipv4_mapped().map_or(local.ip(), std::net::IpAddr::V4)
+            }
+            v4 => v4,
+        };
+        self.refused.contains(&ip)
+    }
+}
+
+impl axum::serve::Listener for PublicListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (io, peer) = axum::serve::Listener::accept(&mut self.inner).await;
+            match io.local_addr() {
+                Ok(local) if self.refuses(local) => {
+                    tracing::debug!(%peer, "a connection from an agent network to the public listener was closed");
+                    drop(io);
+                }
+                _ => return (io, peer),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+/// The networks lore's runner listener addresses are on, from the
+/// container's routing table (`/proc/net/route`): what lore must never
+/// take an `X-Forwarded-For` from. An address with no matching route
+/// stands for itself.
+pub fn agent_networks(addresses: &[std::net::IpAddr]) -> Vec<crate::auth::Cidr> {
+    let table = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    agent_networks_in(&table, addresses)
+}
+
+fn agent_networks_in(table: &str, addresses: &[std::net::IpAddr]) -> Vec<crate::auth::Cidr> {
+    let routes: Vec<(u32, u32)> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let destination = u32::from_str_radix(fields.get(1)?, 16).ok()?;
+            let gateway = u32::from_str_radix(fields.get(2)?, 16).ok()?;
+            let mask = u32::from_str_radix(fields.get(7)?, 16).ok()?;
+            // The kernel writes the bytes in network order read as a
+            // little-endian number.
+            (gateway == 0 && mask != 0).then(|| (destination.swap_bytes(), mask.swap_bytes()))
+        })
+        .collect();
+    addresses
+        .iter()
+        .map(|address| {
+            let std::net::IpAddr::V4(v4) = address else {
+                return crate::auth::Cidr::new(*address, 128);
+            };
+            let ip = u32::from(*v4);
+            routes
+                .iter()
+                .filter(|(destination, mask)| ip & mask == *destination)
+                .max_by_key(|(_, mask)| mask.count_ones())
+                .map(|(destination, mask)| {
+                    crate::auth::Cidr::new(
+                        std::net::IpAddr::V4((*destination).into()),
+                        mask.count_ones() as u8,
+                    )
+                })
+                .unwrap_or_else(|| crate::auth::Cidr::new(*address, 32))
+        })
+        .collect()
+}
+
+/// Removes the proxy headers from a request on the runner listener: it is
+/// reached straight from the agent networks, never through a proxy, so the
+/// direct peer is always the caller.
+pub async fn strip_forwarded(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    for name in [
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "forwarded",
+        "x-real-ip",
+    ] {
+        request.headers_mut().remove(name);
+    }
+    next.run(request).await
+}
+
+/// The line that says how many output lines of a run were left out.
+fn dropped_line(agent: &str, run_id: &str, count: u64, first: u64) -> HubEvent {
+    HubEvent::Run {
+        agent: agent.to_string(),
+        message: FromRunner::RunOutput {
+            run_id: run_id.to_string(),
+            // The first left-out line's number, which nothing else has.
+            seq: first,
+            stream: "lore".into(),
+            line: format!(
+                "{count} output line(s) were left out here: they came faster than lore could \
+                 store them"
+            ),
+        },
+    }
 }
 
 /// A second runner that tried to connect for an agent whose link was live.
@@ -321,7 +509,7 @@ impl std::fmt::Display for HubError {
         f.write_str(match self {
             HubError::NotConnected => {
                 "the agent's container is not connected to lore; start it \
-                 (docker compose --profile agents up -d) and check its log"
+                 (docker compose -f docker-compose.agents.yml up -d) and check its log"
             }
             HubError::Timeout => "the agent's container did not answer in time",
             HubError::Closed => "the link to the agent's container closed",
@@ -390,6 +578,9 @@ struct Inner {
     resources: HashMap<String, Resources>,
     terminals: HashMap<String, Terminal>,
     intrusions: HashMap<String, Intrusion>,
+    /// Output lines left out per run (the queue was full): how many, and
+    /// the first one's sequence number, which the summary line takes.
+    dropped: HashMap<String, (u64, u64)>,
 }
 
 /// What the hub hands the task runner: what a runner said about a run,
@@ -407,6 +598,9 @@ pub enum HubEvent {
 pub struct Hub {
     db: Db,
     tokens: Vec<RunnerToken>,
+    /// Where each CLI signs in (`LORE_SIGN_IN_HOSTS_*` or the built-in
+    /// lists).
+    sign_in_hosts: Vec<(Kind, Vec<String>)>,
     inner: Mutex<Inner>,
     next_id: AtomicU64,
     /// Wrong runner secrets, by address: ten in fifteen minutes lock it out.
@@ -417,19 +611,23 @@ pub struct Hub {
     run_rx: Mutex<Option<mpsc::Receiver<HubEvent>>>,
 }
 
-/// Whether a link goes on after a message.
-#[derive(Debug, PartialEq, Eq)]
-enum Flow {
-    Continue,
-    Drop(&'static str),
-}
-
 impl Hub {
     pub fn new(db: Db, tokens: Vec<RunnerToken>) -> Self {
         let (run_tx, run_rx) = mpsc::channel(RUN_EVENTS_QUEUE);
+        let sign_in_hosts = [Kind::Claude, Kind::Codex, Kind::Opencode]
+            .into_iter()
+            .map(|kind| {
+                let hosts = sign_in_hosts_from_env(kind).unwrap_or_else(|error| {
+                    tracing::warn!(%error, "using the built-in sign-in hosts");
+                    sign_in_hosts(kind).iter().map(|h| h.to_string()).collect()
+                });
+                (kind, hosts)
+            })
+            .collect();
         Self {
             db,
             tokens,
+            sign_in_hosts,
             inner: Mutex::default(),
             next_id: AtomicU64::new(1),
             failures: RateLimiter::new(10, Duration::from_secs(15 * 60)),
@@ -503,6 +701,18 @@ impl Hub {
 
     fn token(&self, agent: &str) -> Option<&RunnerToken> {
         self.tokens.iter().find(|token| token.agent == agent)
+    }
+
+    /// Where the agent's CLI signs in.
+    fn hosts_of(&self, agent: &str) -> Vec<String> {
+        let Some(kind) = self.token(agent).map(|token| token.kind) else {
+            return Vec::new();
+        };
+        self.sign_in_hosts
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, hosts)| hosts.clone())
+            .unwrap_or_default()
     }
 
     /// Whether `presented` is the runner secret of `agent`. Every stored
@@ -712,23 +922,83 @@ impl Hub {
         }
     }
 
-    /// Hands a run event to the task runner; a full queue drops the link.
-    fn run_event(&self, agent: &str, message: &FromRunner) -> Flow {
-        match self.run_tx.try_send(HubEvent::Run {
+    /// Hands a run's start, end or refusal to the task runner: never left
+    /// out, it waits for room when the queue is full (without holding up
+    /// the link).
+    fn run_event(&self, agent: &str, message: &FromRunner) {
+        let mut events = Vec::new();
+        // A run's end comes after the line saying what was left out.
+        if let FromRunner::RunExit { run_id, .. } = message
+            && let Some((count, first)) = self.inner().dropped.remove(run_id)
+        {
+            events.push(dropped_line(agent, run_id, count, first));
+        }
+        events.push(HubEvent::Run {
             agent: agent.to_string(),
             message: message.clone(),
-        }) {
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                Flow::Drop("its run events come faster than lore can store them")
+        });
+        let mut events = events.into_iter();
+        while let Some(event) = events.next() {
+            if let Err(mpsc::error::TrySendError::Full(event)) = self.run_tx.try_send(event) {
+                let rest: Vec<HubEvent> = std::iter::once(event).chain(events).collect();
+                let tx = self.run_tx.clone();
+                tokio::spawn(async move {
+                    for event in rest {
+                        let _ = tx.send(event).await;
+                    }
+                });
+                return;
             }
-            _ => Flow::Continue,
+        }
+    }
+
+    /// One output line for the task runner. When the queue is full the line
+    /// is left out and counted rather than the link closed (a legitimate
+    /// run may print fast); once there is room again, one line says how
+    /// many were left out.
+    fn run_line(&self, agent: &str, run_id: &str, seq: u64, stream: &str, line: &str) {
+        self.say_dropped(agent, run_id);
+        if self.inner().dropped.contains_key(run_id) {
+            self.note_dropped(run_id, seq);
+            return;
+        }
+        let event = HubEvent::Run {
+            agent: agent.to_string(),
+            message: FromRunner::RunOutput {
+                run_id: run_id.to_string(),
+                seq,
+                stream: stream.to_string(),
+                line: line.to_string(),
+            },
+        };
+        if self.run_tx.try_send(event).is_err() {
+            self.note_dropped(run_id, seq);
+        }
+    }
+
+    fn note_dropped(&self, run_id: &str, seq: u64) {
+        let mut inner = self.inner();
+        let entry = inner.dropped.entry(run_id.to_string()).or_insert((0, seq));
+        entry.0 += 1;
+    }
+
+    /// Sends the "lines were left out" line for a run when there is room.
+    fn say_dropped(&self, agent: &str, run_id: &str) {
+        let Some((count, first)) = self.inner().dropped.get(run_id).copied() else {
+            return;
+        };
+        if self
+            .run_tx
+            .try_send(dropped_line(agent, run_id, count, first))
+            .is_ok()
+        {
+            self.inner().dropped.remove(run_id);
         }
     }
 
     /// What a runner said: answers go to whoever asked; reports update the
     /// stored state.
-    fn on_message(&self, agent: &str, message: FromRunner) -> Flow {
-        let mut flow = Flow::Continue;
+    fn on_message(&self, agent: &str, message: FromRunner) {
         match &message {
             FromRunner::Status {
                 signed_in,
@@ -756,15 +1026,16 @@ impl Hub {
                 needs_code,
                 message: said,
             } => {
-                // Only a link to where the agent's CLI signs in is shown.
-                let kind = self.token(agent).map(|token| token.kind);
+                // Only a link to where the agent's CLI signs in is shown,
+                // and a refused one appears nowhere, not even in the text.
+                let hosts = self.hosts_of(agent);
                 let checked = url
                     .as_deref()
-                    .zip(kind)
-                    .and_then(|(url, kind)| checked_sign_in_url(kind, url));
+                    .and_then(|url| checked_sign_in_url_in(&hosts, url));
                 if url.is_some() && checked.is_none() {
                     tracing::warn!(%agent, "a sign-in link to an unexpected place was refused");
                 }
+                let said = hide_other_links(said, &hosts);
                 if let Some(login) = self.inner().logins.get_mut(agent)
                     && login.id == *id
                 {
@@ -773,7 +1044,11 @@ impl Hub {
                     if url.is_some() && checked.is_none() {
                         login.message = format!(
                             "The runner reported a sign-in link that is not at a host this CLI \
-                             signs in at, so it is not shown.\n{said}"
+                             signs in at, so it is not shown (the owner may list the CLI's \
+                             sign-in hosts in LORE_SIGN_IN_HOSTS_{}).\n{said}",
+                            self.token(agent)
+                                .map(|token| token.kind.id().to_ascii_uppercase())
+                                .unwrap_or_default()
                         );
                     }
                     (login.url, login.url_host) = checked.unzip();
@@ -794,7 +1069,7 @@ impl Hub {
                     login.url_host = None;
                     login.code = None;
                     login.needs_code = false;
-                    login.message = said.clone();
+                    login.message = hide_other_links(said, &self.hosts_of(agent));
                 }
                 tracing::info!(%agent, ok, "an interactive sign-in ended");
             }
@@ -815,13 +1090,22 @@ impl Hub {
             FromRunner::Unsupported { command, .. } => {
                 tracing::warn!(%agent, %command, "the runner does not support a command");
                 if command == "run_start" {
-                    flow = self.run_event(agent, &message);
+                    self.run_event(agent, &message);
                 }
             }
-            FromRunner::RunStarted { .. }
-            | FromRunner::RunOutput { .. }
-            | FromRunner::RunExit { .. } => {
-                flow = self.run_event(agent, &message);
+            FromRunner::RunStarted { .. } | FromRunner::RunExit { .. } => {
+                self.run_event(agent, &message);
+            }
+            FromRunner::RunOutput {
+                run_id,
+                seq,
+                stream,
+                line,
+            } => self.run_line(agent, run_id, *seq, stream, line),
+            FromRunner::RunOutputs { run_id, lines } => {
+                for line in lines {
+                    self.run_line(agent, run_id, line.seq, &line.stream, &line.line);
+                }
             }
             FromRunner::TerminalOutput { term_id, data } => {
                 self.on_terminal_output(agent, term_id, data);
@@ -845,7 +1129,6 @@ impl Hub {
                 let _ = answer.send(message);
             }
         }
-        flow
     }
 
     /// Whether the agent's current link is alive: it answers a ping within
@@ -1089,13 +1372,7 @@ impl Hub {
                     }
                     match frame {
                         Message::Text(text) => match protocol::decode::<FromRunner>(text.as_str()) {
-                            Ok(message) => {
-                                if let Flow::Drop(why) = self.on_message(agent, message) {
-                                    tracing::warn!(%agent, why, "closing a runner's link");
-                                    let _ = socket.send(Message::Close(None)).await;
-                                    return;
-                                }
-                            }
+                            Ok(message) => self.on_message(agent, message),
                             Err(error) => {
                                 tracing::warn!(%agent, %error, "a runner message could not be read");
                             }
@@ -1188,7 +1465,7 @@ mod tests {
     use crate::runner::{
         self, Config, End,
         drivers::{Driver, Settings},
-        protocol::{CredentialKind, LoginMethod, Secret},
+        protocol::{CredentialKind, LoginMethod, RunLine, Secret},
     };
 
     const CLAUDE_SECRET: &str = "claude-runner-secret-0123456789abcdef";
@@ -1335,7 +1612,7 @@ esac
     fn start(config: Config) -> tokio::task::JoinHandle<Result<End>> {
         let driver = Arc::new(Driver::new(config.settings.clone()));
         driver.prepare().unwrap();
-        tokio::spawn(async move { runner::session(&config, driver).await })
+        tokio::spawn(async move { runner::session(&config, driver, Default::default()).await })
     }
 
     const WAIT: Duration = Duration::from_secs(20);
@@ -1662,11 +1939,19 @@ esac
         // Another agent's secret.
         let wrong = config(&pair, "claude-builtin", Kind::Claude, CODEX_SECRET);
         let driver = Arc::new(Driver::new(wrong.settings.clone()));
-        assert!(runner::session(&wrong, driver).await.is_err());
+        assert!(
+            runner::session(&wrong, driver, Default::default())
+                .await
+                .is_err()
+        );
         // An agent lore does not know.
         let unknown = config(&pair, "gemini-builtin", Kind::Claude, CLAUDE_SECRET);
         let driver = Arc::new(Driver::new(unknown.settings.clone()));
-        assert!(runner::session(&unknown, driver).await.is_err());
+        assert!(
+            runner::session(&unknown, driver, Default::default())
+                .await
+                .is_err()
+        );
         assert!(pair.hub.link("claude-builtin").is_none());
         assert!(
             !pair
@@ -2404,7 +2689,9 @@ esac
         let pair = listen().await;
         let lying = config(&pair, "claude-builtin", Kind::Codex, CLAUDE_SECRET);
         let driver = Arc::new(Driver::new(lying.settings.clone()));
-        let ended = runner::session(&lying, driver).await.unwrap();
+        let ended = runner::session(&lying, driver, Default::default())
+            .await
+            .unwrap();
         assert!(
             matches!(&ended, End::Refused(reason) if reason.contains("runs claude")),
             "{ended:?}"
@@ -2422,7 +2709,9 @@ esac
         connected(&pair.hub, "claude-builtin").await;
         let thief = config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET);
         let driver = Arc::new(Driver::new(thief.settings.clone()));
-        let ended = runner::session(&thief, driver).await.unwrap();
+        let ended = runner::session(&thief, driver, Default::default())
+            .await
+            .unwrap();
         assert!(
             matches!(&ended, End::Refused(reason) if reason.contains("another runner")),
             "{ended:?}"
@@ -2473,20 +2762,40 @@ esac
     async fn a_sign_in_link_to_elsewhere_is_not_shown() {
         let pair = listen().await;
         pair.hub.login_started("claude-builtin", 7, "interactive");
-        let flow = pair.hub.on_message(
+        pair.hub.on_message(
             "claude-builtin",
             FromRunner::LoginPrompt {
                 id: 7,
                 url: Some("https://phish.example/login".into()),
                 code: None,
                 needs_code: true,
-                message: "open it".into(),
+                message: "open https://phish.example/login?next=1 to sign in".into(),
             },
         );
-        assert_eq!(flow, Flow::Continue);
         let login = pair.hub.login_state("claude-builtin").unwrap();
         assert_eq!((login.url, login.url_host), (None, None));
         assert!(login.message.contains("not shown"), "{}", login.message);
+        // H12: the refused link appears nowhere in what the page gets.
+        assert!(
+            !login.message.contains("phish.example"),
+            "{}",
+            login.message
+        );
+        pair.hub.on_message(
+            "claude-builtin",
+            FromRunner::LoginDone {
+                id: 7,
+                ok: false,
+                message: "failed at https://phish.example/x".into(),
+            },
+        );
+        let login = pair.hub.login_state("claude-builtin").unwrap();
+        assert!(
+            !login.message.contains("phish.example"),
+            "{}",
+            login.message
+        );
+        pair.hub.login_started("claude-builtin", 7, "interactive");
         pair.hub.on_message(
             "claude-builtin",
             FromRunner::LoginPrompt {
@@ -2501,31 +2810,164 @@ esac
         assert_eq!(login.url_host.as_deref(), Some("claude.ai"));
     }
 
-    /// Run events wait in a bounded queue: a runner that floods it is
-    /// dropped instead of growing lore's memory; a link over its frame rate
-    /// is too.
+    /// H6: run events wait in a bounded queue. Output lines past it are
+    /// left out and counted (one line says how many), the run's end still
+    /// arrives, and the link stays; a link over its frame rate is closed.
     #[tokio::test]
-    async fn a_flooding_runner_loses_its_link() {
+    async fn a_flood_of_output_lines_is_summarised_not_fatal() {
         let pair = listen().await;
-        let line = |seq| FromRunner::RunOutput {
-            run_id: "r1".into(),
-            seq,
-            stream: "text".into(),
-            line: "x".into(),
-        };
-        for seq in 0..RUN_EVENTS_QUEUE as u64 {
-            assert_eq!(
-                pair.hub.on_message("claude-builtin", line(seq)),
-                Flow::Continue
+        let mut events = pair.hub.take_events().unwrap();
+        let lines: Vec<RunLine> = (1..=(RUN_EVENTS_QUEUE as u64 + 500))
+            .map(|seq| RunLine {
+                seq,
+                stream: "stderr".into(),
+                line: format!("noise {seq}"),
+            })
+            .collect();
+        for chunk in lines.chunks(200) {
+            pair.hub.on_message(
+                "claude-builtin",
+                FromRunner::RunOutputs {
+                    run_id: "r1".into(),
+                    lines: chunk.to_vec(),
+                },
             );
         }
-        assert!(matches!(
-            pair.hub.on_message("claude-builtin", line(u64::MAX)),
-            Flow::Drop(_)
-        ));
+        pair.hub.on_message(
+            "claude-builtin",
+            FromRunner::RunExit {
+                run_id: "r1".into(),
+                code: Some(0),
+                pushed: false,
+                head: None,
+                work_free_bytes: None,
+                reason: None,
+                answer: None,
+            },
+        );
+        let (mut kept, mut summary, mut exit) = (0, None, false);
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_secs(2), events.recv()).await
+        {
+            match event {
+                HubEvent::Run {
+                    message: FromRunner::RunOutput { stream, line, .. },
+                    ..
+                } if stream == "lore" => summary = Some(line),
+                HubEvent::Run {
+                    message: FromRunner::RunOutput { .. },
+                    ..
+                } => kept += 1,
+                HubEvent::Run {
+                    message: FromRunner::RunExit { .. },
+                    ..
+                } => {
+                    exit = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(kept, RUN_EVENTS_QUEUE);
+        assert!(exit, "the run's end was lost");
+        let summary = summary.expect("no line said that lines were left out");
+        assert!(summary.starts_with("500 output line(s)"), "{summary}");
         let mut bucket = Bucket::new(10.0, 20.0);
         assert!((0..20).all(|_| bucket.take(1.0)));
         assert!(!bucket.take(1.0));
+    }
+
+    /// H2: the agent networks come from the routing table; an address
+    /// without a route stands for itself.
+    #[test]
+    fn agent_networks_are_read_from_the_routing_table() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                     eth0\t00000000\t010012AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+                     eth0\t000012AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n\
+                     eth1\t00FA1FAC\t00000000\t0001\t0\t0\t0\tF0FFFFFF\t0\t0\t0\n";
+        let nets = agent_networks_in(
+            table,
+            &["172.31.250.2".parse().unwrap(), "10.9.9.9".parse().unwrap()],
+        );
+        assert_eq!(
+            nets[0],
+            crate::auth::Cidr::parse("172.31.250.0/28").unwrap()
+        );
+        assert_eq!(nets[1], crate::auth::Cidr::parse("10.9.9.9/32").unwrap());
+        assert!(nets[0].contains("172.31.250.9".parse().unwrap()));
+        assert!(!nets[0].contains("172.31.250.17".parse().unwrap()));
+    }
+
+    /// H2: a connection accepted on an agent-network address of lore never
+    /// reaches the public router; one on another address does.
+    #[tokio::test]
+    async fn the_public_listener_closes_connections_from_agent_networks() {
+        use axum::serve::ListenerExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = Router::new().route("/admin/api/session", get(|| async { "here" }));
+        let serve_on = |refused: Vec<std::net::IpAddr>| {
+            let app = app.clone();
+            async move {
+                let inner = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = inner.local_addr().unwrap().port();
+                let listener = PublicListener::new(inner, refused).tap_io(|_| {});
+                tokio::spawn(async move {
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await
+                });
+                port
+            }
+        };
+        let ask = |port: u16| async move {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let _ = stream
+                .write_all(
+                    b"GET /admin/api/session HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let mut answer = Vec::new();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer)).await;
+            String::from_utf8_lossy(&answer).into_owned()
+        };
+        let open = serve_on(vec!["10.1.2.3".parse().unwrap()]).await;
+        assert!(ask(open).await.contains("here"));
+        let closed = serve_on(vec!["127.0.0.1".parse().unwrap()]).await;
+        assert_eq!(ask(closed).await, "");
+    }
+
+    /// H12: the owner can list a CLI's sign-in hosts.
+    #[test]
+    fn the_owner_may_name_the_sign_in_hosts() {
+        let hosts = vec!["login.example.org".to_string()];
+        assert!(checked_sign_in_url_in(&hosts, "https://login.example.org/a").is_some());
+        assert!(checked_sign_in_url_in(&hosts, "https://claude.ai/a").is_none());
+        assert_eq!(
+            hide_other_links(
+                "go to https://evil.example/x now, or https://login.example.org/y",
+                &hosts
+            ),
+            "go to [a link to another host, not shown] now, or https://login.example.org/y"
+        );
+        // SAFETY: a name no other test uses.
+        unsafe {
+            std::env::set_var(
+                "LORE_SIGN_IN_HOSTS_OPENCODE",
+                "auth.example.net, x.example.com",
+            )
+        };
+        assert_eq!(
+            sign_in_hosts_from_env(Kind::Opencode).unwrap(),
+            vec!["auth.example.net".to_string(), "x.example.com".to_string()]
+        );
+        unsafe { std::env::set_var("LORE_SIGN_IN_HOSTS_OPENCODE", "https://x/") };
+        assert!(sign_in_hosts_from_env(Kind::Opencode).is_err());
+        unsafe { std::env::remove_var("LORE_SIGN_IN_HOSTS_OPENCODE") };
     }
 
     /// State-changing built-in routes take JSON only (a cross-site form
@@ -2560,6 +3002,34 @@ esac
             crate::ops::Guard::default(),
         )
         .with_builtin(pair.hub.clone());
+        // G9: a finished run whose summary quotes what it said.
+        pair.db
+            .insert_run(&crate::db::NewRun {
+                id: "r-summary".into(),
+                agent: "claude-builtin".into(),
+                kind: "task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        pair.db
+            .finish_run(
+                "r-summary",
+                &crate::db::RunEnd {
+                    status: "done".into(),
+                    summary: "secret-ish summary of the run".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let runner = crate::taskrunner::start(
+            pair.db.clone(),
+            pair.hub.clone(),
+            events.clone(),
+            crate::ops::Guard::default(),
+            None,
+        )
+        .unwrap();
+        let admin = admin.with_task_runner(runner);
         let router = crate::admin::router(Arc::new(admin));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -2574,6 +3044,24 @@ esac
         let http = reqwest::Client::new();
         let owner = sign_in(&http, &base, "admin", "admin-password-long").await;
         let viewer = sign_in(&http, &base, "viewer", "viewer-password-long").await;
+        let history = |cookie: String| {
+            let http = http.clone();
+            let base = base.clone();
+            async move {
+                http.get(format!("{base}/admin/api/builtin/runs"))
+                    .header(header::COOKIE, cookie)
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap()
+            }
+        };
+        let seen = history(viewer.clone()).await;
+        assert!(seen.contains("r-summary"), "{seen}");
+        assert!(!seen.contains("secret-ish summary"), "{seen}");
+        assert!(history(owner.clone()).await.contains("secret-ish summary"));
         for path in ["logout", "refresh", "login/cancel", "stop"] {
             let form = http
                 .post(format!("{base}/admin/api/builtin/claude-builtin/{path}"))

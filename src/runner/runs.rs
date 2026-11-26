@@ -43,7 +43,7 @@ use tokio::{
 
 use super::{
     drivers::{CliHome, Driver, redact_with, shorten},
-    protocol::{FromRunner, Kind, RunKind, RunSpec, ToRunner},
+    protocol::{FromRunner, Kind, RunKind, RunLine, RunSpec, ToRunner},
     sandbox::{self, Occupancy},
 };
 
@@ -69,16 +69,29 @@ const NICE: i32 = 10;
 /// Longest final answer sent back for a conversation.
 const ANSWER_CHARS: usize = 32_000;
 
-/// The runs of one link: at most one at a time.
+/// The runs going on in this runner process, by run id: a run stays here
+/// until it is cleaned up, whichever link it started on.
+pub type Registry = Arc<Mutex<HashMap<String, watch::Sender<Option<String>>>>>;
+
+/// Most output lines sent to lore in one frame.
+const BATCH_LINES: usize = 200;
+/// Most output bytes sent to lore in one frame (JSON escaping may grow
+/// them up to six times; a frame holds 1 MiB).
+const BATCH_BYTES: usize = 128 * 1024;
+/// Longest a line waits in a batch while the CLI runs.
+const BATCH_WAIT: Duration = Duration::from_millis(100);
+
+/// The runs of one link: at most one at a time in the container.
 pub struct Runs {
     driver: Arc<Driver>,
     out: mpsc::Sender<FromRunner>,
     work: PathBuf,
     git: PathBuf,
     agent: String,
-    /// Dropping a run's sender stops it.
-    active: Arc<Mutex<HashMap<String, watch::Sender<Option<String>>>>>,
-    /// Shared with the terminals: a run does not start while one is open.
+    /// The runner process's runs; a run's sender stops it.
+    active: Registry,
+    /// The runner process's: a run does not start while a terminal is
+    /// open, a sign-in goes, or an earlier run is still being cleaned up.
     occupancy: Arc<Occupancy>,
 }
 
@@ -89,15 +102,16 @@ impl Runs {
         work: PathBuf,
         git: PathBuf,
         agent: String,
-        occupancy: Arc<Occupancy>,
+        active: Registry,
     ) -> Self {
+        let occupancy = driver.occupancy().clone();
         Self {
             driver,
             out,
             work,
             git,
             agent,
-            active: Arc::default(),
+            active,
             occupancy,
         }
     }
@@ -121,7 +135,10 @@ impl Runs {
                 None
             }
             ToRunner::CleanWorkdir { run_id } => {
-                if valid_run_id(&run_id) && !self.active().contains_key(&run_id) {
+                if valid_run_id(&run_id)
+                    && !self.active().contains_key(&run_id)
+                    && !self.occupancy.run_going()
+                {
                     let _ = std::fs::remove_dir_all(self.work.join(&run_id));
                 }
                 None
@@ -163,16 +180,26 @@ impl Runs {
             secrets: Vec::new(),
             seq: 0,
             sent_bytes: 0,
+            batch: Vec::new(),
+            batch_bytes: 0,
+            batching: false,
             answer: None,
             spec,
         };
-        let (active, occupancy, out) = (
+        let (active, occupancy, out, driver) = (
             self.active.clone(),
             self.occupancy.clone(),
             self.out.clone(),
+            self.driver.clone(),
         );
+        // The janitor leaves the run's directory alone while it goes.
+        let held = self.driver.hold(&run.dir);
         tokio::spawn(async move {
             let exit = run.execute(stop_rx).await;
+            drop(held);
+            // Still holding the container: whatever this or an earlier run
+            // left under /work goes.
+            driver.clean_now();
             // The slot is free before lore hears that the run ended, so a
             // follow-up lore starts at once is not refused.
             active
@@ -198,11 +225,14 @@ fn refused(run_id: String, reason: String) -> FromRunner {
     }
 }
 
-/// The link closed: every run stops (its sender goes), and still deletes
-/// its work directory.
+/// The link closed: every run is told to stop, and still cleans up (its
+/// work directory, the agent user's processes) before it leaves the
+/// registry and frees the container.
 impl Drop for Runs {
     fn drop(&mut self) {
-        self.active().clear();
+        for stop in self.active().values() {
+            let _ = stop.send(Some("link_closed".into()));
+        }
     }
 }
 
@@ -230,6 +260,11 @@ struct Run {
     secrets: Vec<String>,
     seq: u64,
     sent_bytes: u64,
+    /// Output lines not sent yet: while the CLI runs, lines go to lore in
+    /// frames of up to [`BATCH_LINES`] lines.
+    batch: Vec<RunLine>,
+    batch_bytes: usize,
+    batching: bool,
     /// The CLI's final message so far (a conversation's answer).
     answer: Option<String>,
     spec: RunSpec,
@@ -246,16 +281,9 @@ impl Run {
         self.secrets = self.driver.secrets();
         self.secrets.push(self.spec.token.expose().to_string());
         // Nothing of an earlier run or terminal may be alive when this
-        // one's token arrives in the container.
-        if let Some(user) = self.driver.user()
-            && let Err(error) = sandbox::sweep(user).await
-        {
-            tracing::warn!(%error, "a run was refused: the agent user's processes would not end");
-            return refused(
-                self.spec.run_id.clone(),
-                format!("{BUSY}processes of the agent user would not end"),
-            );
-        }
+        // one's token arrives in the container (the runner exits when
+        // that cannot be done).
+        self.driver.sweep().await;
         let (ended, pushed, head) = match self.work_through(&mut stop).await {
             Ok(result) => result,
             Err(error) => {
@@ -279,6 +307,7 @@ impl Run {
             )
             .await;
         }
+        self.flush().await;
         let free = super::read_resources(&self.work).await.work_free_bytes;
         let reason = ended.reason.map(|reason| self.redact(&reason));
         let answer = self
@@ -297,11 +326,15 @@ impl Run {
         }
     }
 
+    /// Every known secret, then every credential format the leak scan
+    /// knows: a token the CLI renewed during the run is not in the list
+    /// made at its start, and is caught by its format.
     fn redact(&self, text: &str) -> String {
-        redact_with(text, &self.secrets)
+        crate::leakscan::redact_formats(&redact_with(text, &self.secrets))
     }
 
-    /// Sends one line (redacted and cut) to lore.
+    /// Queues one line (redacted and cut) for lore; sent at once outside
+    /// the CLI's output loop, in batches inside it.
     async fn say(&mut self, stream: &str, text: &str) {
         let line = shorten(&self.redact(text), LINE_CHARS);
         if line.is_empty() {
@@ -309,13 +342,29 @@ impl Run {
         }
         self.seq += 1;
         self.sent_bytes += line.len() as u64;
+        self.batch_bytes += line.len();
+        self.batch.push(RunLine {
+            seq: self.seq,
+            stream: stream.into(),
+            line,
+        });
+        if !self.batching || self.batch.len() >= BATCH_LINES || self.batch_bytes >= BATCH_BYTES {
+            self.flush().await;
+        }
+    }
+
+    /// Sends the queued lines in one frame.
+    async fn flush(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+        let lines = std::mem::take(&mut self.batch);
+        self.batch_bytes = 0;
         let _ = self
             .out
-            .send(FromRunner::RunOutput {
+            .send(FromRunner::RunOutputs {
                 run_id: self.spec.run_id.clone(),
-                seq: self.seq,
-                stream: stream.into(),
-                line,
+                lines,
             })
             .await;
     }
@@ -489,18 +538,13 @@ impl Run {
         Ok(home)
     }
 
-    /// After the CLI: every process of the agent user ends, then a
-    /// credential the CLI refreshed is taken back (checked), and a
-    /// conversation keeps its transcripts. Nothing else of the home stays.
+    /// After the CLI: every process of the agent user ends (or the runner
+    /// exits, and nothing of the home is read), and a conversation keeps
+    /// its transcripts. Nothing else of the home stays: a credential the
+    /// CLI renewed during the run is never taken back (the run may have
+    /// written any account's into it).
     async fn after_cli(&mut self, home: &CliHome) {
-        if let Some(user) = self.driver.user()
-            && let Err(error) = sandbox::sweep(user).await
-        {
-            self.say("error", &format!("after the run: {error}")).await;
-        }
-        if let Err(error) = self.driver.harvest(home, false) {
-            tracing::warn!(%error, "a refreshed credential could not be stored");
-        }
+        self.driver.sweep().await;
         if self.spec.kind == RunKind::Chat
             && let Some(name) = self.spec.workdir.clone()
             && let Err(error) = self.driver.keep_transcripts(&name, home)
@@ -685,6 +729,7 @@ impl Run {
     ) -> Result<Ended> {
         let mut child = command.spawn().context("starting the CLI")?;
         let session = child.id().and_then(|pid| Pid::from_raw(pid as i32));
+        self.flush().await;
         let _ = self
             .out
             .send(FromRunner::RunStarted {
@@ -738,8 +783,11 @@ impl Run {
         let mut code = None;
         let mut exited = false;
         let mut open = true;
+        let mut tick = tokio::time::interval(BATCH_WAIT);
+        self.batching = true;
         while open || !exited {
             tokio::select! {
+                _ = tick.tick(), if !self.batch.is_empty() => self.flush().await,
                 line = lines_rx.recv(), if open => match line {
                     Some((is_err, line)) => {
                         if line.trim().is_empty() {
@@ -752,6 +800,7 @@ impl Run {
                         };
                         if let Some(session_id) = parsed.session.filter(|_| !session_sent) {
                             session_sent = true;
+                            self.flush().await;
                             let _ = self.out.send(FromRunner::RunStarted {
                                 run_id: self.spec.run_id.clone(),
                                 session_id: Some(self.redact(&session_id)),
@@ -827,6 +876,8 @@ impl Run {
                 }
             }
         }
+        self.batching = false;
+        self.flush().await;
         // Nothing the CLI started outlives the run.
         if let Some(session) = session {
             super::terminal::kill_session(session);
@@ -1726,14 +1777,14 @@ esac
         )
         .unwrap();
         let (tx, rx) = mpsc::channel(1024);
-        let occupancy = Arc::new(Occupancy::default());
+        let occupancy = driver.occupancy().clone();
         let runs = Runs::new(
             driver,
             tx,
             dir.join("work"),
             git,
             "claude-builtin".into(),
-            occupancy.clone(),
+            Registry::default(),
         );
         Bench {
             runs,
@@ -1778,12 +1829,99 @@ esac
 
     const QUIET_CLI: &str = "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"result\":\"ok\"}'\n";
 
+    /// Every line of a run until its end, and how many frames carried them.
+    async fn lines_of(rx: &mut mpsc::Receiver<FromRunner>, run_id: &str) -> (Vec<String>, usize) {
+        let (mut lines, mut frames) = (Vec::new(), 0);
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("no run_exit in time")
+                .expect("the channel closed");
+            match message {
+                FromRunner::RunOutputs { lines: batch, .. } => {
+                    frames += 1;
+                    lines.extend(batch.into_iter().map(|line| line.line));
+                }
+                FromRunner::RunOutput { line, .. } => {
+                    frames += 1;
+                    lines.push(line);
+                }
+                FromRunner::RunExit { run_id: id, .. } if id == run_id => return (lines, frames),
+                _ => {}
+            }
+        }
+    }
+
+    /// H1: whatever a run leaves in its home, the stored sign-in is never
+    /// replaced by it.
+    #[tokio::test]
+    async fn a_run_never_changes_the_stored_sign_in() {
+        let mut bench = bench(
+            "keep-sign-in",
+            "#!/bin/sh\nprintf '{\"claudeAiOauth\":{\"accessToken\":\"ATTACKER-ACCESS-000000\",\"refreshToken\":\"ATTACKER-REFRESH-00000\"}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\"}'\n",
+        )
+        .await;
+        let stored = bench.dir.join("state/claude-credentials.json");
+        let original = br#"{"claudeAiOauth":{"accessToken":"owner-access-0000000000","refreshToken":"owner-refresh-000000000"}}"#; // lore:allow-secret (fake test value)
+        super::super::drivers::write_private(&stored, original).unwrap();
+        bench.runs.handle(ToRunner::RunStart {
+            spec: spec("r1", "", &bench.mcp),
+        });
+        exit_of(&mut bench.rx, "r1").await;
+        assert_eq!(std::fs::read(&stored).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&bench.dir);
+    }
+
+    /// H6: a CLI that prints thousands of short lines reaches lore in a
+    /// few frames, every line kept and in order.
+    #[tokio::test]
+    async fn a_noisy_run_s_lines_travel_in_batches() {
+        let mut bench = bench(
+            "noisy",
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 30000 ]; do echo \"noise $i\" >&2; i=$((i+1)); done\n",
+        )
+        .await;
+        bench.runs.handle(ToRunner::RunStart {
+            spec: spec("r1", "", &bench.mcp),
+        });
+        let (lines, frames) = lines_of(&mut bench.rx, "r1").await;
+        let noise: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("noise "))
+            .collect();
+        assert_eq!(noise.len(), 30_000);
+        assert_eq!(noise[29_999], "noise 29999");
+        assert!(frames < 1_000, "{frames} frames for 30000 lines");
+        let _ = std::fs::remove_dir_all(&bench.dir);
+    }
+
+    /// H13: a token the CLI renewed during the run (not in the list made
+    /// at its start) is redacted by its format.
+    #[tokio::test]
+    async fn a_renewed_token_is_redacted_by_its_format() {
+        let mut bench = bench(
+            "renewed",
+            "#!/bin/sh\necho 'renewed sk-ant-oat01-RENEWEDtokenRENEWEDtokenRENEWEDtoken0123' >&2\n", // lore:allow-secret (fake test value)
+        )
+        .await;
+        bench.runs.handle(ToRunner::RunStart {
+            spec: spec("r1", "", &bench.mcp),
+        });
+        let (lines, _) = lines_of(&mut bench.rx, "r1").await;
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with("renewed"))
+            .unwrap();
+        assert!(!line.contains("RENEWEDtoken"), "{line}");
+        let _ = std::fs::remove_dir_all(&bench.dir);
+    }
+
     /// A container that is only busy answers `busy: …`, which lore can
     /// take as "try again later": another run, or an open terminal.
     #[tokio::test]
     async fn a_busy_container_says_so() {
         let mut bench = bench("busy", "#!/bin/sh\nsleep 5\n").await;
-        assert!(bench.occupancy.open_terminal());
+        assert_eq!(bench.occupancy.open_terminal(), Ok(true));
         bench.runs.handle(ToRunner::RunStart {
             spec: spec("r1", "", &bench.mcp),
         });
@@ -1806,7 +1944,7 @@ esac
         };
         assert!(reason.unwrap().starts_with(BUSY));
         // A terminal does not open while the run goes.
-        assert!(!bench.occupancy.open_terminal());
+        assert!(bench.occupancy.open_terminal().is_err());
         bench.runs.handle(ToRunner::RunStop {
             run_id: "r2".into(),
         });

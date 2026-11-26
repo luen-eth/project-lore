@@ -256,6 +256,10 @@ async fn main() -> Result<()> {
     // The internal listener: the runners' link, and `/mcp` and `/git` for
     // the built-in agents' runs (the only place their run tokens work).
     let mut runner_listener = None;
+    // lore's addresses on the agent networks: the public listener closes
+    // what arrives there, and nothing from those networks may speak for
+    // someone else in X-Forwarded-For.
+    let mut agent_addresses: Vec<std::net::IpAddr> = Vec::new();
     if let Some(hub) = &hub {
         // One address, or one per agent network (comma separated).
         let mut listeners = Vec::new();
@@ -273,8 +277,41 @@ async fn main() -> Result<()> {
                 "listening for built-in agent runners (internal network only; never publish this port)"
             );
             listeners.push(listener);
+            if !runner_bind.ip().is_unspecified() {
+                agent_addresses.push(runner_bind.ip());
+            }
+        }
+        if agent_addresses.is_empty() {
+            tracing::warn!(
+                "LORE_RUNNER_BIND listens on every address: the public listener cannot tell \
+                 connections from the agent networks apart. Bind it to lore's address on each \
+                 agent network, as the compose file does."
+            );
         }
         runner_listener = Some((listeners, hub.clone().router()));
+    }
+    let trusted_proxies = auth::parse_trusted_proxies(&env_or("LORE_TRUSTED_PROXIES", ""))?;
+    if trust_proxy {
+        let never = builtin::agent_networks(&agent_addresses);
+        let trust = if !trusted_proxies.is_empty() {
+            auth::ProxyTrust::Listed {
+                trusted: trusted_proxies,
+                never,
+            }
+        } else if hub.is_some() {
+            tracing::warn!(
+                "LORE_TRUST_PROXY is on without LORE_TRUSTED_PROXIES: X-Forwarded-For is believed \
+                 from any private or loopback peer outside the agent networks. Set \
+                 LORE_TRUSTED_PROXIES to your reverse proxy's network (for Dokploy, the subnet \
+                 of dokploy-network) so other containers cannot choose their address."
+            );
+            auth::ProxyTrust::Private { never }
+        } else {
+            auth::ProxyTrust::Any
+        };
+        auth::set_proxy_trust(trust);
+    } else if !trusted_proxies.is_empty() {
+        tracing::warn!("LORE_TRUSTED_PROXIES is set but LORE_TRUST_PROXY is off: it has no effect");
     }
     for warning in startup_warnings(
         &db,
@@ -297,6 +334,21 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, data = %data_dir.display(), "project-lore listening");
+    // Leftover temporary files (spooled pushes, backups, restores) and old
+    // safety copies go every ten minutes.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+            loop {
+                every.tick().await;
+                let db = db.clone();
+                let _ = tokio::task::spawn_blocking(move || db.sweep_leftovers()).await;
+            }
+        });
+    }
+    use axum::serve::ListenerExt;
+    let listener = builtin::PublicListener::new(listener, agent_addresses).tap_io(|_| {});
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -476,7 +528,11 @@ fn app_and_agents(
 /// network): the runners' link, and `/mcp` and `/git` for the runs, marked
 /// `auth::InternalListener` so run tokens work there and nowhere else.
 fn serve_internal(listeners: Vec<tokio::net::TcpListener>, runners: Router, agents: Router) {
-    let router = runners.merge(agents.layer(axum::Extension(auth::InternalListener)));
+    let router = runners.merge(
+        agents
+            .layer(axum::Extension(auth::InternalListener))
+            .layer(middleware::from_fn(builtin::strip_forwarded)),
+    );
     for listener in listeners {
         let router = router.clone();
         tokio::spawn(async move {
@@ -1549,5 +1605,53 @@ mod tests {
             let value: Value = response.json().await.unwrap();
             assert!(!text(value.clone()).contains("may not call"), "{value}");
         }
+    }
+
+    /// On the runner listener a request is always attributed to its direct
+    /// peer: a container that rotates `X-Forwarded-For` is still locked out
+    /// after the failure limit, even with `LORE_TRUST_PROXY=on`.
+    #[tokio::test]
+    async fn the_runner_listener_never_believes_forwarded_addresses() {
+        let dir = std::env::temp_dir().join(format!("lore-internal-xff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        let tokens = auth::load_tokens("", &format!("claude:{ENV_TOKEN}")).unwrap();
+        let events = Events::new();
+        let lore = Lore::new(
+            db.clone(),
+            Embedder::disabled(),
+            0.8,
+            events.clone(),
+            12,
+            None,
+            ops::Guard::default(),
+        );
+        let (_public, agents) = app_and_agents(
+            McpAuth::new(tokens, db.clone(), true),
+            lore,
+            None,
+            events,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        serve_internal(vec![listener], Router::new(), agents);
+        let http = reqwest::Client::new();
+        let mut codes = Vec::new();
+        for i in 0..25 {
+            let response = http
+                .post(format!("{base}/mcp"))
+                .header(header::AUTHORIZATION, "Bearer wrong-token-0123456789abcdef")
+                .header("x-forwarded-for", format!("203.0.113.{i}"))
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }))
+                .send()
+                .await
+                .unwrap();
+            codes.push(response.status().as_u16());
+        }
+        assert!(codes.contains(&429), "{codes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

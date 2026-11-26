@@ -642,6 +642,8 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
         .merge(builtin::routes())
         .merge(extra)
         .route_layer(middleware::from_fn_with_state(admin.clone(), guard))
+        // Before the guard: a cross-site write is refused whoever sent it.
+        .route_layer(middleware::from_fn(builtin::same_origin_writes))
         .layer(middleware::from_fn(security_headers))
         .with_state(admin)
 }
@@ -5959,6 +5961,78 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// H11: a write from another site (a sibling subdomain included) is
+    /// refused before anything happens, even with the session cookie; the
+    /// page itself (same origin) and non-browser clients (no Origin) pass.
+    #[tokio::test]
+    async fn cross_site_writes_are_refused_on_every_admin_route() {
+        let (base, admin) = serve().await;
+        let http = reqwest::Client::new();
+        let cookie = format!("{COOKIE}=admin-token");
+        // A full restore posted by a sibling site, as a no-cors form would.
+        let response = http
+            .post(format!("{base}/admin/api/restore/full"))
+            .header(header::COOKIE, &cookie)
+            .header(header::ORIGIN, "https://other.luen.casa")
+            .header("sec-fetch-site", "same-site")
+            .body("not a database")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert!(
+            !std::fs::read_dir(admin.db.data_dir())
+                .unwrap()
+                .flatten()
+                .any(|item| item
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pre-restore-"))
+        );
+        // Sec-Fetch-Site alone says enough; an Origin of another host too.
+        for (origin, site) in [
+            (None, Some("cross-site")),
+            (Some("https://evil.example"), None),
+            (Some("null"), None),
+        ] {
+            let mut request = http
+                .post(format!("{base}/admin/api/agents/someone/revoke"))
+                .header(header::COOKIE, &cookie);
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            if let Some(site) = site {
+                request = request.header("sec-fetch-site", site);
+            }
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                403,
+                "{origin:?} {site:?}"
+            );
+        }
+        // The page's own request and a script's reach the handler.
+        for origin in [Some(base.clone()), None] {
+            let mut request = http
+                .post(format!("{base}/admin/api/agents/someone/revoke"))
+                .header(header::COOKIE, &cookie)
+                .header("sec-fetch-site", "same-origin");
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = request.send().await.unwrap();
+            assert_ne!(response.status(), 403);
+        }
+        // Reading is not affected.
+        let response = http
+            .get(format!("{base}/admin/api/session"))
+            .header(header::COOKIE, &cookie)
+            .header("sec-fetch-site", "cross-site")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
     }
 
     #[tokio::test]

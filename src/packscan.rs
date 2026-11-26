@@ -303,6 +303,61 @@ pub struct PushView {
     /// against an object the pack does not carry, or an object past the
     /// limits): an object it holds may then be missing here.
     pub complete: bool,
+    /// Commits whose header is not the strict shape git writes and reads
+    /// (`tree`, the `parent` lines right after it, `author`, `committer`,
+    /// then other headers): `short id: why`. Their parents would be read
+    /// differently by git than by lore, so a built-in agent's push that
+    /// carries one is refused.
+    pub malformed_commits: Vec<String>,
+}
+
+/// A commit's tree and parents, read the way git reads them: the first
+/// header line is `tree <id>`, the parents are the `parent <id>` lines
+/// directly after it, then come exactly one `author` and one `committer`
+/// line, and no `tree` or `parent` line appears anywhere later in the
+/// header. Anything else is refused with the reason: a `parent` line after
+/// `author` is ignored by git (it sees a root commit) but would prove a
+/// fast-forward to a reader that takes every `parent` line.
+fn commit_links(data: &[u8], hash_len: usize) -> Result<CommitLinks, &'static str> {
+    let id = |text: &[u8]| {
+        (text.len() == hash_len * 2 && text.iter().all(u8::is_ascii_hexdigit))
+            .then(|| decode_hex(text))
+            .flatten()
+            .ok_or("an object id in the header is not a full hex id")
+    };
+    let mut lines = data
+        .split(|byte| *byte == b'\n')
+        .take_while(|line| !line.is_empty())
+        .peekable();
+    let root = match lines.next().and_then(|line| line.strip_prefix(b"tree ")) {
+        Some(text) => id(text)?,
+        None => return Err("the header does not start with a `tree` line"),
+    };
+    let mut parents = Vec::new();
+    while let Some(text) = lines.peek().and_then(|line| line.strip_prefix(b"parent ")) {
+        parents.push(id(text)?);
+        lines.next();
+    }
+    if !lines
+        .next()
+        .is_some_and(|line| line.starts_with(b"author "))
+    {
+        return Err("the `author` line does not follow the parents");
+    }
+    if !lines
+        .next()
+        .is_some_and(|line| line.starts_with(b"committer "))
+    {
+        return Err("the `committer` line does not follow the `author` line");
+    }
+    for line in lines {
+        for word in [&b"tree "[..], b"parent ", b"author ", b"committer "] {
+            if line.starts_with(word) {
+                return Err("a `tree`, `parent`, `author` or `committer` line is out of place");
+            }
+        }
+    }
+    Ok((root, parents))
 }
 
 fn hex(id: &[u8]) -> String {
@@ -347,6 +402,7 @@ pub fn push_view(body: &[u8], encoding: Option<&str>, limits: &Limits) -> Result
         if reader.too_large || reader.unresolved > 0 {
             view.complete = false;
         }
+        view.malformed_commits = reader.bad_commits.clone();
         for (id, (tree, parents)) in &reader.commits {
             view.commits.insert(
                 hex(id),
@@ -495,6 +551,9 @@ struct Pack<'a> {
     commits: HashMap<Vec<u8>, CommitLinks>,
     /// Deltas whose base the pack does not carry (a thin pack).
     unresolved: usize,
+    /// Commits whose header git would read differently from lore (see
+    /// `commit_links`): `short id: why`.
+    bad_commits: Vec<String>,
     blobs: Vec<BlobHits>,
     found: Vec<Finding>,
 }
@@ -516,6 +575,7 @@ impl<'a> Pack<'a> {
             roots: Vec::new(),
             commits: HashMap::new(),
             unresolved: 0,
+            bad_commits: Vec::new(),
             blobs: Vec::new(),
             found: Vec::new(),
         }
@@ -737,23 +797,27 @@ impl<'a> Pack<'a> {
                     self.scanner
                         .scan_content(&resolved.data, &format!("{what} {short}")),
                 );
-                if resolved.kind == COMMIT
-                    && let Some(root) = resolved
-                        .data
-                        .strip_prefix(b"tree ")
-                        .and_then(|rest| rest.split(|byte| *byte == b'\n').next())
-                        .and_then(decode_hex)
-                {
-                    self.roots.push(root.clone());
-                    if let Some(id) = &id {
-                        let parents = resolved
-                            .data
-                            .split(|byte| *byte == b'\n')
-                            .take_while(|line| !line.is_empty())
-                            .filter_map(|line| line.strip_prefix(b"parent "))
-                            .filter_map(decode_hex)
-                            .collect();
-                        self.commits.insert(id.clone(), (root, parents));
+                if resolved.kind == COMMIT {
+                    match commit_links(&resolved.data, self.hash_len) {
+                        Ok((root, parents)) => {
+                            self.roots.push(root.clone());
+                            if let Some(id) = &id {
+                                self.commits.insert(id.clone(), (root, parents));
+                            }
+                        }
+                        Err(why) => {
+                            // Still scanned for secrets like any commit; a
+                            // built-in agent's push carrying it is refused.
+                            if let Some(root) = resolved
+                                .data
+                                .strip_prefix(b"tree ")
+                                .and_then(|rest| rest.split(|byte| *byte == b'\n').next())
+                                .and_then(decode_hex)
+                            {
+                                self.roots.push(root);
+                            }
+                            self.bad_commits.push(format!("{short}: {why}"));
+                        }
                     }
                 }
             }
@@ -1505,6 +1569,67 @@ mod tests {
             hex(&object_id(BLOB, b"", 20)),
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
         );
+    }
+
+    /// G1: parents only right after `tree`, the way git reads them; any
+    /// other header shape is reported (the re-review's crafted push among
+    /// them).
+    #[test]
+    fn commit_parents_are_read_the_way_git_reads_them() {
+        let (t, p) = ("1".repeat(40), "2".repeat(40));
+        let who = "A <a@example.invalid> 1700000000 +0000";
+        let good = format!("tree {t}\nparent {p}\nauthor {who}\ncommitter {who}\n\nm\n");
+        let (root, parents) = commit_links(good.as_bytes(), 20).unwrap();
+        assert_eq!(
+            (hex(&root), parents.iter().map(|p| hex(p)).collect()),
+            (t.clone(), vec![p.clone()])
+        );
+        for (bad, why) in [
+            (
+                format!("tree {t}\nauthor {who}\ncommitter {who}\nparent {p}\n\nm\n"),
+                "out of place",
+            ),
+            (
+                format!("tree {t}\nauthor {who}\nparent {p}\ncommitter {who}\n\nm\n"),
+                "committer",
+            ),
+            (
+                format!("parent {p}\ntree {t}\nauthor {who}\ncommitter {who}\n\nm\n"),
+                "tree",
+            ),
+            (
+                format!(
+                    "tree {t}\nparent +{}\nauthor {who}\ncommitter {who}\n\nm\n",
+                    &p[1..]
+                ),
+                "hex",
+            ),
+            (format!("tree {t}\ncommitter {who}\n\nm\n"), "author"),
+            (
+                format!("tree {t}\nauthor {who}\ncommitter {who}\nauthor {who}\n\nm\n"),
+                "out of place",
+            ),
+        ] {
+            let refused = commit_links(bad.as_bytes(), 20).unwrap_err();
+            assert!(refused.contains(why), "{bad:?}: {refused}");
+        }
+        let view = push_view(
+            include_bytes!("testdata/misplaced-parent.body"),
+            None,
+            &LIMITS,
+        )
+        .unwrap();
+        assert_eq!(
+            view.malformed_commits.len(),
+            1,
+            "{:?}",
+            view.malformed_commits
+        );
+        assert!(view.commits.is_empty(), "{:?}", view.commits);
+        // An ordinary push has none.
+        let view = push_view(&project(b"print('hello')\n"), None, &LIMITS).unwrap();
+        assert!(view.malformed_commits.is_empty());
+        assert_eq!(view.commits.len(), 1);
     }
 
     #[test]

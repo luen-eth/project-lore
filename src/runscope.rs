@@ -115,6 +115,13 @@ pub struct RunScope {
     /// verified (a shared-token session can name itself anything).
     #[serde(default)]
     pub requested_via: String,
+    /// The branches this run created (by a push through the git proxy or
+    /// `repo_commit`), from lore's record of the run's ref updates
+    /// (`agent_run_refs`): filled in each time the token is checked, never
+    /// part of the stored scope. A run may move these besides the default
+    /// branch.
+    #[serde(skip)]
+    pub created_branches: Vec<String>,
 }
 
 /// What `check_call` decided.
@@ -164,11 +171,38 @@ const TASK_RUN_ACTIONS: &[&str] = &["done", "release"];
 pub const CI_DIRECTORIES: &[&str] = &[".github/workflows", ".github/actions", ".circleci"];
 pub const CI_FILES: &[&str] = &[".gitlab-ci.yml", "azure-pipelines.yml", "Jenkinsfile"];
 
+/// A repository path as git and GitHub resolve it: `/`-separated, with
+/// empty and `.` segments dropped (`./.github//workflows/x` is
+/// `.github/workflows/x`). A path with a `..` segment is refused: it names
+/// nothing inside the repository, and a reader that resolved it would
+/// land somewhere else than the check looked. The one normaliser every
+/// path check of a run uses (`ci_path`, `RunScope::check_path`).
+pub fn normalize_path(path: &str) -> Result<String, String> {
+    let mut kept = Vec::new();
+    for segment in path.trim().split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                return Err(format!(
+                    "this run may not name a repository path with `..` (`{}`)",
+                    path.chars().take(200).collect::<String>()
+                ));
+            }
+            other => kept.push(other),
+        }
+    }
+    Ok(kept.join("/"))
+}
+
 /// The CI definition a repository path is, is below, or holds (a
 /// directory on the way to one, such as `.github`): the name to report,
-/// or `None`. Compared without case, `/`-separated, leading `/` ignored.
+/// or `None`. Compared without case, after `normalize_path` (a path with
+/// `..` counts as a CI path: it is refused anyway).
 pub fn ci_path(path: &str) -> Option<&'static str> {
-    let path = path.trim().trim_matches('/').to_ascii_lowercase();
+    let Ok(path) = normalize_path(path) else {
+        return Some(CI_DIRECTORIES[0]);
+    };
+    let path = path.to_ascii_lowercase();
     if path.is_empty() {
         return None;
     }
@@ -187,6 +221,46 @@ pub fn ci_path(path: &str) -> Option<&'static str> {
         .copied()
 }
 
+/// The CI definitions at a commit: for each CI file or directory, the id
+/// of its entry there (or none), by name.
+pub type CiState = Vec<(&'static str, Option<String>)>;
+
+/// The CI definitions of a commit from its root tree's entries and, when
+/// it has one, its `.github` tree's entries (each as `(name, id)`). The
+/// one reading of "the CI definitions reachable at a commit" that the git
+/// proxy and `repo_commit` share: two commits with the same state run the
+/// same CI files (a directory's id covers everything below it).
+pub fn ci_state(root: &[(String, String)], github: Option<&[(String, String)]>) -> CiState {
+    let find = |entries: &[(String, String)], name: &str| {
+        entries
+            .iter()
+            .find(|(entry, _)| entry == name)
+            .map(|(_, id)| id.to_ascii_lowercase())
+    };
+    let mut out: CiState = Vec::new();
+    for file in CI_FILES {
+        out.push((file, find(root, file)));
+    }
+    for dir in CI_DIRECTORIES {
+        let id = match dir.strip_prefix(".github/") {
+            Some(name) => github.and_then(|entries| find(entries, name)),
+            None => find(root, dir),
+        };
+        out.push((dir, id));
+    }
+    out
+}
+
+/// The CI definitions that differ between two states.
+pub fn ci_changes(before: &CiState, after: &CiState) -> Vec<&'static str> {
+    before
+        .iter()
+        .zip(after)
+        .filter(|(a, b)| a.1 != b.1)
+        .map(|(a, _)| a.0)
+        .collect()
+}
+
 /// The refusal of a CI change.
 pub fn ci_refusal(what: &str) -> String {
     format!(
@@ -198,9 +272,14 @@ pub fn ci_refusal(what: &str) -> String {
 
 /// The Dokploy procedures a run may call to change its task's project,
 /// each with the id key(s) that name its target (exactly one of them must
-/// be given). From Dokploy's API reference (docs.dokploy.com/docs/api);
-/// everything else, `project.remove` and every global procedure included,
-/// is refused.
+/// be given). The owner's choice: full authority inside the task's own
+/// project (create, configure, deploy and remove its applications, compose
+/// services, databases, domains, mounts, ports, redirects, security rules,
+/// backups and environments), nothing outside it. Names and id keys from
+/// Dokploy's API reference (docs.dokploy.com/docs/api, the reference pages
+/// of each resource, read 2026-11-26); everything else, `project.remove`
+/// and every global procedure (settings, users, SSH keys, registries,
+/// destinations, servers, …) included, is refused.
 const DOKPLOY_PROCEDURES: &[(&str, &[&str])] = &[
     ("application.create", &["environmentId"]),
     ("application.update", &["applicationId"]),
@@ -238,6 +317,9 @@ const DOKPLOY_PROCEDURES: &[(&str, &[&str])] = &[
     ("compose.fetchSourceType", &["composeId"]),
     ("compose.disconnectGitProvider", &["composeId"]),
     ("compose.move", &["composeId"]),
+    ("compose.deployTemplate", &["environmentId"]),
+    ("compose.processTemplate", &["composeId"]),
+    ("compose.import", &["composeId"]),
     ("domain.create", &["applicationId", "composeId"]),
     ("domain.update", &["domainId"]),
     ("domain.delete", &["domainId"]),
@@ -257,6 +339,28 @@ const DOKPLOY_PROCEDURES: &[(&str, &[&str])] = &[
     ("environment.update", &["environmentId"]),
     ("environment.remove", &["environmentId"]),
     ("environment.duplicate", &["environmentId"]),
+    (
+        "backup.create",
+        &["postgresId", "mysqlId", "mariadbId", "mongoId", "composeId"],
+    ),
+    ("backup.update", &["backupId"]),
+    ("backup.remove", &["backupId"]),
+    ("backup.manualBackupPostgres", &["backupId"]),
+    ("backup.manualBackupMySql", &["backupId"]),
+    ("backup.manualBackupMariadb", &["backupId"]),
+    ("backup.manualBackupMongo", &["backupId"]),
+    ("backup.manualBackupCompose", &["backupId"]),
+];
+
+/// Ids a procedure names that are not resources of the project and that
+/// it may still name: the template a compose service is made from (from
+/// Dokploy's public catalogue), and the backup destination the owner set
+/// up (a backup of the project's database is sent there; the destination
+/// itself is not changed).
+const DOKPLOY_REFERENCES: &[(&str, &str)] = &[
+    ("compose.deployTemplate", "id"),
+    ("backup.create", "destinationId"),
+    ("backup.update", "destinationId"),
 ];
 
 /// The database kinds, whose procedures all take `<kind>Id`.
@@ -321,24 +425,19 @@ fn dokploy_target(procedure: &str) -> Option<Vec<String>> {
 
 /// The GitHub endpoint classes a run may write under its own repository
 /// (`/repos/{owner}/{repo}/<class>/…`).
+/// No `git` (refs, trees, commits, tags), `merges`, `releases` (they
+/// create tags), `statuses`, `check-runs` or `check-suites` (forged
+/// checks): code changes enter only through the git proxy and
+/// `repo_commit`, which apply the CI rule, and merging is the owner's.
 const GITHUB_WRITE_CLASSES: &[&str] = &[
     "contents",
-    "git",
     "pulls",
     "issues",
     "comments",
     "labels",
     "milestones",
-    "statuses",
-    "check-runs",
-    "check-suites",
-    "merges",
-    "releases",
     "commits",
 ];
-
-/// The Git Data API kinds a run may write.
-const GITHUB_GIT_KINDS: &[&str] = &["blobs", "trees", "commits", "refs", "tags"];
 
 impl RunScope {
     /// `owner/repo`, as the task names it.
@@ -467,19 +566,29 @@ impl RunScope {
         }
     }
 
-    /// The paths of a commit a run makes (`repo_commit`): none may be a CI
-    /// definition unless the owner allows it.
+    /// One repository path a run writes, through `via` (`repo_commit`,
+    /// the Contents API, a Git Data tree entry): normalised first
+    /// (`normalize_path`, which refuses `..`), then no CI definition
+    /// unless the owner allows it. The one path check of every entry point.
+    pub fn check_path(&self, path: &str, via: &str) -> Result<(), String> {
+        let normal = normalize_path(path)?;
+        if self.ci_allowed {
+            return Ok(());
+        }
+        match ci_path(&normal) {
+            Some(what) => Err(ci_refusal(&format!("{what} through {via} `{path}`"))),
+            None => Ok(()),
+        }
+    }
+
+    /// The paths of a commit a run makes (`repo_commit`): each passes
+    /// `check_path`.
     pub fn check_commit_paths<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), String> {
-        if self.ci_allowed {
-            return Ok(());
-        }
         for path in paths {
-            if let Some(what) = ci_path(path) {
-                return Err(ci_refusal(&format!("{what} through `{path}`")));
-            }
+            self.check_path(path, "repo_commit")?;
         }
         Ok(())
     }
@@ -487,13 +596,30 @@ impl RunScope {
     /// The branch of a commit a run makes (`repo_commit`): the default
     /// branch, or a new branch it creates.
     pub fn check_commit_branch(&self, branch: &str, creates: bool) -> Result<(), String> {
-        if creates || (!self.branch.is_empty() && branch == self.branch) {
+        if creates || self.may_move(branch) {
             Ok(())
         } else {
             Err(format!(
-                "this run may commit only to the default branch `{}` or to a new branch, not to \
-                 the existing branch `{branch}`",
-                self.branch
+                "this run may commit only to {}, not to the existing branch `{branch}`",
+                self.movable()
+            ))
+        }
+    }
+
+    /// Where a run's new branch may start (`repo_commit`'s `create_from`):
+    /// the default branch or a branch this run created, by name (lore
+    /// resolves it to its current head), never a tag, a commit or another
+    /// ref such as `refs/pull/N/head`.
+    pub fn check_create_from(&self, from: &str) -> Result<(), String> {
+        let name = from.trim();
+        let name = name.strip_prefix("refs/heads/").unwrap_or(name);
+        if self.may_move(name) {
+            Ok(())
+        } else {
+            Err(format!(
+                "this run may start a new branch only from {} by name, not from `{}`",
+                self.movable().replace(" or a new branch", ""),
+                from.chars().take(100).collect::<String>()
             ))
         }
     }
@@ -538,11 +664,10 @@ impl RunScope {
         if zero(old) {
             return Ok(false);
         }
-        if self.branch.is_empty() || branch != self.branch {
+        if !self.may_move(branch) {
             return Err(format!(
-                "this run may update only the default branch `{}` or create new branches, not \
-                 the existing branch `{branch}`",
-                self.branch
+                "this run may update only {}, not the existing branch `{branch}`",
+                self.movable()
             ));
         }
         Ok(true)
@@ -615,17 +740,43 @@ impl RunScope {
         }
     }
 
+    /// Whether the run may move the existing branch `branch`: the default
+    /// branch, or a branch this run created itself (`created_branches`).
+    pub fn may_move(&self, branch: &str) -> bool {
+        (!self.branch.is_empty() && branch == self.branch)
+            || self
+                .created_branches
+                .iter()
+                .any(|created| created == branch)
+    }
+
+    /// The branches a run may move, as its refusals name them.
+    fn movable(&self) -> String {
+        if self.created_branches.is_empty() {
+            format!("the default branch `{}` or a new branch", self.branch)
+        } else {
+            format!(
+                "the default branch `{}`, a branch this run created ({}) or a new branch",
+                self.branch,
+                self.created_branches.join(", ")
+            )
+        }
+    }
+
     /// The endpoint class of a GitHub write under the run's repository
     /// (`rest` is what follows `/repos/{owner}/{repo}`, decoded and
-    /// lowercased): on the allowlist, and a Contents path that is no CI
-    /// definition.
+    /// lowercased): on the allowlist, and a Contents path that passes
+    /// `check_path`. Refs, merges, Git Data, releases (tags), statuses and
+    /// check runs are not on it: code reaches the repository only through
+    /// the git proxy and `repo_commit`, which compare the CI definitions.
     fn github_class(&self, rest: &[&str]) -> Result<(), String> {
         let class = rest.first().copied().unwrap_or_default();
         let refused = |class: &str| {
             format!(
                 "this run may not call {} endpoints (`/repos/{}/{class}…`): a built-in agent may \
-                 write only contents, git data, pulls, issues and their comments, labels, \
-                 milestones, statuses and check runs, merges and releases of its repository",
+                 write only contents, pull requests (not merge them), issues and their comments, \
+                 labels and milestones of its repository; code goes in by `git push` or \
+                 `repo_commit`, and merging is left to the owner",
                 if class.is_empty() { "these" } else { class },
                 self.repository()
             )
@@ -637,33 +788,32 @@ impl RunScope {
             return Err(refused(class));
         }
         match class {
-            "git" => {
-                let kind = rest.get(1).copied().unwrap_or_default();
-                if !GITHUB_GIT_KINDS.contains(&kind) {
-                    return Err(refused(&format!("git/{kind}")));
-                }
-            }
             // Only comments on a commit.
             "commits" => {
                 if !(rest.len() == 3 && rest[2] == "comments") {
                     return Err(refused("commits"));
                 }
             }
-            "contents" if !self.ci_allowed => {
-                let path = rest[1..].join("/");
-                if let Some(what) = ci_path(&path) {
-                    return Err(ci_refusal(&format!("{what} through the Contents API")));
+            // A pull request may be opened, commented, labelled and
+            // reviewed, never merged, and its head never updated from its
+            // base (both write a branch).
+            "pulls" => {
+                if rest.len() >= 3 && matches!(rest[2], "merge" | "update-branch") {
+                    return Err(refused(&format!("pulls/{}/{}", rest[1], rest[2])));
                 }
+            }
+            "contents" => {
+                let path = rest[1..].join("/");
+                self.check_path(&path, "the Contents API")?;
             }
             _ => {}
         }
         Ok(())
     }
 
-    /// A GitHub write the path check allowed, looked at with its body:
-    /// refs may not be deleted, forced, or move another existing branch
-    /// than the default one, and no tag ref is written; a tree may not
-    /// hold a CI definition (unless the owner allows it). `path` is the
+    /// A GitHub write the path check allowed, looked at with its body: a
+    /// Contents write goes to the default branch or a branch this run
+    /// created, and a pull request's base is never changed. `path` is the
     /// validated path.
     pub fn check_github_request(
         &self,
@@ -676,77 +826,32 @@ impl RunScope {
             .split('/')
             .filter(|segment| !segment.is_empty())
             .collect();
-        if segments.len() < 5 || segments[3] != "git" {
+        if segments.len() < 4 {
             return Ok(());
         }
-        match segments[4] {
-            "refs" => {
-                let name = segments[5..].join("/");
-                if method == "DELETE" {
-                    return Err(format!(
-                        "this run may not delete refs/{name}: a built-in agent never deletes a \
-                         branch or a tag"
-                    ));
-                }
-                if method == "POST" {
-                    let created = body
-                        .and_then(|body| body.get("ref"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if !created.starts_with("refs/heads/") {
-                        return Err(format!(
-                            "this run may create only branches (refs/heads/…), not `{created}`"
-                        ));
-                    }
-                    return Ok(());
-                }
-                // An update of an existing ref.
-                if body
-                    .and_then(|body| body.get("force"))
-                    .is_some_and(|force| force != &Value::Bool(false))
-                {
-                    return Err(
-                        "this run may not force a ref update: a built-in agent only moves a \
-                         branch forward"
-                            .into(),
-                    );
-                }
-                // The original spelling of the branch, for the comparison.
-                let original: Vec<&str> = path
-                    .split('/')
-                    .filter(|segment| !segment.is_empty())
-                    .collect();
-                let branch = original.get(6..).map(|rest| rest.join("/"));
-                match (segments.get(5).copied(), branch) {
-                    (Some("heads"), Some(branch))
-                        if !self.branch.is_empty() && branch == self.branch =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err(format!(
-                        "this run may update only the default branch `{}`, not refs/{name}",
-                        self.branch
-                    )),
-                }
-            }
-            "trees" if method == "POST" && !self.ci_allowed => {
-                let entries = body
-                    .and_then(|body| body.get("tree"))
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                for entry in &entries {
-                    let path = entry
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if let Some(what) = ci_path(path) {
-                        return Err(ci_refusal(&format!(
-                            "{what} through a Git Data tree entry `{path}`"
-                        )));
-                    }
-                }
-                Ok(())
+        match segments[3] {
+            "contents" => match body.and_then(|body| body.get("branch")) {
+                // Without a branch GitHub writes to the default branch.
+                None | Some(Value::Null) => Ok(()),
+                Some(Value::String(branch)) if self.may_move(branch.trim()) => Ok(()),
+                Some(Value::String(branch)) => Err(format!(
+                    "this run may write files only on {}, not on the existing branch `{}` \
+                     (open a new branch with `git push` or `repo_commit` first)",
+                    self.movable(),
+                    branch.chars().take(100).collect::<String>()
+                )),
+                Some(_) => Err("the Contents API `branch` must be a branch name".into()),
+            },
+            "pulls"
+                if method == "PATCH"
+                    && segments.len() == 5
+                    && body.is_some_and(|body| body.get("base").is_some()) =>
+            {
+                Err(
+                    "this run may not change a pull request's base branch: what a pull request \
+                     merges into is left to the owner"
+                        .into(),
+                )
             }
             _ => Ok(()),
         }
@@ -767,10 +872,10 @@ impl RunScope {
         let procedure = req.path.trim().trim_start_matches('/');
         let Some(targets) = dokploy_target(procedure) else {
             return Err(format!(
-                "this run may not call the Dokploy procedure `{procedure}`: inside its task's \
-                 project {project} it may only deploy, start, stop, update and configure the \
-                 project's applications, compose services, databases, domains, mounts, ports, \
-                 redirects, security rules and environments"
+                "this run may not call the Dokploy procedure `{procedure}`: it has full authority \
+                 inside its task's project {project} (its applications, compose services, \
+                 databases, domains, mounts, ports, redirects, security rules, backups and \
+                 environments) and none outside it (no global procedure, no project removal)"
             ));
         };
         let mut named: Vec<(String, String)> = Vec::new();
@@ -780,6 +885,11 @@ impl RunScope {
         if let Some(query) = &req.query {
             collect_named(&Value::Object(query.clone()), &mut named)?;
         }
+        named.retain(|(key, _)| {
+            !DOKPLOY_REFERENCES
+                .iter()
+                .any(|(name, reference)| name.eq_ignore_ascii_case(procedure) && key == reference)
+        });
         let given: Vec<&(String, String)> = named
             .iter()
             .filter(|(key, _)| targets.iter().any(|target| target == key))
@@ -1127,17 +1237,15 @@ mod tests {
         };
         for (method, path) in [
             ("POST", "/repos/luen-eth/shop/pulls"),
-            ("PUT", "/repos/luen-eth/shop/pulls/3/merge"),
+            ("PATCH", "/repos/luen-eth/shop/pulls/3"),
+            ("POST", "/repos/luen-eth/shop/pulls/3/reviews"),
+            ("POST", "/repos/luen-eth/shop/pulls/3/comments"),
             ("PATCH", "/repos/LUEN-ETH/SHOP/issues/3"),
             ("POST", "/repos/luen-eth/shop/issues/3/comments"),
+            ("POST", "/repos/luen-eth/shop/issues/3/labels"),
             ("PUT", "/repos/luen-eth/shop/contents/src/main.rs"),
-            ("POST", "/repos/luen-eth/shop/git/trees"),
-            ("PATCH", "/repos/luen-eth/shop/git/refs/heads/main"),
             ("POST", "/repos/luen-eth/shop/labels"),
-            ("POST", "/repos/luen-eth/shop/statuses/abc"),
-            ("POST", "/repos/luen-eth/shop/check-runs"),
-            ("POST", "/repos/luen-eth/shop/merges"),
-            ("POST", "/repos/luen-eth/shop/releases"),
+            ("POST", "/repos/luen-eth/shop/milestones"),
             ("POST", "/repos/luen-eth/shop/commits/abc/comments"),
         ] {
             assert!(allow(&ops::GITHUB, method, path), "{method} {path}");
@@ -1196,11 +1304,66 @@ mod tests {
                 "dispatches",
             ),
             (ops::GITHUB, "POST", "/repos/luen-eth/shop/%68ooks", "hooks"),
+            (ops::GITHUB, "POST", "/repos/luen-eth/shop/git/notes", "git"),
+            // G3: no ref writes, merges, Git Data, tags or forged checks.
+            (ops::GITHUB, "POST", "/repos/luen-eth/shop/git/refs", "git"),
+            (
+                ops::GITHUB,
+                "PATCH",
+                "/repos/luen-eth/shop/git/refs/heads/main",
+                "git",
+            ),
+            (
+                ops::GITHUB,
+                "DELETE",
+                "/repos/luen-eth/shop/git/refs/heads/x",
+                "git",
+            ),
+            (ops::GITHUB, "POST", "/repos/luen-eth/shop/git/trees", "git"),
             (
                 ops::GITHUB,
                 "POST",
-                "/repos/luen-eth/shop/git/notes",
-                "git/notes",
+                "/repos/luen-eth/shop/git/commits",
+                "git",
+            ),
+            (ops::GITHUB, "POST", "/repos/luen-eth/shop/git/blobs", "git"),
+            (ops::GITHUB, "POST", "/repos/luen-eth/shop/git/tags", "git"),
+            (ops::GITHUB, "POST", "/repos/luen-eth/shop/merges", "merges"),
+            (
+                ops::GITHUB,
+                "PUT",
+                "/repos/luen-eth/shop/pulls/3/merge",
+                "pulls/3/merge",
+            ),
+            (
+                ops::GITHUB,
+                "PUT",
+                "/repos/luen-eth/shop/pulls/3/update-branch",
+                "pulls/3/update-branch",
+            ),
+            (
+                ops::GITHUB,
+                "POST",
+                "/repos/luen-eth/shop/releases",
+                "releases",
+            ),
+            (
+                ops::GITHUB,
+                "POST",
+                "/repos/luen-eth/shop/statuses/abc",
+                "statuses",
+            ),
+            (
+                ops::GITHUB,
+                "POST",
+                "/repos/luen-eth/shop/check-runs",
+                "check-runs",
+            ),
+            (
+                ops::GITHUB,
+                "POST",
+                "/repos/luen-eth/shop/check-suites",
+                "check-suites",
             ),
             (
                 ops::GITHUB,
@@ -1228,93 +1391,66 @@ mod tests {
         }
     }
 
-    /// C3 and C5 through the REST API: CI paths, ref deletion, force,
-    /// tags and other branches.
+    /// C3 and G3/G8 through the REST API: CI paths (normalised), the
+    /// Contents branch, and a pull request's base.
     #[test]
     fn github_bodies_keep_ci_files_and_branches_safe() {
-        let scope = scope();
-        let why = denied(scope.check_call(
-            &ops::GITHUB,
-            "PUT",
+        let scope = RunScope {
+            created_branches: vec!["lore/fix-1".into()],
+            ..scope()
+        };
+        for path in [
             "/repos/luen-eth/shop/contents/.github/workflows/ci.yml",
-        ));
-        assert!(why.contains("CI definitions"), "{why}");
+            "/repos/luen-eth/shop/contents/./.github/workflows/ci.yml",
+            "/repos/luen-eth/shop/contents/.github/./workflows/ci.yml",
+            "/repos/luen-eth/shop/contents/.github/%2E/workflows/ci.yml",
+            "/repos/luen-eth/shop/contents/src/../.github/workflows/ci.yml",
+        ] {
+            let why = denied(scope.check_call(&ops::GITHUB, "PUT", path));
+            assert!(
+                why.contains("CI definitions") || why.contains("`..`"),
+                "{path}: {why}"
+            );
+        }
         let check = |method: &str, path: &str, body: Value| {
             scope.check_github_request(method, path, Some(&body))
         };
-        assert!(
-            check(
-                "POST",
-                "/repos/luen-eth/shop/git/trees",
-                json!({"tree": [{"path": "src/a.rs"}]})
-            )
-            .is_ok()
-        );
-        for entry in [
-            ".github",
-            ".github/workflows/x.yml",
-            "Jenkinsfile",
-            ".circleci",
+        let contents = "/repos/luen-eth/shop/contents/src/a.rs";
+        for body in [
+            json!({"message": "m", "content": "eA=="}),
+            json!({"message": "m", "content": "eA==", "branch": "main"}),
+            json!({"message": "m", "content": "eA==", "branch": "lore/fix-1"}),
         ] {
-            let why = check(
-                "POST",
-                "/repos/luen-eth/shop/git/trees",
-                json!({"base_tree": "abc", "tree": [{"path": entry, "type": "tree", "sha": "1"}]}),
-            )
-            .unwrap_err();
-            assert!(why.contains("CI definitions"), "{entry}: {why}");
+            assert!(check("PUT", contents, body.clone()).is_ok(), "{body}");
+        }
+        for body in [
+            json!({"message": "m", "content": "eA==", "branch": "release"}),
+            json!({"message": "m", "content": "eA==", "branch": "Main"}),
+            json!({"message": "m", "content": "eA==", "branch": ["main"]}),
+        ] {
+            assert!(check("PUT", contents, body.clone()).is_err(), "{body}");
         }
         assert!(
             check(
-                "PATCH",
-                "/repos/luen-eth/shop/git/refs/heads/main",
-                json!({"sha": "x"})
-            )
-            .is_ok()
-        );
-        assert!(
-            check(
-                "POST",
-                "/repos/luen-eth/shop/git/refs",
-                json!({"ref": "refs/heads/new", "sha": "x"})
-            )
-            .is_ok()
-        );
-        for (method, path, body, word) in [
-            (
-                "PATCH",
-                "/repos/luen-eth/shop/git/refs/heads/main",
-                json!({"sha": "x", "force": true}),
-                "force",
-            ),
-            (
-                "PATCH",
-                "/repos/luen-eth/shop/git/refs/heads/release",
-                json!({"sha": "x"}),
-                "only the default branch",
-            ),
-            (
-                "PATCH",
-                "/repos/luen-eth/shop/git/refs/tags/v1",
-                json!({"sha": "x"}),
-                "only the default branch",
-            ),
-            (
                 "DELETE",
-                "/repos/luen-eth/shop/git/refs/heads/old",
-                json!({}),
-                "delete",
-            ),
-            (
+                contents,
+                json!({"message": "m", "sha": "1", "branch": "x"})
+            )
+            .is_err()
+        );
+        // A pull request: title and body yes, its base never.
+        let pull = "/repos/luen-eth/shop/pulls/3";
+        assert!(check("PATCH", pull, json!({"title": "t"})).is_ok());
+        let why = check("PATCH", pull, json!({"base": "release"})).unwrap_err();
+        assert!(why.contains("base"), "{why}");
+        assert!(
+            check(
                 "POST",
-                "/repos/luen-eth/shop/git/refs",
-                json!({"ref": "refs/tags/v9", "sha": "x"}),
-                "only branches",
-            ),
-        ] {
-            let why = check(method, path, body).unwrap_err();
-            assert!(why.contains(word), "{method} {path}: {why}");
-        }
+                "/repos/luen-eth/shop/pulls",
+                json!({"base": "main", "head": "x"})
+            )
+            .is_ok()
+        );
         let allowed = RunScope {
             ci_allowed: true,
             ..scope.clone()
@@ -1327,6 +1463,40 @@ mod tests {
             ),
             Decision::Allow
         );
+    }
+
+    /// G3: a run moves the default branch and the branches it created,
+    /// and starts new branches only from those, by name.
+    #[test]
+    fn a_run_moves_only_the_default_branch_and_its_own_branches() {
+        let scope = RunScope {
+            created_branches: vec!["lore/fix-1".into()],
+            ..scope()
+        };
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        assert_eq!(
+            scope.check_ref_update(&a, &b, "refs/heads/lore/fix-1"),
+            Ok(true)
+        );
+        assert!(
+            scope
+                .check_ref_update(&a, &b, "refs/heads/release")
+                .is_err()
+        );
+        assert!(scope.check_commit_branch("lore/fix-1", false).is_ok());
+        assert!(scope.check_commit_branch("release", false).is_err());
+        for from in ["main", "refs/heads/main", "lore/fix-1"] {
+            assert!(scope.check_create_from(from).is_ok(), "{from}");
+        }
+        for from in [
+            "release",
+            "v1.0",
+            "refs/pull/3/head",
+            "0123456789abcdef0123456789abcdef01234567",
+            "main~1",
+        ] {
+            assert!(scope.check_create_from(from).is_err(), "{from}");
+        }
     }
 
     /// C7, C1, E4: Cloudflare DNS records only; Dokploy procedures on the
@@ -1410,6 +1580,29 @@ mod tests {
                 "/environment.create",
                 json!({"projectId": "proj-1234", "name": "e"}),
             ),
+            // G2: full authority inside the project, the owner's choice.
+            (
+                "/postgres.create",
+                json!({"name": "db", "environmentId": "env-1"}),
+            ),
+            (
+                "/compose.deployTemplate",
+                json!({"environmentId": "env-1", "id": "plausible"}),
+            ),
+            (
+                "/mounts.create",
+                json!({"serviceId": "app-1", "type": "bind", "hostPath": "/data"}),
+            ),
+            (
+                "/application.updateTraefikConfig",
+                json!({"applicationId": "app-1", "traefikConfig": "x"}),
+            ),
+            (
+                "/backup.create",
+                json!({"postgresId": "pg-1", "destinationId": "dest-shared",
+                       "schedule": "0 3 * * *", "prefix": "p", "database": "db",
+                       "databaseType": "postgres"}),
+            ),
         ] {
             assert!(
                 scope
@@ -1449,6 +1642,27 @@ mod tests {
                 "/application.refreshToken",
                 json!({"applicationId": "app-1"}),
                 "procedure",
+            ),
+            (
+                "/backup.manualBackupWebServer",
+                json!({"backupId": "b"}),
+                "procedure",
+            ),
+            (
+                "/destination.create",
+                json!({"projectId": "proj-1234"}),
+                "procedure",
+            ),
+            // An exempt key only for its own procedure.
+            (
+                "/application.update",
+                json!({"applicationId": "app-1", "destinationId": "dest-shared"}),
+                "not one of",
+            ),
+            (
+                "/compose.create",
+                json!({"environmentId": "env-1", "serverId": "srv-1"}),
+                "not one of",
             ),
             // The target outside the project, or not named.
             (
@@ -1530,6 +1744,13 @@ mod tests {
             ("docs/Jenkinsfile", None),
             ("Jenkinsfile", Some("Jenkinsfile")),
             ("", None),
+            // G8: `.` and empty segments are dropped; `..` counts as CI.
+            ("./.github/workflows/x.yml", Some(".github/workflows")),
+            (".github//workflows/x.yml", Some(".github/workflows")),
+            (".github/./workflows", Some(".github/workflows")),
+            ("./Jenkinsfile", Some("Jenkinsfile")),
+            ("src/../x", Some(".github/workflows")),
+            ("./src/main.rs", None),
         ] {
             assert_eq!(ci_path(path), found, "{path}");
         }

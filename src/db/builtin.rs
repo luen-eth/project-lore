@@ -81,6 +81,31 @@ CREATE TABLE IF NOT EXISTS delegations (
     via          TEXT NOT NULL DEFAULT '',
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
+-- Every ref update lore let a run make (schema 8): a push through the git
+-- proxy (`via` push) or a `repo_commit` (`via` repo_commit). `old` is
+-- empty or zeros for a branch the run created. A task is marked done only
+-- when its default branch points at a `new` recorded here for the run.
+CREATE TABLE IF NOT EXISTS agent_run_refs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id     TEXT NOT NULL,
+    ref        TEXT NOT NULL,
+    old        TEXT NOT NULL DEFAULT '',
+    new        TEXT NOT NULL,
+    via        TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS agent_run_refs_run ON agent_run_refs (run_id);
+-- What a built-in agent's run wrote to the shared memory and the board
+-- (schema 8): `kind` entry or message, the row's id, and the run. lore
+-- sets it itself, so briefings and `recall` can mark such text as written
+-- by a built-in run.
+CREATE TABLE IF NOT EXISTS run_writes (
+    kind       TEXT NOT NULL,
+    item_id    INTEGER NOT NULL,
+    run_id     TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (kind, item_id)
+);
 "#;
 
 /// Board tasks a built-in agent may take a day, at most.
@@ -1061,6 +1086,141 @@ impl Db {
                 params![oldest],
             )?;
         }
+    }
+}
+
+/// One ref update lore let a run make.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RunRef {
+    #[serde(rename = "ref")]
+    pub name: String,
+    pub old: String,
+    pub new: String,
+    pub via: String,
+    pub created_at: String,
+}
+
+impl RunRef {
+    /// Whether the update created the branch.
+    pub fn created(&self) -> bool {
+        self.old.bytes().all(|byte| byte == b'0')
+    }
+}
+
+impl Db {
+    /// Records a ref update lore let run `run_id` make (`via` push or
+    /// repo_commit). `old` empty or zeros: the run created the branch.
+    pub fn record_run_ref(
+        &self,
+        run_id: &str,
+        name: &str,
+        old: &str,
+        new: &str,
+        via: &str,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO agent_run_refs (run_id, ref, old, new, via) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                run_id,
+                name,
+                old.to_ascii_lowercase(),
+                new.to_ascii_lowercase(),
+                via
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The ref updates of a run, oldest first.
+    pub fn run_refs(&self, run_id: &str) -> Result<Vec<RunRef>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT ref, old, new, via, created_at FROM agent_run_refs WHERE run_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(RunRef {
+                name: row.get(0)?,
+                old: row.get(1)?,
+                new: row.get(2)?,
+                via: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The branches a run created (short names), in the order it created
+    /// them.
+    pub fn run_created_branches(&self, run_id: &str) -> Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        for update in self.run_refs(run_id)? {
+            if update.created()
+                && let Some(branch) = update.name.strip_prefix("refs/heads/")
+                && !out.iter().any(|known| known == branch)
+            {
+                out.push(branch.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// The default branch's head lore read with its own credential before
+    /// the run started (schema 8).
+    pub fn set_run_base_head(&self, run_id: &str, head: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE agent_runs SET base_head = ?2 WHERE id = ?1",
+            params![run_id, head.to_ascii_lowercase()],
+        )?;
+        Ok(())
+    }
+
+    /// The base head recorded for a run; empty when none was read.
+    #[cfg(test)]
+    pub fn run_base_head(&self, run_id: &str) -> Result<String> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT base_head FROM agent_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Marks an entry or a message (`kind`) as written by run `run_id`.
+    pub fn mark_run_write(&self, kind: &str, item_id: i64, run_id: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO run_writes (kind, item_id, run_id) VALUES (?1, ?2, ?3)",
+            params![kind, item_id, run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Which of `ids` (entries or messages, by `kind`) a run wrote: id →
+    /// run id.
+    pub fn run_writes(
+        &self,
+        kind: &str,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        let mut out = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT run_id FROM run_writes WHERE kind = ?1 AND item_id = ?2")?;
+        for id in ids {
+            if let Some(run) = stmt
+                .query_row(params![kind, id], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                out.insert(*id, run);
+            }
+        }
+        Ok(out)
     }
 }
 

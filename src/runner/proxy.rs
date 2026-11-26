@@ -40,8 +40,32 @@ platform.claude.com,api.openai.com,auth.openai.com,chatgpt.com,api.deepseek.com,
 
 /// Largest request head read.
 const HEAD_BYTES: usize = 8 * 1024;
-/// Tunnels open at once.
-const MAX_TUNNELS: usize = 256;
+
+/// How many tunnels the proxy holds, in all and for one client, and how
+/// long one may last: one agent cannot take every tunnel, nor hold one for
+/// ever.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Tunnels open at once, in all.
+    pub total: usize,
+    /// Tunnels open at once from one client address.
+    pub per_source: usize,
+    /// A tunnel through which nothing passed this long is closed.
+    pub idle: Duration,
+    /// A tunnel is closed after this long, whatever passes.
+    pub lifetime: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            total: 256,
+            per_source: 64,
+            idle: Duration::from_secs(15 * 60),
+            lifetime: Duration::from_secs(3 * 60 * 60),
+        }
+    }
+}
 
 /// What the proxy lets through.
 #[derive(Debug, Clone)]
@@ -158,10 +182,52 @@ pub async fn main_from_env() -> Result<()> {
 
 /// Accepts tunnels until the listener fails.
 pub async fn serve(listener: TcpListener, policy: Policy) {
+    serve_with(listener, policy, Limits::default()).await
+}
+
+/// One client's open tunnels; the count goes down when dropped.
+struct SourceSlot {
+    counts: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// [`serve`] with given limits.
+pub async fn serve_with(listener: TcpListener, policy: Policy, limits: Limits) {
     let policy = Arc::new(policy);
-    let slots = Arc::new(Semaphore::new(MAX_TUNNELS));
+    let slots = Arc::new(Semaphore::new(limits.total));
+    let counts: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>> = Arc::default();
     loop {
         let Ok((client, peer)) = listener.accept().await else {
+            continue;
+        };
+        let source = {
+            let mut table = counts.lock().unwrap_or_else(|e| e.into_inner());
+            let count = table.entry(peer.ip()).or_insert(0);
+            if *count >= limits.per_source {
+                None
+            } else {
+                *count += 1;
+                Some(SourceSlot {
+                    counts: counts.clone(),
+                    ip: peer.ip(),
+                })
+            }
+        };
+        let Some(source) = source else {
+            tracing::warn!(%peer, "a client holds as many tunnels as one may; refused");
+            drop(client);
             continue;
         };
         let Ok(slot) = slots.clone().try_acquire_owned() else {
@@ -170,10 +236,14 @@ pub async fn serve(listener: TcpListener, policy: Policy) {
         };
         let policy = policy.clone();
         tokio::spawn(async move {
-            if let Err(error) = tunnel(client, &policy).await {
-                tracing::debug!(%peer, %error, "a tunnel ended");
+            let ended = tokio::time::timeout(limits.lifetime, tunnel(client, &policy, limits.idle));
+            match ended.await {
+                Ok(Err(error)) => tracing::debug!(%peer, %error, "a tunnel ended"),
+                Err(_) => tracing::info!(%peer, "a tunnel reached its lifetime and was closed"),
+                Ok(Ok(())) => {}
             }
             drop(slot);
+            drop(source);
         });
     }
 }
@@ -188,7 +258,7 @@ async fn answer(client: &mut TcpStream, status: &str) -> Result<()> {
     Ok(())
 }
 
-async fn tunnel(mut client: TcpStream, policy: &Policy) -> Result<()> {
+async fn tunnel(mut client: TcpStream, policy: &Policy, idle: Duration) -> Result<()> {
     let mut head = Vec::new();
     let mut buffer = [0u8; 1024];
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -259,7 +329,45 @@ async fn tunnel(mut client: TcpStream, policy: &Policy) -> Result<()> {
     if head.len() > end {
         upstream.write_all(&head[end..]).await?;
     }
-    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    relay(client, upstream, idle).await
+}
+
+/// Carries bytes both ways until both sides are done, or nothing passed
+/// for `idle`.
+async fn relay(client: TcpStream, upstream: TcpStream, idle: Duration) -> Result<()> {
+    let (mut client_read, mut client_write) = client.into_split();
+    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+    let mut up = vec![0u8; 16 * 1024];
+    let mut down = vec![0u8; 16 * 1024];
+    let (mut up_open, mut down_open) = (true, true);
+    let mut last = tokio::time::Instant::now();
+    while up_open || down_open {
+        tokio::select! {
+            read = client_read.read(&mut up), if up_open => {
+                let n = read?;
+                if n == 0 {
+                    up_open = false;
+                    let _ = upstream_write.shutdown().await;
+                } else {
+                    upstream_write.write_all(&up[..n]).await?;
+                    last = tokio::time::Instant::now();
+                }
+            }
+            read = upstream_read.read(&mut down), if down_open => {
+                let n = read?;
+                if n == 0 {
+                    down_open = false;
+                    let _ = client_write.shutdown().await;
+                } else {
+                    client_write.write_all(&down[..n]).await?;
+                    last = tokio::time::Instant::now();
+                }
+            }
+            _ = tokio::time::sleep_until(last + idle) => {
+                anyhow::bail!("idle for {} seconds", idle.as_secs());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -311,10 +419,96 @@ mod tests {
     }
 
     async fn start(policy: Policy) -> SocketAddr {
+        start_with(policy, Limits::default()).await
+    }
+
+    async fn start_with(policy: Policy, limits: Limits) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, policy));
+        tokio::spawn(serve_with(listener, policy, limits));
         addr
+    }
+
+    /// H8: one client cannot hold every tunnel, and a tunnel that carries
+    /// nothing, or lasts too long, is closed.
+    #[tokio::test]
+    async fn one_client_cannot_hold_the_proxy_and_idle_tunnels_close() {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = echo.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 64];
+                    while let Ok(n) = socket.read(&mut buffer).await {
+                        if n == 0 || socket.write_all(&buffer[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let mut policy = Policy::parse("localhost", &port.to_string()).unwrap();
+        policy.allow_private = true;
+        let limits = Limits {
+            total: 10,
+            per_source: 3,
+            idle: Duration::from_millis(400),
+            lifetime: Duration::from_secs(2),
+        };
+        let proxy = start_with(policy, limits).await;
+        let connect = || async {
+            let mut stream = TcpStream::connect(proxy).await.unwrap();
+            stream
+                .write_all(format!("CONNECT localhost:{port} HTTP/1.1\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut reply = vec![0u8; 64];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut reply))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+            (stream, String::from_utf8_lossy(&reply[..n]).into_owned())
+        };
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let (stream, reply) = connect().await;
+            assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+            held.push(stream);
+        }
+        // A fourth from the same address is refused at once.
+        let (_, reply) = connect().await;
+        assert_eq!(reply, "");
+        // Idle tunnels close by themselves, and the slots come back.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let mut buffer = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(1), held[0].read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap_or(0);
+        assert_eq!(n, 0, "an idle tunnel stayed open");
+        let (mut busy, reply) = connect().await;
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        // A busy tunnel still ends at its lifetime.
+        let started = tokio::time::Instant::now();
+        loop {
+            if busy.write_all(b"ping").await.is_err() {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(200), busy.read(&mut buffer)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                _ => {}
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the tunnel outlived its lifetime"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(started.elapsed() >= Duration::from_millis(1500));
     }
 
     async fn ask(proxy: SocketAddr, request: &str) -> String {

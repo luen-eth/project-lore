@@ -61,6 +61,14 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(90);
 /// Resource readings are sent this often.
 const RESOURCES_EVERY: Duration = Duration::from_secs(60);
 
+/// The janitor looks for leftovers this often while the container is idle
+/// (and after every run, terminal and sign-in).
+const JANITOR_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// The runner renews an interactive sign-in in a clean moment this often
+/// (runs never give a renewed credential back).
+const RENEW_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// Longest wait between two connection attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -237,9 +245,36 @@ pub async fn main_from_env() -> Result<()> {
     if let Err(error) = driver.prepare() {
         tracing::warn!(%error, "preparing the CLI's state directory failed");
     }
+    // Whatever an earlier runner left under /work goes now.
+    driver.clean_leftovers().await;
+    {
+        // While idle: leftovers every ten minutes, a clean sign-in renewal
+        // every six hours (the first one after ten minutes).
+        let driver = driver.clone();
+        tokio::spawn(async move {
+            let mut janitor = tokio::time::interval(JANITOR_EVERY);
+            let start = tokio::time::Instant::now() + JANITOR_EVERY;
+            let mut renew = tokio::time::interval_at(start, RENEW_EVERY);
+            loop {
+                tokio::select! {
+                    _ = janitor.tick() => {
+                        driver.clean_leftovers().await;
+                    }
+                    _ = renew.tick() => match driver.renew_sign_in().await {
+                        Ok(true) => tracing::info!("a renewed sign-in was stored"),
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(%error, "renewing the sign-in failed"),
+                    },
+                }
+            }
+        });
+    }
+    // One for the process: a run still being cleaned up after the link
+    // dropped stays here, and keeps the container, until it is done.
+    let registry = runs::Registry::default();
     let mut backoff = Duration::from_secs(1);
     loop {
-        match session(&config, driver.clone()).await {
+        match session(&config, driver.clone(), registry.clone()).await {
             Ok(End::Closed) => {
                 tracing::info!("the link to lore closed; dialling again");
                 backoff = Duration::from_secs(1);
@@ -265,7 +300,11 @@ pub enum End {
 }
 
 /// One connection: the handshake, then commands until the link drops.
-pub async fn session(config: &Config, driver: Arc<Driver>) -> Result<End> {
+pub async fn session(
+    config: &Config,
+    driver: Arc<Driver>,
+    registry: runs::Registry,
+) -> Result<End> {
     let mut request = config
         .url
         .as_str()
@@ -322,23 +361,18 @@ pub async fn session(config: &Config, driver: Arc<Driver>) -> Result<End> {
     tracing::info!("connected to lore");
 
     let (out_tx, mut out_rx) = mpsc::channel::<FromRunner>(256);
-    let occupancy = Arc::new(sandbox::Occupancy::default());
     // Closed with the link: dropping it kills every terminal's session.
-    let terminals = terminal::Terminals::new(
-        driver.clone(),
-        out_tx.clone(),
-        terminal::Limits::default(),
-        occupancy.clone(),
-    );
+    let terminals =
+        terminal::Terminals::new(driver.clone(), out_tx.clone(), terminal::Limits::default());
     // Closed with the link too: dropping it stops the run, which still
-    // deletes its work directory.
+    // cleans up before it frees the container.
     let runs = runs::Runs::new(
         driver.clone(),
         out_tx.clone(),
         config.work.clone(),
         config.git.clone(),
         config.agent.clone(),
-        occupancy,
+        registry,
     );
     {
         let (driver, out) = (driver.clone(), out_tx.clone());
@@ -382,11 +416,28 @@ pub async fn session(config: &Config, driver: Arc<Driver>) -> Result<End> {
                 sink.send(Message::text(protocol::encode(&message))).await?;
             }
             _ = resources.tick() => {
-                let mut reading = read_resources(&config.work).await;
-                if driver.is_fresh() {
-                    reading.state_bytes = Some(driver.state_bytes());
-                }
-                let _ = out_tx.try_send(FromRunner::Resources(reading));
+                // Off the link's loop: the volume's size is a walk of its
+                // files (bounded), and `df` is a process.
+                let (driver, work, out) = (driver.clone(), config.work.clone(), out_tx.clone());
+                tokio::spawn(async move {
+                    let mut reading = read_resources(&work).await;
+                    if driver.is_fresh() {
+                        let state = driver.state_path();
+                        reading.state_free_bytes = free_bytes(&state).await;
+                        let measuring = driver.clone();
+                        reading.state_bytes = tokio::time::timeout(
+                            Duration::from_secs(20),
+                            tokio::task::spawn_blocking(move || measuring.state_bytes()),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                    }
+                    let (cleaned, cleaned_at) = driver.cleaned();
+                    reading.cleaned = Some(cleaned);
+                    reading.cleaned_at = cleaned_at;
+                    let _ = out.try_send(FromRunner::Resources(reading));
+                });
             }
             _ = silence.tick() => {
                 if last_heard.elapsed() > SILENCE_LIMIT {
@@ -520,27 +571,34 @@ pub async fn read_resources(work: &std::path::Path) -> Resources {
     let load = read("/proc/loadavg").and_then(|text| text.split_whitespace().next()?.parse().ok());
     let mem_used_bytes = read("/sys/fs/cgroup/memory.current").and_then(|t| t.trim().parse().ok());
     let mem_limit_bytes = read("/sys/fs/cgroup/memory.max").and_then(|t| t.trim().parse().ok());
-    let work_free_bytes = tokio::process::Command::new("df")
-        .args(["-Pk"])
-        .arg(work)
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .output()
-        .await
-        .ok()
-        .and_then(|output| {
-            let text = String::from_utf8_lossy(&output.stdout).into_owned();
-            let line = text.lines().nth(1)?.to_string();
-            let available: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
-            Some(available * 1024)
-        });
     Resources {
         load,
         mem_used_bytes,
         mem_limit_bytes,
-        work_free_bytes,
-        state_bytes: None,
+        work_free_bytes: free_bytes(work).await,
+        ..Resources::default()
     }
+}
+
+/// Free space where `path` is, from `df`.
+async fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("df")
+            .args(["-Pk"])
+            .arg(path)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let line = text.lines().nth(1)?.to_string();
+    let available: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
+    Some(available * 1024)
 }
 
 #[cfg(test)]

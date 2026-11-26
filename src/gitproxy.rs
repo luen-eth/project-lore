@@ -33,6 +33,7 @@ use crate::{
     leakscan,
     ops::{self, transport_reason},
     packscan::{self, Verdict},
+    runscope::CiState,
     vault::{Secret, VaultKey},
 };
 
@@ -402,7 +403,12 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
                 .extensions
                 .get::<ConnectInfo<SocketAddr>>()
                 .map(|info| info.0);
-            let ip = client_ip(&parts.headers, peer, state.auth.trust_proxy);
+            // On the internal listener the direct peer is the caller.
+            let internal = parts
+                .extensions
+                .get::<crate::auth::InternalListener>()
+                .is_some();
+            let ip = client_ip(&parts.headers, peer, state.auth.trust_proxy && !internal);
             if let Some(retry_after) = state.auth.failures.hit(&ip) {
                 tracing::warn!(%ip, "too many failed token attempts");
                 return too_many_requests(retry_after);
@@ -561,6 +567,7 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
     // and checked before a byte of it goes upstream. A push to a private
     // repository streams through untouched.
     let mut spooled: Option<SpoolStream> = None;
+    let mut run_updates: RefUpdates = Vec::new();
     let mut body = Some(body);
     let (owner, repo) = git.repo.split_once('/').unwrap_or((git.repo.as_str(), ""));
     let mut scan = None;
@@ -600,7 +607,10 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
                 .map(str::to_string);
             let taken = body.take().expect("the body is read once");
             match check_push(&state, taken, encoding, scan, run).await {
-                Ok(stream) => spooled = Some(stream),
+                Ok((stream, updates)) => {
+                    spooled = Some(stream);
+                    run_updates = updates;
+                }
                 Err(refused) => {
                     conclude(
                         &state,
@@ -744,6 +754,26 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
         .await;
         return plain(StatusCode::BAD_GATEWAY, reason);
     }
+    // A built-in agent's accepted push: every ref update it made is
+    // recorded for its run (lore credits a task only with a commit its own
+    // run pushed, and lets the run move again only branches it created).
+    if let Some(scope) = scope.as_ref().filter(|_| status.is_success())
+        && !run_updates.is_empty()
+    {
+        let db = state.auth.db.clone();
+        let run_id = scope.run_id.clone();
+        let updates = std::mem::take(&mut run_updates);
+        let recorded = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            for (old, new, name) in &updates {
+                db.record_run_ref(&run_id, name, old, new, "push")?;
+            }
+            Ok(())
+        })
+        .await;
+        if !matches!(recorded, Ok(Ok(()))) {
+            tracing::error!("recording a run's pushed refs failed");
+        }
+    }
     // The row is written once the headers are in: the duration is the
     // time to the response, and the body streams on without bookkeeping.
     conclude(
@@ -849,6 +879,10 @@ fn with_no_thin(body: &[u8]) -> Option<Vec<u8>> {
     (done && at == body.len()).then_some(out)
 }
 
+/// The ref updates of a push (`old`, `new`, ref), as its command list
+/// names them.
+type RefUpdates = Vec<(String, String, String)>;
+
 /// What the checks of a built-in agent's push need.
 struct RunPush<'a> {
     scope: &'a crate::runscope::RunScope,
@@ -859,10 +893,6 @@ struct RunPush<'a> {
     owner: String,
     repo: String,
 }
-
-/// The CI definitions at a commit: for each CI file or directory, the id
-/// of its entry (or none), by name.
-type CiState = Vec<(&'static str, Option<String>)>;
 
 impl RunPush<'_> {
     /// One GET on GitHub's API with lore's credential: the JSON, or why
@@ -945,7 +975,7 @@ impl RunPush<'_> {
             .collect())
     }
 
-    /// The CI definitions at a commit.
+    /// The CI definitions at a commit (`runscope::ci_state`).
     async fn ci_state(
         &self,
         state: &GitProxy,
@@ -954,29 +984,11 @@ impl RunPush<'_> {
     ) -> Result<CiState, String> {
         let root = self.tree_of(state, view, commit).await?;
         let root = self.entries(state, view, &root).await?;
-        let find = |entries: &[(String, String)], name: &str| {
-            entries
-                .iter()
-                .find(|(entry, _)| entry == name)
-                .map(|(_, id)| id.clone())
-        };
-        let mut out: CiState = Vec::new();
-        for file in crate::runscope::CI_FILES {
-            out.push((file, find(&root, file)));
-        }
-        let github = find(&root, ".github");
-        let github = match github {
-            Some(tree) => Some(self.entries(state, view, &tree).await?),
+        let github = match root.iter().find(|(name, _)| name == ".github") {
+            Some((_, tree)) => Some(self.entries(state, view, &tree.clone()).await?),
             None => None,
         };
-        for dir in crate::runscope::CI_DIRECTORIES {
-            let id = match dir.strip_prefix(".github/") {
-                Some(name) => github.as_deref().and_then(|entries| find(entries, name)),
-                None => find(&root, dir),
-            };
-            out.push((dir, id));
-        }
-        Ok(out)
+        Ok(crate::runscope::ci_state(&root, github.as_deref()))
     }
 
     /// Whether `old` is an ancestor of `new`: through the commits the pack
@@ -1029,6 +1041,14 @@ impl RunPush<'_> {
     /// old commit (the default branch's head for a new branch) unless the
     /// owner allows it. The refusal, when there is one.
     async fn check(&self, state: &GitProxy, view: &packscan::PushView) -> Result<(), String> {
+        // A commit git would read differently (a `parent` line after
+        // `author`, …) could prove a fast-forward that is not one.
+        if let Some(bad) = view.malformed_commits.first() {
+            return Err(format!(
+                "the push carries a commit whose header is not the shape git writes ({bad}); a \
+                 built-in agent pushes only commits made by git"
+            ));
+        }
         for (old, new, name) in &view.commands.updates {
             let existing = self.scope.check_ref_update(old, new, name)?;
             if existing && !self.fast_forward(state, view, old, new).await {
@@ -1080,12 +1100,7 @@ impl RunPush<'_> {
                 .await
                 .map_err(unreadable)?;
             let after = self.ci_state(state, view, new).await.map_err(unreadable)?;
-            let changed: Vec<&str> = before
-                .iter()
-                .zip(&after)
-                .filter(|(a, b)| a.1 != b.1)
-                .map(|(a, _)| a.0)
-                .collect();
+            let changed = crate::runscope::ci_changes(&before, &after);
             if !changed.is_empty() {
                 return Err(crate::runscope::ci_refusal(&format!(
                     "{} in {name}",
@@ -1217,7 +1232,7 @@ async fn check_push(
     encoding: Option<String>,
     guard: Option<ops::Guard>,
     run: Option<RunPush<'_>>,
-) -> Result<SpoolStream, PushRefused> {
+) -> Result<(SpoolStream, RefUpdates), PushRefused> {
     let permit = match tokio::time::timeout(SCAN_WAIT, scan_slots().acquire_owned()).await {
         Ok(Ok(permit)) => permit,
         _ => {
@@ -1328,7 +1343,11 @@ async fn check_push(
     };
     // A built-in agent's push: its refs and its CI definitions, refused in
     // the protocol when the command list could be read.
+    let mut accepted: RefUpdates = Vec::new();
     if let Some(run) = &run {
+        if let Some(Ok(view)) = &view {
+            accepted = view.commands.updates.clone();
+        }
         let refusal = match &view {
             _ if over => Some(format!(
                 "lore refused this push: it is larger than lore checks for a built-in agent's run \
@@ -1379,11 +1398,14 @@ async fn check_push(
             let file = tokio::fs::File::open(&spool.0)
                 .await
                 .map_err(|error| internal(&error))?;
-            return Ok(SpoolStream {
-                file,
-                buffer: vec![0; 64 * 1024],
-                _spool: spool,
-            });
+            return Ok((
+                SpoolStream {
+                    file,
+                    buffer: vec![0; 64 * 1024],
+                    _spool: spool,
+                },
+                accepted,
+            ));
         }
         Verdict::Found(findings) => {
             let mut lines = vec![
@@ -3593,6 +3615,87 @@ mod tests {
         let text = response.text().await.unwrap();
         assert!(text.contains("ng refs/heads/main"), "{text}");
         assert!(text.contains("delete"), "{text}");
+        assert_eq!(log.lock().unwrap().len(), sent, "nothing went upstream");
+        assert_eq!(db.ops_log(1).unwrap()[0].outcome, "denied");
+    }
+
+    /// G3 and G5: every ref update of a run's accepted push is recorded
+    /// for the run, and a branch the run created is one it may move later
+    /// (its token's scope learns it); a refused push records nothing.
+    #[tokio::test]
+    async fn a_run_s_accepted_pushes_are_recorded_for_it() {
+        let (base, db, _log) = working_proxy().await;
+        let token = run_token(&db, "run-git-record");
+        // The owner's switch, so this push needs no CI comparison upstream.
+        db.execute_for_test(
+            "UPDATE agent_runs SET scope = json_set(scope, '$.ci_allowed', json('true'))
+             WHERE id = 'run-git-record'",
+        );
+        let (zero, new) = ("0".repeat(40), "c".repeat(40));
+        let push = |line: String| {
+            let body = format!("{:04x}{line}0000", line.len() + 4);
+            reqwest::Client::new()
+                .post(format!("{base}/git/github/me/shop.git/git-receive-pack"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(body)
+                .send()
+        };
+        let response = push(format!("{zero} {new} refs/heads/feature\0report-status\n"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let refs = db.run_refs("run-git-record").unwrap();
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(
+            (
+                refs[0].name.as_str(),
+                refs[0].new.as_str(),
+                refs[0].via.as_str()
+            ),
+            ("refs/heads/feature", new.as_str(), "push")
+        );
+        assert_eq!(
+            db.run_created_branches("run-git-record").unwrap(),
+            vec!["feature"]
+        );
+        let auth = McpAuth::new(Vec::new(), db.clone(), false);
+        let found = auth.authenticate_on(&token, true).await.unwrap();
+        assert_eq!(found.scope().unwrap().created_branches, vec!["feature"]);
+        // Another existing branch is still refused, and nothing recorded.
+        let text = push(format!(
+            "{} {} refs/heads/release\0report-status\n",
+            "a".repeat(40),
+            "b".repeat(40)
+        ))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+        assert!(text.contains("ng refs/heads/release"), "{text}");
+        assert_eq!(db.run_refs("run-git-record").unwrap().len(), 1);
+    }
+
+    /// G1 end to end, with the re-review's crafted push: a commit whose
+    /// `parent OLD` line comes after `committer` (git reads a root commit,
+    /// a loose reader a fast-forward) is refused, and nothing goes up.
+    #[tokio::test]
+    async fn a_commit_with_a_misplaced_parent_is_refused() {
+        let (base, db, log) = working_proxy().await;
+        let token = run_token(&db, "run-git-misplaced");
+        let body = include_bytes!("testdata/misplaced-parent.body").to_vec();
+        let sent = log.lock().unwrap().len();
+        let response = reqwest::Client::new()
+            .post(format!("{base}/git/github/me/shop.git/git-receive-pack"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("ng refs/heads/main"), "{text}");
+        assert!(text.contains("not the shape git writes"), "{text}");
         assert_eq!(log.lock().unwrap().len(), sent, "nothing went upstream");
         assert_eq!(db.ops_log(1).unwrap()[0].outcome, "denied");
     }

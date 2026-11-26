@@ -905,6 +905,10 @@ impl Lore {
                         .check_commit_paths(commit.changes.iter().map(|(path, _)| path.as_str()))
                         .and_then(|()| {
                             scope.check_commit_branch(&commit.branch, commit.create_from.is_some())
+                        })
+                        .and_then(|()| match &commit.create_from {
+                            Some(from) => scope.check_create_from(from),
+                            None => Ok(()),
                         });
                 }
                 checked.err()
@@ -1032,7 +1036,31 @@ impl Lore {
                 .await
             }
             Plan::Commit(plan) => match self.leak_check(&upstream, &plan, scan).await {
-                Ok(()) => repo_commit(&mut upstream, &plan).await,
+                Ok(()) => {
+                    let run = scope.as_ref().map(|scope| scope.branch.clone());
+                    let committed = repo_commit(&mut upstream, &plan, run.as_deref()).await;
+                    // A run's commit is recorded for its run, like a push
+                    // through the git proxy: lore credits a task only with
+                    // such a commit, and a branch it created may be moved
+                    // again by the same run.
+                    if let (Ok(done), Some(scope)) = (&committed, &scope) {
+                        let (db, run_id) = (self.db.clone(), scope.run_id.clone());
+                        let (name, old, new) = (
+                            format!("refs/heads/{}", plan.branch),
+                            done.old.clone().unwrap_or_else(|| "0".repeat(40)),
+                            done.new.clone(),
+                        );
+                        if let Err(error) = blocking(move || {
+                            db.record_run_ref(&run_id, &name, &old, &new, "repo_commit")
+                                .map_err(internal)
+                        })
+                        .await
+                        {
+                            tracing::error!(%error, "recording a run's commit failed");
+                        }
+                    }
+                    committed.map(|done| done.text)
+                }
                 Err(refusal) => {
                     let this = self.clone();
                     let (session_id, actor, label, path) = (
@@ -1082,6 +1110,7 @@ impl Lore {
                         actor: &actor,
                         label: &label,
                         session_id: Some(&session_id),
+                        readable: scope.as_ref().and_then(|scope| scope.readable.as_deref()),
                     };
                     hint = self
                         .owner_hint(
@@ -1689,7 +1718,11 @@ async fn repo_search(
 /// One commit through the Git Data API: the branch's head, its tree, one
 /// blob per written file, one tree on top of the head's, one commit, and
 /// the branch moved to it without force (or created at it).
-async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<String, Failure> {
+async fn repo_commit(
+    upstream: &mut Upstream<'_>,
+    plan: &CommitPlan,
+    run_branch: Option<&str>,
+) -> Result<Committed, Failure> {
     let branch_ref = format!("/git/ref/heads/{}", encode_path(&plan.branch));
     upstream.step = "ref";
     let (status, value, _) = upstream
@@ -1710,6 +1743,31 @@ async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<S
             (head.to_string(), None)
         }
         404 => match &plan.create_from {
+            // A run starts a branch only from a branch by name (the scope
+            // checked which): read as a branch, never as a tag or commit.
+            Some(base) if run_branch.is_some() => {
+                let name = base.strip_prefix("refs/heads/").unwrap_or(base);
+                let value = upstream
+                    .json(
+                        "GET",
+                        upstream.repo_path(&format!("/git/ref/heads/{}", encode_path(name))),
+                        &[],
+                        None,
+                        &format!("the branch `{name}`"),
+                    )
+                    .await?;
+                let head = value
+                    .pointer("/object/sha")
+                    .and_then(Value::as_str)
+                    .filter(|_| {
+                        value.get("ref").and_then(Value::as_str)
+                            == Some(&format!("refs/heads/{name}"))
+                    })
+                    .ok_or_else(|| {
+                        Failure::plain(format!("GitHub found no branch `{name}` to start from"))
+                    })?;
+                (head.to_string(), Some(base.clone()))
+            }
             Some(base) => {
                 let resolved = upstream.resolve(Some(base)).await?;
                 (resolved.commit, Some(base.clone()))
@@ -1759,6 +1817,55 @@ async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<S
         .and_then(Value::as_str)
         .ok_or_else(|| Failure::plain("GitHub's answer for the head commit named no tree"))?
         .to_string();
+    // A run's commit to another branch than the default one: the CI
+    // definitions it starts from must be the default branch's, the rule
+    // the git proxy applies to a pushed branch. Its own changes never touch
+    // a CI path (the scope checked), so the new tip has the same.
+    if let Some(default) = run_branch
+        && plan.branch != default
+    {
+        upstream.step = "ci";
+        let from = ci_state_of(upstream, &base_tree).await?;
+        let value = upstream
+            .json(
+                "GET",
+                upstream.repo_path(&format!("/git/ref/heads/{}", encode_path(default))),
+                &[],
+                None,
+                "the default branch",
+            )
+            .await?;
+        let default_head = value
+            .pointer("/object/sha")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Failure::plain("GitHub's answer for the default branch named no commit")
+            })?
+            .to_string();
+        let default_tree = upstream
+            .json(
+                "GET",
+                upstream.repo_path(&format!("/git/commits/{default_head}")),
+                &[],
+                None,
+                "the default branch's commit",
+            )
+            .await?
+            .pointer("/tree/sha")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| Failure::plain("GitHub named no tree for the default branch"))?;
+        let against = ci_state_of(upstream, &default_tree).await?;
+        let changed = crate::runscope::ci_changes(&against, &from);
+        if !changed.is_empty() {
+            return Err(Failure::plain(crate::runscope::ci_refusal(&format!(
+                "{} differ between `{}` at {head} and the default branch `{default}`; nothing \
+                 was written",
+                changed.join(", "),
+                plan.branch
+            ))));
+        }
+    }
     // The current entries keep a file's mode (executable, symlink) and
     // catch a path that is a directory or a deletion of nothing.
     upstream.step = "tree";
@@ -1922,7 +2029,48 @@ async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<S
     for line in changed {
         out.push_str(&format!("- {line}\n"));
     }
-    Ok(out)
+    Ok(Committed {
+        text: out,
+        old: created.is_none().then(|| head.to_ascii_lowercase()),
+        new: new_commit.to_ascii_lowercase(),
+    })
+}
+
+/// What `repo_commit` did: its answer, the branch's head before (none for
+/// a branch it created) and the new commit.
+struct Committed {
+    text: String,
+    old: Option<String>,
+    new: String,
+}
+
+/// The CI definitions of a tree (`runscope::ci_state`): its root entries
+/// and its `.github` tree's, one level each.
+async fn ci_state_of(
+    upstream: &mut Upstream<'_>,
+    tree: &str,
+) -> Result<crate::runscope::CiState, Failure> {
+    let pairs = |entries: Vec<TreeEntry>| -> Vec<(String, String)> {
+        entries
+            .into_iter()
+            .map(|entry| (entry.path, entry.sha))
+            .collect()
+    };
+    let (root, whole) = upstream.tree(tree, false).await?;
+    if !whole {
+        return Err(Failure::plain(
+            "lore could not read the whole tree to compare its CI definitions; nothing was written",
+        ));
+    }
+    let root = pairs(root);
+    let github = match root.iter().find(|(name, _)| name == ".github") {
+        Some((_, sha)) => {
+            let sha = sha.clone();
+            Some(pairs(upstream.tree(&sha, false).await?.0))
+        }
+        None => None,
+    };
+    Ok(crate::runscope::ci_state(&root, github.as_deref()))
 }
 
 /// An answer cut to the output limit every provider tool has.
@@ -2101,6 +2249,20 @@ mod tests {
                     json!([{"sha": sha, "commit": {"tree": {"sha": TREE}}}]),
                 )
             }
+            // A branch whose tree carries a workflow the default branch
+            // does not have (`lore/fix` at 6666…, tree 7777…).
+            ("GET", ["git", "trees", "7777777777777777777777777777777777777777"]) => reply(
+                200,
+                json!({"sha": "7777777777777777777777777777777777777777", "truncated": false,
+                       "tree": [{"path": ".github", "mode": "040000", "type": "tree",
+                                 "sha": "8888888888888888888888888888888888888888"}]}),
+            ),
+            ("GET", ["git", "trees", "8888888888888888888888888888888888888888"]) => reply(
+                200,
+                json!({"sha": "8888888888888888888888888888888888888888", "truncated": false,
+                       "tree": [{"path": "workflows", "mode": "040000", "type": "tree",
+                                 "sha": "9999999999999999999999999999999999999999"}]}),
+            ),
             ("GET", ["git", "trees", _]) => reply(
                 200,
                 json!({"sha": TREE, "truncated": false, "tree": tree_entries()}),
@@ -2128,6 +2290,11 @@ mod tests {
                     _ => reply(404, json!({"message": "Not Found"})),
                 }
             }
+            ("GET", ["git", "ref", "heads", "lore", "fix"]) => reply(
+                200,
+                json!({"ref": "refs/heads/lore/fix",
+                       "object": {"sha": "6666666666666666666666666666666666666666"}}),
+            ),
             ("GET", ["git", "ref", "heads", branch @ ..]) => {
                 if branch.join("/") == "main" {
                     reply(
@@ -2138,6 +2305,11 @@ mod tests {
                     reply(404, json!({"message": "Not Found"}))
                 }
             }
+            ("GET", ["git", "commits", "6666666666666666666666666666666666666666"]) => reply(
+                200,
+                json!({"sha": "6666666666666666666666666666666666666666",
+                       "tree": {"sha": "7777777777777777777777777777777777777777"}}),
+            ),
             ("GET", ["git", "commits", sha]) => {
                 reply(200, json!({"sha": sha, "tree": {"sha": TREE}}))
             }
@@ -3164,6 +3336,81 @@ mod tests {
             "{answer}"
         );
         assert!(lines(&log).contains(&"PATCH /repos/ME/Shop/git/refs/heads/main".to_string()));
+        // G5: the commit is recorded for the run.
+        let refs = lore.db.run_refs("run-1").unwrap();
+        assert_eq!(
+            (
+                refs[0].name.as_str(),
+                refs[0].old.as_str(),
+                refs[0].new.as_str(),
+                refs[0].via.as_str()
+            ),
+            ("refs/heads/main", HEAD, NEW_COMMIT, "repo_commit")
+        );
+        // G3: a new branch starts only from the default branch or one the
+        // run created, by name; never from a tag, a commit or a pull
+        // request's ref.
+        let start = |from: &str, branch: &str| {
+            args::<RepoCommitArgs>(
+                &session,
+                json!({
+                    "repo": "me/shop", "branch": branch, "create_from": from,
+                    "message": "Change", "changes": [{"path": "a.txt", "content": "a\n"}]
+                }),
+            )
+        };
+        log.lock().unwrap().clear();
+        for from in ["v1", "refs/pull/3/head", HEAD, "release"] {
+            let refused = lore
+                .repo_commit(start(from, "lore/new"), as_run(&scope))
+                .await
+                .unwrap_err();
+            assert!(
+                refused.contains("may start a new branch only from"),
+                "{from}: {refused}"
+            );
+        }
+        assert!(log.lock().unwrap().is_empty());
+        let answer = lore
+            .repo_commit(start("main", "lore/new"), as_run(&scope))
+            .await
+            .unwrap();
+        assert!(
+            answer.contains("branch: lore/new (created from main"),
+            "{answer}"
+        );
+        assert!(lines(&log).contains(&"GET /repos/me/shop/git/ref/heads/main".to_string()));
+        assert_eq!(
+            lore.db.run_created_branches("run-1").unwrap(),
+            vec!["lore/new"]
+        );
+        // A branch the run created whose CI definitions differ from the
+        // default branch's: refused before anything is written (the rule
+        // the git proxy applies to a pushed branch).
+        log.lock().unwrap().clear();
+        let own = RunScope {
+            created_branches: vec!["lore/fix".into()],
+            ..scope.clone()
+        };
+        let refused = lore
+            .repo_commit(
+                args::<RepoCommitArgs>(
+                    &session,
+                    json!({"repo": "me/shop", "branch": "lore/fix", "message": "Change",
+                           "changes": [{"path": "a.txt", "content": "a\n"}]}),
+                ),
+                as_run(&own),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("CI definitions"), "{refused}");
+        assert!(
+            !lines(&log)
+                .iter()
+                .any(|line| line.starts_with("POST") || line.starts_with("PATCH")),
+            "{:?}",
+            lines(&log)
+        );
         // The read tools read anywhere, through either account.
         log.lock().unwrap().clear();
         lore.repo_tree(
