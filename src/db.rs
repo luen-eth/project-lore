@@ -1182,6 +1182,10 @@ pub struct Db {
     /// The database file; its directory holds the temporary files and the
     /// safety copies of the full backup and restore.
     path: Arc<PathBuf>,
+    /// Tests only: makes `load_full_backup` fail right after the pages
+    /// were replaced.
+    #[cfg(test)]
+    pub fail_after_load: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A stored user as the admin view lists it: no password hash.
@@ -1304,6 +1308,17 @@ impl Refusal {
     }
 }
 
+/// Why loading a full backup failed, and whether the live database had
+/// already been replaced when it did.
+#[derive(Debug)]
+pub enum LoadError {
+    /// Nothing was changed.
+    Unchanged(anyhow::Error),
+    /// The backup's pages replaced the live database, then a later step
+    /// (the migration, the counts) failed.
+    Replaced(anyhow::Error),
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -1318,6 +1333,8 @@ impl Db {
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
             path: Arc::new(path.to_path_buf()),
+            #[cfg(test)]
+            fail_after_load: Arc::default(),
         };
         db.remove_stale_temp_files();
         Ok(db)
@@ -1397,19 +1414,35 @@ impl Db {
 
     /// Replaces the live database with a prepared full backup through the
     /// SQLite online backup API, all or nothing, then runs the start-up
-    /// migration and returns the row count of every table.
-    pub fn load_full_backup(&self, source: &Path) -> Result<Vec<(String, i64)>> {
+    /// migration and returns the row count of every table. The error says
+    /// whether the live pages were already replaced when it happened.
+    pub fn load_full_backup(
+        &self,
+        source: &Path,
+    ) -> std::result::Result<Vec<(String, i64)>, LoadError> {
         let src = Connection::open_with_flags(
             source,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        )
+        .and_then(|conn| harden(&conn).map(|()| conn))
+        .map_err(|error| LoadError::Unchanged(error.into()))?;
         let mut conn = self.lock();
         {
-            let backup = rusqlite::backup::Backup::new(&src, &mut conn)?;
-            run_backup(&backup)?;
+            let backup = rusqlite::backup::Backup::new(&src, &mut conn)
+                .map_err(|error| LoadError::Unchanged(error.into()))?;
+            run_backup(&backup).map_err(LoadError::Unchanged)?;
         }
-        migrate(&conn)?;
-        table_counts(&conn)
+        #[cfg(test)]
+        if self
+            .fail_after_load
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(LoadError::Replaced(anyhow::anyhow!(
+                "a failure injected by a test"
+            )));
+        }
+        migrate(&conn).map_err(LoadError::Replaced)?;
+        table_counts(&conn).map_err(LoadError::Replaced)
     }
 
     /// The row count of every table, by name.
@@ -4385,6 +4418,7 @@ pub fn check_full_backup(path: &Path) -> std::result::Result<(), Refusal> {
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
+    .and_then(|conn| harden(&conn).map(|()| conn))
     .map_err(|_| Refusal::new("open", "the file cannot be opened as a SQLite database"))?;
     let integrity: std::result::Result<Vec<String>, rusqlite::Error> =
         conn.prepare("PRAGMA integrity_check").and_then(|mut stmt| {
@@ -4444,6 +4478,125 @@ pub fn check_full_backup(path: &Path) -> std::result::Result<(), Refusal> {
             ),
         ));
     }
+    check_schema_objects(&conn)?;
+    Ok(())
+}
+
+/// The FTS5 shadow tables of `entries_fts`. Lore's index keeps its content
+/// in `entries`, so `_content` never exists; it is accepted all the same,
+/// since it holds nothing that could run.
+const FTS_SHADOW_TABLES: &[&str] = &[
+    "entries_fts_data",
+    "entries_fts_idx",
+    "entries_fts_content",
+    "entries_fts_docsize",
+    "entries_fts_config",
+];
+
+/// Makes a connection to a database lore did not write safe to read and
+/// migrate: SQL in its schema may call only innocuous functions and
+/// virtual tables (`trusted_schema` off), and the schema itself cannot be
+/// tampered with through the connection (the defensive flag).
+fn harden(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::config::DbConfig;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+    conn.pragma_update(None, "trusted_schema", false)?;
+    Ok(())
+}
+
+/// Every schema object a fresh, migrated empty database holds: (type,
+/// name) with its SQL.
+fn expected_objects() -> Result<HashMap<(String, String), Option<String>>> {
+    let conn = Connection::open_in_memory()?;
+    migrate(&conn)?;
+    let mut stmt = conn.prepare("SELECT type, name, sql FROM sqlite_master")?;
+    let rows = stmt.query_map([], |row| Ok(((row.get(0)?, row.get(1)?), row.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Refuses a backup whose schema holds anything lore's own schema does not
+/// create: a view, a trigger other than the full-text index's own (with
+/// the SQL lore writes), a table or an index lore does not have, or a
+/// virtual table other than the full-text index. Restoring such a file
+/// would plant objects that run SQL inside the live database. SQLite's
+/// own objects (`sqlite_sequence`, the statistics tables, the automatic
+/// indexes of lore's tables) and the full-text index's shadow tables pass.
+fn check_schema_objects(conn: &Connection) -> std::result::Result<(), Refusal> {
+    let unreadable = || Refusal::new("schema", "the database schema cannot be read");
+    let expected = expected_objects().map_err(|_| unreadable())?;
+    let lore_tables: Vec<&str> = expected
+        .keys()
+        .filter(|(kind, _)| kind == "table")
+        .map(|(_, name)| name.as_str())
+        .collect();
+    let found: Vec<(String, String, String, Option<String>)> = conn
+        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()
+        })
+        .map_err(|_| unreadable())?;
+    for (kind, name, table, sql) in found {
+        let shown: String = name.chars().take(80).collect();
+        let foreign = |what: &str| {
+            Refusal::new(
+                "objects",
+                format!(
+                    "the database holds the {what} \"{shown}\", which lore's schema does not \
+                     create; a full backup made by lore never has one, so it is refused"
+                ),
+            )
+        };
+        let known = expected.get(&(kind.clone(), name.clone()));
+        let virtual_table = sql.as_deref().is_some_and(|sql| {
+            sql.trim_start()
+                .to_ascii_uppercase()
+                .starts_with("CREATE VIRTUAL")
+        });
+        match kind.as_str() {
+            "view" => return Err(foreign("view")),
+            "trigger" => {
+                if known.is_none_or(|lore_sql| *lore_sql != sql) {
+                    return Err(foreign("trigger"));
+                }
+            }
+            "table" => {
+                let internal = matches!(
+                    name.as_str(),
+                    "sqlite_sequence" | "sqlite_stat1" | "sqlite_stat4"
+                );
+                let shadow = FTS_SHADOW_TABLES.contains(&name.as_str());
+                if !(known.is_some() || internal || shadow) {
+                    return Err(foreign("table"));
+                }
+                // Only the full-text index is a virtual table, and only an
+                // FTS5 one.
+                let fts5 = sql.as_deref().is_some_and(|sql| {
+                    sql.to_ascii_lowercase()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .any(|pair| pair[0] == "using" && pair[1].starts_with("fts5"))
+                });
+                if virtual_table && !(name == "entries_fts" && fts5) {
+                    return Err(foreign("virtual table"));
+                }
+            }
+            "index" => {
+                let automatic = name.starts_with("sqlite_autoindex_")
+                    && sql.is_none()
+                    && (lore_tables.contains(&table.as_str())
+                        || FTS_SHADOW_TABLES.contains(&table.as_str()));
+                if !(known.is_some() || automatic) {
+                    return Err(foreign("index"));
+                }
+            }
+            _ => return Err(foreign(&kind)),
+        }
+    }
     Ok(())
 }
 
@@ -4453,7 +4606,15 @@ pub fn check_full_backup(path: &Path) -> std::result::Result<(), Refusal> {
 pub fn prepare_full_backup(path: &Path) -> std::result::Result<(), Refusal> {
     let prepared = (|| -> Result<()> {
         let conn = Connection::open(path)?;
+        harden(&conn)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        // The full-text index and its triggers are always lore's own: they
+        // are dropped here and created again from lore's schema below, so
+        // nothing the file defined for them survives.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS entries_ai; DROP TRIGGER IF EXISTS entries_ad;
+             DROP TRIGGER IF EXISTS entries_au; DROP TABLE IF EXISTS entries_fts;",
+        )?;
         migrate(&conn)?;
         conn.execute(
             "INSERT INTO entries_fts (entries_fts) VALUES ('rebuild')",
@@ -7930,6 +8091,99 @@ mod tests {
 
         assert_eq!(live.table_counts().unwrap(), before);
         assert_eq!(live.recent(None, None, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn full_backups_with_objects_lore_does_not_create_are_refused() {
+        let dir = test_dir("full-objects");
+        let live = Db::open(&dir.join("live/lore.db")).unwrap();
+        populate(&live);
+        let clean = dir.join("clean.sqlite");
+        live.snapshot_to(&clean).unwrap();
+        check_full_backup(&clean).unwrap();
+        let planted = [
+            (
+                "steal",
+                "CREATE TRIGGER steal AFTER INSERT ON users BEGIN \
+                 UPDATE users SET permissions = '[\"users\"]'; END;",
+            ),
+            (
+                "peek",
+                "CREATE VIEW peek AS SELECT password_hash FROM users;",
+            ),
+            ("extra", "CREATE TABLE extra (id INTEGER PRIMARY KEY);"),
+            (
+                "users_hash",
+                "CREATE INDEX users_hash ON users (password_hash);",
+            ),
+            (
+                "notes_fts",
+                "CREATE VIRTUAL TABLE notes_fts USING fts5 (body);",
+            ),
+            // A trigger with lore's name and other SQL.
+            (
+                "entries_ai",
+                "DROP TRIGGER entries_ai; CREATE TRIGGER entries_ai AFTER INSERT ON entries \
+                 BEGIN DELETE FROM users; END;",
+            ),
+        ];
+        for (index, (name, sql)) in planted.iter().enumerate() {
+            let file = dir.join(format!("planted-{index}.sqlite"));
+            live.snapshot_to(&file).unwrap();
+            Connection::open(&file).unwrap().execute_batch(sql).unwrap();
+            let refusal = check_full_backup(&file).unwrap_err();
+            assert_eq!(refusal.check, "objects", "{name}: {refusal:?}");
+            assert!(refusal.message.contains(name), "{refusal:?}");
+        }
+        // The objects SQLite makes itself pass: statistics, automatic indexes.
+        let analyzed = dir.join("analyzed.sqlite");
+        live.snapshot_to(&analyzed).unwrap();
+        Connection::open(&analyzed)
+            .unwrap()
+            .execute_batch("ANALYZE;")
+            .unwrap();
+        check_full_backup(&analyzed).unwrap();
+    }
+
+    #[test]
+    fn an_uploaded_database_is_opened_without_trusting_its_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        harden(&conn).unwrap();
+        let trusted: bool = conn
+            .query_row("PRAGMA trusted_schema", [], |row| row.get(0))
+            .unwrap();
+        assert!(!trusted);
+        use rusqlite::config::DbConfig;
+        assert!(conn.db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE).unwrap());
+        assert!(
+            !conn
+                .db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA)
+                .unwrap()
+        );
+        // Defensive: the schema cannot be written through the connection.
+        conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
+        assert!(
+            conn.execute_batch("PRAGMA writable_schema = ON; DELETE FROM sqlite_master;")
+                .is_err()
+        );
+        // A prepared backup keeps lore's own full-text triggers and index.
+        let dir = test_dir("full-harden");
+        let live = Db::open(&dir.join("live/lore.db")).unwrap();
+        populate(&live);
+        let file = dir.join("prepared.sqlite");
+        live.snapshot_to(&file).unwrap();
+        check_full_backup(&file).unwrap();
+        prepare_full_backup(&file).unwrap();
+        check_full_backup(&file).unwrap();
+        let target = Db::open(&dir.join("target/lore.db")).unwrap();
+        target.load_full_backup(&file).unwrap();
+        assert_eq!(
+            target
+                .search("stripe", None, None, None, 5, 0.8)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

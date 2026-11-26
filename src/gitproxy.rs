@@ -1061,6 +1061,7 @@ mod tests {
                 redirect_uri: "http://127.0.0.1:9/cb".into(),
                 authorized_by: "admin".into(),
                 reserved: vec!["claude".into()],
+                services_off: false,
                 code_hash: format!("code-{agent}"),
                 code_challenge: "c".repeat(43),
                 code_expires_at: crate::db::unix_now() + 300,

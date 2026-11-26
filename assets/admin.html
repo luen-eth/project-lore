@@ -120,7 +120,7 @@
     <h4>Full database (.sqlite)</h4>
     <button id="full-download" class="ghost" type="button"><b>Download</b><span>The whole database exactly as stored: memories, sessions, activity, board, every file version, profile, rules, the encrypted credentials, service levels, the operations log and the users with their password hashes. Keep it private.</span></button>
     <div id="full-restore-box" class="full-restore">
-      <p class="small-text">Restoring replaces everything here with the uploaded database. A safety copy of the current database is kept on the server first.</p>
+      <p class="small-text">Restoring replaces everything here with the uploaded database, its users, passwords, permissions and agent tokens included, so it is only for users who hold every permission. Restoring an older backup brings back deleted users and old passwords. A safety copy of the current database is kept on the server first.</p>
       <label class="board-field"><span>Type RESTORE to enable it</span>
         <input id="full-confirm" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="RESTORE">
       </label>

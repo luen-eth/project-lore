@@ -15,7 +15,6 @@ use std::{
 
 use async_imap::{
     Client, Session,
-    imap_proto::BodyStructure,
     types::{Fetch, Flag, NameAttribute},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -57,6 +56,25 @@ const MAX_ACCOUNT_CHARS: usize = 254;
 const MAX_PASSWORD_CHARS: usize = 1024;
 /// Longest address list or subject shown on one line.
 const MAX_LINE_CHARS: usize = 300;
+/// The shortest mailbox password accepted. Redaction replaces the password
+/// wherever it appears in an answer; a very short one would blank out
+/// ordinary words and tell which ones they were.
+pub const MIN_PASSWORD_CHARS: usize = 8;
+/// The most of a message's header lines `list` fetches.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+/// Attachments `read` lists by name; the rest are counted.
+const MAX_ATTACHMENTS_LISTED: usize = 50;
+/// Longest whole answer an agent gets: the cut body plus room for the
+/// headers and the attachment list.
+const MAX_ANSWER_CHARS: usize = ops::MAX_BODY_CHARS + 30_000;
+/// Mailbox calls running at once, at most; a call waits this long for a
+/// free slot, then is told to try again.
+const MAIL_SLOTS: usize = 2;
+const SLOT_WAIT: Duration = Duration::from_secs(5);
+/// The stack of the thread each mailbox session runs on. The IMAP parser
+/// recurses into what the server sends; a large stack of its own keeps a
+/// hostile answer away from the server's worker threads.
+const SESSION_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// Names of the sent folder on servers without SPECIAL-USE.
 const SENT_NAMES: &[&str] = &["sent", "sent items", "sent messages", "sent mail"];
 
@@ -141,6 +159,12 @@ pub fn normalize_account(account: &str) -> Result<String, String> {
 pub fn check_password(password: &str) -> Result<(), String> {
     if password.is_empty() {
         return Err("enter the password".into());
+    }
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(format!(
+            "the password must be at least {MIN_PASSWORD_CHARS} characters; use an app password \
+             if the provider offers one"
+        ));
     }
     if password.chars().count() > MAX_PASSWORD_CHARS || password.chars().any(char::is_control) {
         return Err(format!(
@@ -428,6 +452,10 @@ pub enum MailError {
     Refused(String),
     /// The call took longer than it may.
     Timeout,
+    /// Every mailbox slot was taken.
+    Busy,
+    /// The server's address is loopback, private or otherwise not public.
+    NotPublic,
 }
 
 impl MailError {
@@ -441,8 +469,34 @@ impl MailError {
                 .into(),
             MailError::Refused(reason) => reason.clone(),
             MailError::Timeout => "the mail server did not answer in time".into(),
+            MailError::Busy => "the mailbox is busy with other calls; try again in a moment".into(),
+            MailError::NotPublic => "the mail server's address is not a public one: lore does \
+                                     not connect to loopback, private or link-local addresses"
+                .into(),
         }
     }
+
+    /// What the operations log keeps: a fixed text per kind, never the
+    /// server's own words, which may repeat search terms (addresses,
+    /// subjects).
+    pub fn log_text(&self) -> &'static str {
+        match self {
+            MailError::Transport(_) => "the mail server could not be reached",
+            MailError::Login => "the mail server refused the login",
+            MailError::Refused(_) => "the request was refused",
+            MailError::Timeout => "the mail server did not answer in time",
+            MailError::Busy => "the mailbox was busy",
+            MailError::NotPublic => "the mail server's address is not public",
+        }
+    }
+}
+
+/// A call that did not work: the sentence the caller sees (redacted) and
+/// the fixed text the operations log keeps.
+#[derive(Debug)]
+pub struct Failure {
+    pub message: String,
+    pub log: &'static str,
 }
 
 /// A server error as one short line: the server's own words, cut.
@@ -458,71 +512,215 @@ fn server_error(error: async_imap::error::Error) -> MailError {
 }
 
 /// One call to the mailbox over TLS, end to end: connect, log in, do it,
-/// log out. The answer and the error are redacted (the password and lore's
-/// own secrets) before they leave.
+/// log out, on a thread of its own (see `on_session_thread`). The answer
+/// and the error are redacted (the password and every secret the guard
+/// holds) before they leave.
 pub async fn run(
-    mailbox: &Mailbox,
-    password: &Secret,
-    guard: &ops::Guard,
-    action: &Action,
-) -> Result<String, String> {
-    let outcome = tokio::time::timeout(CALL_TIMEOUT, async {
-        let stream = connect_tls(mailbox).await?;
-        session(stream, &mailbox.account, password, Job::Do(action)).await
-    })
+    mailbox: Mailbox,
+    password: Secret,
+    guard: ops::Guard,
+    action: Action,
+) -> Result<String, Failure> {
+    let account = mailbox.account.clone();
+    match on_session_thread(
+        Target::Tls(mailbox),
+        account,
+        password,
+        guard,
+        Job::Do(action),
+    )
     .await
-    .unwrap_or(Err(MailError::Timeout));
-    finish(outcome, password, guard)
-}
-
-/// The admin page's Test: log in and count the folders.
-pub async fn test(
-    mailbox: &Mailbox,
-    password: &Secret,
-    guard: &ops::Guard,
-) -> Result<usize, String> {
-    let outcome = tokio::time::timeout(CALL_TIMEOUT, async {
-        let stream = connect_tls(mailbox).await?;
-        session(stream, &mailbox.account, password, Job::CountFolders).await
-    })
-    .await
-    .unwrap_or(Err(MailError::Timeout));
-    match outcome {
-        Ok(Done::Count(count)) => Ok(count),
-        Ok(Done::Text(_)) => Err("internal error: unexpected answer".into()),
-        Err(error) => Err(guard.redact(&error.message(), password.expose())),
+    {
+        Ok(Done::Text { text, .. }) => Ok(text),
+        Ok(Done::Count(count)) => Ok(count.to_string()),
+        Err(failure) => Err(failure),
     }
 }
 
-/// The same call over plain TCP, for the tests' scripted server only.
+/// The admin page's Test: log in and count the folders.
+pub async fn test(mailbox: Mailbox, password: Secret, guard: ops::Guard) -> Result<usize, Failure> {
+    let account = mailbox.account.clone();
+    match on_session_thread(
+        Target::Tls(mailbox),
+        account,
+        password,
+        guard,
+        Job::CountFolders,
+    )
+    .await
+    {
+        Ok(Done::Count(count)) => Ok(count),
+        Ok(Done::Text { .. }) => Err(Failure {
+            message: "internal error: unexpected answer".into(),
+            log: "internal error",
+        }),
+        Err(failure) => Err(failure),
+    }
+}
+
+/// The same call over plain TCP to any address, for the tests' scripted
+/// server only.
 #[cfg(test)]
 pub async fn run_plain(
     address: std::net::SocketAddr,
     account: &str,
-    password: &Secret,
-    guard: &ops::Guard,
-    action: &Action,
-) -> Result<String, String> {
-    let outcome = tokio::time::timeout(CALL_TIMEOUT, async {
-        let stream = tokio::net::TcpStream::connect(address)
-            .await
-            .map_err(|_| MailError::Transport("the connection failed".into()))?;
-        session(stream, account, password, Job::Do(action)).await
-    })
+    password: Secret,
+    guard: ops::Guard,
+    action: Action,
+) -> Result<String, Failure> {
+    match on_session_thread(
+        Target::Plain(address),
+        account.to_string(),
+        password,
+        guard,
+        Job::Do(action),
+    )
     .await
-    .unwrap_or(Err(MailError::Timeout));
-    finish(outcome, password, guard)
+    {
+        Ok(Done::Text { text, .. }) => Ok(text),
+        Ok(Done::Count(count)) => Ok(count.to_string()),
+        Err(failure) => Err(failure),
+    }
 }
 
+/// The mailbox slots every call takes one of.
+fn slots() -> Arc<tokio::sync::Semaphore> {
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAIL_SLOTS)))
+        .clone()
+}
+
+/// One of `slots`, waiting at most `SLOT_WAIT` for it: never an unbounded
+/// queue.
+async fn take_slot(
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, MailError> {
+    match tokio::time::timeout(SLOT_WAIT, slots.acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        _ => Err(MailError::Busy),
+    }
+}
+
+/// Runs one session on a dedicated thread with a 64 MiB stack and a
+/// runtime of its own: the IMAP parser and the message rendering never run
+/// on the server's async workers, and a parse that recurses deep has room.
+/// A call first waits a few seconds for one of the two mailbox slots; the
+/// slot stays taken until the thread ends. The 60 s limit is enforced here,
+/// from outside the thread, and inside it too, so the thread ends as well.
+async fn on_session_thread(
+    target: Target,
+    account: String,
+    password: Secret,
+    guard: ops::Guard,
+    job: Job,
+) -> Result<Done, Failure> {
+    let refuse = |error: MailError| Failure {
+        message: error.message(),
+        log: error.log_text(),
+    };
+    let permit = take_slot(slots()).await.map_err(refuse)?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("lore-mail".into())
+        .stack_size(SESSION_STACK_BYTES)
+        .spawn(move || {
+            let _permit = permit;
+            let outcome = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(async {
+                    tokio::time::timeout(
+                        CALL_TIMEOUT,
+                        connect_and_run(target, &account, &password, job),
+                    )
+                    .await
+                    .unwrap_or(Err(MailError::Timeout))
+                }),
+                Err(_) => Err(MailError::Transport(
+                    "internal error: the mail session could not start".into(),
+                )),
+            };
+            let _ = sender.send(finish(outcome, &password, &guard));
+        });
+    if spawned.is_err() {
+        return Err(refuse(MailError::Transport(
+            "internal error: the mail session could not start".into(),
+        )));
+    }
+    match tokio::time::timeout(CALL_TIMEOUT, receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(refuse(MailError::Transport(
+            "internal error: the mail session ended unexpectedly".into(),
+        ))),
+        Err(_) => Err(refuse(MailError::Timeout)),
+    }
+}
+
+/// Redacts an answer or an error (the password and the guard's secrets),
+/// cuts an answer that is too long, and only then puts the untrusted-mail
+/// warning in front, so no redaction can touch the warning.
 fn finish(
     outcome: Result<Done, MailError>,
     password: &Secret,
     guard: &ops::Guard,
-) -> Result<String, String> {
+) -> Result<Done, Failure> {
     match outcome {
-        Ok(Done::Text(text)) => Ok(guard.redact(&text, password.expose())),
-        Ok(Done::Count(count)) => Ok(count.to_string()),
-        Err(error) => Err(guard.redact(&error.message(), password.expose())),
+        Ok(Done::Text { text, untrusted }) => {
+            let text = guard.redact(&text, password.expose());
+            let text = if text.chars().count() > MAX_ANSWER_CHARS {
+                let mut cut: String = text.chars().take(MAX_ANSWER_CHARS).collect();
+                cut.push_str(&format!(
+                    "\n(cut: the answer was longer than {MAX_ANSWER_CHARS} characters)"
+                ));
+                cut
+            } else {
+                text
+            };
+            let text = if untrusted {
+                format!("{UNTRUSTED}\n{text}")
+            } else {
+                text
+            };
+            Ok(Done::Text { text, untrusted })
+        }
+        Ok(Done::Count(count)) => Ok(Done::Count(count)),
+        Err(error) => Err(Failure {
+            message: guard.redact(&error.message(), password.expose()),
+            log: error.log_text(),
+        }),
+    }
+}
+
+/// Where a session connects.
+enum Target {
+    /// The stored mailbox, over TLS, at a public address only.
+    Tls(Mailbox),
+    /// Any address over plain TCP: the tests' scripted server.
+    #[cfg(test)]
+    Plain(std::net::SocketAddr),
+}
+
+/// Connects to the target and runs the job; on the session thread.
+async fn connect_and_run(
+    target: Target,
+    account: &str,
+    password: &Secret,
+    job: Job,
+) -> Result<Done, MailError> {
+    match target {
+        Target::Tls(mailbox) => {
+            let stream = connect_tls(&mailbox).await?;
+            session(stream, account, password, job).await
+        }
+        #[cfg(test)]
+        Target::Plain(address) => {
+            let stream = tokio::net::TcpStream::connect(address)
+                .await
+                .map_err(|_| MailError::Transport("the connection failed".into()))?;
+            session(stream, account, password, job).await
+        }
     }
 }
 
@@ -547,16 +745,79 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
         .clone()
 }
 
-/// TCP to the server, then the TLS handshake, within the connect timeout.
+/// True for an address on the public internet: not loopback, private,
+/// link-local, shared (CGNAT), unspecified, multicast, broadcast,
+/// documentation, benchmarking or reserved, in IPv4 or IPv6 (IPv4-mapped
+/// and NAT64 addresses are judged by the IPv4 address inside).
+pub fn is_public_address(ip: std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || a == 0
+                || (a == 100 && (b & 0xc0) == 64)
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && (b & 0xfe) == 18)
+                || a >= 240)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_address(IpAddr::V4(v4));
+            }
+            let segments = v6.segments();
+            // NAT64 (64:ff9b::/96) reaches the IPv4 address in its last bits.
+            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                let [.., high, low] = segments;
+                let v4 = Ipv4Addr::from((u32::from(high) << 16) | u32::from(low));
+                return is_public_address(IpAddr::V4(v4));
+            }
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || segments[..6] == [0, 0, 0, 0, 0, 0])
+        }
+    }
+}
+
+/// Resolves the host, keeps only public addresses and connects to one of
+/// them (the address checked is the address used: nothing is resolved
+/// twice), then the TLS handshake, within the connect timeout.
 async fn connect_tls(
     mailbox: &Mailbox,
 ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, MailError> {
     let name = rustls::pki_types::ServerName::try_from(mailbox.host.clone())
         .map_err(|_| MailError::Transport("the host name is not valid".into()))?;
     tokio::time::timeout(CONNECT_TIMEOUT, async {
-        let tcp = tokio::net::TcpStream::connect((mailbox.host.as_str(), mailbox.port))
-            .await
-            .map_err(|_| MailError::Transport("the connection failed".into()))?;
+        let resolved: Vec<std::net::SocketAddr> =
+            tokio::net::lookup_host((mailbox.host.as_str(), mailbox.port))
+                .await
+                .map_err(|_| MailError::Transport("the host name could not be resolved".into()))?
+                .collect();
+        let public: Vec<std::net::SocketAddr> = resolved
+            .into_iter()
+            .filter(|address| is_public_address(address.ip()))
+            .collect();
+        if public.is_empty() {
+            return Err(MailError::NotPublic);
+        }
+        let mut tcp = None;
+        for address in public {
+            if let Ok(stream) = tokio::net::TcpStream::connect(address).await {
+                tcp = Some(stream);
+                break;
+            }
+        }
+        let tcp = tcp.ok_or_else(|| MailError::Transport("the connection failed".into()))?;
         tokio_rustls::TlsConnector::from(tls_config())
             .connect(name, tcp)
             .await
@@ -571,13 +832,18 @@ async fn connect_tls(
     .unwrap_or(Err(MailError::Transport("connecting timed out".into())))
 }
 
-enum Job<'a> {
-    Do(&'a Action),
+enum Job {
+    Do(Action),
     CountFolders,
 }
 
 enum Done {
-    Text(String),
+    /// An answer; `untrusted` when it carries message content, which
+    /// `finish` then puts the warning in front of.
+    Text {
+        text: String,
+        untrusted: bool,
+    },
     Count(usize),
 }
 
@@ -586,7 +852,7 @@ async fn session<T>(
     stream: T,
     account: &str,
     password: &Secret,
-    job: Job<'_>,
+    job: Job,
 ) -> Result<Done, MailError>
 where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
@@ -608,7 +874,10 @@ where
         Job::CountFolders => folders(&mut session)
             .await
             .map(|list| Done::Count(list.len())),
-        Job::Do(action) => perform(&mut session, action).await.map(Done::Text),
+        Job::Do(action) => perform(&mut session, &action).await.map(|text| Done::Text {
+            untrusted: !matches!(action, Action::Folders),
+            text,
+        }),
     };
     let _ = session.logout().await;
     result
@@ -742,11 +1011,16 @@ where
                 return Ok(format!("No messages in {name} match."));
             }
             let set: Vec<String> = uids.iter().map(u32::to_string).collect();
+            // No BODYSTRUCTURE: its parser recurses as deep as the server
+            // nests parts. The header lines alone, at most 64 KiB of them,
+            // say enough, `Content-Type` included.
             let fetches = fetch_all(
                 session,
                 &set.join(","),
-                "(UID FLAGS RFC822.SIZE BODYSTRUCTURE \
-                 BODY.PEEK[HEADER.FIELDS (DATE FROM TO SUBJECT)])",
+                &format!(
+                    "(UID FLAGS RFC822.SIZE \
+                     BODY.PEEK[HEADER.FIELDS (DATE FROM TO SUBJECT CONTENT-TYPE)]<0.{MAX_HEADER_BYTES}>)"
+                ),
             )
             .await?;
             let mut rows: Vec<Summary> = fetches.iter().filter_map(Summary::from_fetch).collect();
@@ -801,23 +1075,6 @@ fn is_seen(fetch: &Fetch) -> bool {
     fetch.flags().any(|flag| matches!(flag, Flag::Seen))
 }
 
-/// True when the structure has a part that is not body text: a file, an
-/// attached message, or a text part marked as an attachment.
-fn has_attachment(structure: &BodyStructure<'_>) -> bool {
-    let disposition = |common: &async_imap::imap_proto::BodyContentCommon<'_>| {
-        common
-            .disposition
-            .as_ref()
-            .map(|disposition| disposition.ty.to_ascii_lowercase())
-    };
-    match structure {
-        BodyStructure::Multipart { bodies, .. } => bodies.iter().any(has_attachment),
-        BodyStructure::Message { .. } => true,
-        BodyStructure::Basic { common, .. } => disposition(common).as_deref() != Some("inline"),
-        BodyStructure::Text { common, .. } => disposition(common).as_deref() == Some("attachment"),
-    }
-}
-
 /// One message as `list` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
@@ -828,6 +1085,8 @@ pub struct Summary {
     pub subject: String,
     pub seen: bool,
     pub size: Option<usize>,
+    /// The message is `multipart/mixed`, the type mail with attachments
+    /// has: it may have attachments.
     pub attachments: bool,
 }
 
@@ -837,7 +1096,6 @@ impl Summary {
         let mut summary = Self::from_header(fetch.uid?, header);
         summary.seen = is_seen(fetch);
         summary.size = fetch.size.map(|size| size as usize);
-        summary.attachments = fetch.bodystructure().is_some_and(has_attachment);
         Some(summary)
     }
 
@@ -868,6 +1126,12 @@ impl Summary {
             summary.from = addresses(message.from());
             summary.to = addresses(message.to());
             summary.subject = one_line(message.subject().unwrap_or(""), MAX_LINE_CHARS);
+            summary.attachments = message.content_type().is_some_and(|ctype| {
+                ctype.ctype().eq_ignore_ascii_case("multipart")
+                    && ctype
+                        .subtype()
+                        .is_some_and(|subtype| subtype.eq_ignore_ascii_case("mixed"))
+            });
         }
         summary
     }
@@ -947,9 +1211,10 @@ pub fn render_folders(folders: &[Folder]) -> String {
     out
 }
 
-/// The `list` answer: the warning, then one block per message.
+/// The `list` answer: one block per message. The untrusted-mail warning is
+/// put in front after redaction (see `finish`).
 pub fn render_list(folder: &str, total: usize, rows: &[Summary]) -> String {
-    let mut out = format!("{UNTRUSTED}\n");
+    let mut out = String::new();
     out.push_str(&format!(
         "{folder}: {} of {total} matching messages, newest first.\n",
         rows.len()
@@ -964,7 +1229,7 @@ pub fn render_list(folder: &str, total: usize, rows: &[Summary]) -> String {
             line.push_str(&format!(" · {}", human_size(size)));
         }
         if row.attachments {
-            line.push_str(" · has attachments");
+            line.push_str(" · may have attachments");
         }
         out.push_str(&line);
         out.push('\n');
@@ -976,9 +1241,10 @@ pub fn render_list(folder: &str, total: usize, rows: &[Summary]) -> String {
     out
 }
 
-/// The `read` answer: the warning, the headers, the attachments by name,
-/// type and size, then the text body (the plain part, otherwise the HTML
-/// reduced to text), cut like other tool output.
+/// The `read` answer: the headers, the attachments by name, type and size
+/// (the first 50, the rest counted), then the text body (the plain part,
+/// otherwise the HTML reduced to text), cut like other tool output. The
+/// untrusted-mail warning is put in front after redaction (see `finish`).
 pub fn render_message(
     raw: &[u8],
     folder: &str,
@@ -986,7 +1252,7 @@ pub fn render_message(
     seen: bool,
     size: Option<usize>,
 ) -> String {
-    let mut out = format!("{UNTRUSTED}\n");
+    let mut out = String::new();
     let mut head = format!(
         "Folder: {folder} · uid {uid} · {}",
         if seen { "read" } else { "unread" }
@@ -1016,8 +1282,10 @@ pub fn render_message(
     if let Some(id) = message.message_id() {
         out.push_str(&format!("Message-ID: <{}>\n", one_line(id, MAX_LINE_CHARS)));
     }
+    let attachment_count = message.attachments().count();
     let attachments: Vec<String> = message
         .attachments()
+        .take(MAX_ATTACHMENTS_LISTED)
         .map(|part| {
             let name = part
                 .attachment_name()
@@ -1039,10 +1307,15 @@ pub fn render_message(
         .collect();
     if !attachments.is_empty() {
         out.push_str(&format!(
-            "Attachments ({}, listed only):\n{}\n",
-            attachments.len(),
+            "Attachments ({attachment_count}, listed only):\n{}\n",
             attachments.join("\n")
         ));
+        if attachment_count > attachments.len() {
+            out.push_str(&format!(
+                "- and {} more\n",
+                attachment_count - attachments.len()
+            ));
+        }
     }
     if raw.len() >= MAX_MESSAGE_BYTES {
         out.push_str("(only the first 10 MiB of this message were read)\n");
@@ -1398,7 +1671,8 @@ mod tests {
     #[test]
     fn a_plain_message_becomes_text() {
         let text = render_message(PLAIN.as_bytes(), "INBOX", 7, false, Some(2048));
-        assert!(text.starts_with(UNTRUSTED), "{text}");
+        // The warning is added after redaction, by `finish`.
+        assert!(text.starts_with("Folder: INBOX"), "{text}");
         assert!(
             text.contains("Folder: INBOX · uid 7 · unread · 2 KB"),
             "{text}"
@@ -1486,7 +1760,7 @@ mod tests {
 
         // Something that is not a message at all still answers.
         let text = render_message(b"", "INBOX", 6, true, None);
-        assert!(text.starts_with(UNTRUSTED), "{text}");
+        assert!(text.contains("could not be parsed"), "{text}");
     }
 
     #[test]
@@ -1562,26 +1836,35 @@ mod tests {
         assert!(resolve_folder(&[folder("INBOX", Some("inbox"))], "sent").is_err());
     }
 
+    fn text_of(done: Result<Done, Failure>) -> String {
+        match done {
+            Ok(Done::Text { text, .. }) => text,
+            Ok(Done::Count(count)) => count.to_string(),
+            Err(failure) => panic!("failed: {failure:?}"),
+        }
+    }
+
     #[test]
     fn output_is_redacted() {
         let guard = ops::Guard::new(["lore-own-secret-value"], Vec::new());
         let password = Secret::new("mail-password-1");
         let done = finish(
-            Ok(Done::Text(
-                "pw mail-password-1 and lore-own-secret-value here".into(),
-            )),
+            Ok(Done::Text {
+                text: "pw mail-password-1 and lore-own-secret-value here".into(),
+                untrusted: false,
+            }),
             &password,
             &guard,
-        )
-        .unwrap();
-        assert_eq!(done, "pw [redacted] and [redacted] here");
+        );
+        assert_eq!(text_of(done), "pw [redacted] and [redacted] here");
         let error = finish(
             Err(MailError::Refused("echo mail-password-1".into())),
             &password,
             &guard,
         )
-        .unwrap_err();
-        assert_eq!(error, "echo [redacted]");
+        .err()
+        .unwrap();
+        assert_eq!(error.message, "echo [redacted]");
     }
 
     /// A tiny scripted IMAP server on 127.0.0.1:0 over plain TCP. It
@@ -1591,6 +1874,16 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
         message: &'static str,
     ) -> std::net::SocketAddr {
+        fake_server_with(log, message, String::new()).await
+    }
+
+    /// Like `fake_server`; `unasked` is put into the list FETCH answer of
+    /// uid 11 whether it was asked for or not, as a hostile server may.
+    async fn fake_server_with(
+        log: Arc<Mutex<Vec<String>>>,
+        message: &'static str,
+        unasked: String,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1599,6 +1892,7 @@ mod tests {
                     return;
                 };
                 let log = log.clone();
+                let unasked = unasked.clone();
                 tokio::spawn(async move {
                     let (read, mut write) = socket.into_split();
                     let mut lines = BufReader::new(read).lines();
@@ -1644,15 +1938,13 @@ mod tests {
                                     Subject: First\r\n\r\n";
                                 let second = "Date: Fri, 8 Mar 2024 09:00:00 +0100\r\n\
                                     From: Bo <bo@example.com>\r\nTo: me@example.com\r\n\
-                                    Subject: Second mail-password-1\r\n\r\n";
+                                    Subject: Second mail-password-1\r\n\
+                                    Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n";
                                 format!(
                                     "* 1 FETCH (UID 10 FLAGS (\\Seen) RFC822.SIZE 1200 \
-                                     BODYSTRUCTURE (\"text\" \"plain\" (\"charset\" \"utf-8\") NIL NIL \"7bit\" 12 1 NIL NIL NIL) \
-                                     BODY[HEADER.FIELDS (DATE FROM TO SUBJECT)] {{{}}}\r\n{first})\r\n\
-                                     * 2 FETCH (UID 11 FLAGS () RFC822.SIZE 34000 \
-                                     BODYSTRUCTURE ((\"text\" \"plain\" (\"charset\" \"utf-8\") NIL NIL \"7bit\" 12 1 NIL NIL NIL)\
-                                     (\"application\" \"pdf\" (\"name\" \"a.pdf\") NIL NIL \"base64\" 3000 NIL (\"attachment\" (\"filename\" \"a.pdf\")) NIL) \"mixed\") \
-                                     BODY[HEADER.FIELDS (DATE FROM TO SUBJECT)] {{{}}}\r\n{second})\r\n\
+                                     BODY[HEADER.FIELDS (DATE FROM TO SUBJECT CONTENT-TYPE)]<0> {{{}}}\r\n{first})\r\n\
+                                     * 2 FETCH (UID 11 FLAGS () RFC822.SIZE 34000 {unasked}\
+                                     BODY[HEADER.FIELDS (DATE FROM TO SUBJECT CONTENT-TYPE)]<0> {{{}}}\r\n{second})\r\n\
                                      {tag} OK FETCH completed\r\n",
                                     first.len(),
                                     second.len()
@@ -1696,15 +1988,14 @@ mod tests {
     async fn only_read_only_commands_reach_the_server() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let address = fake_server(log.clone(), PLAIN).await;
-        let password = Secret::new("mail-password-1");
         let guard = ops::Guard::default();
 
         let folders = run_plain(
             address,
             "me@example.com",
-            &password,
-            &guard,
-            &Action::Folders,
+            Secret::new("mail-password-1"),
+            guard.clone(),
+            Action::Folders,
         )
         .await
         .unwrap();
@@ -1716,9 +2007,9 @@ mod tests {
         let list = run_plain(
             address,
             "me@example.com",
-            &password,
-            &guard,
-            &parse(&Query {
+            Secret::new("mail-password-1"),
+            guard.clone(),
+            parse(&Query {
                 folder: Some("sent".into()),
                 from: Some("bo".into()),
                 ..query("list")
@@ -1734,7 +2025,9 @@ mod tests {
         let first = list.find("uid 10").unwrap();
         assert!(second < first, "{list}");
         assert!(
-            list.contains("uid 11 · 2024-03-08T09:00:00+01:00 · unread · 34 KB · has attachments"),
+            list.contains(
+                "uid 11 · 2024-03-08T09:00:00+01:00 · unread · 34 KB · may have attachments"
+            ),
             "{list}"
         );
         assert!(
@@ -1749,9 +2042,9 @@ mod tests {
         let read = run_plain(
             address,
             "me@example.com",
-            &password,
-            &guard,
-            &Action::Read {
+            Secret::new("mail-password-1"),
+            guard.clone(),
+            Action::Read {
                 folder: "inbox".into(),
                 uid: 11,
             },
@@ -1766,15 +2059,16 @@ mod tests {
         let missing = run_plain(
             address,
             "me@example.com",
-            &password,
-            &guard,
-            &Action::Read {
+            Secret::new("mail-password-1"),
+            guard.clone(),
+            Action::Read {
                 folder: "INBOX".into(),
                 uid: 99,
             },
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         assert!(missing.contains("no message with uid 99"), "{missing}");
 
         let log = log.lock().unwrap().clone();
@@ -1811,6 +2105,17 @@ mod tests {
                 "{forbidden} was sent: {log:?}"
             );
         }
+        // No fetch asks for the structure, and the header lines are a
+        // partial fetch.
+        assert!(
+            log.iter().all(|line| !line.contains("BODYSTRUCTURE")),
+            "{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|line| line.contains("CONTENT-TYPE)]<0.65536>")),
+            "{log:?}"
+        );
         // Every body fetch peeks.
         for line in log.iter().filter(|line| line.contains("FETCH")) {
             assert!(!line.contains("BODY["), "a fetch without PEEK: {line}");
@@ -1819,6 +2124,211 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_deeply_nested_structure_from_the_server_does_not_crash_lore() {
+        // A structure nested 1500 deep, sent although nobody asked for it.
+        // Its parser recurses once per level: on a worker's (or this test
+        // thread's) 2 MiB stack that overflows and aborts the process; the
+        // session's own thread has room.
+        let depth = 1500;
+        let nested = format!(
+            "BODYSTRUCTURE {}(\"text\" \"plain\" NIL NIL NIL \"7bit\" 1 1){} ",
+            "(".repeat(depth),
+            " \"mixed\")".repeat(depth)
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let address = fake_server_with(log, PLAIN, nested).await;
+        let list = run_plain(
+            address,
+            "me@example.com",
+            Secret::new("mail-password-1"),
+            ops::Guard::default(),
+            parse(&query("list")).unwrap(),
+        )
+        .await;
+        // Whatever the answer, lore is still here to give it.
+        match list {
+            Ok(text) => assert!(text.starts_with(UNTRUSTED), "{text}"),
+            Err(failure) => assert!(!failure.message.is_empty()),
+        }
+    }
+
+    #[test]
+    fn the_attachment_list_and_the_answer_are_bounded() {
+        let mut raw = String::from(
+            "From: a@example.com\r\nSubject: many\r\n\
+             Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+             --b\r\nContent-Type: text/plain\r\n\r\nbody\r\n",
+        );
+        for index in 0..2000 {
+            raw.push_str(&format!(
+                "--b\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Disposition: attachment; filename=\"f{index}.bin\"\r\n\r\nx\r\n"
+            ));
+        }
+        raw.push_str("--b--\r\n");
+        let text = render_message(raw.as_bytes(), "INBOX", 1, true, None);
+        assert!(
+            text.contains("Attachments (2000, listed only):"),
+            "{}",
+            &text[..400]
+        );
+        assert_eq!(text.matches(".bin · ").count(), MAX_ATTACHMENTS_LISTED);
+        assert!(text.contains("- and 1950 more"), "{text}");
+        assert!(text.chars().count() < 20_000, "{}", text.chars().count());
+
+        // Whatever is rendered, the answer is cut to its limit.
+        let long = "y".repeat(MAX_ANSWER_CHARS * 2);
+        let done = finish(
+            Ok(Done::Text {
+                text: long,
+                untrusted: true,
+            }),
+            &Secret::new("mail-password-1"),
+            &ops::Guard::default(),
+        );
+        let text = text_of(done);
+        assert!(text.starts_with(UNTRUSTED));
+        assert!(text.chars().count() < MAX_ANSWER_CHARS + 300);
+        assert!(
+            text.ends_with("characters)"),
+            "{}",
+            &text[text.len() - 80..]
+        );
+    }
+
+    #[test]
+    fn the_warning_survives_redaction() {
+        // A password that is part of the warning's own words.
+        let password = Secret::new("untrusted data");
+        let done = finish(
+            Ok(Done::Text {
+                text: "Subject: untrusted data inside".into(),
+                untrusted: true,
+            }),
+            &password,
+            &ops::Guard::default(),
+        );
+        let text = text_of(done);
+        assert!(text.starts_with(&format!("{UNTRUSTED}\n")), "{text}");
+        assert!(text.ends_with("Subject: [redacted] inside"), "{text}");
+        // And a short password is refused when it is stored.
+        assert!(check_password("short12").is_err());
+        assert!(check_password("eight-ch").is_ok());
+    }
+
+    #[tokio::test]
+    async fn mailbox_calls_wait_for_a_free_slot() {
+        assert_eq!(MAIL_SLOTS, 2);
+        // The same kind of semaphore, so other tests' calls are not held up.
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAIL_SLOTS));
+        let first = take_slot(slots.clone()).await.unwrap();
+        let _second = take_slot(slots.clone()).await.unwrap();
+        let started = std::time::Instant::now();
+        let busy = take_slot(slots.clone()).await.unwrap_err();
+        assert!(started.elapsed() >= SLOT_WAIT);
+        assert!(busy.message().contains("busy"), "{busy:?}");
+        assert_eq!(busy.log_text(), "the mailbox was busy");
+        // A slot freed in time is taken.
+        let waiting = tokio::spawn(take_slot(slots.clone()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(first);
+        assert!(waiting.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn only_public_addresses_are_reached() {
+        use std::net::IpAddr;
+        for private in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::a00:1",
+        ] {
+            let ip: IpAddr = private.parse().unwrap();
+            assert!(!is_public_address(ip), "{private}");
+        }
+        for public in [
+            "93.184.216.34",
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "64:ff9b::5db8:d822",
+        ] {
+            let ip: IpAddr = public.parse().unwrap();
+            assert!(is_public_address(ip), "{public}");
+        }
+        // A stored mailbox on a private address is never connected to.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        for host in ["127.0.0.1", "localhost"] {
+            let refused = run(
+                Mailbox {
+                    host: host.into(),
+                    port,
+                    account: "me@example.com".into(),
+                },
+                Secret::new("mail-password-1"),
+                ops::Guard::default(),
+                Action::Folders,
+            )
+            .await
+            .unwrap_err();
+            assert!(refused.message.contains("not a public one"), "{refused:?}");
+        }
+        // Nothing reached the listener.
+        let accepted = tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
+        assert!(accepted.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_servers_refusal_reaches_the_agent_but_not_the_log() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            write.write_all(b"* OK ready\r\n").await.unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut words = line.splitn(3, ' ');
+                let tag = words.next().unwrap_or("*").to_string();
+                let verb = words.next().unwrap_or("").to_ascii_uppercase();
+                let reply = match verb.as_str() {
+                    "LOGIN" => format!("{tag} OK done\r\n"),
+                    "LIST" => format!("* LIST () \"/\" \"INBOX\"\r\n{tag} OK done\r\n"),
+                    // The server's words repeat what it was sent.
+                    "EXAMINE" => format!("{tag} NO cannot open {line} for ana@example.com\r\n"),
+                    _ => format!("{tag} OK bye\r\n"),
+                };
+                if write.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let failure = run_plain(
+            address,
+            "me@example.com",
+            Secret::new("mail-password-1"),
+            ops::Guard::default(),
+            parse(&Query {
+                from: Some("ana@example.com".into()),
+                ..query("list")
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.message.contains("ana@example.com"), "{failure:?}");
+        assert_eq!(failure.log, "the request was refused");
     }
 
     #[tokio::test]
@@ -1841,12 +2351,13 @@ mod tests {
         let error = run_plain(
             address,
             "me@example.com",
-            &Secret::new("mail-password-1"),
-            &ops::Guard::default(),
-            &Action::Folders,
+            Secret::new("mail-password-1"),
+            ops::Guard::default(),
+            Action::Folders,
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         assert!(error.contains("refused the login"), "{error}");
         assert!(!error.contains("mail-password-1"), "{error}");
     }

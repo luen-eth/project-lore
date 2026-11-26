@@ -926,7 +926,9 @@ function applySession(session) {
   $("full-download").hidden = !can("backup");
   $("backup-import").hidden = !can("restore");
   $("backup-restore").hidden = !can("restore");
-  $("full-restore-box").hidden = !can("restore");
+  // A full database brings its own users and tokens: restoring one is for
+  // a user holding every permission, as the server enforces.
+  $("full-restore-box").hidden = !ALL_PERMISSIONS.every(can);
   // Stored users change their own password; built-in ones in the environment.
   $("own-password").hidden = !state.stored;
   $("own-username").value = state.username;
@@ -1570,7 +1572,9 @@ $("full-file").addEventListener("change", async (event) => {
       const reason = response.status === 413
         ? "The file is larger than 2 GiB."
         : result.error || "The database could not be restored.";
-      backupStatus(`${reason} Nothing changed.`, "bad");
+      // Only a failure after the database was replaced says so itself;
+      // every other refusal changed nothing.
+      backupStatus(result.check === "after-load" ? reason : `${reason} Nothing changed.`, "bad");
       $("full-restore").disabled = $("full-confirm").value.trim() !== "RESTORE";
       return;
     }
@@ -1590,7 +1594,7 @@ $("full-file").addEventListener("change", async (event) => {
     applySession(session);
     await refresh(false);
   } catch (_) {
-    backupStatus("The database could not be sent. Nothing changed.", "bad");
+    backupStatus("The answer did not arrive, so it is not known whether the database was replaced. Reload the page to see.", "bad");
     $("full-restore").disabled = $("full-confirm").value.trim() !== "RESTORE";
   }
 });
@@ -3132,7 +3136,10 @@ function permissionChecks(container, checked, disabledIds) {
     box.type = "checkbox";
     box.value = perm.id;
     box.checked = checked.includes(perm.id);
-    if (disabledIds && disabledIds.includes(perm.id)) box.disabled = true;
+    // Only a permission the signed-in user holds can be granted or taken
+    // away; the server refuses the others too.
+    if ((disabledIds && disabledIds.includes(perm.id)) || !can(perm.id)) box.disabled = true;
+    if (!can(perm.id)) label.title = "You do not hold this permission, so you cannot grant it.";
     const text = el("span");
     text.append(el("b", "", perm.id), el("span", "muted", perm.explanation));
     label.append(box, text);
@@ -3188,6 +3195,14 @@ function userItem(user) {
     user.last_login_at ? `last sign-in ${ago(user.last_login_at)}` : "never signed in",
     `added by ${user.created_by || "unknown"}`];
   item.append(el("div", "board-meta", meta.join(" · ")), permissionPills(user.permissions));
+  // A user who holds a permission the signed-in user lacks cannot be
+  // changed or deleted by them; the server refuses it too.
+  const stronger = user.permissions.filter((id) => !can(id));
+  if (stronger.length) {
+    item.append(el("p", "board-meta",
+      `Holds ${stronger.join(", ")}, which you do not hold: only a user who holds them can change or delete this user.`));
+    return item;
+  }
   if (usersState.editing === user.id) {
     item.append(userEditor(user));
   } else {

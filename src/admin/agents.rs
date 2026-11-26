@@ -124,6 +124,9 @@ pub(super) async fn consent_request(
             "username": me.username,
             "services": services,
             "services_enabled": state.db.ops_enabled()?,
+            // Without `integrations` the approver cannot hand out service
+            // access: the agent gets level off on every service.
+            "services_off": !me.perms.contains(Perm::Integrations),
             // The mailbox is not among them: it is off for a new agent
             // until someone with `integrations` grants it.
             "mailbox": state.db.mail_vault()?.is_some(),
@@ -209,6 +212,7 @@ pub(super) async fn consent_approve(
         redirect_uri: request.redirect_uri.clone(),
         authorized_by: me.username.clone(),
         reserved,
+        services_off: !me.perms.contains(Perm::Integrations),
         code_hash: oauth::token_hash(&code),
         code_challenge: request.code_challenge.clone(),
         code_expires_at: db::unix_now() + CODE_TTL_SECS,

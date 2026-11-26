@@ -111,6 +111,16 @@ impl Perms {
         self == Self::all()
     }
 
+    /// True when every permission here is also in `other`.
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+
+    /// The permissions here that `other` lacks.
+    pub fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     pub fn ids(self) -> Vec<&'static str> {
         Perm::ALL
             .into_iter()

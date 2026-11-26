@@ -49,7 +49,10 @@ async fn main() -> Result<()> {
     for directive in ["async_imap=off", "imap_proto=off"] {
         filter = filter.add_directive(directive.parse().expect("a fixed log directive"));
     }
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    {
+        use tracing_subscriber::util::SubscriberInitExt;
+        log_subscriber(filter, std::io::stderr).init();
+    }
 
     let tokens = auth::load_tokens(&env_or("LORE_TOKEN", ""), &env_or("LORE_TOKENS", ""))?;
     let data_dir = PathBuf::from(env_or("LORE_DATA_DIR", "./data"));
@@ -182,6 +185,18 @@ async fn main() -> Result<()> {
     if admin.is_some() {
         tracing::info!("admin view enabled at /admin; agents may also authorize through OAuth");
     }
+    for warning in startup_warnings(
+        &db,
+        admin.is_some(),
+        &auth.allowed_hosts,
+        &auth
+            .tokens
+            .iter()
+            .map(|token| token.agent.clone())
+            .collect::<Vec<_>>(),
+    )? {
+        tracing::warn!("{warning}");
+    }
     let app = app(auth, lore, vault, events, admin);
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -195,6 +210,75 @@ async fn main() -> Result<()> {
     .with_graceful_shutdown(shutdown())
     .await?;
     Ok(())
+}
+
+/// Targets never logged, whatever `RUST_LOG` says: the IMAP client and its
+/// parser trace the LOGIN command with the mailbox password and every
+/// answer, mail included.
+const SILENCED_TARGETS: &[&str] = &["async_imap", "imap_proto"];
+
+/// True for an event or span from a silenced crate.
+fn silenced(target: &str) -> bool {
+    SILENCED_TARGETS
+        .iter()
+        .any(|prefix| target.starts_with(prefix))
+}
+
+/// The log subscriber: `filter` (from `RUST_LOG`) decides what is written,
+/// and on top of it a filter that drops everything from the silenced
+/// crates. That one does not depend on `filter`, so a more specific
+/// directive such as `RUST_LOG=async_imap::imap_stream=trace` cannot turn
+/// them back on.
+fn log_subscriber<W>(
+    filter: tracing_subscriber::EnvFilter,
+    writer: W,
+) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .finish()
+        .with(tracing_subscriber::filter::filter_fn(|metadata| {
+            !silenced(metadata.target())
+        }))
+}
+
+/// What the start-up log warns about: OAuth mounted without
+/// `LORE_ALLOWED_HOSTS` (its issuer and redirect origin then follow the
+/// request's Host header), and an env-token agent whose name an OAuth agent
+/// already has (the token then acts as that OAuth agent, with its levels
+/// and history).
+fn startup_warnings(
+    db: &Db,
+    oauth: bool,
+    allowed_hosts: &[String],
+    env_agents: &[String],
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    if oauth && allowed_hosts.is_empty() {
+        warnings.push(
+            "OAuth is on but LORE_ALLOWED_HOSTS is not set: the issuer and the consent page's \
+             origin follow whatever Host header a request carries. Set LORE_ALLOWED_HOSTS to the \
+             public host name(s) lore is reached at."
+                .to_string(),
+        );
+    }
+    for name in env_agents {
+        if db
+            .registry_agent(name)?
+            .is_some_and(|agent| agent.kind == "oauth")
+        {
+            warnings.push(format!(
+                "the env token agent \"{name}\" has the name of an OAuth agent: that token acts as \
+                 the OAuth agent, with its levels and history. Rename the token's agent in \
+                 LORE_TOKENS, or delete the OAuth agent in the agents panel."
+            ));
+        }
+    }
+    Ok(warnings)
 }
 
 /// The HTTP routes: `/mcp` behind the bearer check, `/health`, the git
@@ -370,6 +454,68 @@ mod tests {
         db::NewUser,
         users::{self, Perms},
     };
+
+    #[test]
+    fn the_imap_crates_are_never_logged_whatever_rust_log_says() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        // The directive that beat the old `async_imap=off`.
+        let filter = tracing_subscriber::EnvFilter::new(
+            "info,async_imap::imap_stream=trace,imap_proto=trace,async_imap=off",
+        );
+        let subscriber = log_subscriber(filter, move || writer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "async_imap::imap_stream", "LOGIN me@example.com hunter2-secret");
+            tracing::trace!(target: "async_imap", "LOGIN me@example.com hunter2-secret");
+            tracing::trace!(target: "imap_proto::parser", "a parsed answer with mail");
+            tracing::info!(target: "lore_check", "still logged");
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("still logged"), "{text}");
+        assert!(!text.contains("hunter2-secret"), "{text}");
+        assert!(!text.contains("parsed answer"), "{text}");
+        assert!(silenced("async_imap::imap_stream") && silenced("imap_proto"));
+        assert!(!silenced("project_lore::mail"));
+    }
+
+    #[test]
+    fn start_up_warns_about_an_open_host_and_a_shared_agent_name() {
+        let dir = std::env::temp_dir().join(format!("lore-warnings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        let agents = vec!["claude".to_string(), "cursor".to_string()];
+        assert!(
+            startup_warnings(&db, false, &[], &agents)
+                .unwrap()
+                .is_empty()
+        );
+        let open = startup_warnings(&db, true, &[], &agents).unwrap();
+        assert_eq!(open.len(), 1);
+        assert!(open[0].contains("LORE_ALLOWED_HOSTS"));
+        let pinned = vec!["lore.example.com".to_string()];
+        assert!(
+            startup_warnings(&db, true, &pinned, &agents)
+                .unwrap()
+                .is_empty()
+        );
+        db.execute_for_test(
+            "INSERT INTO agent_registry (name, kind, created_by) VALUES ('cursor', 'oauth', 'admin');",
+        );
+        let shared = startup_warnings(&db, true, &pinned, &agents).unwrap();
+        assert_eq!(shared.len(), 1);
+        assert!(shared[0].contains("\"cursor\""), "{shared:?}");
+    }
 
     const ENV_TOKEN: &str = "claude-env-token-0123456789abcdef";
     const ADMIN_PASSWORD: &str = "admin-password-long";

@@ -127,7 +127,14 @@ function render() {
   grants.replaceChildren();
   grants.append(el("li", "", "Read and write the shared memory: search, log, amend and delete entries."));
   grants.append(el("li", "", "Read and write the board (tasks, messages, handoff notes) and the project files."));
-  if (data.services.length) {
+  if (data.services_off) {
+    // The approver lacks `integrations`: the server writes level off for
+    // every service the agent has no level for yet.
+    grants.append(el("li", "services",
+      "No access to the services (Cloudflare, GitHub, GitLab, Dokploy), configured now or later: you do not hold " +
+      "the integrations permission, so the agent gets level off on every service it has no level for yet. " +
+      "Someone with that permission can raise it in the Integrations panel."));
+  } else if (data.services.length) {
     const item = el("li", "services");
     item.append(el("span", "", "Full access to every configured service: "));
     const names = el("b", "", data.services.join(", "));

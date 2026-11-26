@@ -835,6 +835,25 @@ impl Guard {
         }
     }
 
+    /// This guard plus more secrets to redact, for one call: every
+    /// credential stored in the vault (see `stored_secrets`), so an answer
+    /// through one credential cannot carry another. Values shorter than 8
+    /// characters are skipped, like lore's own.
+    pub fn with_secrets(&self, secrets: &[Secret]) -> Self {
+        let mut forms: Vec<String> = self.secret_forms.to_vec();
+        for secret in secrets {
+            if secret.expose().chars().count() >= MIN_OWN_SECRET_CHARS {
+                forms.extend(secret_forms(secret.expose()));
+            }
+        }
+        forms.sort();
+        forms.dedup();
+        Self {
+            secret_forms: forms.into(),
+            dokploy_protected: self.dokploy_protected.clone(),
+        }
+    }
+
     /// How many protected Dokploy ids there are; for the start-up log.
     pub fn protected_count(&self) -> usize {
         self.dokploy_protected.len()
@@ -881,6 +900,27 @@ impl Guard {
         }
         Ok(())
     }
+}
+
+/// Every credential stored in the vault, decrypted: each service's and the
+/// mailbox password. A row the key cannot open is skipped. Read once per
+/// call and dropped with it; never logged.
+pub fn stored_secrets(db: &Db, key: &VaultKey) -> anyhow::Result<Vec<Secret>> {
+    let mut secrets = Vec::new();
+    for provider in ALL {
+        if let Some(stored) = db.vault(provider.id)?
+            && let Ok(secret) =
+                key.decrypt(provider.id, &stored.base_url, &stored.nonce, &stored.secret)
+        {
+            secrets.push(secret);
+        }
+    }
+    if let Some(stored) = db.mail_vault()?
+        && let Ok((_, password)) = crate::mail::Mailbox::open(key, &stored)
+    {
+        secrets.push(password);
+    }
+    Ok(secrets)
 }
 
 /// True when `value`, or anything inside it, is exactly `id`: a string
@@ -1846,6 +1886,60 @@ mod tests {
         let own = Guard::new([secret], Vec::new());
         let out = own.redact(&text, "unrelated-credential");
         assert!(!out.contains("tok"), "{out}");
+    }
+
+    #[test]
+    fn every_stored_credential_is_redacted_from_every_answer() {
+        let dir = std::env::temp_dir().join(format!("lore-ops-stored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        let key = VaultKey::from_env_value(&"ef".repeat(32)).unwrap().unwrap();
+        for (provider, secret) in [
+            ("github", "ghp_personal_token_value_1"),
+            ("github_org", "ghp_organization_token_value_2"),
+            ("cloudflare", "short"),
+        ] {
+            let (nonce, cipher) = key.encrypt(provider, "", secret);
+            db.set_vault(provider, "", &nonce, &cipher, "").unwrap();
+        }
+        let mailbox = crate::mail::Mailbox {
+            host: "imap.example.com".into(),
+            port: 993,
+            account: "me@example.com".into(),
+        };
+        let (nonce, cipher) = key.encrypt(
+            crate::mail::ID,
+            &mailbox.sealed_with(),
+            "mailbox-password-3",
+        );
+        db.set_mail_vault(
+            "imap.example.com",
+            993,
+            "me@example.com",
+            &nonce,
+            &cipher,
+            "",
+        )
+        .unwrap();
+        let stored = stored_secrets(&db, &key).unwrap();
+        assert_eq!(stored.len(), 4);
+        // An answer through the organization's token carries the personal
+        // token and the mailbox password: both go, and so does the one in
+        // use; lore's own secrets still go too.
+        let guard = Guard::new(["lore-own-secret-value"], Vec::new()).with_secrets(&stored);
+        let answer = "ghp_personal_token_value_1 ghp_organization_token_value_2 \
+                      mailbox-password-3 lore-own-secret-value short";
+        let out = guard.redact(answer, "ghp_organization_token_value_2");
+        assert_eq!(
+            out, "[redacted] [redacted] [redacted] [redacted] short",
+            "{out}"
+        );
+        // Without the stored secrets, only the one in use would go.
+        let plain = Guard::default().redact(answer, "ghp_organization_token_value_2");
+        assert!(plain.contains("ghp_personal_token_value_1"));
+        // A key that opens nothing finds nothing to add.
+        let other = VaultKey::from_env_value(&"12".repeat(32)).unwrap().unwrap();
+        assert!(stored_secrets(&db, &other).unwrap().is_empty());
     }
 
     /// The protected id of lore's own Dokploy application in the tests.

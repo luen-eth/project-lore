@@ -74,9 +74,28 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 CREATE INDEX IF NOT EXISTS oauth_tokens_grant ON oauth_tokens (grant_id);
 "#;
 
+/// Every table and column that records an agent's name in its history:
+/// a new OAuth agent may not take a name found in any of them.
+const AGENT_HISTORY: &[(&str, &str)] = &[
+    ("agents", "name"),
+    ("entries", "agent"),
+    ("sessions", "agent"),
+    ("activity", "agent"),
+    ("files", "agent"),
+    ("tasks", "created_by"),
+    ("tasks", "claimed_by"),
+    ("tasks", "done_by"),
+    ("messages", "from_agent"),
+    ("message_reads", "agent"),
+    ("ops_log", "agent"),
+];
+
 /// Registered clients kept at most; the oldest never-authorized ones go
 /// first.
 pub const MAX_OAUTH_CLIENTS: i64 = 200;
+/// A client never authorized within this many seconds of registering is
+/// removed at the next registration.
+const UNAUTHORIZED_CLIENT_TTL_SECS: i64 = 60 * 60;
 /// Seconds between two `last_used_at` writes for one token.
 const TOUCH_EVERY: i64 = 60;
 
@@ -122,6 +141,10 @@ pub struct Approval {
     pub authorized_by: String,
     /// Names no new agent may take: the env-token agents.
     pub reserved: Vec<String>,
+    /// The approver lacks `integrations`: the agent gets level `off` on
+    /// every HTTP provider it has no level for yet, so approving cannot
+    /// hand out the stored service credentials.
+    pub services_off: bool,
     pub code_hash: String,
     pub code_challenge: String,
     pub code_expires_at: i64,
@@ -135,6 +158,7 @@ impl std::fmt::Debug for Approval {
             .field("client_id", &self.client_id)
             .field("redirect_uri", &self.redirect_uri)
             .field("authorized_by", &self.authorized_by)
+            .field("services_off", &self.services_off)
             .field("code_hash", &"[redacted]")
             .finish()
     }
@@ -404,11 +428,17 @@ impl Db {
         Ok(true)
     }
 
-    /// Stores a newly registered client. At most `MAX_OAUTH_CLIENTS` are
-    /// kept: the oldest never-authorized ones are removed to make room, and
-    /// when every client was authorized the registration is refused.
+    /// Stores a newly registered client. Clients never authorized within
+    /// an hour of registering are removed first. At most
+    /// `MAX_OAUTH_CLIENTS` are kept: the oldest never-authorized ones are
+    /// removed to make room, and when every client was authorized the
+    /// registration is refused.
     pub fn register_oauth_client(&self, client: &OAuthClient) -> Result<()> {
         let conn = self.lock();
+        conn.execute(
+            "DELETE FROM oauth_clients WHERE authorized_at IS NULL AND created_at < ?1",
+            params![unix_now() - UNAUTHORIZED_CLIENT_TTL_SECS],
+        )?;
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM oauth_clients", [], |row| row.get(0))?;
         if count >= MAX_OAUTH_CLIENTS {
@@ -462,11 +492,17 @@ impl Db {
         let tx = conn.transaction()?;
         let existing = get_registry_agent(&tx, &approval.agent)?;
         if approval.new_agent {
-            let seen: bool = tx.query_row(
-                "SELECT COUNT(*) > 0 FROM agents WHERE name = ?1",
-                params![approval.agent],
-                |row| row.get(0),
-            )?;
+            // A name that wrote or did anything before belongs to someone:
+            // a new OAuth agent under it would inherit its history and its
+            // levels.
+            let mut seen = false;
+            for (table, column) in AGENT_HISTORY {
+                seen |= tx.query_row(
+                    &format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE lower({column}) = ?1)"),
+                    params![approval.agent.to_lowercase()],
+                    |row| row.get::<_, bool>(0),
+                )?;
+            }
             if approval.reserved.contains(&approval.agent) {
                 anyhow::bail!(
                     "\"{}\" belongs to an agent with a token in the environment",
@@ -501,6 +537,15 @@ impl Db {
                     }
                 }
                 _ => anyhow::bail!("there is no OAuth agent named \"{}\"", approval.agent),
+            }
+        }
+        if approval.services_off {
+            for provider in super::PROVIDERS {
+                tx.execute(
+                    "INSERT OR IGNORE INTO ops_permissions (agent, provider, level)
+                     VALUES (?1, ?2, 'off')",
+                    params![approval.agent.to_lowercase(), provider],
+                )?;
             }
         }
         let now = unix_now();
@@ -1013,6 +1058,7 @@ mod tests {
             redirect_uri: "http://127.0.0.1:9/cb".into(),
             authorized_by: "admin".into(),
             reserved: vec!["claude".into()],
+            services_off: false,
             code_hash: code.into(),
             code_challenge: "c".repeat(43),
             code_expires_at: unix_now() + 300,
@@ -1063,6 +1109,95 @@ mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         assert!(db.registry_agent("claude").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_approver_without_integrations_grants_no_service() {
+        let (db, _) = temp_db("services-off");
+        client(&db, "client-1");
+        // Approved by someone with `integrations`: the default, full.
+        db.approve(&approval("trusted", true, "t1")).unwrap();
+        for provider in crate::db::PROVIDERS {
+            assert_eq!(db.ops_level("trusted", provider).unwrap(), "full");
+        }
+        // Approved with `agents` alone: off on every service, mail too.
+        let restricted = Approval {
+            services_off: true,
+            ..approval("cursor", true, "c1")
+        };
+        db.approve(&restricted).unwrap();
+        for provider in crate::db::PROVIDERS {
+            assert_eq!(
+                db.ops_level("cursor", provider).unwrap(),
+                "off",
+                "{provider}"
+            );
+        }
+        assert_eq!(db.ops_level("cursor", "mail").unwrap(), "off");
+        // Re-authorizing keeps the levels someone already set and turns the
+        // rest off.
+        db.set_ops_level("trusted", "github", "read").unwrap();
+        db.set_ops_level("trusted", "dokploy", "full").unwrap();
+        db.approve(&Approval {
+            services_off: true,
+            ..approval("trusted", false, "t2")
+        })
+        .unwrap();
+        assert_eq!(db.ops_level("trusted", "github").unwrap(), "read");
+        assert_eq!(db.ops_level("trusted", "cloudflare").unwrap(), "off");
+        // Level `full` keeps no row, so it is off now as well: the
+        // approver could not have granted it.
+        assert_eq!(db.ops_level("trusted", "dokploy").unwrap(), "off");
+    }
+
+    #[test]
+    fn never_authorized_clients_expire_after_an_hour() {
+        let (db, _) = temp_db("client-age");
+        client(&db, "stale");
+        client(&db, "used");
+        client(&db, "recent");
+        db.approve(&Approval {
+            client_id: "used".into(),
+            ..approval("cursor", true, "u1")
+        })
+        .unwrap();
+        db.execute_for_test(&format!(
+            "UPDATE oauth_clients SET created_at = {} WHERE client_id IN ('stale', 'used')",
+            unix_now() - 2 * 60 * 60
+        ));
+        client(&db, "new");
+        assert!(db.oauth_client("stale").unwrap().is_none());
+        for kept in ["used", "recent", "new"] {
+            assert!(db.oauth_client(kept).unwrap().is_some(), "{kept}");
+        }
+    }
+
+    #[test]
+    fn a_new_agent_cannot_take_a_name_from_the_history() {
+        let (db, _) = temp_db("history-names");
+        client(&db, "client-1");
+        db.execute_for_test(
+            "INSERT INTO entries (project, kind, title, body, agent)
+               VALUES ('p', 'note', 't', 'b', 'Writer');
+             INSERT INTO sessions (id, agent, project, title, started_at, last_seen_at)
+               VALUES ('s1', 'sessioner', 'p', 't', 'x', 'x');
+             INSERT INTO ops_log (agent, provider, method, path, status, outcome, created_at)
+               VALUES ('caller', 'github', 'GET', '/user', 200, 'ok', 'x');
+             INSERT INTO tasks (project, title, created_by, created_at, updated_at)
+               VALUES ('p', 't', 'planner', 'x', 'x');",
+        );
+        for name in ["writer", "sessioner", "caller", "planner"] {
+            let refused = db.approve(&approval(name, true, &format!("c-{name}")));
+            assert!(refused.is_err(), "{name}");
+            assert!(db.registry_agent(name).unwrap().is_none());
+        }
+        db.approve(&approval("fresh", true, "c-fresh")).unwrap();
+        // The OAuth agent's own history does not stop its re-authorization.
+        db.execute_for_test(
+            "INSERT INTO entries (project, kind, title, body, agent)
+               VALUES ('p', 'note', 't', 'b', 'fresh');",
+        );
+        db.approve(&approval("fresh", false, "c-fresh-2")).unwrap();
     }
 
     #[test]

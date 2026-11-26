@@ -71,6 +71,8 @@ const MAX_JSON_BYTES: usize = 64 * 1024;
 const MAX_FILE_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// Longest file text the detail view returns; longer text is cut.
 const FILE_TEXT_CHARS: usize = 200_000;
+/// Argon2 password checks that may run at the same time.
+const ARGON_PERMITS: usize = 3;
 /// Name the feed shows for actions taken from this page.
 const ADMIN_ACTOR: &str = "admin";
 const ICON: &str = include_str!("../assets/icon.svg");
@@ -146,6 +148,10 @@ enum Access {
     SignedIn,
     /// A signed-in user holding this permission.
     Needs(Perm),
+    /// A signed-in user holding every permission: the built-in admin, or a
+    /// stored user given all of them. Loading a whole database is as much
+    /// as being the administrator.
+    Everything,
 }
 
 /// Every route of the admin view and who may reach it. The guard looks a
@@ -218,11 +224,9 @@ const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/admin/api/export", Access::Needs(Perm::Backup)),
     ("GET", "/admin/api/backup/full", Access::Needs(Perm::Backup)),
     ("POST", "/admin/api/import", Access::Needs(Perm::Restore)),
-    (
-        "POST",
-        "/admin/api/restore/full",
-        Access::Needs(Perm::Restore),
-    ),
+    // A full database brings its own users, permissions, OAuth tokens and
+    // credentials, so restoring one is as much as holding every permission.
+    ("POST", "/admin/api/restore/full", Access::Everything),
     ("PUT", "/admin/api/profile", Access::Needs(Perm::Settings)),
     ("POST", "/admin/api/rules", Access::Needs(Perm::Settings)),
     (
@@ -306,6 +310,10 @@ pub struct Admin {
     guard: ops::Guard,
     sessions: Mutex<HashMap<String, AdminSession>>,
     logins: RateLimiter,
+    /// Argon2 verifications running at once, at most `ARGON_PERMITS`: each
+    /// takes 19 MiB and a core, so a flood of sign-ins is answered 429
+    /// rather than queued.
+    argon: Arc<tokio::sync::Semaphore>,
     /// Set while a full backup is being written or a full restore runs:
     /// one at a time.
     busy: AtomicBool,
@@ -363,6 +371,7 @@ impl Admin {
             sessions: Mutex::new(HashMap::new()),
             // Five wrong attempts lock the address out for fifteen minutes.
             logins: RateLimiter::new(5, Duration::from_secs(15 * 60)),
+            argon: Arc::new(tokio::sync::Semaphore::new(ARGON_PERMITS)),
             busy: AtomicBool::new(false),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(8))
@@ -639,6 +648,12 @@ async fn guard(State(admin): State<Arc<Admin>>, mut request: Request, next: Next
     {
         return forbidden(&format!("this needs the {} permission", perm.id()));
     }
+    if access == Access::Everything && !user.perms.is_all() {
+        return forbidden(
+            "restoring a full database needs every permission: the file brings its own users, \
+             permissions and tokens, so it is as much as being the administrator",
+        );
+    }
     request.extensions_mut().insert(user);
     next.run(request).await
 }
@@ -689,6 +704,8 @@ enum LoginOutcome {
     Wrong,
     /// The password was right, but the user is disabled.
     Disabled,
+    /// Every Argon2 slot is taken: nothing was checked.
+    Busy,
 }
 
 /// Checks a user name and password. Built-in passwords are compared in
@@ -716,8 +733,14 @@ async fn check_login(admin: &Arc<Admin>, username: &str, password: String) -> Lo
         VIEWER_USER if is_viewer() => LoginOutcome::Ok(SignedIn::builtin_viewer()),
         ADMIN_USER | VIEWER_USER => LoginOutcome::Wrong,
         name => {
+            // The slot moves into the blocking task, so it is held until
+            // the hash is checked even when the request goes away.
+            let Ok(permit) = admin.argon.clone().try_acquire_owned() else {
+                return LoginOutcome::Busy;
+            };
             let (state, name) = (admin.clone(), name.to_string());
             let checked = tokio::task::spawn_blocking(move || -> anyhow::Result<LoginOutcome> {
+                let _permit = permit;
                 let found = state.db.user_login(&name)?;
                 let hash = found
                     .as_ref()
@@ -759,7 +782,9 @@ async fn login(
     Json(form): Json<LoginForm>,
 ) -> Response {
     let ip = client_ip(&headers, Some(peer), admin.trust_proxy);
-    if let Some(retry_after) = admin.logins.blocked(&ip) {
+    // Every attempt counts before anything is checked, so parallel requests
+    // cannot all slip under the limit; a successful sign-in clears it.
+    if let Some(retry_after) = admin.logins.hit(&ip) {
         return too_many_requests(retry_after);
     }
 
@@ -767,7 +792,6 @@ async fn login(
         && let Err(reason) = verify_captcha(&admin.http, recaptcha, &form.captcha, &ip).await
     {
         tracing::warn!(%ip, %reason, "admin login rejected by reCAPTCHA");
-        admin.logins.hit(&ip);
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "The request looked automated. Try again." })),
@@ -778,9 +802,12 @@ async fn login(
     let username = form.username.trim().to_lowercase();
     let user = match check_login(&admin, &username, form.password).await {
         LoginOutcome::Ok(user) => user,
+        LoginOutcome::Busy => {
+            tracing::warn!(%ip, "sign-in refused: every password check slot is busy");
+            return too_many_requests(2);
+        }
         LoginOutcome::Wrong => {
             tracing::warn!(%ip, "admin login with a wrong user name or password");
-            admin.logins.hit(&ip);
             tokio::time::sleep(Duration::from_millis(400)).await;
             let message = if username.is_empty() {
                 "Wrong password."
@@ -791,12 +818,10 @@ async fn login(
         }
         LoginOutcome::Disabled => {
             tracing::warn!(%ip, "sign-in by a disabled user");
-            admin.logins.hit(&ip);
             return forbidden("This user is disabled.");
         }
     };
 
-    admin.logins.reset(&ip);
     let token = match random_token() {
         Ok(token) => token,
         Err(error) => {
@@ -804,6 +829,28 @@ async fn login(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    // The user may have been changed, disabled or deleted while the
+    // password was checked: the session gets the state as it is now.
+    let state = admin.clone();
+    let session_token = token.clone();
+    let started =
+        tokio::task::spawn_blocking(move || start_session(&state, &session_token, user)).await;
+    let user = match started {
+        Ok(Ok(Some(user))) => user,
+        Ok(Ok(None)) => {
+            tracing::warn!(%ip, "a sign-in raced a change to its user and was refused");
+            return forbidden("This user was changed or disabled while signing in.");
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "starting a session failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "the session task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    admin.logins.reset(&ip);
     let body = json!({
         "ok": true,
         "role": user.role(),
@@ -812,18 +859,40 @@ async fn login(
         "stored": user.user_id.is_some(),
     });
     tracing::info!(%ip, user = %user.username, "signed in to the admin view");
-    admin.sessions().insert(
-        token.clone(),
-        AdminSession {
-            expires: Instant::now() + SESSION_TTL,
-            user,
-        },
-    );
     let cookie = format!(
         "{COOKIE}={token}; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age={}",
         SESSION_TTL.as_secs()
     );
     ([(header::SET_COOKIE, cookie)], Json(body)).into_response()
+}
+
+/// Inserts the session for a checked sign-in. A stored user is read again
+/// under the sessions lock: a change made while the password was being
+/// checked (disabled, deleted, other permissions) either shows here or
+/// ends this session right after, because `end_sessions_of` needs the same
+/// lock. `None` when the user is gone or disabled.
+fn start_session(
+    admin: &Admin,
+    token: &str,
+    mut user: SignedIn,
+) -> anyhow::Result<Option<SignedIn>> {
+    let mut sessions = admin.sessions();
+    if let Some(id) = user.user_id {
+        match admin.db.user(id)? {
+            Some(now) if !now.disabled && now.username == user.username => {
+                user.perms = now.perms();
+            }
+            _ => return Ok(None),
+        }
+    }
+    sessions.insert(
+        token.to_string(),
+        AdminSession {
+            expires: Instant::now() + SESSION_TTL,
+            user: user.clone(),
+        },
+    );
+    Ok(Some(user))
 }
 
 async fn logout(State(admin): State<Arc<Admin>>, headers: HeaderMap) -> Response {
@@ -900,6 +969,9 @@ async fn add_user(
         Ok(perms) => perms,
         Err(message) => return bad_request(&message),
     };
+    if let Err(message) = may_grant(&me, perms) {
+        return forbidden(&message);
+    }
     let state = admin.clone();
     let password = form.password;
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<db::User> {
@@ -928,6 +1000,41 @@ async fn add_user(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// A user may grant only permissions they hold themselves; the built-in
+/// admin holds every one.
+fn may_grant(me: &SignedIn, perms: Perms) -> Result<(), String> {
+    if perms.is_subset_of(me.perms) {
+        Ok(())
+    } else {
+        Err(format!(
+            "you can only grant permissions you hold yourself; you do not hold {}",
+            perms.without(me.perms).ids().join(", ")
+        ))
+    }
+}
+
+/// A user may change, disable or delete (or set the password of) only a
+/// stored user whose every permission they hold themselves.
+fn may_manage(me: &SignedIn, user: &db::User) -> Result<(), String> {
+    let missing = user.perms().without(me.perms);
+    if missing == Perms::none() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} holds permissions you do not hold ({}), so you cannot change or delete them",
+            user.username,
+            missing.ids().join(", ")
+        ))
+    }
+}
+
+/// How a change to a stored user went, past the request checks.
+enum UserChange<T> {
+    Done(T),
+    Missing,
+    Forbidden(String),
 }
 
 /// Permission ids for an activity note.
@@ -987,6 +1094,11 @@ async fn update_user(
     if myself && form.disabled == Some(true) {
         return bad_request("you cannot disable yourself");
     }
+    if let Some(perms) = patch.permissions
+        && let Err(message) = may_grant(&me, perms)
+    {
+        return forbidden(&message);
+    }
     patch.disabled = form.disabled;
     let password = form.password.filter(|password| !password.is_empty());
     if let Some(password) = &password
@@ -996,15 +1108,18 @@ async fn update_user(
     }
     let keep = cookie(&headers, COOKIE);
     let state = admin.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<db::User>> {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<UserChange<db::User>> {
         let Some(before) = state.db.user(id)? else {
-            return Ok(None);
+            return Ok(UserChange::Missing);
         };
+        if let Err(message) = may_manage(&me, &before) {
+            return Ok(UserChange::Forbidden(message));
+        }
         if let Some(password) = &password {
             patch.password_hash = Some(users::hash_password(password)?);
         }
         let Some(after) = state.db.update_user(id, &patch)? else {
-            return Ok(None);
+            return Ok(UserChange::Missing);
         };
         let mut changes = Vec::new();
         if before.email != after.email {
@@ -1039,12 +1154,13 @@ async fn update_user(
             );
             note_activity(&state, "users", &summary);
         }
-        Ok(Some(after))
+        Ok(UserChange::Done(after))
     })
     .await;
     match result {
-        Ok(Ok(Some(user))) => Json(user).into_response(),
-        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(UserChange::Done(user))) => Json(user).into_response(),
+        Ok(Ok(UserChange::Missing)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(UserChange::Forbidden(message))) => forbidden(&message),
         Ok(Err(error)) => bad_request(&error.to_string()),
         Err(error) => {
             tracing::error!(%error, "changing a user failed");
@@ -1063,19 +1179,26 @@ async fn delete_user(
         return bad_request("you cannot delete yourself");
     }
     let state = admin.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<db::User>> {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<UserChange<()>> {
+        let Some(before) = state.db.user(id)? else {
+            return Ok(UserChange::Missing);
+        };
+        if let Err(message) = may_manage(&me, &before) {
+            return Ok(UserChange::Forbidden(message));
+        }
         let Some(user) = state.db.delete_user(id)? else {
-            return Ok(None);
+            return Ok(UserChange::Missing);
         };
         state.end_sessions_of(id, None, None);
         let summary = format!("{} deleted the user {}", me.username, user.username);
         note_activity(&state, "users", &summary);
-        Ok(Some(user))
+        Ok(UserChange::Done(()))
     })
     .await;
     match result {
-        Ok(Ok(Some(_))) => Json(json!({ "ok": true })).into_response(),
-        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(UserChange::Done(()))) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(UserChange::Missing)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(UserChange::Forbidden(message))) => forbidden(&message),
         Ok(Err(error)) => bad_request(&error.to_string()),
         Err(error) => {
             tracing::error!(%error, "deleting a user failed");
@@ -1113,16 +1236,22 @@ async fn change_own_password(
         );
     };
     let ip = client_ip(&headers, Some(peer), admin.trust_proxy);
-    if let Some(retry_after) = admin.logins.blocked(&ip) {
-        return too_many_requests(retry_after);
-    }
     if let Err(message) = users::check_password(&form.password) {
         return bad_request(&message);
     }
+    // Like a sign-in: the attempt counts before the current password is
+    // checked, and the check needs a free Argon2 slot.
+    if let Some(retry_after) = admin.logins.hit(&ip) {
+        return too_many_requests(retry_after);
+    }
+    let Ok(permit) = admin.argon.clone().try_acquire_owned() else {
+        return too_many_requests(2);
+    };
     let keep = cookie(&headers, COOKIE);
     let state = admin.clone();
     let result =
         tokio::task::spawn_blocking(move || -> anyhow::Result<Result<(), &'static str>> {
+            let _permit = permit;
             let Some(hash) = state.db.user_password_hash(id)? else {
                 return Ok(Err("your user no longer exists"));
             };
@@ -1141,11 +1270,11 @@ async fn change_own_password(
         })
         .await;
     match result {
-        Ok(Ok(Ok(()))) => Json(json!({ "ok": true })).into_response(),
-        Ok(Ok(Err(message))) => {
-            admin.logins.hit(&ip);
-            bad_request(message)
+        Ok(Ok(Ok(()))) => {
+            admin.logins.reset(&ip);
+            Json(json!({ "ok": true })).into_response()
         }
+        Ok(Ok(Err(message))) => bad_request(message),
         Ok(Err(error)) => bad_request(&error.to_string()),
         Err(error) => {
             tracing::error!(%error, "changing a password failed");
@@ -1261,25 +1390,37 @@ async fn full_restore(
     let Some(_busy) = admin.try_busy() else {
         return conflict();
     };
+    // Owns the temporary file from before the first byte arrives: however
+    // the request ends (refused, done, or dropped because the client went
+    // away mid-upload), the file goes with it.
     let temp = match admin.db.temp_path("restore") {
-        Ok(path) => path,
+        Ok(path) => TempFile(path),
         Err(error) => {
             tracing::error!(%error, "no temporary file for the restore");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let received = receive_upload(body, &temp).await;
-    let response = match received {
+    let received = receive_upload(body, &temp.0).await;
+    match received {
         Err(Upload::TooLarge) => too_large(),
         Err(Upload::Failed(reason)) => refused("upload", &reason),
         Ok(0) => refused("upload", "the upload was empty"),
         Ok(_) => {
             let state = admin.clone();
-            let path = temp.clone();
-            let outcome =
-                tokio::task::spawn_blocking(move || restore_prepared(&state, &me, &path)).await;
+            // The blocking work owns the file now: if the client leaves
+            // while it runs, the file is removed when it ends, not before.
+            let outcome = tokio::task::spawn_blocking(move || {
+                let temp = temp;
+                restore_prepared(&state, &me, &temp.0)
+            })
+            .await;
             match outcome {
                 Ok(Ok(value)) => Json(value).into_response(),
+                Ok(Err(refusal)) if refusal.check == "after-load" => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": refusal.message, "check": refusal.check })),
+                )
+                    .into_response(),
                 Ok(Err(refusal)) => {
                     tracing::warn!(check = refusal.check, reason = %refusal.message, "full restore refused");
                     refused(refusal.check, &refusal.message)
@@ -1290,10 +1431,17 @@ async fn full_restore(
                 }
             }
         }
-    };
-    let cleanup = temp.clone();
-    let _ = tokio::task::spawn_blocking(move || db::remove_database_files(&cleanup)).await;
-    response
+    }
+}
+
+/// A temporary database file, removed (with its journal files) when this
+/// is dropped.
+struct TempFile(std::path::PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        db::remove_database_files(&self.0);
+    }
 }
 
 fn too_large() -> Response {
@@ -1354,13 +1502,26 @@ fn restore_prepared(
                 "the safety copy of the current database could not be written: {error}"
             ),
         })?;
-    let counts = admin
-        .db
-        .load_full_backup(path)
-        .map_err(|error| db::Refusal {
+    let counts = admin.db.load_full_backup(path).map_err(|error| match error {
+        db::LoadError::Unchanged(error) => db::Refusal {
             check: "load",
             message: format!("the backup could not be loaded; nothing changed: {error}"),
-        })?;
+        },
+        db::LoadError::Replaced(error) => {
+            tracing::error!(%error, snapshot = %snapshot, "a full restore failed after the database was replaced");
+            // The sessions follow what the database now holds.
+            keep_sessions_of_existing_users(admin);
+            db::Refusal {
+                check: "after-load",
+                message: format!(
+                    "the backup replaced the database, but a later step failed: {error}. The \
+                     database may now be the backup without lore's latest schema changes; \
+                     restart lore, which runs them again. The database as it was before the \
+                     restore is in the safety copy {snapshot} in the data directory."
+                ),
+            }
+        }
+    })?;
     // Derived state: vectors from another model are dropped and computed
     // again in the background, like after a JSON restore.
     if let Some(model) = admin.embedding_model
@@ -2501,7 +2662,7 @@ async fn test_integration(
     let prepared = {
         let state = admin.clone();
         tokio::task::spawn_blocking(
-            move || -> anyhow::Result<Result<(String, Secret), String>> {
+            move || -> anyhow::Result<Result<(String, Secret, ops::Guard), String>> {
                 let request = provider.test_request();
                 let Some(key) = state.vault.as_ref() else {
                     state.db.log_op(
@@ -2566,13 +2727,16 @@ async fn test_integration(
                         provider.id
                     )));
                 };
-                Ok(Ok((provider.api_base(&row.base_url), secret)))
+                let guard = state
+                    .guard
+                    .with_secrets(&ops::stored_secrets(&state.db, key)?);
+                Ok(Ok((provider.api_base(&row.base_url), secret, guard)))
             },
         )
         .await
     };
-    let (base, secret) = match prepared {
-        Ok(Ok(Ok(pair))) => pair,
+    let (base, secret, guard) = match prepared {
+        Ok(Ok(Ok(prepared))) => prepared,
         Ok(Ok(Err(message))) => {
             return Json(json!({ "ok": false, "status": 0, "message": message })).into_response();
         }
@@ -2587,7 +2751,7 @@ async fn test_integration(
     };
     let request = provider.test_request();
     let started = Instant::now();
-    let outcome = ops::call(&admin.ops_http, &base, &secret, &admin.guard, &request).await;
+    let outcome = ops::call(&admin.ops_http, &base, &secret, &guard, &request).await;
     // What the test found, ready to answer and to log.
     let (ok, status, message, log_status, log_outcome, log_detail) = match &outcome {
         Ok(response) => {
@@ -2726,7 +2890,7 @@ async fn test_mail(admin: Arc<Admin>) -> Response {
     let prepared = {
         let state = admin.clone();
         tokio::task::spawn_blocking(
-            move || -> anyhow::Result<Result<(mail::Mailbox, Secret), String>> {
+            move || -> anyhow::Result<Result<(mail::Mailbox, Secret, ops::Guard), String>> {
                 let refuse = |detail: &str| {
                     state.db.log_op(
                         ADMIN_ACTOR,
@@ -2751,7 +2915,12 @@ async fn test_mail(admin: Arc<Admin>) -> Response {
                     return Ok(Err("No mailbox is stored.".into()));
                 };
                 match mail::Mailbox::open(key, &stored) {
-                    Ok(pair) => Ok(Ok(pair)),
+                    Ok((mailbox, password)) => {
+                        let guard = state
+                            .guard
+                            .with_secrets(&ops::stored_secrets(&state.db, key)?);
+                        Ok(Ok((mailbox, password, guard)))
+                    }
                     Err(_) => {
                         refuse("the stored credential cannot be decrypted")?;
                         Ok(Err(
@@ -2765,8 +2934,8 @@ async fn test_mail(admin: Arc<Admin>) -> Response {
         )
         .await
     };
-    let (mailbox, password) = match prepared {
-        Ok(Ok(Ok(pair))) => pair,
+    let (mailbox, password, guard) = match prepared {
+        Ok(Ok(Ok(prepared))) => prepared,
         Ok(Ok(Err(message))) => {
             return Json(json!({ "ok": false, "status": 0, "message": message })).into_response();
         }
@@ -2780,19 +2949,25 @@ async fn test_mail(admin: Arc<Admin>) -> Response {
         }
     };
     let started = Instant::now();
-    let outcome = mail::test(&mailbox, &password, &admin.guard).await;
+    let host = mailbox.host.clone();
+    let outcome = mail::test(mailbox, password, guard).await;
     let (ok, message, log_outcome, detail) = match &outcome {
         Ok(count) => (
             true,
             format!(
-                "Logged in to {}: {count} folder{}.",
-                mailbox.host,
+                "Logged in to {host}: {count} folder{}.",
                 if *count == 1 { "" } else { "s" }
             ),
             "ok",
             String::new(),
         ),
-        Err(reason) => (false, format!("{reason}."), "error", reason.clone()),
+        // The page hears the server's words; the log keeps a fixed text.
+        Err(failure) => (
+            false,
+            format!("{}.", failure.message),
+            "error",
+            failure.log.to_string(),
+        ),
     };
     let summary = format!("tested {} ({})", mail::ID, if ok { "ok" } else { "failed" });
     let state = admin.clone();
@@ -4417,11 +4592,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(tested["ok"], false);
+        // A loopback address is refused before anything connects, so Test
+        // cannot be used to probe internal ports.
         assert!(
             tested["message"]
                 .as_str()
                 .unwrap()
-                .contains("could not be reached"),
+                .contains("not a public one"),
             "{tested}"
         );
         let row = &admin.db.ops_log(1).unwrap()[0];
@@ -4945,7 +5122,7 @@ mod tests {
     #[tokio::test]
     async fn users_are_managed_with_the_users_permission() {
         let (base, admin) = serve().await;
-        let me = stored_user(&admin, "boss", &["users"], "boss-token");
+        let me = stored_user(&admin, "boss", &["users", "write", "backup"], "boss-token");
         let client = reqwest::Client::new();
         let call = |method: reqwest::Method, path: String, token: &str| {
             client
@@ -5098,7 +5275,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 400);
-        // Adding a permission to himself is fine, and his session follows.
+        // Dropping another permission is fine, and his session follows.
         let response = call(reqwest::Method::PUT, mine.clone(), "boss-token")
             .json(&json!({ "permissions": ["users", "write"] }))
             .send()
@@ -5115,7 +5292,9 @@ mod tests {
                     );
                     headers
                 })
-                .is_some_and(|user| user.perms.contains(Perm::Write))
+                .is_some_and(
+                    |user| user.perms.contains(Perm::Write) && !user.perms.contains(Perm::Backup)
+                )
         );
 
         // Disabling and deleting Ana end her sessions.
@@ -5188,6 +5367,335 @@ mod tests {
                 .any(|note| note.contains("boss deleted the user ana"))
         );
         assert!(notes.iter().all(|note| !note.contains("another-password")));
+    }
+
+    #[tokio::test]
+    async fn users_cannot_grant_or_touch_permissions_they_lack() {
+        let (base, admin) = serve().await;
+        stored_user(&admin, "boss", &["users"], "boss-token");
+        let chief = stored_user(&admin, "chief", &["users", "integrations"], "chief-token");
+        let ann = stored_user(&admin, "ann", &[], "ann-token");
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: String, token: &str| {
+            client
+                .request(method, format!("{base}{path}"))
+                .header(header::COOKIE, format!("{COOKIE}={token}"))
+        };
+        let boss_id = admin.db.user_login("boss").unwrap().unwrap().user.id;
+        let chief_path = format!("/admin/api/users/{}", chief.id);
+        let ann_path = format!("/admin/api/users/{}", ann.id);
+        let refused: Vec<(reqwest::Method, String, serde_json::Value)> = vec![
+            // Granting what boss does not hold: to a new user, to himself,
+            // to someone weaker.
+            (
+                reqwest::Method::POST,
+                "/admin/api/users".into(),
+                json!({ "username": "mole", "password": "a-long-password",
+                        "permissions": ["integrations"] }),
+            ),
+            (
+                reqwest::Method::PUT,
+                format!("/admin/api/users/{boss_id}"),
+                json!({ "permissions": ["users", "restore"] }),
+            ),
+            (
+                reqwest::Method::PUT,
+                ann_path.clone(),
+                json!({ "permissions": ["agents"] }),
+            ),
+            // Touching a stronger user in any way.
+            (
+                reqwest::Method::PUT,
+                chief_path.clone(),
+                json!({ "password": "taken-over-now" }),
+            ),
+            (
+                reqwest::Method::PUT,
+                chief_path.clone(),
+                json!({ "disabled": true }),
+            ),
+            (
+                reqwest::Method::PUT,
+                chief_path.clone(),
+                json!({ "email": "boss@example.org" }),
+            ),
+            (
+                reqwest::Method::PUT,
+                chief_path.clone(),
+                json!({ "permissions": ["users"] }),
+            ),
+            (reqwest::Method::DELETE, chief_path.clone(), json!({})),
+        ];
+        for (method, path, body) in refused {
+            let mut request = call(method.clone(), path.clone(), "boss-token");
+            if method != reqwest::Method::DELETE {
+                request = request.json(&body);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), 403, "{method} {path} {body}");
+        }
+        // Nothing changed.
+        assert!(admin.db.user_login("mole").unwrap().is_none());
+        let after = admin.db.user(chief.id).unwrap().unwrap();
+        assert_eq!(after.perms(), chief.perms());
+        assert!(!after.disabled && after.email == chief.email);
+        assert!(has_session(&admin, "chief-token"));
+        assert_eq!(
+            admin.db.user(boss_id).unwrap().unwrap().perms(),
+            Perms::parse(&["users"]).unwrap()
+        );
+        assert_eq!(
+            admin.db.user(ann.id).unwrap().unwrap().perms(),
+            Perms::none()
+        );
+        assert_eq!(
+            login(
+                &base,
+                json!({ "username": "chief", "password": "a-long-password" })
+            )
+            .await
+            .status(),
+            200
+        );
+        // What boss holds he may grant, and weaker users he may change.
+        let response = call(reqwest::Method::PUT, ann_path.clone(), "boss-token")
+            .json(&json!({ "permissions": ["users"], "password": "ann-new-password" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        // The built-in admin holds everything.
+        let response = call(reqwest::Method::PUT, chief_path.clone(), "admin-token")
+            .json(&json!({ "permissions": ["agents", "restore"] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let response = call(reqwest::Method::DELETE, chief_path, "admin-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn parallel_sign_ins_are_counted_before_the_password_is_checked() {
+        let (base, admin) = serve().await;
+        stored_user(&admin, "luis", &[], "luis-token");
+        // Rounds of as many parallel attempts as there are Argon2 slots, so
+        // only the counting can turn one away: five are checked, no more.
+        let mut statuses = Vec::new();
+        for _ in 0..4 {
+            let round: Vec<_> = (0..ARGON_PERMITS)
+                .map(|_| {
+                    let base = base.clone();
+                    tokio::spawn(async move {
+                        login(
+                            &base,
+                            json!({ "username": "luis", "password": "wrong-password" }),
+                        )
+                        .await
+                        .status()
+                        .as_u16()
+                    })
+                })
+                .collect();
+            for attempt in round {
+                statuses.push(attempt.await.unwrap());
+            }
+        }
+        let checked = statuses.iter().filter(|status| **status == 401).count();
+        assert_eq!(checked, 5, "{statuses:?}");
+        assert!(statuses.iter().all(|status| matches!(status, 401 | 429)));
+        // Still locked out, even with the right password.
+        let response = login(
+            &base,
+            json!({ "username": "luis", "password": "a-long-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 429);
+    }
+
+    #[tokio::test]
+    async fn password_checks_wait_for_no_free_argon2_slot() {
+        let (base, admin) = serve().await;
+        stored_user(&admin, "luis", &[], "luis-token");
+        let held = admin
+            .argon
+            .clone()
+            .try_acquire_many_owned(ARGON_PERMITS as u32)
+            .unwrap();
+        let response = login(
+            &base,
+            json!({ "username": "luis", "password": "a-long-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 429);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        let response = reqwest::Client::new()
+            .put(format!("{base}/admin/api/password"))
+            .header(header::COOKIE, format!("{COOKIE}=luis-token"))
+            .json(&json!({ "current": "a-long-password", "password": "new-password-1" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 429);
+        // The built-in passwords need no Argon2 slot.
+        let response = login(&base, json!({ "password": "admin-password" })).await;
+        assert_eq!(response.status(), 200);
+        drop(held);
+        let response = login(
+            &base,
+            json!({ "username": "luis", "password": "a-long-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+    }
+
+    #[test]
+    fn a_session_starts_with_the_user_as_stored_now() {
+        let dir = std::env::temp_dir().join(format!("lore-admin-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let admin = Admin::new(
+            Db::open(&dir.join("lore.db")).unwrap(),
+            "admin-password".into(),
+            None,
+            None,
+            false,
+            Vec::new(),
+            None,
+            0.8,
+            Events::new(),
+            Embedder::disabled(),
+            12,
+            None,
+            ops::Guard::default(),
+        );
+        let user = admin
+            .db
+            .add_user(&NewUser {
+                username: "luis".into(),
+                email: None,
+                password_hash: "x".into(),
+                permissions: Perms::parse(&["write", "users"]).unwrap(),
+                created_by: "admin".into(),
+            })
+            .unwrap();
+        // What the password check saw before the user was changed.
+        let checked = SignedIn {
+            username: "luis".into(),
+            user_id: Some(user.id),
+            perms: user.perms(),
+        };
+        admin
+            .db
+            .update_user(
+                user.id,
+                &UserPatch {
+                    permissions: Some(Perms::parse(&["write"]).unwrap()),
+                    ..UserPatch::default()
+                },
+            )
+            .unwrap();
+        let started = start_session(&admin, "t1", checked.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.perms, Perms::parse(&["write"]).unwrap());
+        assert_eq!(
+            admin.sessions().get("t1").unwrap().user.perms,
+            Perms::parse(&["write"]).unwrap()
+        );
+        admin
+            .db
+            .update_user(
+                user.id,
+                &UserPatch {
+                    disabled: Some(true),
+                    ..UserPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            start_session(&admin, "t2", checked.clone())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!admin.sessions().contains_key("t2"));
+        admin.db.delete_user(user.id).unwrap();
+        assert!(start_session(&admin, "t3", checked).unwrap().is_none());
+        // The built-in users have nothing stored to re-read.
+        assert!(
+            start_session(&admin, "t4", SignedIn::builtin_admin())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restore_that_fails_after_the_load_says_so_and_names_the_safety_copy() {
+        let (base, admin) = serve().await;
+        let file = admin.db.temp_path("upload-source").unwrap();
+        admin.db.snapshot_to(&file).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        db::remove_database_files(&file);
+        admin
+            .db
+            .fail_after_load
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let response = reqwest::Client::new()
+            .post(format!("{base}/admin/api/restore/full"))
+            .header(header::COOKIE, format!("{COOKIE}=admin-token"))
+            .body(bytes)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 500);
+        let answer: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(answer["check"], "after-load");
+        let message = answer["error"].as_str().unwrap();
+        assert!(!message.contains("nothing changed"), "{message}");
+        let snapshot = std::fs::read_dir(admin.db.data_dir())
+            .unwrap()
+            .flatten()
+            .map(|item| item.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with("pre-restore-"))
+            .unwrap();
+        assert!(message.contains(&snapshot), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_full_restore_upload_leaves_no_file() {
+        let (_base, admin) = serve().await;
+        let dir = admin.db.data_dir();
+        let temp_files = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|item| item.file_name().to_string_lossy().starts_with(".lore-tmp-"))
+                .count()
+        };
+        // An upload that sends one chunk and then stalls, the way a client
+        // that went away looks to the handler until it is dropped.
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        sender
+            .send(Ok(Bytes::from(vec![b'x'; 64 * 1024])))
+            .await
+            .unwrap();
+        let body = Body::from_stream(ReceiverStream::new(receiver));
+        let handler = full_restore(
+            State(admin.clone()),
+            Extension(SignedIn::builtin_admin()),
+            HeaderMap::new(),
+            body,
+        );
+        // The request is dropped mid-upload, as axum drops it when the
+        // connection goes away.
+        let dropped = tokio::time::timeout(Duration::from_millis(300), handler).await;
+        assert!(dropped.is_err(), "the stalled upload finished");
+        assert_eq!(temp_files(), 0, "the temporary file stayed behind");
+        drop(sender);
+        // And the next restore is not blocked by it.
+        assert!(admin.try_busy().is_some());
     }
 
     #[tokio::test]
@@ -5303,7 +5811,13 @@ mod tests {
         );
 
         let (target, target_admin) = serve().await;
-        let gone = stored_user(&target_admin, "gone", &["restore"], "gone-token");
+        let gone = stored_user(
+            &target_admin,
+            "gone",
+            &Perm::ALL.map(Perm::id),
+            "gone-token",
+        );
+        stored_user(&target_admin, "restorer", &["restore"], "restorer-token");
         let upload = |token: &str, body: Vec<u8>| {
             client
                 .post(format!("{target}/admin/api/restore/full"))
@@ -5323,7 +5837,15 @@ mod tests {
                 check
             );
         }
-        assert_eq!(target_admin.db.users().unwrap().len(), 1);
+        assert_eq!(target_admin.db.users().unwrap().len(), 2);
+        // `restore` alone is not enough for a whole database: it carries its
+        // own users and tokens.
+        let response = upload("restorer-token", file.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(target_admin.db.users().unwrap().len(), 2);
 
         let response = upload("gone-token", file.to_vec()).send().await.unwrap();
         assert_eq!(response.status(), 200);

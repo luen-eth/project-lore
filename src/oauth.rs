@@ -49,8 +49,12 @@ pub const REFRESH_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 pub const CODE_TTL_SECS: i64 = 5 * 60;
 /// How long a consent page may stay open before it has to start again.
 const PENDING_TTL: Duration = Duration::from_secs(15 * 60);
-/// Consent requests kept at most; the oldest go first.
+/// Consent requests kept at most. When full, the client with the most open
+/// requests loses its oldest, so a flood from one client cannot push out
+/// another's.
 const MAX_PENDING: usize = 500;
+/// Open consent requests one client may have; its oldest goes first.
+const MAX_PENDING_PER_CLIENT: usize = 20;
 /// Redirect URIs a client may register.
 const MAX_REDIRECT_URIS: usize = 5;
 const MAX_REDIRECT_URI_CHARS: usize = 2000;
@@ -61,9 +65,14 @@ const MAX_FORM_BYTES: usize = 16 * 1024;
 /// Names an OAuth agent may never take: lore's own users and the agent of
 /// the shared token.
 const RESERVED_AGENT_NAMES: &[&str] = &["admin", "viewer", "shared"];
-/// Schemes that are never a redirect target, whatever a client registers.
+/// Schemes that are never a redirect target, whatever a client registers:
+/// ones that run code or read files, well-known web, file and network
+/// schemes, and the handlers operating systems register for dangerous
+/// things (installing apps, searching shares, opening archives).
 const REFUSED_SCHEMES: &[&str] = &[
     "javascript",
+    "jscript",
+    "livescript",
     "data",
     "file",
     "vbscript",
@@ -72,11 +81,46 @@ const REFUSED_SCHEMES: &[&str] = &[
     "filesystem",
     "view-source",
     "ftp",
+    "ftps",
+    "sftp",
     "ws",
     "wss",
     "mailto",
     "tel",
+    "sms",
+    "callto",
+    "gopher",
+    "smb",
+    "nfs",
+    "ssh",
+    "telnet",
+    "ldap",
+    "ldaps",
+    "news",
+    "nntp",
+    "irc",
+    "rtsp",
+    "sip",
+    "jar",
+    "intent",
+    "itms",
+    "itms-apps",
+    "itms-services",
+    "search",
+    "search-ms",
+    "hcp",
+    "its",
+    "mk",
+    "res",
+    "shell",
+    "chrome",
+    "chrome-extension",
+    "moz-extension",
+    "resource",
 ];
+/// Scheme prefixes refused like `REFUSED_SCHEMES`: Windows' `ms-*`
+/// handlers (`ms-msdt`, `ms-officecmd`, …) and their `vnd.ms-` kin.
+const REFUSED_SCHEME_PREFIXES: &[&str] = &["ms-", "vnd.ms-"];
 
 const CONSENT_PAGE: &str = include_str!("../assets/consent.html");
 
@@ -95,6 +139,8 @@ pub struct OAuth {
     registrations: RateLimiter,
     /// Failed token requests per client address.
     failures: RateLimiter,
+    /// Authorization requests (consent pages) per client address.
+    authorizations: RateLimiter,
 }
 
 /// A validated authorization request waiting for the user's decision.
@@ -138,6 +184,8 @@ impl OAuth {
             registrations: RateLimiter::new(10, Duration::from_secs(10 * 60)),
             // Thirty failed token requests per address in five minutes.
             failures: RateLimiter::new(30, Duration::from_secs(5 * 60)),
+            // Thirty consent pages per address in ten minutes.
+            authorizations: RateLimiter::new(30, Duration::from_secs(10 * 60)),
         }
     }
 
@@ -151,11 +199,33 @@ impl OAuth {
     fn add_pending(&self, request: Pending) -> Option<String> {
         let id = random_token().ok()?;
         let mut pending = self.pending();
-        while pending.len() >= MAX_PENDING {
-            let oldest = pending
+        // The oldest open request of one client.
+        let oldest_of = |pending: &HashMap<String, Pending>, client: &str| {
+            pending
                 .iter()
-                .min_by_key(|(_, request)| request.created)
-                .map(|(id, _)| id.clone())?;
+                .filter(|(_, open)| open.client_id == client)
+                .min_by_key(|(_, open)| open.created)
+                .map(|(id, _)| id.clone())
+        };
+        while pending
+            .values()
+            .filter(|open| open.client_id == request.client_id)
+            .count()
+            >= MAX_PENDING_PER_CLIENT
+        {
+            let oldest = oldest_of(&pending, &request.client_id)?;
+            pending.remove(&oldest);
+        }
+        while pending.len() >= MAX_PENDING {
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for open in pending.values() {
+                *counts.entry(open.client_id.as_str()).or_default() += 1;
+            }
+            let busiest = counts
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(client, _)| client.to_string())?;
+            let oldest = oldest_of(&pending, &busiest)?;
             pending.remove(&oldest);
         }
         pending.insert(id.clone(), request);
@@ -439,7 +509,18 @@ pub fn check_redirect_uri(uri: &str) -> Result<(), String> {
             }
         }
         scheme => {
-            if REFUSED_SCHEMES.contains(&scheme) || scheme.len() < 2 {
+            let mut chars = scheme.chars();
+            let shaped = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+                && chars.all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '-')
+                });
+            if !shaped
+                || scheme.len() < 2
+                || REFUSED_SCHEMES.contains(&scheme)
+                || REFUSED_SCHEME_PREFIXES
+                    .iter()
+                    .any(|prefix| scheme.starts_with(prefix))
+            {
                 return Err(format!("the scheme \"{scheme}\" is not a redirect target"));
             }
         }
@@ -650,9 +731,15 @@ fn redirect_error(
 /// as an OAuth error.
 async fn authorize(
     State(oauth): State<Arc<OAuth>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     query: Result<Query<AuthorizeQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    let ip = client_ip(&headers, Some(peer), oauth.trust_proxy);
+    if let Some(retry_after) = oauth.authorizations.hit(&ip) {
+        tracing::warn!(%ip, "too many authorization requests");
+        return too_many_requests(retry_after);
+    }
     let query = query.map(|Query(query)| query).unwrap_or_default();
     let Some(origin) = public_origin(&headers, oauth.trust_proxy, &oauth.allowed_hosts) else {
         return error_page(
@@ -1161,6 +1248,86 @@ mod tests {
         );
     }
 
+    fn test_oauth(label: &str) -> OAuth {
+        let dir =
+            std::env::temp_dir().join(format!("lore-oauth-test-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        OAuth::new(
+            Db::open(&dir.join("lore.db")).unwrap(),
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn open_request(client: &str) -> Pending {
+        Pending {
+            client_id: client.into(),
+            client_name: String::new(),
+            redirect_uri: "http://127.0.0.1:9/cb".into(),
+            state: None,
+            code_challenge: "c".repeat(43),
+            created: Instant::now(),
+            csrf: None,
+        }
+    }
+
+    #[test]
+    fn a_flood_of_consent_requests_cannot_expire_another_clients() {
+        let oauth = test_oauth("pending");
+        let real = oauth.add_pending(open_request("real-client")).unwrap();
+        // One client keeps at most its own share.
+        let mut flood = Vec::new();
+        for _ in 0..(MAX_PENDING_PER_CLIENT + 5) {
+            flood.push(oauth.add_pending(open_request("flooder")).unwrap());
+        }
+        assert!(oauth.pending_request(&flood[0]).is_none());
+        assert!(oauth.pending_request(flood.last().unwrap()).is_some());
+        // Many clients filling every slot push out the busiest client's
+        // oldest requests, never the one request of another.
+        for client in 0..(MAX_PENDING / MAX_PENDING_PER_CLIENT + 2) {
+            for _ in 0..MAX_PENDING_PER_CLIENT {
+                oauth
+                    .add_pending(open_request(&format!("flooder-{client}")))
+                    .unwrap();
+            }
+        }
+        assert!(oauth.pending().len() <= MAX_PENDING);
+        assert!(oauth.pending_request(&real).is_some());
+    }
+
+    #[tokio::test]
+    async fn authorization_requests_are_limited_per_address() {
+        let oauth = Arc::new(test_oauth("authorize-limit"));
+        let peer: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let mut statuses = Vec::new();
+        for _ in 0..31 {
+            let response = authorize(
+                State(oauth.clone()),
+                ConnectInfo(peer),
+                host("lore.example.com"),
+                Ok(Query(AuthorizeQuery::default())),
+            )
+            .await;
+            statuses.push(response.status());
+        }
+        assert!(
+            statuses[..30]
+                .iter()
+                .all(|status| *status == StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(statuses[30], StatusCode::TOO_MANY_REQUESTS);
+        // Another address is not affected.
+        let response = authorize(
+            State(oauth),
+            ConnectInfo("203.0.113.8:5000".parse().unwrap()),
+            host("lore.example.com"),
+            Ok(Query(AuthorizeQuery::default())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn redirect_uris_are_checked() {
         for good in [
@@ -1170,6 +1337,8 @@ mod tests {
             "http://[::1]:9999/",
             "cursor://anysphere.cursor-retrieval/oauth/callback",
             "vscode://vscode.github-authentication/did-authenticate",
+            "com.example.app:/oauth2redirect",
+            "my-client+v2://callback",
         ] {
             assert!(check_redirect_uri(good).is_ok(), "{good} was refused");
         }
@@ -1183,6 +1352,17 @@ mod tests {
             "relative/path",
             "https://user:pass@client.example.com/",
             "https://client.example.com/a b",
+            "ms-msdt:/id",
+            "ms-officecmd:x",
+            "MS-SETTINGS:privacy",
+            "search-ms:query=x&crumb=location:\\\\host\\share",
+            "intent://scan/",
+            "itms-services://?action=download-manifest&url=https://x/m.plist",
+            "jar:https://example.com/a.jar!/x",
+            "vnd.ms-excel:x",
+            "smb://host/share",
+            "ssh://host",
+            "gopher://host/",
         ] {
             assert!(check_redirect_uri(bad).is_err(), "{bad:?} was accepted");
         }
