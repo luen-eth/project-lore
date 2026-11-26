@@ -25,8 +25,12 @@
     <h1>project-lore</h1>
     <p class="muted">The shared memory of your agents.</p>
     <label class="field">
+      <span class="sr-only">Username</span>
+      <input id="username" type="text" placeholder="Username" autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>
+    </label>
+    <label class="field">
       <span class="sr-only">Password</span>
-      <input id="password" type="password" placeholder="Password" autocomplete="current-password" required autofocus>
+      <input id="password" type="password" placeholder="Password" autocomplete="current-password" required>
     </label>
     <button id="login-button" type="submit">Enter</button>
     <p id="login-error" class="error" role="alert"></p>
@@ -60,6 +64,7 @@
       <button id="board-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="board">Board</button>
       <button id="integrations-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="integrations">Integrations</button>
       <button id="profile-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="profile">Profile</button>
+      <button id="users-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="users" hidden>Users</button>
       <button id="backup-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="backup">Backup</button>
       <button id="logout" class="ghost" type="button">Sign out</button>
     </div>
@@ -106,11 +111,24 @@
 
   <div id="backup" class="backup" hidden>
     <h2>Backup and restore</h2>
+    <p class="muted small-text backup-note">JSON holds the memories, the board, the files and the profile: portable, and it can be merged into another lore. The full database is everything, an exact copy.</p>
+    <h4>JSON backup</h4>
     <button id="backup-export" class="ghost" type="button"><b>Export backup</b><span>Download everything as one JSON file: every memory with its search index, the sessions, the profile, the rules and the agent records.</span></button>
     <button id="backup-import" class="ghost" type="button"><b>Import and merge</b><span>Add the entries, sessions and rules from a backup that are not here yet. Nothing is removed.</span></button>
     <button id="backup-restore" class="ghost danger" type="button"><b>Restore from backup</b><span>Replace everything here with the contents of a backup file.</span></button>
+    <h4>Full database (.sqlite)</h4>
+    <button id="full-download" class="ghost" type="button"><b>Download</b><span>The whole database exactly as stored: memories, sessions, activity, board, every file version, profile, rules, the encrypted credentials, service levels, the operations log and the users with their password hashes. Keep it private.</span></button>
+    <div id="full-restore-box" class="full-restore">
+      <p class="small-text">Restoring replaces everything here with the uploaded database. A safety copy of the current database is kept on the server first.</p>
+      <label class="board-field"><span>Type RESTORE to enable it</span>
+        <input id="full-confirm" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="RESTORE">
+      </label>
+      <button id="full-restore" class="ghost danger" type="button" disabled><b>Restore full database</b><span>Pick a .sqlite file downloaded from lore.</span></button>
+    </div>
     <p id="backup-status" class="small-text" role="status"></p>
+    <ul id="full-result" class="full-result" hidden></ul>
     <input id="backup-file" type="file" accept="application/json,.json" hidden>
+    <input id="full-file" type="file" accept=".sqlite,.db,application/vnd.sqlite3,application/x-sqlite3,application/octet-stream" hidden>
   </div>
 
   <div id="profile" class="profile" hidden>
@@ -132,6 +150,62 @@
     <h4>Rules the agents must follow</h4>
     <div id="profile-rules" class="profile-rules"></div>
     <button id="profile-add-rule" class="ghost" type="button">Add rule</button>
+    <form id="own-password" class="board-form own-password" autocomplete="off" hidden>
+      <h4>Your password</h4>
+      <input class="sr-only" type="text" id="own-username" autocomplete="username" readonly tabindex="-1" aria-hidden="true">
+      <label class="board-field"><span>Current password</span>
+        <input id="own-current" type="password" autocomplete="current-password" required>
+      </label>
+      <div class="board-form-row even">
+        <label class="board-field"><span>New password (at least 10 characters)</span>
+          <input id="own-new" type="password" autocomplete="new-password" minlength="10" maxlength="256" required>
+        </label>
+        <label class="board-field"><span>New password again</span>
+          <input id="own-again" type="password" autocomplete="new-password" minlength="10" maxlength="256" required>
+        </label>
+      </div>
+      <div class="board-form-actions">
+        <button id="own-submit" class="ghost small" type="submit">Change password</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="users" class="board users" hidden>
+    <div class="board-head">
+      <h2>Users</h2>
+      <span id="users-count" class="muted small-text"></span>
+    </div>
+    <p id="users-status" class="small-text" role="status"></p>
+    <div class="board-scroll">
+      <section>
+        <form id="user-form" class="board-form" autocomplete="off">
+          <h4>New user</h4>
+          <div class="board-form-row even">
+            <label class="board-field"><span>User name</span>
+              <input id="user-name" type="text" maxlength="32" placeholder="2 to 32 of a-z 0-9 . _ -" autocapitalize="none" spellcheck="false" required>
+            </label>
+            <label class="board-field"><span>E-mail (optional)</span>
+              <input id="user-email" type="email" maxlength="254" autocapitalize="none" spellcheck="false">
+            </label>
+          </div>
+          <div class="board-form-row even">
+            <label class="board-field"><span>Password (at least 10 characters)</span>
+              <input id="user-password" type="password" autocomplete="new-password" minlength="10" maxlength="256" required>
+            </label>
+            <label class="board-field"><span>Password again</span>
+              <input id="user-password-again" type="password" autocomplete="new-password" minlength="10" maxlength="256" required>
+            </label>
+          </div>
+          <fieldset id="user-perms" class="perm-checks">
+            <legend>Permissions (everyone signed in can read)</legend>
+          </fieldset>
+          <div class="board-form-actions">
+            <button id="user-submit" class="ghost small" type="submit">Add user</button>
+          </div>
+        </form>
+        <ul id="user-list" class="board-list"></ul>
+      </section>
+    </div>
   </div>
 
   <div id="board" class="board" hidden>
@@ -399,6 +473,7 @@
     <span id="more-role" class="role" hidden>Viewer</span>
     <button id="more-integrations" class="ghost" type="button" role="menuitem">Integrations</button>
     <button id="more-profile" class="ghost" type="button" role="menuitem">Profile and rules</button>
+    <button id="more-users" class="ghost" type="button" role="menuitem" hidden>Users</button>
     <button id="more-backup" class="ghost" type="button" role="menuitem">Backup and restore</button>
     <button id="more-logout" class="ghost" type="button" role="menuitem">Sign out</button>
   </div>

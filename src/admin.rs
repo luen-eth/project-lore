@@ -1,40 +1,51 @@
-//! The admin view: password login with two roles (optionally guarded by
-//! reCAPTCHA v3), a session cookie, and the JSON the brain visualisation draws.
+//! The admin view: sign-in with a user name and password (optionally guarded
+//! by reCAPTCHA v3), a session cookie that carries the user's permissions,
+//! the users panel, JSON and full database backups, and the JSON the brain
+//! visualisation draws.
 
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use std::convert::Infallible;
 
 use axum::{
-    Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
+    Extension, Json, Router,
+    body::{Body, Bytes},
+    extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
+    handler::Handler,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
 };
 use serde::Deserialize;
 use serde_json::json;
 use subtle::ConstantTimeEq;
-use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
+use tokio_stream::{
+    Stream, StreamExt,
+    wrappers::{BroadcastStream, ReceiverStream},
+};
 
 use crate::{
     auth::{RateLimiter, client_ip, too_many_requests},
     db::{
-        Backup, Db, FileInfo, Message, NewFile, NewMessage, NewTask, OPS_LEVELS, ProfileInput,
-        Rule, RuleInput, Session, Task,
+        self, Backup, Db, FileInfo, Message, NewFile, NewMessage, NewTask, NewUser, OPS_LEVELS,
+        ProfileInput, Rule, RuleInput, Session, Task, UserPatch,
     },
     embed::Embedder,
     events::Events,
     ops,
+    users::{self, ADMIN_USER, Perm, Perms, VIEWER_USER},
     vault::{Secret, VaultKey},
 };
 
@@ -48,6 +59,8 @@ const RECAPTCHA_ACTION: &str = "login";
 const FEED_LENGTH: usize = 60;
 /// Largest backup file accepted for import.
 const MAX_BACKUP_BYTES: usize = 512 * 1024 * 1024;
+/// Largest full database backup accepted for restore: 2 GiB.
+const MAX_FULL_RESTORE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Largest profile or rule edit accepted.
 const MAX_JSON_BYTES: usize = 64 * 1024;
 /// Largest file upload accepted: a 2 MiB file as base64, inside its JSON.
@@ -74,28 +87,168 @@ pub struct Recaptcha {
     pub min_score: f64,
 }
 
-/// What a signed-in session may do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Role {
-    /// Everything, including backup export, import and restore.
-    Admin,
-    /// Watch only: the graph, the activity feed and entries.
-    Viewer,
+/// Who a signed-in session belongs to and what it may do, recorded at
+/// sign-in. Every signed-in user reads what the viewer reads.
+#[derive(Clone, Debug)]
+pub struct SignedIn {
+    pub username: String,
+    /// The stored user's id; `None` for the built-in `admin` and `viewer`.
+    pub user_id: Option<i64>,
+    pub perms: Perms,
 }
 
-impl Role {
-    fn name(self) -> &'static str {
-        match self {
-            Role::Admin => "admin",
-            Role::Viewer => "viewer",
+impl SignedIn {
+    fn builtin_admin() -> Self {
+        Self {
+            username: ADMIN_USER.into(),
+            user_id: None,
+            perms: Perms::all(),
         }
     }
+
+    fn builtin_viewer() -> Self {
+        Self {
+            username: VIEWER_USER.into(),
+            user_id: None,
+            perms: Perms::none(),
+        }
+    }
+
+    /// The role older pages read: `admin` with every permission, else
+    /// `viewer`.
+    fn role(&self) -> &'static str {
+        if self.perms.is_all() {
+            "admin"
+        } else {
+            "viewer"
+        }
+    }
+}
+
+struct AdminSession {
+    expires: Instant,
+    user: SignedIn,
+}
+
+/// Who may reach a route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Access {
+    /// Anyone: the page, its assets, signing in and out.
+    Public,
+    /// Any signed-in user: everything the viewer reads.
+    SignedIn,
+    /// A signed-in user holding this permission.
+    Needs(Perm),
+}
+
+/// Every route of the admin view and who may reach it. The guard looks a
+/// request up here by its method and route pattern; a route missing from
+/// this table answers 403 to everyone, so a new route stays closed until it
+/// is listed. The README carries the same table.
+const ROUTES: &[(&str, &str, Access)] = &[
+    ("GET", "/admin", Access::Public),
+    ("GET", "/admin/app.js", Access::Public),
+    ("GET", "/admin/app.css", Access::Public),
+    ("GET", "/admin/icon.svg", Access::Public),
+    ("GET", "/admin/backdrop.jpg", Access::Public),
+    ("GET", "/admin/api/session", Access::Public),
+    ("POST", "/admin/api/login", Access::Public),
+    ("POST", "/admin/api/logout", Access::Public),
+    ("GET", "/admin/api/brain", Access::SignedIn),
+    ("GET", "/admin/api/pulse", Access::SignedIn),
+    ("GET", "/admin/api/events", Access::SignedIn),
+    ("GET", "/admin/api/entries/{id}", Access::SignedIn),
+    ("GET", "/admin/api/profile", Access::SignedIn),
+    ("GET", "/admin/api/sessions", Access::SignedIn),
+    ("GET", "/admin/api/sessions/{id}", Access::SignedIn),
+    ("GET", "/admin/api/board", Access::SignedIn),
+    ("GET", "/admin/api/files", Access::SignedIn),
+    ("GET", "/admin/api/files/{id}", Access::SignedIn),
+    ("GET", "/admin/api/files/{id}/download", Access::SignedIn),
+    ("GET", "/admin/api/integrations", Access::SignedIn),
+    ("PUT", "/admin/api/password", Access::SignedIn),
+    ("POST", "/admin/api/tasks", Access::Needs(Perm::Write)),
+    ("PUT", "/admin/api/tasks/{id}", Access::Needs(Perm::Write)),
+    ("POST", "/admin/api/messages", Access::Needs(Perm::Write)),
+    ("POST", "/admin/api/files", Access::Needs(Perm::Write)),
+    (
+        "DELETE",
+        "/admin/api/files/{id}",
+        Access::Needs(Perm::Write),
+    ),
+    ("GET", "/admin/api/export", Access::Needs(Perm::Backup)),
+    ("GET", "/admin/api/backup/full", Access::Needs(Perm::Backup)),
+    ("POST", "/admin/api/import", Access::Needs(Perm::Restore)),
+    (
+        "POST",
+        "/admin/api/restore/full",
+        Access::Needs(Perm::Restore),
+    ),
+    ("PUT", "/admin/api/profile", Access::Needs(Perm::Settings)),
+    ("POST", "/admin/api/rules", Access::Needs(Perm::Settings)),
+    (
+        "PUT",
+        "/admin/api/rules/{id}",
+        Access::Needs(Perm::Settings),
+    ),
+    (
+        "DELETE",
+        "/admin/api/rules/{id}",
+        Access::Needs(Perm::Settings),
+    ),
+    (
+        "PUT",
+        "/admin/api/integrations/{provider}",
+        Access::Needs(Perm::Integrations),
+    ),
+    (
+        "DELETE",
+        "/admin/api/integrations/{provider}",
+        Access::Needs(Perm::Integrations),
+    ),
+    (
+        "POST",
+        "/admin/api/integrations/{provider}/test",
+        Access::Needs(Perm::Integrations),
+    ),
+    (
+        "PUT",
+        "/admin/api/integrations/permissions",
+        Access::Needs(Perm::Integrations),
+    ),
+    (
+        "PUT",
+        "/admin/api/integrations/enabled",
+        Access::Needs(Perm::Integrations),
+    ),
+    ("GET", "/admin/api/users", Access::Needs(Perm::Users)),
+    ("POST", "/admin/api/users", Access::Needs(Perm::Users)),
+    ("PUT", "/admin/api/users/{id}", Access::Needs(Perm::Users)),
+    (
+        "DELETE",
+        "/admin/api/users/{id}",
+        Access::Needs(Perm::Users),
+    ),
+];
+
+/// Who may reach a route, or `None` when the table does not list it.
+fn access(method: &axum::http::Method, pattern: &str) -> Option<Access> {
+    // A HEAD request is answered by the GET handler, so it has its rights.
+    let method = if method == axum::http::Method::HEAD {
+        "GET"
+    } else {
+        method.as_str()
+    };
+    ROUTES
+        .iter()
+        .find(|(m, path, _)| *m == method && *path == pattern)
+        .map(|(_, _, access)| *access)
 }
 
 pub struct Admin {
     pub db: Db,
     pub password: String,
-    /// A second password that signs in with the watch-only role.
+    /// A second password that signs in as the watch-only `viewer`.
     pub viewer_password: Option<String>,
     pub recaptcha: Option<Recaptcha>,
     pub trust_proxy: bool,
@@ -112,11 +265,23 @@ pub struct Admin {
     pub vault: Option<VaultKey>,
     /// lore's own secrets, redacted from the Test button's answer too.
     guard: ops::Guard,
-    sessions: Mutex<HashMap<String, (Instant, Role)>>,
+    sessions: Mutex<HashMap<String, AdminSession>>,
     logins: RateLimiter,
+    /// Set while a full backup is being written or a full restore runs:
+    /// one at a time.
+    busy: AtomicBool,
     http: reqwest::Client,
     /// The client provider calls go through: no redirects, 60 s timeout.
     ops_http: reqwest::Client,
+}
+
+/// Clears `Admin::busy` when the work that set it ends, however it ends.
+struct BusyGuard<'a>(&'a AtomicBool);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Admin {
@@ -156,6 +321,7 @@ impl Admin {
             sessions: Mutex::new(HashMap::new()),
             // Five wrong attempts lock the address out for fifteen minutes.
             logins: RateLimiter::new(5, Duration::from_secs(15 * 60)),
+            busy: AtomicBool::new(false),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(8))
                 .build()
@@ -164,46 +330,100 @@ impl Admin {
         }
     }
 
-    /// The role of the session a request carries, if it has a live one.
-    fn session_role(&self, headers: &HeaderMap) -> Option<Role> {
+    fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, AdminSession>> {
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Who the session a request carries belongs to, if it is live.
+    fn signed_in(&self, headers: &HeaderMap) -> Option<SignedIn> {
         let token = cookie(headers, COOKIE)?;
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.retain(|_, (expires, _)| *expires > Instant::now());
-        sessions.get(&token).map(|(_, role)| *role)
+        let mut sessions = self.sessions();
+        sessions.retain(|_, session| session.expires > Instant::now());
+        sessions.get(&token).map(|session| session.user.clone())
+    }
+
+    /// Ends every session of a stored user except `keep` (the session
+    /// making the change), whose permissions are brought up to date.
+    fn end_sessions_of(&self, user_id: i64, keep: Option<&str>, perms: Option<Perms>) {
+        let mut sessions = self.sessions();
+        sessions.retain(|token, session| {
+            session.user.user_id != Some(user_id) || Some(token.as_str()) == keep
+        });
+        if let (Some(keep), Some(perms)) = (keep, perms)
+            && let Some(session) = sessions.get_mut(keep)
+            && session.user.user_id == Some(user_id)
+        {
+            session.user.perms = perms;
+        }
+    }
+
+    /// One full backup or restore at a time.
+    fn try_busy(&self) -> Option<BusyGuard<'_>> {
+        self.busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| BusyGuard(&self.busy))
     }
 }
 
 pub fn router(admin: Arc<Admin>) -> Router {
-    // Open to both roles.
-    let private = Router::new()
+    router_with(admin, Router::new())
+}
+
+/// The admin routes plus `extra`, all behind the access guard.
+fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
+    Router::new()
+        .route(
+            "/admin",
+            get(|| async { asset("text/html; charset=utf-8", PAGE) }),
+        )
+        .route(
+            "/admin/app.js",
+            get(|| async { asset("text/javascript; charset=utf-8", SCRIPT) }),
+        )
+        .route(
+            "/admin/app.css",
+            get(|| async { asset("text/css; charset=utf-8", STYLE) }),
+        )
+        .route(
+            "/admin/icon.svg",
+            get(|| async { asset("image/svg+xml", ICON) }),
+        )
+        .route(
+            "/admin/backdrop.jpg",
+            get(|| async { ([(header::CONTENT_TYPE, "image/jpeg")], BACKDROP) }),
+        )
+        .route("/admin/api/session", get(session))
+        .route("/admin/api/login", post(login))
+        .route("/admin/api/logout", post(logout))
+        // Reading: any signed-in user.
         .route("/admin/api/brain", get(brain))
         .route("/admin/api/pulse", get(pulse))
         .route("/admin/api/events", get(events))
         .route("/admin/api/entries/{id}", get(entry))
-        .route("/admin/api/profile", get(profile))
         .route("/admin/api/sessions", get(sessions))
         .route("/admin/api/sessions/{id}", get(session_detail))
         .route("/admin/api/board", get(board))
-        .route("/admin/api/files", get(files))
-        .route("/admin/api/files/{id}", get(file_detail))
-        .route("/admin/api/files/{id}/download", get(download_file))
         .route("/admin/api/integrations", get(integrations))
-        .layer(middleware::from_fn_with_state(
-            admin.clone(),
-            require_session,
-        ));
-    // Backups carry the whole store, profile edits change what every
-    // agent is told, and board writes speak for the administrator, so only
-    // the admin role reaches them.
-    let admin_only = Router::new()
+        .route(
+            "/admin/api/password",
+            put(change_own_password).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        // Backups carry the whole store.
         .route("/admin/api/export", get(export))
         .route(
             "/admin/api/import",
             post(import).layer(DefaultBodyLimit::max(MAX_BACKUP_BYTES)),
         )
+        .route("/admin/api/backup/full", get(full_backup))
+        // The upload is streamed to disk with its own cap.
+        .route(
+            "/admin/api/restore/full",
+            post(full_restore).layer(DefaultBodyLimit::disable()),
+        )
         .route(
             "/admin/api/profile",
-            put(save_profile).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+            get(profile).put(save_profile.layer(DefaultBodyLimit::max(MAX_JSON_BYTES))),
         )
         .route(
             "/admin/api/rules",
@@ -231,11 +451,13 @@ pub fn router(admin: Arc<Admin>) -> Router {
         // small limit.
         .route(
             "/admin/api/files",
-            post(upload_file).layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES)),
+            get(files).post(upload_file.layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES))),
         )
-        .route("/admin/api/files/{id}", delete(delete_file))
-        // Credentials speak for the whole server, so only the admin role
-        // reaches the integrations writes.
+        .route(
+            "/admin/api/files/{id}",
+            get(file_detail).delete(delete_file),
+        )
+        .route("/admin/api/files/{id}/download", get(download_file))
         .route(
             "/admin/api/integrations/{provider}",
             put(save_integration)
@@ -254,34 +476,18 @@ pub fn router(admin: Arc<Admin>) -> Router {
             "/admin/api/integrations/enabled",
             put(set_integration_enabled).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
         )
-        .layer(middleware::from_fn_with_state(admin.clone(), require_admin));
-
-    Router::new()
         .route(
-            "/admin",
-            get(|| async { asset("text/html; charset=utf-8", PAGE) }),
+            "/admin/api/users",
+            get(list_users).post(add_user.layer(DefaultBodyLimit::max(MAX_JSON_BYTES))),
         )
         .route(
-            "/admin/app.js",
-            get(|| async { asset("text/javascript; charset=utf-8", SCRIPT) }),
+            "/admin/api/users/{id}",
+            put(update_user)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
+                .delete(delete_user),
         )
-        .route(
-            "/admin/app.css",
-            get(|| async { asset("text/css; charset=utf-8", STYLE) }),
-        )
-        .route(
-            "/admin/icon.svg",
-            get(|| async { asset("image/svg+xml", ICON) }),
-        )
-        .route(
-            "/admin/backdrop.jpg",
-            get(|| async { ([(header::CONTENT_TYPE, "image/jpeg")], BACKDROP) }),
-        )
-        .route("/admin/api/session", get(session))
-        .route("/admin/api/login", post(login))
-        .route("/admin/api/logout", post(logout))
-        .merge(private)
-        .merge(admin_only)
+        .merge(extra)
+        .route_layer(middleware::from_fn_with_state(admin.clone(), guard))
         .layer(middleware::from_fn(security_headers))
         .with_state(admin)
 }
@@ -320,54 +526,145 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-async fn require_session(
-    State(admin): State<Arc<Admin>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if admin.session_role(request.headers()).is_some() {
-        next.run(request).await
-    } else {
-        (
+/// Lets a request through only when `ROUTES` allows it: a signed-in user
+/// for reads, the route's permission for everything else. The signed-in
+/// user is handed to the handler as a request extension.
+async fn guard(State(admin): State<Arc<Admin>>, mut request: Request, next: Next) -> Response {
+    let pattern = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_string())
+        .unwrap_or_default();
+    let Some(access) = access(request.method(), &pattern) else {
+        tracing::warn!(route = %pattern, "a route missing from the access table was refused");
+        return forbidden("this route is not open to anyone");
+    };
+    if access == Access::Public {
+        return next.run(request).await;
+    }
+    let Some(user) = admin.signed_in(request.headers()) else {
+        return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "sign in first" })),
         )
-            .into_response()
+            .into_response();
+    };
+    if let Access::Needs(perm) = access
+        && !user.perms.contains(perm)
+    {
+        return forbidden(&format!("this needs the {} permission", perm.id()));
     }
+    request.extensions_mut().insert(user);
+    next.run(request).await
 }
 
-async fn require_admin(State(admin): State<Arc<Admin>>, request: Request, next: Next) -> Response {
-    match admin.session_role(request.headers()) {
-        Some(Role::Admin) => next.run(request).await,
-        Some(Role::Viewer) => (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "this needs the admin password" })),
-        )
-            .into_response(),
-        None => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "sign in first" })),
-        )
-            .into_response(),
-    }
+fn forbidden(message: &str) -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({ "error": message }))).into_response()
 }
 
-/// Tells the page whether it is signed in and which reCAPTCHA key to load.
+/// Tells the page whether it is signed in, as whom, with which
+/// permissions, and which reCAPTCHA key to load. `role` stays for pages
+/// cached before permissions existed.
 async fn session(State(admin): State<Arc<Admin>>, headers: HeaderMap) -> Json<serde_json::Value> {
-    let role = admin.session_role(&headers);
+    let user = admin.signed_in(&headers);
     Json(json!({
-        "authenticated": role.is_some(),
+        "authenticated": user.is_some(),
         "build": build_id(),
-        "role": role.map(Role::name),
+        "role": user.as_ref().map(SignedIn::role),
+        "username": user.as_ref().map(|user| user.username.as_str()),
+        "permissions": user.as_ref().map(|user| user.perms.ids()),
+        "stored": user.as_ref().is_some_and(|user| user.user_id.is_some()),
         "recaptcha_site_key": admin.recaptcha.as_ref().map(|r| r.site_key.as_str()),
     }))
 }
 
 #[derive(Deserialize)]
 struct LoginForm {
+    /// A user name or a stored user's e-mail address. Empty tries the
+    /// built-in `admin`, then `viewer`, as before user names existed.
+    #[serde(default)]
+    username: String,
     password: String,
     #[serde(default)]
     captcha: String,
+}
+
+impl std::fmt::Debug for LoginForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginForm")
+            .field("username", &self.username)
+            .field("password", &"[redacted]")
+            .finish()
+    }
+}
+
+/// How a sign-in attempt went.
+enum LoginOutcome {
+    Ok(SignedIn),
+    Wrong,
+    /// The password was right, but the user is disabled.
+    Disabled,
+}
+
+/// Checks a user name and password. Built-in passwords are compared in
+/// constant time; stored users are verified against their Argon2id hash,
+/// and an unknown name against a dummy hash, so it takes as long.
+async fn check_login(admin: &Arc<Admin>, username: &str, password: String) -> LoginOutcome {
+    let presented = password.as_bytes();
+    let is_admin = || bool::from(presented.ct_eq(admin.password.as_bytes()));
+    let is_viewer = || {
+        admin
+            .viewer_password
+            .as_ref()
+            .is_some_and(|viewer| bool::from(presented.ct_eq(viewer.as_bytes())))
+    };
+    match username {
+        "" => {
+            // Check both passwords every time so timing does not tell them apart.
+            match (is_admin(), is_viewer()) {
+                (true, _) => LoginOutcome::Ok(SignedIn::builtin_admin()),
+                (false, true) => LoginOutcome::Ok(SignedIn::builtin_viewer()),
+                (false, false) => LoginOutcome::Wrong,
+            }
+        }
+        ADMIN_USER if is_admin() => LoginOutcome::Ok(SignedIn::builtin_admin()),
+        VIEWER_USER if is_viewer() => LoginOutcome::Ok(SignedIn::builtin_viewer()),
+        ADMIN_USER | VIEWER_USER => LoginOutcome::Wrong,
+        name => {
+            let (state, name) = (admin.clone(), name.to_string());
+            let checked = tokio::task::spawn_blocking(move || -> anyhow::Result<LoginOutcome> {
+                let found = state.db.user_login(&name)?;
+                let hash = found
+                    .as_ref()
+                    .map_or(users::dummy_hash(), |login| login.password_hash.as_str());
+                let matches = users::verify_password(&password, hash);
+                let Some(login) = found.filter(|_| matches) else {
+                    return Ok(LoginOutcome::Wrong);
+                };
+                if login.user.disabled {
+                    return Ok(LoginOutcome::Disabled);
+                }
+                state.db.touch_user_login(login.user.id)?;
+                Ok(LoginOutcome::Ok(SignedIn {
+                    perms: login.user.perms(),
+                    username: login.user.username,
+                    user_id: Some(login.user.id),
+                }))
+            })
+            .await;
+            match checked {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "checking a sign-in failed");
+                    LoginOutcome::Wrong
+                }
+                Err(error) => {
+                    tracing::error!(%error, "the sign-in task failed");
+                    LoginOutcome::Wrong
+                }
+            }
+        }
+    }
 }
 
 async fn login(
@@ -393,27 +690,25 @@ async fn login(
             .into_response();
     }
 
-    // Check both passwords every time so timing does not tell them apart.
-    let presented = form.password.as_bytes();
-    let is_admin = bool::from(presented.ct_eq(admin.password.as_bytes()));
-    let is_viewer = admin
-        .viewer_password
-        .as_ref()
-        .is_some_and(|viewer| bool::from(presented.ct_eq(viewer.as_bytes())));
-    let role = match (is_admin, is_viewer) {
-        (true, _) => Some(Role::Admin),
-        (false, true) => Some(Role::Viewer),
-        (false, false) => None,
-    };
-    let Some(role) = role else {
-        tracing::warn!(%ip, "admin login with a wrong password");
-        admin.logins.hit(&ip);
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Wrong password." })),
-        )
-            .into_response();
+    let username = form.username.trim().to_lowercase();
+    let user = match check_login(&admin, &username, form.password).await {
+        LoginOutcome::Ok(user) => user,
+        LoginOutcome::Wrong => {
+            tracing::warn!(%ip, "admin login with a wrong user name or password");
+            admin.logins.hit(&ip);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let message = if username.is_empty() {
+                "Wrong password."
+            } else {
+                "Wrong user name or password."
+            };
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": message }))).into_response();
+        }
+        LoginOutcome::Disabled => {
+            tracing::warn!(%ip, "sign-in by a disabled user");
+            admin.logins.hit(&ip);
+            return forbidden("This user is disabled.");
+        }
     };
 
     admin.logins.reset(&ip);
@@ -424,33 +719,614 @@ async fn login(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    admin
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(token.clone(), (Instant::now() + SESSION_TTL, role));
-    tracing::info!(%ip, role = role.name(), "signed in to the admin view");
+    let body = json!({
+        "ok": true,
+        "role": user.role(),
+        "username": user.username,
+        "permissions": user.perms.ids(),
+        "stored": user.user_id.is_some(),
+    });
+    tracing::info!(%ip, user = %user.username, "signed in to the admin view");
+    admin.sessions().insert(
+        token.clone(),
+        AdminSession {
+            expires: Instant::now() + SESSION_TTL,
+            user,
+        },
+    );
     let cookie = format!(
         "{COOKIE}={token}; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age={}",
         SESSION_TTL.as_secs()
     );
-    (
-        [(header::SET_COOKIE, cookie)],
-        Json(json!({ "ok": true, "role": role.name() })),
-    )
-        .into_response()
+    ([(header::SET_COOKIE, cookie)], Json(body)).into_response()
 }
 
 async fn logout(State(admin): State<Arc<Admin>>, headers: HeaderMap) -> Response {
     if let Some(token) = cookie(&headers, COOKIE) {
-        admin
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&token);
+        admin.sessions().remove(&token);
     }
     let expired = format!("{COOKIE}=; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age=0");
     ([(header::SET_COOKIE, expired)], Json(json!({ "ok": true }))).into_response()
+}
+
+/// Notes a change made from the page in the activity feed.
+fn note_activity(admin: &Admin, tool: &str, summary: &str) {
+    if let Ok(activity) = admin
+        .db
+        .record_activity(ADMIN_ACTOR, tool, "", None, None, &[], summary)
+    {
+        admin.events.publish(activity);
+    }
+}
+
+/// The stored users, the built-in ones (which cannot be changed here) and
+/// what each permission means.
+async fn list_users(State(admin): State<Arc<Admin>>) -> Response {
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let mut builtin =
+            vec![json!({ "username": ADMIN_USER, "permissions": Perms::all().ids() })];
+        if state.viewer_password.is_some() {
+            builtin.push(json!({ "username": VIEWER_USER, "permissions": Perms::none().ids() }));
+        }
+        let permissions: Vec<serde_json::Value> = Perm::ALL
+            .iter()
+            .map(|perm| json!({ "id": perm.id(), "explanation": perm.explanation() }))
+            .collect();
+        Ok(json!({
+            "users": state.db.users()?,
+            "builtin": builtin,
+            "permissions": permissions,
+        }))
+    })
+    .await;
+    respond(result)
+}
+
+#[derive(Deserialize)]
+struct NewUserForm {
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    permissions: Vec<String>,
+}
+
+async fn add_user(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    Json(form): Json<NewUserForm>,
+) -> Response {
+    let username = match users::normalize_username(&form.username) {
+        Ok(name) => name,
+        Err(message) => return bad_request(&message),
+    };
+    let email = match users::normalize_email(&form.email) {
+        Ok(email) => email,
+        Err(message) => return bad_request(&message),
+    };
+    if let Err(message) = users::check_password(&form.password) {
+        return bad_request(&message);
+    }
+    let perms = match Perms::parse(&form.permissions) {
+        Ok(perms) => perms,
+        Err(message) => return bad_request(&message),
+    };
+    let state = admin.clone();
+    let password = form.password;
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<db::User> {
+        let user = state.db.add_user(&NewUser {
+            username,
+            email,
+            password_hash: users::hash_password(&password)?,
+            permissions: perms,
+            created_by: me.username.clone(),
+        })?;
+        let summary = format!(
+            "{} added the user {} ({})",
+            me.username,
+            user.username,
+            describe_perms(perms)
+        );
+        note_activity(&state, "users", &summary);
+        Ok(user)
+    })
+    .await;
+    match result {
+        Ok(Ok(user)) => Json(user).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "adding a user failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Permission ids for an activity note.
+fn describe_perms(perms: Perms) -> String {
+    if perms == Perms::none() {
+        "read only".into()
+    } else {
+        perms.ids().join(", ")
+    }
+}
+
+#[derive(Deserialize)]
+struct UserForm {
+    /// Absent leaves it; empty removes it.
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    permissions: Option<Vec<String>>,
+    #[serde(default)]
+    disabled: Option<bool>,
+    /// A new password; absent or empty leaves it.
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// Changes a stored user. A user cannot take `users` away from themselves
+/// or disable themselves. A new password, other permissions or disabling
+/// ends the user's sessions.
+async fn update_user(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(form): Json<UserForm>,
+) -> Response {
+    let myself = me.user_id == Some(id);
+    let mut patch = UserPatch::default();
+    if let Some(email) = &form.email {
+        match users::normalize_email(email) {
+            Ok(email) => patch.email = Some(email),
+            Err(message) => return bad_request(&message),
+        }
+    }
+    if let Some(ids) = &form.permissions {
+        match Perms::parse(ids) {
+            Ok(perms) => patch.permissions = Some(perms),
+            Err(message) => return bad_request(&message),
+        }
+    }
+    if myself
+        && patch
+            .permissions
+            .is_some_and(|perms| !perms.contains(Perm::Users))
+    {
+        return bad_request("you cannot remove the users permission from yourself");
+    }
+    if myself && form.disabled == Some(true) {
+        return bad_request("you cannot disable yourself");
+    }
+    patch.disabled = form.disabled;
+    let password = form.password.filter(|password| !password.is_empty());
+    if let Some(password) = &password
+        && let Err(message) = users::check_password(password)
+    {
+        return bad_request(&message);
+    }
+    let keep = cookie(&headers, COOKIE);
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<db::User>> {
+        let Some(before) = state.db.user(id)? else {
+            return Ok(None);
+        };
+        if let Some(password) = &password {
+            patch.password_hash = Some(users::hash_password(password)?);
+        }
+        let Some(after) = state.db.update_user(id, &patch)? else {
+            return Ok(None);
+        };
+        let mut changes = Vec::new();
+        if before.email != after.email {
+            changes.push("e-mail".to_string());
+        }
+        let perms_changed = before.permissions != after.permissions;
+        if perms_changed {
+            changes.push(format!("permissions ({})", describe_perms(after.perms())));
+        }
+        if before.disabled != after.disabled {
+            changes.push(
+                if after.disabled {
+                    "disabled"
+                } else {
+                    "enabled"
+                }
+                .to_string(),
+            );
+        }
+        if password.is_some() {
+            changes.push("password".to_string());
+        }
+        if password.is_some() || perms_changed || after.disabled {
+            state.end_sessions_of(id, keep.as_deref(), Some(after.perms()));
+        }
+        if !changes.is_empty() {
+            let summary = format!(
+                "{} changed the user {}: {}",
+                me.username,
+                after.username,
+                changes.join(", ")
+            );
+            note_activity(&state, "users", &summary);
+        }
+        Ok(Some(after))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(user))) => Json(user).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "changing a user failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Removes a stored user and ends their sessions. Nobody deletes themselves.
+async fn delete_user(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    Path(id): Path<i64>,
+) -> Response {
+    if me.user_id == Some(id) {
+        return bad_request("you cannot delete yourself");
+    }
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<db::User>> {
+        let Some(user) = state.db.delete_user(id)? else {
+            return Ok(None);
+        };
+        state.end_sessions_of(id, None, None);
+        let summary = format!("{} deleted the user {}", me.username, user.username);
+        note_activity(&state, "users", &summary);
+        Ok(Some(user))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(_))) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "deleting a user failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PasswordForm {
+    #[serde(default)]
+    current: String,
+    #[serde(default)]
+    password: String,
+}
+
+impl std::fmt::Debug for PasswordForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PasswordForm { [redacted] }")
+    }
+}
+
+/// A stored user changes their own password; the current one is required.
+/// Their other sessions end; this one stays.
+async fn change_own_password(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(form): Json<PasswordForm>,
+) -> Response {
+    let Some(id) = me.user_id else {
+        return bad_request(
+            "the built-in users' passwords are set in the server environment, not here",
+        );
+    };
+    let ip = client_ip(&headers, Some(peer), admin.trust_proxy);
+    if let Some(retry_after) = admin.logins.blocked(&ip) {
+        return too_many_requests(retry_after);
+    }
+    if let Err(message) = users::check_password(&form.password) {
+        return bad_request(&message);
+    }
+    let keep = cookie(&headers, COOKIE);
+    let state = admin.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Result<(), &'static str>> {
+            let Some(hash) = state.db.user_password_hash(id)? else {
+                return Ok(Err("your user no longer exists"));
+            };
+            if !users::verify_password(&form.current, &hash) {
+                return Ok(Err("the current password is wrong"));
+            }
+            let patch = UserPatch {
+                password_hash: Some(users::hash_password(&form.password)?),
+                ..UserPatch::default()
+            };
+            state.db.update_user(id, &patch)?;
+            state.end_sessions_of(id, keep.as_deref(), None);
+            let summary = format!("{} changed their password", me.username);
+            note_activity(&state, "users", &summary);
+            Ok(Ok(()))
+        })
+        .await;
+    match result {
+        Ok(Ok(Ok(()))) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(Err(message))) => {
+            admin.logins.hit(&ip);
+            bad_request(message)
+        }
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "changing a password failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Downloads the whole SQLite database: a consistent snapshot made with the
+/// online backup API into a temporary file, streamed from disk and removed
+/// as soon as it is open. The connection is free while it streams.
+async fn full_backup(State(admin): State<Arc<Admin>>) -> Response {
+    let Some(busy) = admin.try_busy() else {
+        return conflict();
+    };
+    let db = admin.db.clone();
+    let snapshot = tokio::task::spawn_blocking(move || -> anyhow::Result<(std::fs::File, u64)> {
+        let path = db.temp_path("backup")?;
+        let opened = db.snapshot_to(&path).and_then(|()| {
+            let file = std::fs::File::open(&path)?;
+            let length = file.metadata()?.len();
+            Ok((file, length))
+        });
+        // The open handle keeps the bytes readable; the name goes now, so
+        // nothing is left behind whatever happens to the download.
+        db::remove_database_files(&path);
+        opened
+    })
+    .await;
+    drop(busy);
+    let (file, length) = match snapshot {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "writing the full backup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "the full backup task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut file = file;
+        let mut buffer = vec![0u8; 256 * 1024];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let chunk = Bytes::copy_from_slice(&buffer[..read]);
+                    if sender.blocking_send(Ok(chunk)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.blocking_send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    tracing::info!(bytes = length, "full database backup downloaded");
+    let name = format!(
+        "attachment; filename=\"lore-full-{}.sqlite\"",
+        db::utc_stamp()
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_DISPOSITION, name),
+            (header::CONTENT_LENGTH, length.to_string()),
+        ],
+        Body::from_stream(ReceiverStream::new(receiver)),
+    )
+        .into_response()
+}
+
+fn conflict() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": "a full backup or restore is already running; try again shortly" })),
+    )
+        .into_response()
+}
+
+fn refused(check: &str, message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": message, "check": check })),
+    )
+        .into_response()
+}
+
+/// Replaces the whole database with an uploaded `.sqlite` full backup.
+/// The upload is streamed to a temporary file and checked before anything
+/// is touched; a safety copy of the current database is written; then the
+/// backup is loaded all or nothing. Any refusal leaves the live database
+/// as it was and names the check that failed.
+async fn full_restore(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > MAX_FULL_RESTORE_BYTES) {
+        return too_large();
+    }
+    let Some(_busy) = admin.try_busy() else {
+        return conflict();
+    };
+    let temp = match admin.db.temp_path("restore") {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(%error, "no temporary file for the restore");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let received = receive_upload(body, &temp).await;
+    let response = match received {
+        Err(Upload::TooLarge) => too_large(),
+        Err(Upload::Failed(reason)) => refused("upload", &reason),
+        Ok(0) => refused("upload", "the upload was empty"),
+        Ok(_) => {
+            let state = admin.clone();
+            let path = temp.clone();
+            let outcome =
+                tokio::task::spawn_blocking(move || restore_prepared(&state, &me, &path)).await;
+            match outcome {
+                Ok(Ok(value)) => Json(value).into_response(),
+                Ok(Err(refusal)) => {
+                    tracing::warn!(check = refusal.check, reason = %refusal.message, "full restore refused");
+                    refused(refusal.check, &refusal.message)
+                }
+                Err(error) => {
+                    tracing::error!(%error, "the restore task failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+    };
+    let cleanup = temp.clone();
+    let _ = tokio::task::spawn_blocking(move || db::remove_database_files(&cleanup)).await;
+    response
+}
+
+fn too_large() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({ "error": "the file is larger than 2 GiB" })),
+    )
+        .into_response()
+}
+
+enum Upload {
+    TooLarge,
+    Failed(String),
+}
+
+/// Streams a request body to `path`, never holding more than one chunk in
+/// memory. Returns the byte count.
+async fn receive_upload(body: Body, path: &std::path::Path) -> Result<u64, Upload> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|error| Upload::Failed(format!("the upload could not be stored: {error}")))?;
+    let mut stream = body.into_data_stream();
+    let mut total: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| Upload::Failed("the upload was interrupted".into()))?;
+        total += chunk.len() as u64;
+        if total > MAX_FULL_RESTORE_BYTES {
+            return Err(Upload::TooLarge);
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| Upload::Failed(format!("the upload could not be stored: {error}")))?;
+    }
+    file.flush()
+        .await
+        .map_err(|error| Upload::Failed(format!("the upload could not be stored: {error}")))?;
+    file.sync_all()
+        .await
+        .map_err(|error| Upload::Failed(format!("the upload could not be stored: {error}")))?;
+    Ok(total)
+}
+
+/// The blocking part of a full restore, once the upload is on disk.
+fn restore_prepared(
+    admin: &Arc<Admin>,
+    me: &SignedIn,
+    path: &std::path::Path,
+) -> Result<serde_json::Value, db::Refusal> {
+    db::check_full_backup(path)?;
+    db::prepare_full_backup(path)?;
+    let snapshot = admin
+        .db
+        .write_safety_snapshot()
+        .map_err(|error| db::Refusal {
+            check: "snapshot",
+            message: format!(
+                "the safety copy of the current database could not be written: {error}"
+            ),
+        })?;
+    let counts = admin
+        .db
+        .load_full_backup(path)
+        .map_err(|error| db::Refusal {
+            check: "load",
+            message: format!("the backup could not be loaded; nothing changed: {error}"),
+        })?;
+    // Derived state: vectors from another model are dropped and computed
+    // again in the background, like after a JSON restore.
+    if let Some(model) = admin.embedding_model
+        && let Err(error) = admin.db.use_embedding_model(model)
+    {
+        tracing::warn!(%error, "checking the embedding model after a restore failed");
+    }
+    let (db, embedder) = (admin.db.clone(), admin.embedder.clone());
+    std::thread::spawn(move || {
+        if let Err(error) = embedder.backfill(&db) {
+            tracing::warn!(%error, "embedding restored entries failed");
+        }
+    });
+    keep_sessions_of_existing_users(admin);
+    let entries = counts
+        .iter()
+        .find(|(table, _)| table == "entries")
+        .map_or(0, |(_, count)| *count);
+    let summary = format!(
+        "{} restored a full database backup ({entries} entries)",
+        me.username
+    );
+    tracing::info!(entries, snapshot = %snapshot, "full database backup restored");
+    note_activity(admin, "restore", &summary);
+    let tables: serde_json::Map<String, serde_json::Value> = counts
+        .into_iter()
+        .map(|(table, count)| (table, json!(count)))
+        .collect();
+    Ok(json!({ "ok": true, "tables": tables, "snapshot": snapshot }))
+}
+
+/// After a full restore, a stored user's session stays only when the
+/// restored database has that user, enabled, with the same permissions.
+fn keep_sessions_of_existing_users(admin: &Admin) {
+    let users: HashMap<i64, db::User> = match admin.db.users() {
+        Ok(list) => list.into_iter().map(|user| (user.id, user)).collect(),
+        Err(error) => {
+            tracing::warn!(%error, "listing users after a restore failed; ending their sessions");
+            HashMap::new()
+        }
+    };
+    admin
+        .sessions()
+        .retain(|_, session| match session.user.user_id {
+            None => true,
+            Some(id) => users.get(&id).is_some_and(|user| {
+                user.username == session.user.username
+                    && !user.disabled
+                    && user.perms() == session.user.perms
+            }),
+        });
 }
 
 /// Everything the visualisation draws.
@@ -1922,11 +2798,21 @@ mod tests {
     /// Serves the admin router on a free local port with one admin and one
     /// viewer session already signed in.
     async fn serve_with(vault: Option<VaultKey>) -> (String, Arc<Admin>) {
-        // The thread id keeps parallel tests off each other's database.
+        serve_router(vault, Router::new()).await
+    }
+
+    /// Like `serve_with`, with `extra` routes behind the same guard.
+    async fn serve_router(
+        vault: Option<VaultKey>,
+        extra: Router<Arc<Admin>>,
+    ) -> (String, Arc<Admin>) {
+        // A counter keeps every server, even two in one test, on its own
+        // database.
+        static SERVERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "lore-admin-test-{}-{:?}",
+            "lore-admin-test-{}-{}",
             std::process::id(),
-            std::thread::current().id()
+            SERVERS.fetch_add(1, Ordering::SeqCst)
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let db = Db::open(&dir.join("lore.db")).unwrap();
@@ -1945,15 +2831,11 @@ mod tests {
             vault,
             ops::Guard::default(),
         ));
-        {
-            let mut sessions = admin.sessions.lock().unwrap();
-            let expires = Instant::now() + Duration::from_secs(600);
-            sessions.insert("admin-token".into(), (expires, Role::Admin));
-            sessions.insert("viewer-token".into(), (expires, Role::Viewer));
-        }
+        sign_in(&admin, "admin-token", SignedIn::builtin_admin());
+        sign_in(&admin, "viewer-token", SignedIn::builtin_viewer());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = router(admin.clone());
+        let app = router_with(admin.clone(), extra);
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -1963,6 +2845,17 @@ mod tests {
             .unwrap();
         });
         (base, admin)
+    }
+
+    /// Puts a live session for `user` under `token`.
+    fn sign_in(admin: &Admin, token: &str, user: SignedIn) {
+        admin.sessions().insert(
+            token.into(),
+            AdminSession {
+                expires: Instant::now() + Duration::from_secs(600),
+                user,
+            },
+        );
     }
 
     async fn serve() -> (String, Arc<Admin>) {
@@ -3017,5 +3910,697 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(shown["vault_enabled"], false);
+    }
+
+    /// A stored user with a real hash, and a live session for them under
+    /// `token`.
+    fn stored_user(admin: &Admin, name: &str, perms: &[&str], token: &str) -> db::User {
+        let user = admin
+            .db
+            .add_user(&NewUser {
+                username: name.into(),
+                email: Some(format!("{name}@example.com")),
+                password_hash: users::hash_password("a-long-password").unwrap(),
+                permissions: Perms::parse(perms).unwrap(),
+                created_by: "admin".into(),
+            })
+            .unwrap();
+        sign_in(
+            admin,
+            token,
+            SignedIn {
+                username: user.username.clone(),
+                user_id: Some(user.id),
+                perms: user.perms(),
+            },
+        );
+        user
+    }
+
+    fn has_session(admin: &Admin, token: &str) -> bool {
+        admin.sessions().contains_key(token)
+    }
+
+    async fn login(base: &str, body: serde_json::Value) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{base}/admin/api/login"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sign_in_by_name_e_mail_or_password_alone() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &["write"], "unused");
+        stored_user(&admin, "gone", &[], "unused-2");
+        admin
+            .db
+            .update_user(
+                admin.db.user_login("gone").unwrap().unwrap().user.id,
+                &UserPatch {
+                    disabled: Some(true),
+                    ..UserPatch::default()
+                },
+            )
+            .unwrap();
+
+        for (body, name, perms) in [
+            (json!({ "password": "admin-password" }), "admin", 7),
+            (json!({ "password": "viewer-password" }), "viewer", 0),
+            (
+                json!({ "username": "Admin", "password": "admin-password" }),
+                "admin",
+                7,
+            ),
+            (
+                json!({ "username": "viewer", "password": "viewer-password" }),
+                "viewer",
+                0,
+            ),
+            (
+                json!({ "username": "luis", "password": "a-long-password" }),
+                "luis",
+                1,
+            ),
+            (
+                json!({ "username": "LUIS@example.com", "password": "a-long-password" }),
+                "luis",
+                1,
+            ),
+        ] {
+            let response = login(&base, body.clone()).await;
+            assert_eq!(response.status(), 200, "{body}");
+            let cookie = response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let answer: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(answer["username"], name);
+            assert_eq!(answer["permissions"].as_array().unwrap().len(), perms);
+            assert_eq!(answer["role"], if perms == 7 { "admin" } else { "viewer" });
+            // The session endpoint says the same.
+            let token = cookie.split(';').next().unwrap().to_string();
+            let session: serde_json::Value = reqwest::Client::new()
+                .get(format!("{base}/admin/api/session"))
+                .header(header::COOKIE, token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(session["authenticated"], true);
+            assert_eq!(session["username"], name);
+            assert_eq!(session["stored"], name == "luis");
+        }
+        assert!(
+            admin
+                .db
+                .user(user.id)
+                .unwrap()
+                .unwrap()
+                .last_login_at
+                .is_some()
+        );
+
+        // Wrong passwords, the built-in names swapped, an unknown user and a
+        // disabled one: four failures, under the lock-out limit of five.
+        for (body, status) in [
+            (
+                json!({ "username": "luis", "password": "wrong-password" }),
+                401,
+            ),
+            (
+                json!({ "username": "admin", "password": "viewer-password" }),
+                401,
+            ),
+            (
+                json!({ "username": "nobody", "password": "a-long-password" }),
+                401,
+            ),
+            (
+                json!({ "username": "gone", "password": "a-long-password" }),
+                403,
+            ),
+        ] {
+            let response = login(&base, body.clone()).await;
+            assert_eq!(response.status(), status, "{body}");
+            assert!(response.headers().get(header::SET_COOKIE).is_none());
+            let text = response.text().await.unwrap();
+            assert!(!text.contains("password\":"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_permission_guards_its_routes() {
+        let extra = Router::new().route("/admin/api/unlisted", get(|| async { "open?" }));
+        let (base, admin) = serve_router(Some(test_vault_key()), extra).await;
+        for perm in Perm::ALL {
+            stored_user(
+                &admin,
+                perm.id(),
+                &[perm.id()],
+                &format!("{}-token", perm.id()),
+            );
+        }
+        stored_user(&admin, "reader", &[], "reader-token");
+        let backup = admin.db.export().unwrap();
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: &str, token: &str| {
+            client
+                .request(method, format!("{base}{path}"))
+                .header(header::COOKIE, format!("{COOKIE}={token}"))
+        };
+        let task = json!({ "project": "shop", "title": "t", "body": "", "assignee": "" });
+        let profile = json!({ "address": "Boss", "language": "English", "agents": [] });
+        let cases: Vec<(&str, reqwest::Method, &str, Option<serde_json::Value>)> = vec![
+            (
+                "write",
+                reqwest::Method::POST,
+                "/admin/api/tasks",
+                Some(task),
+            ),
+            ("backup", reqwest::Method::GET, "/admin/api/export", None),
+            (
+                "restore",
+                reqwest::Method::POST,
+                "/admin/api/import?mode=merge",
+                Some(serde_json::to_value(&backup).unwrap()),
+            ),
+            (
+                "settings",
+                reqwest::Method::PUT,
+                "/admin/api/profile",
+                Some(profile),
+            ),
+            (
+                "integrations",
+                reqwest::Method::PUT,
+                "/admin/api/integrations/enabled",
+                Some(json!({ "enabled": true })),
+            ),
+            ("users", reqwest::Method::GET, "/admin/api/users", None),
+        ];
+        for (perm, method, path, body) in &cases {
+            for other in Perm::ALL.map(Perm::id).iter().chain(["reader"].iter()) {
+                let mut request = call(method.clone(), path, &format!("{other}-token"));
+                if let Some(body) = body {
+                    request = request.json(body);
+                }
+                let status = request.send().await.unwrap().status();
+                if other == perm {
+                    assert_eq!(status, 200, "{perm} on {path}");
+                } else {
+                    assert_eq!(status, 403, "{other} on {path}");
+                }
+            }
+        }
+        // Reading needs only a session; the full backup needs `backup`.
+        for path in [
+            "/admin/api/brain",
+            "/admin/api/board",
+            "/admin/api/integrations",
+        ] {
+            assert_eq!(
+                call(reqwest::Method::GET, path, "reader-token")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+        assert_eq!(
+            call(
+                reqwest::Method::GET,
+                "/admin/api/backup/full",
+                "reader-token"
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            403
+        );
+        assert_eq!(
+            call(
+                reqwest::Method::POST,
+                "/admin/api/restore/full",
+                "backup-token"
+            )
+            .body("x")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            403
+        );
+        // A route nobody listed is closed, even to the built-in admin.
+        let response = call(reqwest::Method::GET, "/admin/api/unlisted", "admin-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(
+            access(&axum::http::Method::GET, "/admin/api/unlisted"),
+            None
+        );
+        assert_eq!(
+            access(&axum::http::Method::HEAD, "/admin/api/export"),
+            Some(Access::Needs(Perm::Backup))
+        );
+        // Every route the table lists is distinct.
+        for (i, (method, path, _)) in ROUTES.iter().enumerate() {
+            assert!(
+                !ROUTES[i + 1..]
+                    .iter()
+                    .any(|(m, p, _)| m == method && p == path),
+                "{method} {path} listed twice"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn users_are_managed_with_the_users_permission() {
+        let (base, admin) = serve().await;
+        let me = stored_user(&admin, "boss", &["users"], "boss-token");
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: String, token: &str| {
+            client
+                .request(method, format!("{base}{path}"))
+                .header(header::COOKIE, format!("{COOKIE}={token}"))
+        };
+
+        // Malformed and reserved names, short passwords, unknown permissions.
+        for bad in [
+            json!({ "username": "admin", "password": "a-long-password" }),
+            json!({ "username": "Viewer", "password": "a-long-password" }),
+            json!({ "username": "x", "password": "a-long-password" }),
+            json!({ "username": "has space", "password": "a-long-password" }),
+            json!({ "username": "-dash", "password": "a-long-password" }),
+            json!({ "username": "fine", "password": "short" }),
+            json!({ "username": "fine", "email": "nope", "password": "a-long-password" }),
+            json!({ "username": "fine", "password": "a-long-password", "permissions": ["root"] }),
+            json!({ "username": "boss", "password": "a-long-password" }),
+        ] {
+            let response = call(
+                reqwest::Method::POST,
+                "/admin/api/users".into(),
+                "boss-token",
+            )
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), 400, "{bad}");
+            let text = response.text().await.unwrap();
+            assert!(!text.contains("a-long-password"), "{text}");
+        }
+
+        let response = call(
+            reqwest::Method::POST,
+            "/admin/api/users".into(),
+            "boss-token",
+        )
+        .json(&json!({ "username": "Ana", "email": "Ana@Example.com",
+                           "password": "ana-password-1", "permissions": ["write", "backup"] }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let ana: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(ana["username"], "ana");
+        assert_eq!(ana["email"], "ana@example.com");
+        assert_eq!(ana["created_by"], "boss");
+        assert!(ana.get("password_hash").is_none());
+        let ana_id = ana["id"].as_i64().unwrap();
+
+        let listed: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/users".into(),
+            "boss-token",
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let raw = listed.to_string();
+        assert!(!raw.contains("argon2"), "a hash reached the page");
+        assert_eq!(listed["users"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["builtin"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["permissions"].as_array().unwrap().len(), 7);
+
+        // Sign Ana in twice; changing her permissions ends both sessions.
+        for token in ["ana-1", "ana-2"] {
+            sign_in(
+                &admin,
+                token,
+                SignedIn {
+                    username: "ana".into(),
+                    user_id: Some(ana_id),
+                    perms: Perms::parse(&["write", "backup"]).unwrap(),
+                },
+            );
+        }
+        let response = call(
+            reqwest::Method::PUT,
+            format!("/admin/api/users/{ana_id}"),
+            "boss-token",
+        )
+        .json(&json!({ "permissions": ["write"] }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!has_session(&admin, "ana-1") && !has_session(&admin, "ana-2"));
+        // An e-mail change alone keeps her sessions; a new password ends them.
+        sign_in(
+            &admin,
+            "ana-3",
+            SignedIn {
+                username: "ana".into(),
+                user_id: Some(ana_id),
+                perms: Perms::parse(&["write"]).unwrap(),
+            },
+        );
+        let response = call(
+            reqwest::Method::PUT,
+            format!("/admin/api/users/{ana_id}"),
+            "boss-token",
+        )
+        .json(&json!({ "email": "" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["email"],
+            serde_json::Value::Null
+        );
+        assert!(has_session(&admin, "ana-3"));
+        let response = call(
+            reqwest::Method::PUT,
+            format!("/admin/api/users/{ana_id}"),
+            "boss-token",
+        )
+        .json(&json!({ "password": "another-password" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!has_session(&admin, "ana-3"));
+        assert!(has_session(&admin, "boss-token"));
+        let response = login(
+            &base,
+            json!({ "username": "ana", "password": "another-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+
+        // Self-lockout: boss cannot drop `users`, disable or delete himself.
+        let mine = format!("/admin/api/users/{}", me.id);
+        for body in [
+            json!({ "permissions": ["write"] }),
+            json!({ "disabled": true }),
+        ] {
+            let response = call(reqwest::Method::PUT, mine.clone(), "boss-token")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400, "{body}");
+        }
+        let response = call(reqwest::Method::DELETE, mine.clone(), "boss-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        // Adding a permission to himself is fine, and his session follows.
+        let response = call(reqwest::Method::PUT, mine.clone(), "boss-token")
+            .json(&json!({ "permissions": ["users", "write"] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            admin
+                .signed_in(&{
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        header::COOKIE,
+                        format!("{COOKIE}=boss-token").parse().unwrap(),
+                    );
+                    headers
+                })
+                .is_some_and(|user| user.perms.contains(Perm::Write))
+        );
+
+        // Disabling and deleting Ana end her sessions.
+        sign_in(
+            &admin,
+            "ana-4",
+            SignedIn {
+                username: "ana".into(),
+                user_id: Some(ana_id),
+                perms: Perms::none(),
+            },
+        );
+        let response = call(
+            reqwest::Method::PUT,
+            format!("/admin/api/users/{ana_id}"),
+            "boss-token",
+        )
+        .json(&json!({ "disabled": true }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!has_session(&admin, "ana-4"));
+        sign_in(
+            &admin,
+            "ana-5",
+            SignedIn {
+                username: "ana".into(),
+                user_id: Some(ana_id),
+                perms: Perms::none(),
+            },
+        );
+        let response = call(
+            reqwest::Method::DELETE,
+            format!("/admin/api/users/{ana_id}"),
+            "boss-token",
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!has_session(&admin, "ana-5"));
+        assert_eq!(
+            call(
+                reqwest::Method::DELETE,
+                format!("/admin/api/users/{ana_id}"),
+                "boss-token"
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            404
+        );
+        // The feed says who did what, never a password.
+        let feed = admin.db.activity(50).unwrap();
+        let notes: Vec<&str> = feed
+            .iter()
+            .filter(|row| row.tool == "users")
+            .map(|row| row.summary.as_str())
+            .collect();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("boss added the user ana"))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("boss deleted the user ana"))
+        );
+        assert!(notes.iter().all(|note| !note.contains("another-password")));
+    }
+
+    #[tokio::test]
+    async fn own_password_changes_need_the_current_one() {
+        let (base, admin) = serve().await;
+        stored_user(&admin, "luis", &[], "luis-token");
+        sign_in(
+            &admin,
+            "luis-other",
+            admin
+                .signed_in(&{
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        header::COOKIE,
+                        format!("{COOKIE}=luis-token").parse().unwrap(),
+                    );
+                    headers
+                })
+                .unwrap(),
+        );
+        let client = reqwest::Client::new();
+        let change = |token: &str, body: serde_json::Value| {
+            client
+                .put(format!("{base}/admin/api/password"))
+                .header(header::COOKIE, format!("{COOKIE}={token}"))
+                .json(&body)
+        };
+        let response = change(
+            "luis-token",
+            json!({ "current": "wrong-one!!", "password": "new-password-1" }),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        let response = change(
+            "luis-token",
+            json!({ "current": "a-long-password", "password": "short" }),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        // The built-in users' passwords live in the environment.
+        let response = change(
+            "admin-token",
+            json!({ "current": "admin-password", "password": "new-password-1" }),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        let response = change(
+            "luis-token",
+            json!({ "current": "a-long-password", "password": "new-password-1" }),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(has_session(&admin, "luis-token"));
+        assert!(!has_session(&admin, "luis-other"));
+        assert_eq!(
+            login(
+                &base,
+                json!({ "username": "luis", "password": "new-password-1" })
+            )
+            .await
+            .status(),
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_backup_downloads_and_restores_over_http() {
+        let (source, source_admin) = serve().await;
+        source_admin
+            .db
+            .insert(&crate::db::NewEntry {
+                project: "shop".into(),
+                kind: "note".into(),
+                title: "Kept".into(),
+                body: "in the full backup".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        stored_user(&source_admin, "carried", &["users"], "carried-token");
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("{source}/admin/api/backup/full"))
+            .header(header::COOKIE, format!("{COOKIE}=admin-token"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let disposition = response.headers()[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            disposition.starts_with("attachment; filename=\"lore-full-")
+                && disposition.ends_with(".sqlite\"")
+        );
+        let file = response.bytes().await.unwrap();
+        assert!(file.starts_with(b"SQLite format 3\0"));
+        // The temporary copy is gone.
+        let dir = source_admin.db.data_dir();
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|item| { !item.file_name().to_string_lossy().starts_with(".lore-tmp-") })
+        );
+
+        let (target, target_admin) = serve().await;
+        let gone = stored_user(&target_admin, "gone", &["restore"], "gone-token");
+        let upload = |token: &str, body: Vec<u8>| {
+            client
+                .post(format!("{target}/admin/api/restore/full"))
+                .header(header::COOKIE, format!("{COOKIE}={token}"))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(body)
+        };
+        // Refused uploads name the check and change nothing.
+        for (body, check) in [
+            (b"definitely not sqlite".to_vec(), "header"),
+            (Vec::new(), "upload"),
+        ] {
+            let response = upload("admin-token", body).send().await.unwrap();
+            assert_eq!(response.status(), 400);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["check"],
+                check
+            );
+        }
+        assert_eq!(target_admin.db.users().unwrap().len(), 1);
+
+        let response = upload("gone-token", file.to_vec()).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let result: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(result["tables"]["entries"], 1);
+        assert_eq!(result["tables"]["users"], 1);
+        assert!(
+            result["snapshot"]
+                .as_str()
+                .unwrap()
+                .starts_with("pre-restore-")
+        );
+        let target_dir = target_admin.db.data_dir();
+        assert!(
+            target_dir
+                .join(result["snapshot"].as_str().unwrap())
+                .exists()
+        );
+        assert_eq!(
+            target_admin.db.recent(None, None, 5).unwrap()[0].title,
+            "Kept"
+        );
+        // The restoring user no longer exists; the built-in sessions stay.
+        assert!(!has_session(&target_admin, "gone-token"));
+        assert!(has_session(&target_admin, "admin-token"));
+        assert!(
+            target_admin
+                .db
+                .user(gone.id)
+                .unwrap()
+                .is_none_or(|user| user.username != "gone")
+        );
+        assert!(
+            std::fs::read_dir(&target_dir)
+                .unwrap()
+                .flatten()
+                .all(|item| { !item.file_name().to_string_lossy().starts_with(".lore-tmp-") })
+        );
     }
 }

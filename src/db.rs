@@ -4,12 +4,14 @@
 
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+
+use crate::users::Perms;
 
 pub const KINDS: &[&str] = &["update", "decision", "bug", "note", "todo"];
 
@@ -188,6 +190,21 @@ CREATE TABLE IF NOT EXISTS ops_log (
 );
 CREATE INDEX IF NOT EXISTS ops_log_created ON ops_log (created_at DESC);
 
+-- Users who sign in to the admin view besides the two built-in ones. Never
+-- part of the JSON backup; the full database backup carries them.
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE,     -- lowercase
+    email         TEXT UNIQUE,              -- lowercase; NULL when not given
+    password_hash TEXT NOT NULL,            -- Argon2id PHC string
+    permissions   TEXT NOT NULL DEFAULT '[]', -- JSON array of permission ids
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    last_login_at TEXT,
+    created_by    TEXT NOT NULL DEFAULT ''
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5 (
     title, body, tags, files,
     content = 'entries', content_rowid = 'id',
@@ -282,6 +299,39 @@ pub const OPS_OUTCOMES: &[&str] = &["ok", "denied", "error"];
 
 /// Ops log rows kept; older ones are dropped.
 const OPS_LOG_KEPT: i64 = 5000;
+
+/// The schema this build creates and understands, kept in `meta` as
+/// `schema_version`. A database without the key predates it (0). Raise it
+/// whenever a table or column is added, so a full backup from a newer build
+/// is recognised and refused instead of loaded half-understood.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// Columns every database lore ever created has in `entries`: a full
+/// backup without them is not a lore database.
+const OLDEST_ENTRY_COLUMNS: &[&str] = &[
+    "id",
+    "project",
+    "kind",
+    "title",
+    "body",
+    "tags",
+    "files",
+    "agent",
+    "created_at",
+    "updated_at",
+    "embedding",
+];
+
+/// Prefix of the temporary files the full backup and restore write next to
+/// the database; leftovers from an interrupted run are removed at start-up.
+const TEMP_PREFIX: &str = ".lore-tmp-";
+
+/// Prefix of the safety copies a full restore writes before it replaces
+/// the database.
+pub const SNAPSHOT_PREFIX: &str = "pre-restore-";
+
+/// Safety copies kept; older ones are removed.
+const SNAPSHOTS_KEPT: usize = 3;
 
 /// Columns added after the first release, as (table, name, definition).
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
@@ -1078,6 +1128,129 @@ pub struct Hit {
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
+    /// The database file; its directory holds the temporary files and the
+    /// safety copies of the full backup and restore.
+    path: Arc<PathBuf>,
+}
+
+/// A stored user as the admin view lists it: no password hash.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub email: Option<String>,
+    pub permissions: Vec<String>,
+    pub disabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_login_at: Option<String>,
+    pub created_by: String,
+}
+
+impl User {
+    pub fn perms(&self) -> Perms {
+        Perms::parse(&self.permissions).unwrap_or_default()
+    }
+}
+
+/// A stored user with the hash a sign-in is checked against.
+pub struct UserLogin {
+    pub user: User,
+    pub password_hash: String,
+}
+
+impl std::fmt::Debug for UserLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserLogin")
+            .field("user", &self.user)
+            .field("password_hash", &"[redacted]")
+            .finish()
+    }
+}
+
+/// A user to add. Every field is already validated.
+pub struct NewUser {
+    pub username: String,
+    pub email: Option<String>,
+    pub password_hash: String,
+    pub permissions: Perms,
+    pub created_by: String,
+}
+
+impl std::fmt::Debug for NewUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewUser")
+            .field("username", &self.username)
+            .field("email", &self.email)
+            .field("password_hash", &"[redacted]")
+            .field("permissions", &self.permissions)
+            .finish()
+    }
+}
+
+/// A change to a user; `None` leaves the field as it is.
+#[derive(Default)]
+pub struct UserPatch {
+    /// `Some(None)` removes the address.
+    pub email: Option<Option<String>>,
+    pub permissions: Option<Perms>,
+    pub disabled: Option<bool>,
+    pub password_hash: Option<String>,
+}
+
+impl std::fmt::Debug for UserPatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserPatch")
+            .field("email", &self.email)
+            .field("permissions", &self.permissions)
+            .field("disabled", &self.disabled)
+            .field(
+                "password_hash",
+                &self.password_hash.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+const USER_COLUMNS: &str = "id, username, email, permissions, disabled, created_at, updated_at, \
+                            last_login_at, created_by";
+
+impl User {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let permissions: String = row.get(3)?;
+        Ok(Self {
+            id: row.get(0)?,
+            username: row.get(1)?,
+            email: row.get(2)?,
+            permissions: Perms::from_json(&permissions)
+                .ids()
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            disabled: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+            last_login_at: row.get(7)?,
+            created_by: row.get(8)?,
+        })
+    }
+}
+
+/// Why a full database restore was refused: the check that failed, and a
+/// sentence for the page. Nothing was changed when this is returned.
+#[derive(Debug)]
+pub struct Refusal {
+    pub check: &'static str,
+    pub message: String,
+}
+
+impl Refusal {
+    fn new(check: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            check,
+            message: message.into(),
+        }
+    }
 }
 
 impl Db {
@@ -1090,12 +1263,222 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
-        conn.execute_batch(SCHEMA)?;
-        add_missing_columns(&conn)?;
-        migrate_fts(&conn)?;
-        Ok(Self {
+        migrate(&conn)?;
+        let db = Self {
             conn: Arc::new(Mutex::new(conn)),
-        })
+            path: Arc::new(path.to_path_buf()),
+        };
+        db.remove_stale_temp_files();
+        Ok(db)
+    }
+
+    /// The directory the database file lives in.
+    pub fn data_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// A fresh path for a temporary database file next to the database.
+    pub fn temp_path(&self, label: &str) -> Result<PathBuf> {
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("no randomness: {error}"))?;
+        let random: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(self
+            .data_dir()
+            .join(format!("{TEMP_PREFIX}{label}-{random}.sqlite")))
+    }
+
+    /// Removes what an interrupted full backup or restore left behind.
+    fn remove_stale_temp_files(&self) {
+        let Ok(dir) = std::fs::read_dir(self.data_dir()) else {
+            return;
+        };
+        for item in dir.flatten() {
+            if item.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
+                let _ = std::fs::remove_file(item.path());
+            }
+        }
+    }
+
+    /// Copies the whole database, consistently, to `dest` with the SQLite
+    /// online backup API. The connection is held only while the pages are
+    /// copied. The copy uses a rollback journal, so it is one
+    /// self-contained file.
+    pub fn snapshot_to(&self, dest: &Path) -> Result<()> {
+        let mut out = Connection::open(dest)
+            .with_context(|| format!("creating the snapshot {}", dest.display()))?;
+        {
+            let conn = self.lock();
+            let backup = rusqlite::backup::Backup::new(&conn, &mut out)?;
+            run_backup(&backup)?;
+        }
+        out.pragma_update(None, "journal_mode", "DELETE")?;
+        Ok(())
+    }
+
+    /// Writes a safety copy of the database as
+    /// `pre-restore-YYYYMMDD-HHMMSS.sqlite` in the data directory and keeps
+    /// only the newest three. Returns the file name.
+    pub fn write_safety_snapshot(&self) -> Result<String> {
+        let dir = self.data_dir();
+        let stamp = utc_stamp();
+        let mut name = format!("{SNAPSHOT_PREFIX}{stamp}.sqlite");
+        let mut counter = 1;
+        while dir.join(&name).exists() {
+            counter += 1;
+            name = format!("{SNAPSHOT_PREFIX}{stamp}-{counter}.sqlite");
+        }
+        // Written under a temporary name first, so a half-written copy is
+        // never mistaken for a safety copy.
+        let temp = self.temp_path("snapshot")?;
+        let written = self
+            .snapshot_to(&temp)
+            .and_then(|()| Ok(std::fs::rename(&temp, dir.join(&name))?));
+        if let Err(error) = written {
+            remove_database_files(&temp);
+            return Err(error);
+        }
+        prune_snapshots(&dir, SNAPSHOTS_KEPT)?;
+        Ok(name)
+    }
+
+    /// Replaces the live database with a prepared full backup through the
+    /// SQLite online backup API, all or nothing, then runs the start-up
+    /// migration and returns the row count of every table.
+    pub fn load_full_backup(&self, source: &Path) -> Result<Vec<(String, i64)>> {
+        let src = Connection::open_with_flags(
+            source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut conn = self.lock();
+        {
+            let backup = rusqlite::backup::Backup::new(&src, &mut conn)?;
+            run_backup(&backup)?;
+        }
+        migrate(&conn)?;
+        table_counts(&conn)
+    }
+
+    /// The row count of every table, by name.
+    #[cfg(test)]
+    pub fn table_counts(&self) -> Result<Vec<(String, i64)>> {
+        table_counts(&self.lock())
+    }
+
+    /// Every stored user, by name.
+    pub fn users(&self) -> Result<Vec<User>> {
+        let conn = self.lock();
+        let sql = format!("SELECT {USER_COLUMNS} FROM users ORDER BY username");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], User::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn user(&self, id: i64) -> Result<Option<User>> {
+        get_user(&self.lock(), id)
+    }
+
+    /// The user a sign-in names, by user name or, when it holds an `@`, by
+    /// e-mail address, with the hash to check the password against.
+    pub fn user_login(&self, name: &str) -> Result<Option<UserLogin>> {
+        let name = name.trim().to_lowercase();
+        let column = if name.contains('@') {
+            "email"
+        } else {
+            "username"
+        };
+        let sql = format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE {column} = ?1");
+        Ok(self
+            .lock()
+            .query_row(&sql, params![name], |row| {
+                Ok(UserLogin {
+                    user: User::from_row(row)?,
+                    password_hash: row.get(9)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// The stored hash of one user, to check their current password.
+    pub fn user_password_hash(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT password_hash FROM users WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn add_user(&self, new: &NewUser) -> Result<User> {
+        let conn = self.lock();
+        refuse_taken(&conn, None, Some(&new.username), new.email.as_deref())?;
+        conn.execute(
+            "INSERT INTO users (username, email, password_hash, permissions, disabled,
+                                created_at, updated_at, created_by)
+             VALUES (?1, ?2, ?3, ?4, 0, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?5)",
+            params![
+                new.username,
+                new.email,
+                new.password_hash,
+                new.permissions.to_json(),
+                new.created_by
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        get_user(&conn, id)?.context("user vanished after insert")
+    }
+
+    /// Applies a change to one user. `None` when there is no such user.
+    pub fn update_user(&self, id: i64, patch: &UserPatch) -> Result<Option<User>> {
+        let conn = self.lock();
+        if get_user(&conn, id)?.is_none() {
+            return Ok(None);
+        }
+        if let Some(Some(email)) = &patch.email {
+            refuse_taken(&conn, Some(id), None, Some(email))?;
+        }
+        conn.execute(
+            "UPDATE users SET
+                email = CASE WHEN ?2 THEN ?3 ELSE email END,
+                permissions = COALESCE(?4, permissions),
+                disabled = COALESCE(?5, disabled),
+                password_hash = COALESCE(?6, password_hash),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1",
+            params![
+                id,
+                patch.email.is_some(),
+                patch.email.clone().flatten(),
+                patch.permissions.map(Perms::to_json),
+                patch.disabled,
+                patch.password_hash
+            ],
+        )?;
+        get_user(&conn, id)
+    }
+
+    /// Removes one user; returns it, or `None` when there was none.
+    pub fn delete_user(&self, id: i64) -> Result<Option<User>> {
+        let conn = self.lock();
+        let Some(user) = get_user(&conn, id)? else {
+            return Ok(None);
+        };
+        conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+        Ok(Some(user))
+    }
+
+    /// Notes a successful sign-in.
+    pub fn touch_user_login(&self, id: i64) -> Result<()> {
+        self.lock().execute(
+            "UPDATE users SET last_login_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
     }
 
     /// Runs raw SQL, for tests that need to break the database on purpose.
@@ -3763,6 +4146,272 @@ fn validate_backup(backup: &Backup) -> Result<()> {
                 info.id,
                 info.encoding
             );
+        }
+    }
+    Ok(())
+}
+
+/// The start-up migration: creates missing tables, indexes and triggers,
+/// adds missing columns, rebuilds an outdated full-text index and records
+/// the schema version. Additive only, and safe to run again.
+fn migrate(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    add_missing_columns(conn)?;
+    migrate_fts(conn)?;
+    // Never lowered: a database a newer build wrote keeps its number.
+    if schema_version(conn)? < SCHEMA_VERSION {
+        set_meta(conn, "schema_version", &SCHEMA_VERSION.to_string())?;
+    }
+    Ok(())
+}
+
+/// The `schema_version` a database records; 0 when it has none.
+fn schema_version(conn: &Connection) -> Result<i64> {
+    let has_meta: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_meta {
+        return Ok(0);
+    }
+    Ok(meta_value(conn, "schema_version")?
+        .trim()
+        .parse()
+        .unwrap_or(0))
+}
+
+/// Copies every page in one step: the connection lock is held anyway, and
+/// rusqlite's own loop sleeps between small steps.
+fn run_backup(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<()> {
+    use rusqlite::backup::StepResult;
+    loop {
+        match backup.step(-1)? {
+            StepResult::Done => return Ok(()),
+            StepResult::More => continue,
+            StepResult::Busy | StepResult::Locked => {
+                anyhow::bail!("the database is busy; try again")
+            }
+            _ => anyhow::bail!("the backup stopped unexpectedly"),
+        }
+    }
+}
+
+fn table_counts(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let names: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table'
+               AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'entries_fts%'
+             ORDER BY name",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut counts = Vec::with_capacity(names.len());
+    for name in names {
+        let count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM \"{}\"", name.replace('"', "\"\"")),
+            [],
+            |row| row.get(0),
+        )?;
+        counts.push((name, count));
+    }
+    Ok(counts)
+}
+
+/// Checks an uploaded full backup without changing it: the SQLite header,
+/// that it opens read-only, `PRAGMA integrity_check`, the `entries` table
+/// with the columns the oldest schema has, and a schema no newer than this
+/// build understands.
+pub fn check_full_backup(path: &Path) -> std::result::Result<(), Refusal> {
+    use std::io::Read;
+    let mut header = [0u8; 16];
+    let read = std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut header));
+    if read.is_err() || &header != b"SQLite format 3\0" {
+        return Err(Refusal::new(
+            "header",
+            "the file is not a SQLite database (its header is wrong)",
+        ));
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| Refusal::new("open", "the file cannot be opened as a SQLite database"))?;
+    let integrity: std::result::Result<Vec<String>, rusqlite::Error> =
+        conn.prepare("PRAGMA integrity_check").and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        });
+    match integrity {
+        Ok(rows) if rows == ["ok"] => {}
+        Ok(rows) => {
+            return Err(Refusal::new(
+                "integrity",
+                format!(
+                    "the database is damaged: integrity_check reported {}",
+                    rows.first()
+                        .map(|row| row.chars().take(160).collect::<String>())
+                        .unwrap_or_else(|| "nothing".into())
+                ),
+            ));
+        }
+        Err(_) => {
+            return Err(Refusal::new(
+                "integrity",
+                "the database is damaged: integrity_check could not run",
+            ));
+        }
+    }
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('entries')")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()
+        })
+        .map_err(|_| Refusal::new("schema", "the database schema cannot be read"))?;
+    if columns.is_empty() {
+        return Err(Refusal::new(
+            "schema",
+            "the database has no entries table, so it is not a lore database",
+        ));
+    }
+    if let Some(missing) = OLDEST_ENTRY_COLUMNS
+        .iter()
+        .find(|name| !columns.iter().any(|column| column == *name))
+    {
+        return Err(Refusal::new(
+            "schema",
+            format!("the entries table has no {missing} column, so it is not a lore database"),
+        ));
+    }
+    let version = schema_version(&conn)
+        .map_err(|_| Refusal::new("schema", "the database schema cannot be read"))?;
+    if version > SCHEMA_VERSION {
+        return Err(Refusal::new(
+            "version",
+            format!(
+                "the backup comes from a newer lore (schema {version}); this build understands \
+                 schema {SCHEMA_VERSION}. Update lore first."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Brings a checked full backup up to this build's schema in place, so an
+/// older backup gains the newer tables and columns before it replaces
+/// anything, and rebuilds its full-text index.
+pub fn prepare_full_backup(path: &Path) -> std::result::Result<(), Refusal> {
+    let prepared = (|| -> Result<()> {
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        migrate(&conn)?;
+        conn.execute(
+            "INSERT INTO entries_fts (entries_fts) VALUES ('rebuild')",
+            [],
+        )?;
+        Ok(())
+    })();
+    prepared.map_err(|error| {
+        Refusal::new(
+            "migrate",
+            format!("the backup could not be brought up to this build's schema: {error}"),
+        )
+    })
+}
+
+/// Removes a database file and the journal files SQLite may keep next to
+/// it.
+pub fn remove_database_files(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(name));
+    }
+}
+
+/// Keeps the newest `keep` safety copies in `dir`, by the time each was
+/// written, then by name.
+fn prune_snapshots(dir: &Path, keep: usize) -> Result<()> {
+    let mut found: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(dir)?
+        .flatten()
+        .filter_map(|item| {
+            let name = item.file_name().to_string_lossy().into_owned();
+            if !(name.starts_with(SNAPSHOT_PREFIX) && name.ends_with(".sqlite")) {
+                return None;
+            }
+            let written = item.metadata().and_then(|meta| meta.modified()).ok()?;
+            Some((written, name))
+        })
+        .collect();
+    found.sort();
+    let excess = found.len().saturating_sub(keep);
+    for (_, name) in &found[..excess] {
+        std::fs::remove_file(dir.join(name))
+            .with_context(|| format!("removing the old safety copy {name}"))?;
+    }
+    Ok(())
+}
+
+/// The current UTC time as `YYYYMMDD-HHMMSS`, for file names.
+pub fn utc_stamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rest) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+    // Howard Hinnant's days-to-civil conversion.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+fn get_user(conn: &Connection, id: i64) -> Result<Option<User>> {
+    let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?1");
+    Ok(conn
+        .query_row(&sql, params![id], User::from_row)
+        .optional()?)
+}
+
+/// Refuses a user name or e-mail address another user already has.
+fn refuse_taken(
+    conn: &Connection,
+    except: Option<i64>,
+    username: Option<&str>,
+    email: Option<&str>,
+) -> Result<()> {
+    let except = except.unwrap_or(-1);
+    if let Some(username) = username {
+        let taken: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM users WHERE username = ?1 AND id != ?2",
+            params![username, except],
+            |row| row.get(0),
+        )?;
+        if taken {
+            anyhow::bail!("the user name \"{username}\" is taken");
+        }
+    }
+    if let Some(email) = email {
+        let taken: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM users WHERE email = ?1 AND id != ?2",
+            params![email, except],
+            |row| row.get(0),
+        )?;
+        if taken {
+            anyhow::bail!("another user has that e-mail address");
         }
     }
     Ok(())
@@ -6669,5 +7318,373 @@ mod tests {
         assert_eq!(db.get(1).unwrap().unwrap().title, "old");
         assert_eq!(db.ops_log(10).unwrap().len(), 1);
         assert!(db.vault("dokploy").unwrap().is_some());
+    }
+
+    /// A fresh, empty directory for one test.
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lore-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn user_fixture(name: &str, email: Option<&str>, perms: &[&str]) -> NewUser {
+        NewUser {
+            username: name.into(),
+            email: email.map(String::from),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+            permissions: Perms::parse(perms).unwrap(),
+            created_by: "admin".into(),
+        }
+    }
+
+    /// Entries, a file in two versions, a task, a user and a vault row.
+    fn populate(db: &Db) {
+        db.insert(&entry("shop", "Checkout", "Stripe webhooks verified"))
+            .unwrap();
+        db.insert(&entry("blog", "Feed", "RSS and Atom")).unwrap();
+        for content in ["first", "second"] {
+            db.save_file(&NewFile {
+                project: "shop".into(),
+                path: "docs/plan.md".into(),
+                kind: "doc".into(),
+                description: "the plan".into(),
+                encoding: "utf8".into(),
+                content: content.into(),
+                entry_id: None,
+                agent: "claude".into(),
+                session_id: None,
+            })
+            .unwrap();
+        }
+        db.add_task(&NewTask {
+            project: "shop".into(),
+            title: "Ship it".into(),
+            body: String::new(),
+            assignee: String::new(),
+            created_by: "admin".into(),
+            session_id: None,
+        })
+        .unwrap();
+        db.add_user(&user_fixture("luis", Some("luis@example.com"), &["write"]))
+            .unwrap();
+        db.set_vault("github", "", b"nonce-bytes-24", b"ciphertext", "1234")
+            .unwrap();
+    }
+
+    /// A hash over every row of a table, in id order.
+    fn table_hash(db: &Db, table: &str, columns: &str) -> String {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare(&format!("SELECT {columns} FROM {table} ORDER BY id"))
+            .unwrap();
+        let count = stmt.column_count();
+        let mut bytes = Vec::new();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            for i in 0..count {
+                let value: Value = row.get(i).unwrap();
+                bytes.extend(format!("{value:?}|").into_bytes());
+            }
+            bytes.push(b'\n');
+        }
+        sha256_hex(&bytes)
+    }
+
+    #[test]
+    fn users_are_stored_unique_and_lowercase() {
+        let db = temp_db_named("users");
+        let user = db
+            .add_user(&user_fixture(
+                "luis",
+                Some("luis@example.com"),
+                &["users", "write"],
+            ))
+            .unwrap();
+        assert_eq!(user.permissions, ["write", "users"]);
+        assert!(!user.disabled && user.last_login_at.is_none());
+        assert!(db.add_user(&user_fixture("luis", None, &[])).is_err());
+        assert!(
+            db.add_user(&user_fixture("other", Some("luis@example.com"), &[]))
+                .is_err()
+        );
+        // Two users without an address are fine.
+        db.add_user(&user_fixture("a1", None, &[])).unwrap();
+        db.add_user(&user_fixture("a2", None, &[])).unwrap();
+        assert_eq!(db.user_login("LUIS").unwrap().unwrap().user.id, user.id);
+        assert_eq!(
+            db.user_login("Luis@Example.com").unwrap().unwrap().user.id,
+            user.id
+        );
+        assert!(db.user_login("nobody").unwrap().is_none());
+        let login = db.user_login("luis").unwrap().unwrap();
+        assert!(
+            !format!("{login:?}").contains("argon2"),
+            "the hash leaked into Debug"
+        );
+
+        let changed = db
+            .update_user(
+                user.id,
+                &UserPatch {
+                    email: Some(None),
+                    permissions: Some(Perms::parse(&["backup"]).unwrap()),
+                    disabled: Some(true),
+                    password_hash: Some("$argon2id$new".into()),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (changed.email, changed.permissions, changed.disabled),
+            (None, vec!["backup".to_string()], true)
+        );
+        assert_eq!(
+            db.user_password_hash(user.id).unwrap().as_deref(),
+            Some("$argon2id$new")
+        );
+        // An empty patch changes nothing.
+        let same = db
+            .update_user(user.id, &UserPatch::default())
+            .unwrap()
+            .unwrap();
+        assert!(same.disabled);
+        assert!(
+            db.update_user(999, &UserPatch::default())
+                .unwrap()
+                .is_none()
+        );
+        db.touch_user_login(user.id).unwrap();
+        assert!(db.user(user.id).unwrap().unwrap().last_login_at.is_some());
+        assert_eq!(db.delete_user(user.id).unwrap().unwrap().username, "luis");
+        assert!(db.delete_user(user.id).unwrap().is_none());
+        assert_eq!(db.users().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn json_backups_leave_the_users_alone() {
+        let db = temp_db_named("json-users");
+        populate(&db);
+        let backup = db.export().unwrap();
+        assert!(
+            !serde_json::to_string(&backup)
+                .unwrap()
+                .contains("luis@example.com"),
+            "a user reached the JSON backup"
+        );
+        db.add_user(&user_fixture("later", None, &[])).unwrap();
+        db.restore(&backup).unwrap();
+        db.merge(&backup).unwrap();
+        let names: Vec<String> = db
+            .users()
+            .unwrap()
+            .into_iter()
+            .map(|u| u.username)
+            .collect();
+        assert_eq!(names, ["later", "luis"]);
+    }
+
+    #[test]
+    fn a_database_from_before_users_opens_and_keeps_its_rows() {
+        let dir = test_dir("pre-users");
+        let path = dir.join("lore.db");
+        {
+            let db = Db::open(&path).unwrap();
+            populate(&db);
+        }
+        // Turn it back into what the previous release wrote: no users
+        // table and no schema version.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP TABLE users; DELETE FROM meta WHERE key = 'schema_version';")
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let counts: HashMap<String, i64> = db.table_counts().unwrap().into_iter().collect();
+        assert_eq!(counts["entries"], 2);
+        assert_eq!(counts["files"], 2);
+        assert_eq!(counts["tasks"], 1);
+        assert_eq!(counts["vault"], 1);
+        assert_eq!(counts["users"], 0);
+        assert_eq!(schema_version(&db.lock()).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            db.search("webhooks", None, None, None, 5, 0.8)
+                .unwrap()
+                .len(),
+            1
+        );
+        // A newer build's number is never lowered.
+        set_meta(&db.lock(), "schema_version", "99").unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(schema_version(&db.lock()).unwrap(), 99);
+    }
+
+    #[test]
+    fn a_full_backup_restores_into_another_database_exactly() {
+        let dir = test_dir("full-roundtrip");
+        let source = Db::open(&dir.join("a/lore.db")).unwrap();
+        populate(&source);
+        let file = dir.join("full.sqlite");
+        source.snapshot_to(&file).unwrap();
+        check_full_backup(&file).unwrap();
+        prepare_full_backup(&file).unwrap();
+
+        let target = Db::open(&dir.join("b/lore.db")).unwrap();
+        target
+            .insert(&entry("old", "Replaced", "gone after the restore"))
+            .unwrap();
+        let counts = target.load_full_backup(&file).unwrap();
+        assert_eq!(counts, source.table_counts().unwrap());
+        let entries = "id, project, kind, title, body, tags, files, agent, created_at, updated_at";
+        let files = "id, project, path, version, content, sha256, created_at";
+        assert_eq!(
+            table_hash(&target, "entries", entries),
+            table_hash(&source, "entries", entries)
+        );
+        assert_eq!(
+            table_hash(&target, "files", files),
+            table_hash(&source, "files", files)
+        );
+        assert_eq!(target.users().unwrap()[0].username, "luis");
+        assert!(target.vault("github").unwrap().is_some());
+        assert_eq!(
+            target
+                .search("webhooks", None, None, None, 5, 0.8)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            target
+                .search("Replaced", None, None, None, 5, 0.8)
+                .unwrap()
+                .is_empty()
+        );
+        // The target keeps working on its own file.
+        target
+            .insert(&entry("new", "After", "written after"))
+            .unwrap();
+        drop(target);
+        let reopened = Db::open(&dir.join("b/lore.db")).unwrap();
+        assert_eq!(reopened.recent(None, None, 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn bad_full_backups_are_refused_and_change_nothing() {
+        let dir = test_dir("full-bad");
+        let live = Db::open(&dir.join("live/lore.db")).unwrap();
+        populate(&live);
+        let before = live.table_counts().unwrap();
+
+        let text = dir.join("text.sqlite");
+        std::fs::write(&text, b"this is not a database at all, just text").unwrap();
+        assert_eq!(check_full_backup(&text).unwrap_err().check, "header");
+
+        let foreign = dir.join("foreign.sqlite");
+        Connection::open(&foreign)
+            .unwrap()
+            .execute_batch("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);")
+            .unwrap();
+        assert_eq!(check_full_backup(&foreign).unwrap_err().check, "schema");
+
+        let partial = dir.join("partial.sqlite");
+        Connection::open(&partial)
+            .unwrap()
+            .execute_batch("CREATE TABLE entries (id INTEGER PRIMARY KEY, project TEXT);")
+            .unwrap();
+        assert_eq!(check_full_backup(&partial).unwrap_err().check, "schema");
+
+        let newer = dir.join("newer.sqlite");
+        live.snapshot_to(&newer).unwrap();
+        Connection::open(&newer)
+            .unwrap()
+            .execute_batch("UPDATE meta SET value = '999' WHERE key = 'schema_version';")
+            .unwrap();
+        assert_eq!(check_full_backup(&newer).unwrap_err().check, "version");
+
+        // A real database with pages overwritten in the middle.
+        let corrupt = dir.join("corrupt.sqlite");
+        live.snapshot_to(&corrupt).unwrap();
+        let mut bytes = std::fs::read(&corrupt).unwrap();
+        assert!(bytes.len() > 4096 * 4);
+        for byte in &mut bytes[4096 + 100..4096 * 3] {
+            *byte = 0xA5;
+        }
+        std::fs::write(&corrupt, &bytes).unwrap();
+        let refusal = check_full_backup(&corrupt).unwrap_err();
+        assert!(
+            matches!(refusal.check, "integrity" | "open" | "schema"),
+            "{refusal:?}"
+        );
+
+        assert_eq!(live.table_counts().unwrap(), before);
+        assert_eq!(live.recent(None, None, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn safety_snapshots_are_written_and_pruned() {
+        let dir = test_dir("snapshots");
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        populate(&db);
+        let mut names = Vec::new();
+        for _ in 0..5 {
+            names.push(db.write_safety_snapshot().unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut kept: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|item| item.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(SNAPSHOT_PREFIX))
+            .collect();
+        kept.sort();
+        let mut newest = names[2..].to_vec();
+        newest.sort();
+        assert_eq!(kept, newest);
+        assert!(names[0].starts_with(SNAPSHOT_PREFIX) && names[0].ends_with(".sqlite"));
+        // Each copy is a complete database of its own.
+        check_full_backup(&dir.join(&names[4])).unwrap();
+        // No temporary file is left behind.
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|item| !item.file_name().to_string_lossy().starts_with(TEMP_PREFIX))
+        );
+        assert_eq!(utc_stamp().len(), "YYYYMMDD-HHMMSS".len());
+    }
+
+    #[test]
+    fn an_older_full_backup_gains_the_new_tables() {
+        let dir = test_dir("full-old");
+        let old = dir.join("old.sqlite");
+        Connection::open(&old)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,
+                 kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+                 tags TEXT NOT NULL DEFAULT '', files TEXT NOT NULL DEFAULT '',
+                 agent TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT 'x',
+                 updated_at TEXT, embedding BLOB);
+                 INSERT INTO entries (project, kind, title, body) VALUES ('p', 'note', 'old', 'entry');
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+        check_full_backup(&old).unwrap();
+        prepare_full_backup(&old).unwrap();
+        let db = Db::open(&dir.join("live/lore.db")).unwrap();
+        populate(&db);
+        let counts: HashMap<String, i64> = db.load_full_backup(&old).unwrap().into_iter().collect();
+        assert_eq!(counts["entries"], 1);
+        for table in ["users", "files", "tasks", "vault", "ops_log", "sessions"] {
+            assert_eq!(counts.get(table), Some(&0), "{table}");
+        }
+        assert_eq!(db.get(1).unwrap().unwrap().title, "old");
+        assert_eq!(
+            db.search("entry", None, None, None, 5, 0.8).unwrap().len(),
+            1
+        );
+        db.add_user(&user_fixture("fresh", None, &[])).unwrap();
     }
 }

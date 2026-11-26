@@ -444,6 +444,26 @@ button:focus-visible, [tabindex]:focus-visible {
 .backup button span { font-size: 12px; color: var(--muted); font-weight: 400; line-height: 1.4; }
 .backup button.danger b { color: var(--danger); }
 .backup button.danger:hover { background: rgba(255, 122, 144, 0.12); border-color: rgba(255, 122, 144, 0.4); }
+.backup { max-height: calc(100vh - 76px); overflow-y: auto; }
+.backup h4 {
+  margin: 6px 0 0; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.1em; color: var(--muted); font-weight: 600;
+}
+.backup p { margin: 0; }
+.backup .backup-note { line-height: 1.45; }
+.full-restore {
+  display: grid; gap: 8px; padding: 10px 12px; border-radius: 12px;
+  background: rgba(255, 122, 144, 0.06); border: 1px solid rgba(255, 122, 144, 0.22);
+}
+.full-restore input { width: 100%; padding: 7px 9px; font-family: var(--mono); letter-spacing: 0.08em; }
+.full-result {
+  list-style: none; margin: 0; padding: 8px 10px; border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04); display: grid; gap: 2px;
+  font-size: 12px; max-height: 180px; overflow-y: auto;
+}
+.full-result li { display: flex; justify-content: space-between; gap: 10px; }
+.full-result li span { font-family: var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.full-result li b { font-family: var(--mono); font-weight: 500; }
 #backup-status { margin: 2px 0 0; min-height: 1.4em; color: var(--muted); }
 #backup-status.ok { color: var(--ok); }
 #backup-status.bad { color: var(--danger); }
@@ -546,6 +566,36 @@ button:focus-visible, [tabindex]:focus-visible {
 .board-field input[type="text"], .board-field select { width: 100%; padding: 7px 9px; font-size: 13px; color: var(--text); }
 .board-field textarea { padding: 8px 10px; font-size: 13px; color: var(--text); min-height: 58px; }
 .board-form-actions { display: flex; justify-content: flex-end; }
+.board-form-row.even { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.board-field input[type="email"], .board-field input[type="password"] {
+  width: 100%; padding: 7px 9px; font-size: 13px; color: var(--text);
+}
+
+/* The Users panel and the own-password form: the Board panel's frame,
+   with permission checkboxes that carry a one-line explanation. */
+#users-status { margin: 0; min-height: 1.4em; color: var(--muted); }
+#users-status:empty { display: none; }
+#users-status.ok { color: var(--ok); }
+#users-status.bad { color: var(--danger); }
+.perm-checks { margin: 0; padding: 0; border: 0; display: grid; gap: 4px; min-width: 0; }
+.perm-checks legend { padding: 0; margin-bottom: 4px; font-size: 12px; color: var(--muted); }
+.perm-check {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; align-items: start;
+  padding: 5px 8px; border-radius: 9px; font-size: 12px; cursor: pointer;
+}
+.perm-check:hover { background: rgba(255, 255, 255, 0.04); }
+.perm-check input { margin-top: 2px; }
+.perm-check > span { display: grid; gap: 1px; }
+.perm-check b { font-family: var(--mono); font-weight: 500; font-size: 12px; color: var(--text); }
+.user-perms { display: flex; flex-wrap: wrap; gap: 4px; }
+.user-perms .pill { margin-left: 0; }
+.pill.perm { color: var(--accent); }
+.user-item.disabled { opacity: 0.7; }
+.user-item.builtin { border-color: rgba(199, 155, 255, 0.18); }
+.user-editor { margin-top: 6px; background: rgba(0, 0, 0, 0.18); }
+.user-disabled { margin-left: 0; }
+.own-password { margin-top: 6px; }
+.own-password h4 { margin: 0; }
 
 .board-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
 .board-list .none { color: var(--muted); font-size: 13px; padding: 6px 2px; }
@@ -583,7 +633,7 @@ button:focus-visible, [tabindex]:focus-visible {
 .pill.handoff { color: var(--violet); }
 
 @media (max-width: 760px) {
-  .board-form-row, .board-form-row.three, .board-form-row.three:has(#message-to-field[hidden]) { grid-template-columns: 1fr; }
+  .board-form-row, .board-form-row.three, .board-form-row.even, .board-form-row.three:has(#message-to-field[hidden]) { grid-template-columns: 1fr; }
   #board-project { margin-left: 0; max-width: none; }
 }
 
@@ -912,8 +962,10 @@ a.button-link:hover { background: rgba(255, 255, 255, 0.11); }
   .board-chips button { flex: 1; font-size: 13px; }
   #board-project, #files-project { margin-left: 0; max-width: none; width: 100%; padding: 8px 10px; }
   #files-search { min-width: 0; width: 100%; padding: 8px 12px; }
-  .board-form-row, .board-form-row.three, .board-form-row.three:has(#message-to-field[hidden]) { grid-template-columns: 1fr; }
-  .board-field input[type="text"], .board-field select { padding: 8px 10px; }
+  .board-form-row, .board-form-row.three, .board-form-row.even, .board-form-row.three:has(#message-to-field[hidden]) { grid-template-columns: 1fr; }
+  .board-field input[type="text"], .board-field input[type="email"], .board-field input[type="password"], .board-field select { padding: 8px 10px; }
+  .perm-check { min-height: 44px; align-items: center; font-size: 13px; }
+  .full-restore input { min-height: 44px; }
   .board-form-actions > button { width: 100%; }
   .board-item-head { flex-wrap: wrap; }
   .board-title { flex: 1 1 140px; }
@@ -951,7 +1003,7 @@ a.button-link:hover { background: rgba(255, 255, 255, 0.11); }
   .login-card button { min-height: 48px; font-size: 15px; }
 
   /* Backup */
-  .backup { gap: 10px; }
+  .backup { gap: 10px; max-height: none; }
   .backup button { padding: 12px 14px; }
 }
 

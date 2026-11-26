@@ -44,12 +44,15 @@ const TOOLS = {
   dokploy: { verb: "called Dokploy", tone: "write" },
   git_fetch: { verb: "fetched a repository", tone: "read" },
   git_push: { verb: "pushed to a repository", tone: "write" },
+  users: { verb: "changed the users", tone: "write" },
 };
 const WRITES = new Set([
   "hello", "checkin", "bye", "log", "amend", "forget", "profile", "rules", "import", "restore", "reindex",
   "task_add", "task_update", "send", "handoff", "file_save", "file_delete",
-  "cloudflare", "github", "git_server", "dokploy", "git_push",
+  "cloudflare", "github", "git_server", "dokploy", "git_push", "users",
 ]);
+/* The permission ids the server knows; a signed-in user holds some of them. */
+const ALL_PERMISSIONS = ["write", "backup", "restore", "settings", "integrations", "agents", "users"];
 const FALLBACK_POLL_MS = 30000;
 const FEED_MAX = 120;
 const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -741,6 +744,7 @@ const state = {
   filter: null, // { type: 'project' | 'agent' | 'kind', value }
   query: "", timer: null, clock: null, source: null, refreshing: null,
   siteKey: null, decorative: false, role: "viewer",
+  username: "", perms: new Set(), stored: false,
   sessions: [], openSessions: 0, openTasks: 0, fileCount: 0,
 };
 
@@ -764,6 +768,10 @@ function showLogin() {
   $("backup-toggle").setAttribute("aria-expanded", "false");
   $("profile").hidden = true;
   $("profile-toggle").setAttribute("aria-expanded", "false");
+  resetOwnPassword();
+  resetBackup();
+  closeUsers();
+  resetUsers();
   closeBoard();
   Object.assign(board, { data: null, tab: "tasks", filter: "open", project: "" });
   closeFiles();
@@ -784,7 +792,8 @@ function showLogin() {
     graph.setData(fake.nodes, fake.links);
     state.decorative = true;
   }
-  $("password").focus();
+  $("password").value = "";
+  if ($("username").value) $("password").focus(); else $("username").focus();
 }
 
 function loadRecaptcha(siteKey) {
@@ -816,12 +825,12 @@ $("login-form").addEventListener("submit", async (event) => {
     const response = await api("/admin/api/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password: $("password").value, captcha }),
+      body: JSON.stringify({ username: $("username").value.trim(), password: $("password").value, captcha }),
     });
     if (response.ok) {
       $("password").value = "";
       const body = await response.json().catch(() => ({}));
-      await enter(body.role);
+      await enter(body);
     } else if (response.status === 429) {
       const wait = Number(response.headers.get("Retry-After")) || 60;
       error.textContent = `Too many attempts. Try again in ${Math.ceil(wait / 60)} min.`;
@@ -841,28 +850,56 @@ $("logout").addEventListener("click", async () => {
   showLogin();
 });
 
-/* A viewer session watches; only the admin role is offered the backup menu.
-   The server enforces this too, so hiding the button is a courtesy, not the lock. */
-function applyRole(role) {
-  state.role = role === "admin" ? "admin" : "viewer";
-  const admin = state.role === "admin";
-  $("backup-toggle").hidden = !admin;
-  $("more-backup").hidden = !admin;
-  $("role").hidden = admin;
-  $("more-role").hidden = admin;
-  // The board forms write as the administrator; a viewer never sees them.
-  $("task-form").hidden = !admin;
-  $("message-form").hidden = !admin;
-  // So is the file form; a viewer only reads and downloads.
-  $("file-form").hidden = !admin;
-  if (!admin) {
+/* Whether the signed-in user holds a permission. */
+function can(permission) {
+  return state.perms.has(permission);
+}
+
+/* Every signed-in user reads; each control that changes something shows
+   only with its permission. The server enforces the same on every route,
+   so hiding a control is a courtesy, not the lock. */
+function applySession(session) {
+  // A server from before permissions sent only the role.
+  const perms = Array.isArray(session.permissions)
+    ? session.permissions
+    : session.role === "admin" ? ALL_PERMISSIONS : [];
+  state.perms = new Set(perms);
+  state.role = session.role === "admin" ? "admin" : "viewer";
+  state.username = session.username || state.role;
+  state.stored = !!session.stored;
+  const backupMenu = can("backup") || can("restore");
+  $("backup-toggle").hidden = !backupMenu;
+  $("more-backup").hidden = !backupMenu;
+  $("users-toggle").hidden = !can("users");
+  $("more-users").hidden = !can("users");
+  // The badge next to the brand names who is signed in.
+  for (const badge of [$("role"), $("more-role")]) {
+    badge.textContent = state.username;
+    badge.title = perms.length ? "Permissions: " + perms.join(", ") : "Read only";
+    badge.hidden = false;
+  }
+  // The board and file forms write; reading needs no permission.
+  $("task-form").hidden = !can("write");
+  $("message-form").hidden = !can("write");
+  $("file-form").hidden = !can("write");
+  // The backup dialog: downloads need backup, restores need restore.
+  $("backup-export").hidden = !can("backup");
+  $("full-download").hidden = !can("backup");
+  $("backup-import").hidden = !can("restore");
+  $("backup-restore").hidden = !can("restore");
+  $("full-restore-box").hidden = !can("restore");
+  // Stored users change their own password; built-in ones in the environment.
+  $("own-password").hidden = !state.stored;
+  $("own-username").value = state.username;
+  if (!backupMenu) {
     $("backup").hidden = true;
     $("backup-toggle").setAttribute("aria-expanded", "false");
   }
+  if (!can("users")) closeUsers();
 }
 
-async function enter(role) {
-  applyRole(role);
+async function enter(session) {
+  applySession(session || {});
   $("login").hidden = true;
   $("app").hidden = false;
   graph.byId = new Map();
@@ -1376,8 +1413,20 @@ $("backup-toggle").addEventListener("click", () => {
     closeBoard();
     closeFiles();
     closeIntegrations();
+    closeUsers();
+  } else {
+    resetBackup();
   }
 });
+
+/* The typed confirmation and the last restore's table counts do not
+   outlive the dialog. */
+function resetBackup() {
+  $("full-confirm").value = "";
+  $("full-restore").disabled = true;
+  $("full-result").hidden = true;
+  $("full-result").replaceChildren();
+}
 
 $("backup-export").addEventListener("click", () => {
   // A plain navigation: the server answers with a file attachment.
@@ -1438,6 +1487,76 @@ $("backup-file").addEventListener("change", async (event) => {
   }
 });
 
+/* The full database: a .sqlite download, and a restore that replaces
+   everything after the word RESTORE is typed. */
+$("full-download").addEventListener("click", () => {
+  const link = document.createElement("a");
+  link.href = "/admin/api/backup/full";
+  link.download = "";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  backupStatus("Full database download started. Keep the file private: it holds the encrypted credentials and the password hashes.", "ok");
+});
+
+$("full-confirm").addEventListener("input", () => {
+  $("full-restore").disabled = $("full-confirm").value.trim() !== "RESTORE";
+});
+
+$("full-restore").addEventListener("click", () => {
+  if ($("full-confirm").value.trim() !== "RESTORE") return;
+  $("full-file").click();
+});
+
+$("full-file").addEventListener("change", async (event) => {
+  const file = event.target.files[0];
+  event.target.value = "";
+  if (!file) return;
+  if ($("full-confirm").value.trim() !== "RESTORE") return;
+  const sure = window.confirm(
+    `Replace the whole database with "${file.name}"?\n\n` +
+    "Every memory, session, file, setting, credential and user here is replaced by the file's contents. " +
+    "A safety copy of the current database is kept on the server.");
+  if (!sure) { backupStatus("Restore cancelled. Nothing changed."); return; }
+  $("full-restore").disabled = true;
+  $("full-result").hidden = true;
+  backupStatus("Uploading and checking the database…");
+  try {
+    const response = await api("/admin/api/restore/full", {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const reason = response.status === 413
+        ? "The file is larger than 2 GiB."
+        : result.error || "The database could not be restored.";
+      backupStatus(`${reason} Nothing changed.`, "bad");
+      $("full-restore").disabled = $("full-confirm").value.trim() !== "RESTORE";
+      return;
+    }
+    $("full-confirm").value = "";
+    backupStatus(`Restored. The previous database was kept on the server as ${result.snapshot}.`, "ok");
+    const list = $("full-result");
+    list.replaceChildren();
+    for (const [table, count] of Object.entries(result.tables || {})) {
+      const item = el("li");
+      item.append(el("span", "", table), el("b", "", String(count)));
+      list.append(item);
+    }
+    list.hidden = !list.children.length;
+    // The restored database may not know this user any more.
+    const session = await (await fetch("/admin/api/session", { credentials: "same-origin" })).json();
+    if (!session.authenticated) { showLogin(); return; }
+    applySession(session);
+    await refresh(false);
+  } catch (_) {
+    backupStatus("The database could not be sent. Nothing changed.", "bad");
+    $("full-restore").disabled = $("full-confirm").value.trim() !== "RESTORE";
+  }
+});
+
 /* ---------- Profile and rules ---------- */
 
 function profileStatus(text, tone) {
@@ -1457,8 +1576,11 @@ $("profile-toggle").addEventListener("click", () => {
     closeBoard();
     closeFiles();
     closeIntegrations();
+    closeUsers();
     profileStatus("");
     loadProfile();
+  } else {
+    resetOwnPassword();
   }
 });
 
@@ -1472,7 +1594,7 @@ async function loadProfile() {
     profileStatus("The profile could not be loaded.", "bad");
     return;
   }
-  const admin = state.role === "admin";
+  const admin = can("settings");
   $("profile-address").value = data.address || "";
   $("profile-language").value = data.language || "";
   $("profile-address").readOnly = !admin;
@@ -1679,6 +1801,7 @@ $("board-toggle").addEventListener("click", () => {
   if (!open) { closeBoard(); return; }
   panel.hidden = false;
   $("board-toggle").setAttribute("aria-expanded", "true");
+  closeUsers();
   $("backup").hidden = true;
   $("backup-toggle").setAttribute("aria-expanded", "false");
   $("profile").hidden = true;
@@ -1762,7 +1885,7 @@ function fillSelect(select, options) {
 }
 
 function renderBoard() {
-  const admin = state.role === "admin";
+  const admin = can("write");
   const tasksTab = board.tab === "tasks";
   $("board-tab-tasks").classList.toggle("active", tasksTab);
   $("board-tab-tasks").setAttribute("aria-selected", String(tasksTab));
@@ -2049,6 +2172,7 @@ $("files-toggle").addEventListener("click", () => {
   if (!panel.hidden) { closeFiles(); return; }
   panel.hidden = false;
   $("files-toggle").setAttribute("aria-expanded", "true");
+  closeUsers();
   $("backup").hidden = true;
   $("backup-toggle").setAttribute("aria-expanded", "false");
   $("profile").hidden = true;
@@ -2101,7 +2225,7 @@ function filesActivity(activity) {
 }
 
 function renderFiles() {
-  const admin = state.role === "admin";
+  const admin = can("write");
   const detail = filesState.openId !== null;
   $("files-browse").hidden = detail;
   $("file-detail").hidden = !detail;
@@ -2201,7 +2325,7 @@ async function showFile(id, quiet) {
 }
 
 function renderFileDetail(data) {
-  const admin = state.role === "admin";
+  const admin = can("write");
   const { file, versions } = data;
   const box = $("file-detail");
   box.replaceChildren(backButton());
@@ -2473,6 +2597,7 @@ $("integrations-toggle").addEventListener("click", () => {
   if (!panel.hidden) { closeIntegrations(); return; }
   panel.hidden = false;
   $("integrations-toggle").setAttribute("aria-expanded", "true");
+  closeUsers();
   $("backup").hidden = true;
   $("backup-toggle").setAttribute("aria-expanded", "false");
   $("profile").hidden = true;
@@ -2519,7 +2644,7 @@ function integrationsActivity(activity) {
 }
 
 function renderIntegrations() {
-  const admin = state.role === "admin";
+  const admin = can("integrations");
   const data = integrationsState.data;
 
   $("integrations-vault").hidden = !data || data.vault_enabled;
@@ -2798,6 +2923,318 @@ $("integrations-enabled").addEventListener("change", async (event) => {
   }
 });
 
+/* ---------- Your password (stored users) ---------- */
+
+function resetOwnPassword() {
+  for (const id of ["own-current", "own-new", "own-again"]) $(id).value = "";
+}
+
+$("own-password").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const current = $("own-current").value, password = $("own-new").value;
+  if (password !== $("own-again").value) {
+    profileStatus("The two new passwords differ.", "bad");
+    return;
+  }
+  if (password.length < 10) {
+    profileStatus("The new password must be at least 10 characters.", "bad");
+    return;
+  }
+  $("own-submit").disabled = true;
+  try {
+    const response = await api("/admin/api/password", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current, password }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      profileStatus(result.error || "The password could not be changed.", "bad");
+      return;
+    }
+    resetOwnPassword();
+    profileStatus("Password changed. Your other sessions were signed out.", "ok");
+  } catch (_) {
+    profileStatus("The password could not be changed.", "bad");
+  } finally {
+    $("own-submit").disabled = false;
+  }
+});
+
+/* ---------- Users ---------- */
+
+/* The add form is static markup; the permission checkboxes and the list
+   are rebuilt from what the server sends. */
+const usersState = { data: null, editing: null };
+
+function usersStatus(text, tone) {
+  const node = $("users-status");
+  node.textContent = text;
+  node.className = "small-text" + (tone ? " " + tone : "");
+}
+
+function closeUsers() {
+  $("users").hidden = true;
+  $("users-toggle").setAttribute("aria-expanded", "false");
+  usersState.editing = null;
+  // Typed passwords do not outlive the panel.
+  for (const input of $("users").querySelectorAll('input[type="password"]')) input.value = "";
+}
+
+function resetUsers() {
+  usersState.data = null;
+  usersState.editing = null;
+  $("user-form").reset();
+  $("user-list").replaceChildren();
+  $("user-perms").replaceChildren($("user-perms").querySelector("legend"));
+  usersStatus("");
+}
+
+$("users-toggle").addEventListener("click", () => {
+  const panel = $("users");
+  if (!panel.hidden) { closeUsers(); return; }
+  panel.hidden = false;
+  $("users-toggle").setAttribute("aria-expanded", "true");
+  $("backup").hidden = true;
+  $("backup-toggle").setAttribute("aria-expanded", "false");
+  $("profile").hidden = true;
+  $("profile-toggle").setAttribute("aria-expanded", "false");
+  closeBoard();
+  closeFiles();
+  closeIntegrations();
+  usersStatus("");
+  loadUsers();
+});
+
+async function loadUsers() {
+  try {
+    const response = await api("/admin/api/users");
+    if (!response.ok) throw new Error("failed");
+    usersState.data = await response.json();
+  } catch (_) {
+    usersStatus("The users could not be loaded.", "bad");
+    return;
+  }
+  renderUsers();
+}
+
+/* One checkbox per permission, with its explanation. */
+function permissionChecks(container, checked, disabledIds) {
+  const data = usersState.data;
+  for (const old of container.querySelectorAll(".perm-check")) old.remove();
+  for (const perm of data ? data.permissions : []) {
+    const label = el("label", "perm-check");
+    const box = el("input");
+    box.type = "checkbox";
+    box.value = perm.id;
+    box.checked = checked.includes(perm.id);
+    if (disabledIds && disabledIds.includes(perm.id)) box.disabled = true;
+    const text = el("span");
+    text.append(el("b", "", perm.id), el("span", "muted", perm.explanation));
+    label.append(box, text);
+    container.append(label);
+  }
+}
+
+function checkedPermissions(container) {
+  return [...container.querySelectorAll('.perm-check input[type="checkbox"]')]
+    .filter((box) => box.checked)
+    .map((box) => box.value);
+}
+
+function permissionPills(ids) {
+  const row = el("div", "user-perms");
+  if (!ids.length) row.append(el("span", "pill", "read only"));
+  for (const id of ids) row.append(el("span", "pill perm", id));
+  return row;
+}
+
+function renderUsers() {
+  const data = usersState.data;
+  if (!data) return;
+  // The add form keeps what was typed; only the checkboxes are rebuilt,
+  // and they keep their state.
+  const form = $("user-perms");
+  permissionChecks(form, form.querySelector(".perm-check") ? checkedPermissions(form) : []);
+
+  const list = $("user-list");
+  list.replaceChildren();
+  for (const builtin of data.builtin) {
+    const item = el("li", "board-item user-item builtin");
+    const head = el("div", "board-item-head");
+    head.append(el("span", "board-title", builtin.username), el("span", "board-id", "built-in"));
+    item.append(head, permissionPills(builtin.permissions),
+      el("p", "board-meta", "Its password is set in the server environment; it cannot be changed here."));
+    list.append(item);
+  }
+  for (const user of data.users) list.append(userItem(user));
+  $("users-count").textContent =
+    `${data.users.length} stored user${data.users.length === 1 ? "" : "s"}, ${data.builtin.length} built-in`;
+}
+
+function userItem(user) {
+  const item = el("li", "board-item user-item" + (user.disabled ? " disabled" : ""));
+  const head = el("div", "board-item-head");
+  head.append(el("span", "board-title", user.username));
+  if (user.disabled) head.append(el("span", "pill cancelled", "disabled"));
+  if (user.username === state.username && state.stored) head.append(el("span", "pill", "you"));
+  head.append(el("span", "board-id", "#" + user.id));
+  item.append(head);
+  const meta = [user.email || "no e-mail",
+    user.last_login_at ? `last sign-in ${ago(user.last_login_at)}` : "never signed in",
+    `added by ${user.created_by || "unknown"}`];
+  item.append(el("div", "board-meta", meta.join(" · ")), permissionPills(user.permissions));
+  if (usersState.editing === user.id) {
+    item.append(userEditor(user));
+  } else {
+    const actions = el("div", "board-actions");
+    const edit = el("button", "ghost small", "Edit");
+    edit.type = "button";
+    edit.addEventListener("click", () => { usersState.editing = user.id; renderUsers(); });
+    actions.append(edit);
+    const myself = user.username === state.username && state.stored;
+    if (!myself) {
+      const remove = el("button", "ghost small danger", "Delete");
+      remove.type = "button";
+      remove.addEventListener("click", () => deleteUser(user));
+      actions.append(remove);
+    }
+    item.append(actions);
+  }
+  return item;
+}
+
+/* The edit form of one user: e-mail, permissions, disabled, a new password. */
+function userEditor(user) {
+  const myself = user.username === state.username && state.stored;
+  const form = el("form", "board-form user-editor");
+  form.autocomplete = "off";
+  const email = el("input");
+  email.type = "email";
+  email.maxLength = 254;
+  email.value = user.email || "";
+  const emailField = el("label", "board-field");
+  emailField.append(el("span", "", "E-mail (empty removes it)"), email);
+  const perms = el("fieldset", "perm-checks");
+  perms.append(el("legend", "", "Permissions"));
+  // Nobody takes the users permission away from themselves.
+  permissionChecks(perms, user.permissions, myself ? ["users"] : null);
+  const disabled = el("input");
+  disabled.type = "checkbox";
+  disabled.checked = user.disabled;
+  disabled.disabled = myself;
+  const disabledField = el("label", "rule-toggle user-disabled");
+  disabledField.append(disabled, el("span", "", myself ? "disabled (not for yourself)" : "disabled: cannot sign in"));
+  const password = el("input");
+  password.type = "password";
+  password.autocomplete = "new-password";
+  password.maxLength = 256;
+  const again = el("input");
+  again.type = "password";
+  again.autocomplete = "new-password";
+  again.maxLength = 256;
+  const passwordField = el("label", "board-field");
+  passwordField.append(el("span", "", "New password (optional)"), password);
+  const againField = el("label", "board-field");
+  againField.append(el("span", "", "New password again"), again);
+  const row = el("div", "board-form-row even");
+  row.append(passwordField, againField);
+  const actions = el("div", "board-actions");
+  const save = el("button", "ghost small", "Save");
+  save.type = "submit";
+  const cancel = el("button", "ghost small", "Cancel");
+  cancel.type = "button";
+  cancel.addEventListener("click", () => { usersState.editing = null; renderUsers(); });
+  actions.append(cancel, save);
+  form.append(emailField, perms, disabledField, row, actions);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (password.value !== again.value) {
+      usersStatus("The two passwords differ.", "bad");
+      return;
+    }
+    const payload = {
+      email: email.value.trim(),
+      permissions: checkedPermissions(perms),
+      disabled: disabled.checked,
+    };
+    if (password.value) payload.password = password.value;
+    save.disabled = true;
+    try {
+      const response = await api("/admin/api/users/" + user.id, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        usersStatus(result.error || "The user could not be saved.", "bad");
+        return;
+      }
+      usersState.editing = null;
+      usersStatus(`Saved ${user.username}.`, "ok");
+      await loadUsers();
+    } catch (_) {
+      usersStatus("The user could not be saved.", "bad");
+    } finally {
+      save.disabled = false;
+    }
+  });
+  return form;
+}
+
+async function deleteUser(user) {
+  const sure = window.confirm(`Delete the user ${user.username}?\n\nThey are signed out and can no longer sign in. This cannot be undone.`);
+  if (!sure) return;
+  try {
+    const response = await api("/admin/api/users/" + user.id, { method: "DELETE" });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      usersStatus(result.error || "The user could not be deleted.", "bad");
+      return;
+    }
+    usersStatus(`Deleted ${user.username}.`, "ok");
+    await loadUsers();
+  } catch (_) {
+    usersStatus("The user could not be deleted.", "bad");
+  }
+}
+
+$("user-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const password = $("user-password").value;
+  if (password !== $("user-password-again").value) {
+    usersStatus("The two passwords differ.", "bad");
+    return;
+  }
+  const payload = {
+    username: $("user-name").value.trim().toLowerCase(),
+    email: $("user-email").value.trim(),
+    password,
+    permissions: checkedPermissions($("user-perms")),
+  };
+  $("user-submit").disabled = true;
+  try {
+    const response = await api("/admin/api/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      usersStatus(result.error || "The user could not be added.", "bad");
+      return;
+    }
+    $("user-form").reset();
+    usersStatus(`Added ${result.username}.`, "ok");
+    await loadUsers();
+  } catch (_) {
+    usersStatus("The user could not be added.", "bad");
+  } finally {
+    $("user-submit").disabled = false;
+  }
+});
+
 /* ---------- Tooltip and entry drawer ---------- */
 
 graph.onHover = (node, x, y) => {
@@ -2843,6 +3280,8 @@ document.addEventListener("keydown", (event) => {
     closeFiles();
   } else if (!$("integrations").hidden) {
     closeIntegrations();
+  } else if (!$("users").hidden) {
+    closeUsers();
   } else if (!$("board").hidden) {
     closeBoard();
   } else if (!$("backup").hidden) {
@@ -2851,6 +3290,7 @@ document.addEventListener("keydown", (event) => {
   } else if (!$("profile").hidden) {
     $("profile").hidden = true;
     $("profile-toggle").setAttribute("aria-expanded", "false");
+    resetOwnPassword();
   } else {
     closeDetail();
   }
@@ -2960,16 +3400,21 @@ const DESTINATIONS = {
   profile: {
     shown: () => !$("profile").hidden,
     open: () => $("profile-toggle").click(),
-    close: () => { $("profile").hidden = true; $("profile-toggle").setAttribute("aria-expanded", "false"); },
+    close: () => { $("profile").hidden = true; $("profile-toggle").setAttribute("aria-expanded", "false"); resetOwnPassword(); },
+  },
+  users: {
+    shown: () => !$("users").hidden,
+    open: () => $("users-toggle").click(),
+    close: () => closeUsers(),
   },
   backup: {
     shown: () => !$("backup").hidden,
     open: () => $("backup-toggle").click(),
-    close: () => { $("backup").hidden = true; $("backup-toggle").setAttribute("aria-expanded", "false"); },
+    close: () => { $("backup").hidden = true; $("backup-toggle").setAttribute("aria-expanded", "false"); resetBackup(); },
   },
 };
-/* Profile, Integrations and Backup live behind the More tab. */
-const TAB_OF = { side: "side", feed: "feed", board: "board", files: "files", integrations: "more", profile: "more", backup: "more" };
+/* Profile, Users, Integrations and Backup live behind the More tab. */
+const TAB_OF = { side: "side", feed: "feed", board: "board", files: "files", integrations: "more", profile: "more", users: "more", backup: "more" };
 
 function moreOpen() { return !$("more").hidden; }
 
@@ -2986,7 +3431,7 @@ function closeMore() {
 }
 
 function currentDestination() {
-  for (const name of ["integrations", "profile", "backup", "board", "files", "side", "feed"]) {
+  for (const name of ["integrations", "profile", "users", "backup", "board", "files", "side", "feed"]) {
     if (DESTINATIONS[name].shown()) return name;
   }
   return "graph";
@@ -3010,7 +3455,7 @@ function showDestination(name) {
     if (other !== name && destination.shown()) destination.close();
   }
   if (name !== "graph" && !DESTINATIONS[name].shown()) DESTINATIONS[name].open();
-  for (const sheet of [$("side"), $("feed"), $("board"), $("files"), $("integrations"), $("profile"), $("backup")]) sheet.scrollTop = 0;
+  for (const sheet of [$("side"), $("feed"), $("board"), $("files"), $("integrations"), $("profile"), $("users"), $("backup")]) sheet.scrollTop = 0;
   syncTabs();
 }
 
@@ -3029,13 +3474,14 @@ for (const tab of document.querySelectorAll("#tabbar .tab")) {
 $("more-scrim").addEventListener("click", closeMore);
 $("more-integrations").addEventListener("click", () => showDestination("integrations"));
 $("more-profile").addEventListener("click", () => showDestination("profile"));
+$("more-users").addEventListener("click", () => showDestination("users"));
 $("more-backup").addEventListener("click", () => showDestination("backup"));
 $("more-logout").addEventListener("click", () => { closeMore(); $("logout").click(); });
 
 /* On a phone only one panel shows at a time: whichever opened last wins,
    whatever code path opened it. */
 {
-  const panels = { side: $("side"), feed: $("feed"), board: $("board"), files: $("files"), integrations: $("integrations"), profile: $("profile"), backup: $("backup") };
+  const panels = { side: $("side"), feed: $("feed"), board: $("board"), files: $("files"), integrations: $("integrations"), profile: $("profile"), users: $("users"), backup: $("backup") };
   const observer = new MutationObserver((records) => {
     if (isPhone()) {
       // The last record is the newest change; the panel it opened stays.
@@ -3117,7 +3563,7 @@ syncTabs();
     state.siteKey = session.recaptcha_site_key;
     state.build = session.build;
     loadRecaptcha(state.siteKey);
-    if (session.authenticated) await enter(session.role); else showLogin();
+    if (session.authenticated) await enter(session); else showLogin();
   } catch (_) {
     showLogin();
     $("login-error").textContent = "The server cannot be reached.";

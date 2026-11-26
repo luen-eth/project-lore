@@ -435,40 +435,101 @@ says so, and nothing can be stored.
 
 ### Backup and restore
 
-The **Backup** menu covers moving and protecting the whole store:
+The **Backup** menu covers moving and protecting the whole store. It has two
+sections: the JSON backup holds the memories, the board, the files and the profile,
+is portable and can be merged into another lore; the full database backup is
+everything, an exact copy. See [Backups](#backups) for what each contains.
 
 | Action | What it does |
 |---|---|
 | **Export backup** | Downloads the whole store as one JSON file (version 5): every entry, its embedding vector, the activity log, the agent records, the sessions with their check-ins, the profile, the rules, the tasks, messages and handoff notes, and every version of every kept file. |
 | **Import and merge** | Adds the entries, sessions, rules, tasks, messages and file versions of a backup that are not present yet; a file version whose bytes a path already holds is skipped, any other becomes that path's next version. Nothing is removed. |
 | **Restore from backup** | Replaces everything with the backup, after a confirmation. All or nothing: a file that fails validation changes nothing. |
+| **Full database → Download** | Downloads the whole SQLite database as `lore-full-YYYYMMDD-HHMMSS.sqlite`. |
+| **Full database → Restore** | Replaces the whole database with an uploaded `.sqlite` file, after typing `RESTORE`. A safety copy of the current database is kept on the server first. |
 
 ![The backup menu](docs/backup.jpg)
 
-A backup is complete: restoring it reproduces the store exactly, search index
-included. The vectors are reused when the instance runs the same embedding model as
-the one the backup came from; with a different model they are recomputed in the
-background, and the page redraws the links when that finishes.
+A JSON backup is complete for what it carries: restoring it reproduces the memories,
+search index included. The vectors are reused when the instance runs the same
+embedding model as the one the backup came from; with a different model they are
+recomputed in the background, and the page redraws the links when that finishes.
 
 Older backups still load. Restoring one only replaces what it carries: a backup
 older than version 5 leaves the kept files as they are, one older than version 4
 also leaves the board, and one older than version 3 also leaves the sessions, the
-profile and the rules.
+profile and the rules. Neither import nor restore of a JSON backup touches the
+stored users.
 
-### Two passwords, two roles
+### Users and permissions
 
-Sign-in asks for one password and is protected by invisible reCAPTCHA v3. Which
-password you type decides what you get:
+Sign-in asks for a user name and a password and is protected by invisible
+reCAPTCHA v3. A stored user may also type their e-mail address as the user name.
+Two users are built in and come from the environment; they are never stored and
+cannot be changed in the page:
 
-| Password | Role | Can do |
+| User | Password | Can do |
 |---|---|---|
-| `LORE_ADMIN_PASSWORD` | admin | everything, including backup export, import and restore, editing the profile and rules, adding tasks and messages on the board, adding and deleting files, and storing service credentials |
-| `LORE_VIEWER_PASSWORD` | viewer | watch the graph, the sessions and the live activity, open entries, read the profile, the board and the integrations, read and download files |
+| `admin` | `LORE_ADMIN_PASSWORD` | every permission |
+| `viewer` | `LORE_VIEWER_PASSWORD` (only when set) | read only: the graph, the sessions and the live activity, entries, the profile, the board, the integrations, and reading and downloading files |
 
-A viewer never sees the Backup menu, and the server refuses the backup endpoints
-and every profile, rule, board or file edit for a viewer session, so hiding the buttons is not
-what keeps the data in. Share the viewer password with someone who should watch
-but not take a copy.
+A sign-in without a user name (an old cached page) is tried as `admin` and then as
+`viewer`, as before user names existed.
+
+Anyone holding the `users` permission adds more users in the **Users** panel: a user
+name (`[a-z0-9][a-z0-9._-]{1,31}`, stored lowercase; `admin` and `viewer` are
+reserved), an optional e-mail address (unique), a password of 10 to 256 characters
+(stored only as an Argon2id hash) and any of these permissions. Every signed-in user
+can read everything the viewer reads.
+
+| Permission | Allows |
+|---|---|
+| `write` | add and change board tasks and messages, add and delete project files |
+| `backup` | download backups (JSON and full) |
+| `restore` | import and restore backups (JSON and full) |
+| `settings` | edit the profile and the rules |
+| `integrations` | store, test and remove service credentials, set the per-agent service levels and the kill switch |
+| `agents` | manage agents (reserved for the agent registry) |
+| `users` | add, change and delete users |
+
+A user can be edited (e-mail, permissions, disabled, a new password) or deleted;
+nobody can remove `users` from themselves, nor disable or delete themselves. A new
+password, other permissions, disabling or deleting a user ends that user's sessions.
+Stored users change their own password, with the current one, under **Profile**.
+The page shows each control only with its permission and the server checks the same
+permission on every route, so hiding a button is not what keeps the data in.
+
+Every admin route is mapped to exactly one access level in a table in
+`src/admin.rs`; a route missing from that table answers `403` to everyone.
+
+| Method | Route | Needs |
+|---|---|---|
+| `GET` | `/admin`, `/admin/app.js`, `/admin/app.css`, `/admin/icon.svg`, `/admin/backdrop.jpg` | nothing |
+| `GET` | `/admin/api/session` | nothing |
+| `POST` | `/admin/api/login`, `/admin/api/logout` | nothing |
+| `GET` | `/admin/api/brain`, `/pulse`, `/events`, `/entries/{id}`, `/profile`, `/sessions`, `/sessions/{id}`, `/board`, `/files`, `/files/{id}`, `/files/{id}/download`, `/integrations` | signed in |
+| `PUT` | `/admin/api/password` (own password, stored users) | signed in |
+| `POST` | `/admin/api/tasks` | `write` |
+| `PUT` | `/admin/api/tasks/{id}` | `write` |
+| `POST` | `/admin/api/messages` | `write` |
+| `POST` | `/admin/api/files` | `write` |
+| `DELETE` | `/admin/api/files/{id}` | `write` |
+| `GET` | `/admin/api/export` | `backup` |
+| `GET` | `/admin/api/backup/full` | `backup` |
+| `POST` | `/admin/api/import` (merge and replace) | `restore` |
+| `POST` | `/admin/api/restore/full` | `restore` |
+| `PUT` | `/admin/api/profile` | `settings` |
+| `POST` | `/admin/api/rules` | `settings` |
+| `PUT`, `DELETE` | `/admin/api/rules/{id}` | `settings` |
+| `PUT`, `DELETE` | `/admin/api/integrations/{provider}` | `integrations` |
+| `POST` | `/admin/api/integrations/{provider}/test` | `integrations` |
+| `PUT` | `/admin/api/integrations/permissions` | `integrations` |
+| `PUT` | `/admin/api/integrations/enabled` | `integrations` |
+| `GET`, `POST` | `/admin/api/users` | `users` |
+| `PUT`, `DELETE` | `/admin/api/users/{id}` | `users` |
+
+`GET /admin/api/session` returns `username`, `permissions` and, for older pages,
+`role` (`admin` when the user holds every permission, else `viewer`).
 
 ![The sign-in screen](docs/login.jpg)
 
@@ -556,8 +617,8 @@ meaningful change, decision or bug fix. Every `log` call includes `path`
 |---|---|---|
 | `LORE_TOKENS` | | `agent:secret` pairs, comma separated. Entries are attributed to the agent, and one agent's access can be revoked without touching the others. |
 | `LORE_TOKEN` | | One secret shared by all agents. Can be combined with `LORE_TOKENS`. |
-| `LORE_ADMIN_PASSWORD` | | Password for `/admin` (12 characters or more). Unset disables the admin view. |
-| `LORE_VIEWER_PASSWORD` | | Optional second password for a watch-only sign-in: graph, activity and entries, but no backup menu. Must differ from the admin password. |
+| `LORE_ADMIN_PASSWORD` | | Password of the built-in user `admin` at `/admin` (12 characters or more). Unset disables the admin view. |
+| `LORE_VIEWER_PASSWORD` | | Optional password of the built-in watch-only user `viewer`: graph, activity and entries, but no backup menu. Must differ from the admin password. |
 | `LORE_RECAPTCHA_SITE_KEY`, `LORE_RECAPTCHA_SECRET_KEY` | | reCAPTCHA v3 keys for the admin sign-in. Unset skips the check. |
 | `LORE_RECAPTCHA_MIN_SCORE` | `0.5` | Lowest reCAPTCHA score accepted. |
 | `LORE_VAULT_KEY` | | Key the service credentials are encrypted with: exactly 64 hex characters (`openssl rand -hex 32`). Unset disables the credential vault: no credential can be stored and the provider tools refuse. Losing it means entering the credentials again. |
@@ -589,11 +650,13 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
 - **Each agent** is limited to 600 requests a minute, which contains a runaway loop.
 - **Admin sign-in** locks an address out for 15 minutes after five wrong passwords,
   and with reCAPTCHA configured, refuses requests Google scores as automated. If
-  Google cannot be reached the sign-in fails closed.
+  Google cannot be reached the sign-in fails closed. Stored users' passwords are
+  Argon2id hashes, verified off the async executor; a sign-in for an unknown user
+  name is verified against a dummy hash, so names cannot be probed by timing.
 - **The admin view** cannot edit individual entries. Its only write actions are
-  backup import and restore, the profile and rules, the board, and adding and
-  deleting files, all of which need a signed-in admin session (a `SameSite=Strict`
-  cookie). It is served with a strict Content-Security-Policy and uses no third-party
+  backup import and restore, the profile and rules, the board, adding and
+  deleting files, the integrations and the users, each of which needs a signed-in
+  session (a `SameSite=Strict` cookie) holding the route's permission. It is served with a strict Content-Security-Policy and uses no third-party
   scripts apart from reCAPTCHA on the sign-in form. JSON bodies are limited to 64 KB,
   except a file upload (4 MiB, room for a 2 MiB file as base64).
 - **Kept files** are never rendered by the admin view: their text is shown as plain
@@ -637,8 +700,37 @@ treat them like passwords.
 
 ## Backups
 
-The simplest backup is **Backup → Export backup** in the admin view: one JSON file
-that **Restore from backup** loads into any project-lore instance.
+The admin view offers two kinds of backup (permission `backup` to download,
+`restore` to load one):
+
+- **JSON** (**Backup → Export backup**): the memories with their vectors, the
+  activity log, the agent records, the sessions, the profile and the rules, the
+  board, and every version of every kept file. It is portable: it can be restored
+  into any project-lore instance or merged into one that already has data. It holds
+  no credential, no service level, no operations log and no user.
+- **Full database** (**Backup → Full database → Download**): a consistent snapshot of
+  the whole SQLite database taken with the SQLite online backup API, exactly as
+  stored: entries, links, sessions, activity, the board, every file version, the
+  profile and rules, the vault (still encrypted with `LORE_VAULT_KEY`), the service
+  levels, the operations log, the users with their password hashes, and every other
+  table. **The file contains encrypted credentials and password hashes: keep it
+  private.**
+
+Restoring a full backup (**Full database → Restore**, after typing `RESTORE`)
+first checks the upload without changing anything: the SQLite header, that it opens
+read-only, `PRAGMA integrity_check`, the `entries` table with the columns every lore
+database has, and that it does not come from a newer lore schema. It then writes a
+safety copy of the current database to `<data dir>/pre-restore-YYYYMMDD-HHMMSS.sqlite`
+(the three newest are kept), brings an older backup up to the current schema, loads
+it with the SQLite backup API all or nothing, rebuilds the search index and the
+vectors, and answers with the row count of every table. If any step fails, the live
+database is unchanged and the answer names the check that failed. Uploads are capped
+at 2 GiB. Signed-in users stay signed in, except stored users the restored database
+no longer has (or has disabled, or with other permissions).
+
+Restoring a full backup taken with a different `LORE_VAULT_KEY` leaves the stored
+service credentials unreadable: the Integrations panel says so, and they have to be
+entered again.
 
 All state also lives in the data volume. `lore.db` holds the entries, the sessions,
 the board and the kept files; `models/` is a
@@ -667,7 +759,8 @@ Rust 1.85 or newer. The source is small:
 | `src/server.rs` | The MCP tools |
 | `src/db.rs` | SQLite schema, full-text and hybrid search |
 | `src/embed.rs` | Local embedding models |
-| `src/admin.rs` | Admin sign-in, the graph API, live events, backup and restore |
+| `src/admin.rs` | Admin sign-in, the route permission table, users, the graph API, live events, backup and restore |
+| `src/users.rs` | Permissions, user name and password rules, Argon2id hashing |
 | `src/events.rs` | Fan-out of agent activity to open admin pages |
 | `assets/` | The admin page (plain HTML, CSS and canvas JavaScript, no build step) |
 

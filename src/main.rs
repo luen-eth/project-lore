@@ -8,6 +8,7 @@ mod events;
 mod gitproxy;
 mod ops;
 mod server;
+mod users;
 mod vault;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
