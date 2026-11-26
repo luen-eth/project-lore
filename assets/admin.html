@@ -456,6 +456,36 @@
           </form>
           <p class="int-result small-text" role="status"></p>
         </li>
+        <li class="board-item integration" data-provider="mail" data-kind="mail">
+          <div class="board-item-head">
+            <span class="board-title">Mailbox (IMAP, read-only)</span>
+            <span class="board-id int-status">Not set</span>
+          </div>
+          <p class="muted small-text">IMAP access over TLS, for reading only: agents may list folders and messages and read them. lore never sends, moves, deletes or marks mail. Each agent sees the mailbox only after its mail level is set to read below. Many providers need an app password here, not the account password.</p>
+          <p class="int-url-view muted small-text"></p>
+          <form class="integration-form" autocomplete="off" data-provider="mail" hidden>
+            <div class="int-pair">
+              <label class="board-field"><span>Server host</span>
+                <input class="int-host" type="text" placeholder="imap.example.com" spellcheck="false" autocapitalize="off">
+              </label>
+              <label class="board-field"><span>Port</span>
+                <input class="int-port" type="number" min="1" max="65535" step="1" placeholder="993" inputmode="numeric">
+              </label>
+            </div>
+            <label class="board-field"><span>Account (e-mail address or login)</span>
+              <input class="int-account" type="text" autocomplete="off" data-1p-ignore data-lpignore="true" placeholder="me@example.com" spellcheck="false" autocapitalize="off">
+            </label>
+            <label class="board-field"><span>Password (often an app password)</span>
+              <input class="int-secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" placeholder="Enter once; lore stores it encrypted" spellcheck="false">
+            </label>
+            <div class="board-actions">
+              <button class="ghost small int-save" type="submit">Save</button>
+              <button class="ghost small int-test" type="button">Test</button>
+              <button class="ghost small danger int-remove" type="button">Remove</button>
+            </div>
+          </form>
+          <p class="int-result small-text" role="status"></p>
+        </li>
       </ul>
       <section class="integrations-perms">
         <h4>Agent permissions</h4>

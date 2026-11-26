@@ -7,6 +7,7 @@ mod db;
 mod embed;
 mod events;
 mod gitproxy;
+mod mail;
 mod oauth;
 mod ops;
 mod server;
@@ -40,12 +41,15 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         return healthcheck();
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,ort=warn,rmcp=warn".into()),
-        )
-        .init();
+    // The IMAP client traces every command it sends, the mailbox's LOGIN
+    // with its password included, and every answer, mail included: it is
+    // silenced whatever RUST_LOG says.
+    let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,ort=warn,rmcp=warn".into());
+    for directive in ["async_imap=off", "imap_proto=off"] {
+        filter = filter.add_directive(directive.parse().expect("a fixed log directive"));
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let tokens = auth::load_tokens(&env_or("LORE_TOKEN", ""), &env_or("LORE_TOKENS", ""))?;
     let data_dir = PathBuf::from(env_or("LORE_DATA_DIR", "./data"));

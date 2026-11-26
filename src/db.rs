@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS files_project_path ON files (project, path, version DESC);
 
 CREATE TABLE IF NOT EXISTS vault (
-    provider   TEXT PRIMARY KEY,            -- cloudflare | github | github_org | gitlab | dokploy
+    provider   TEXT PRIMARY KEY,            -- cloudflare | github | github_org | gitlab | dokploy | mail
     base_url   TEXT NOT NULL DEFAULT '',    -- gitlab and dokploy only
     nonce      BLOB NOT NULL,
     secret     BLOB NOT NULL,               -- ciphertext
@@ -297,6 +297,19 @@ pub const PROVIDERS: &[&str] = &["cloudflare", "github", "github_org", "gitlab",
 /// row means full.
 pub const OPS_LEVELS: &[&str] = &["off", "read", "full"];
 
+/// The mailbox: kept in the vault and in the level table like the
+/// services, but not one of `PROVIDERS` (it is not an HTTP API), with its
+/// own levels and its own default.
+pub const MAIL_PROVIDER: &str = "mail";
+
+/// What an agent may do with the mailbox: nothing, or look. `full` is
+/// accepted and stored as `read`; there is nothing more to grant.
+pub const MAIL_LEVELS: &[&str] = &["off", "read"];
+
+/// The mailbox level without a permission row: unlike the services, an
+/// agent sees the mailbox only after someone grants it.
+pub const MAIL_DEFAULT_LEVEL: &str = "off";
+
 /// How a provider call went: it answered, it was refused, or it failed.
 pub const OPS_OUTCOMES: &[&str] = &["ok", "denied", "error"];
 
@@ -308,8 +321,9 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// whenever a table or column is added, so a full backup from a newer build
 /// is recognised and refused instead of loaded half-understood.
 ///
-/// 1: users. 2: the agent registry and the OAuth tables.
-pub const SCHEMA_VERSION: i64 = 2;
+/// 1: users. 2: the agent registry and the OAuth tables. 3: the mailbox
+/// columns of `vault` (host, port, account).
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Columns every database lore ever created has in `entries`: a full
 /// backup without them is not a lore database.
@@ -348,6 +362,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("entries", "session_id", "TEXT"),
     ("activity", "session_id", "TEXT"),
     ("sessions", "implicit", "INTEGER NOT NULL DEFAULT 0"),
+    // The mailbox's server and login, in clear: they are sealed into the
+    // stored password as associated data. Empty for the HTTP services.
+    ("vault", "host", "TEXT NOT NULL DEFAULT ''"),
+    ("vault", "port", "INTEGER NOT NULL DEFAULT 0"),
+    ("vault", "account", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -968,6 +987,31 @@ pub struct VaultStatus {
     /// The last four characters of the credential.
     pub hint: String,
     pub updated_at: String,
+}
+
+/// The stored mailbox: where it is and whose it is, in clear, and the
+/// password, encrypted with all three as associated data. `Debug` leaves
+/// the ciphertext and the nonce out.
+#[derive(Clone)]
+pub struct StoredMail {
+    pub host: String,
+    pub port: u16,
+    pub account: String,
+    pub nonce: Vec<u8>,
+    pub secret: Vec<u8>,
+    pub updated_at: String,
+}
+
+impl std::fmt::Debug for StoredMail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredMail")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("account", &self.account)
+            .field("secret", &"[redacted]")
+            .finish()
+    }
 }
 
 /// One agent's permission on one provider: off, read or full.
@@ -3447,11 +3491,60 @@ impl Db {
 
     /// Removes one provider's credential. False when none was stored.
     pub fn delete_vault(&self, provider: &str) -> Result<bool> {
-        let provider = normalize_provider(provider)?;
+        let provider = normalize_level_provider(provider)?;
         Ok(self
             .lock()
             .execute("DELETE FROM vault WHERE provider = ?1", params![provider])?
             > 0)
+    }
+
+    /// Stores the mailbox: host, port and account in clear, the password
+    /// already encrypted (with those three as associated data), and the
+    /// hint (the page shows none for a password, so it is empty).
+    pub fn set_mail_vault(
+        &self,
+        host: &str,
+        port: u16,
+        account: &str,
+        nonce: &[u8],
+        secret: &[u8],
+        hint: &str,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO vault (provider, base_url, nonce, secret, hint, updated_at,
+                                host, port, account)
+             VALUES (?1, '', ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?5, ?6, ?7)
+             ON CONFLICT (provider) DO UPDATE SET
+                base_url = '', nonce = excluded.nonce, secret = excluded.secret,
+                hint = excluded.hint, updated_at = excluded.updated_at,
+                host = excluded.host, port = excluded.port, account = excluded.account",
+            params![MAIL_PROVIDER, nonce, secret, hint, host, port, account],
+        )?;
+        Ok(())
+    }
+
+    /// The stored mailbox, the password still encrypted; `None` when none
+    /// is stored.
+    pub fn mail_vault(&self) -> Result<Option<StoredMail>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT host, port, account, nonce, secret, updated_at
+                 FROM vault WHERE provider = ?1",
+                params![MAIL_PROVIDER],
+                |row| {
+                    let port: i64 = row.get(1)?;
+                    Ok(StoredMail {
+                        host: row.get(0)?,
+                        port: u16::try_from(port).unwrap_or(0),
+                        account: row.get(2)?,
+                        nonce: row.get(3)?,
+                        secret: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// One agent's level on one provider: off, read or full. No row means
@@ -3459,7 +3552,7 @@ impl Db {
     /// restricts.
     pub fn ops_level(&self, agent: &str, provider: &str) -> Result<String> {
         let agent = agent.trim().to_lowercase();
-        let provider = normalize_provider(provider)?;
+        let provider = normalize_level_provider(provider)?;
         let level: Option<String> = self
             .lock()
             .query_row(
@@ -3468,6 +3561,14 @@ impl Db {
                 |row| row.get(0),
             )
             .optional()?;
+        if provider == MAIL_PROVIDER {
+            // The mailbox only knows off and read: a row that says `full`
+            // means read, and no row means off.
+            return Ok(match level.as_deref() {
+                Some("read" | "full") => "read".into(),
+                _ => MAIL_DEFAULT_LEVEL.into(),
+            });
+        }
         Ok(level.unwrap_or_else(|| "full".into()))
     }
 
@@ -3478,12 +3579,32 @@ impl Db {
         if agent.is_empty() {
             anyhow::bail!("the agent must be named");
         }
-        let provider = normalize_provider(provider)?;
-        let level = level.trim().to_lowercase();
+        let provider = normalize_level_provider(provider)?;
+        let mut level = level.trim().to_lowercase();
         if !OPS_LEVELS.contains(&level.as_str()) {
             anyhow::bail!("level must be one of: {}", OPS_LEVELS.join(", "));
         }
         let conn = self.lock();
+        if provider == MAIL_PROVIDER {
+            // `full` is read for the mailbox, and the default is off: only
+            // a grant is stored.
+            if level == "full" {
+                level = "read".into();
+            }
+            if level == MAIL_DEFAULT_LEVEL {
+                conn.execute(
+                    "DELETE FROM ops_permissions WHERE agent = ?1 AND provider = ?2",
+                    params![agent, provider],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO ops_permissions (agent, provider, level) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (agent, provider) DO UPDATE SET level = excluded.level",
+                    params![agent, provider, level],
+                )?;
+            }
+            return Ok(());
+        }
         if level == "full" {
             conn.execute(
                 "DELETE FROM ops_permissions WHERE agent = ?1 AND provider = ?2",
@@ -3556,7 +3677,7 @@ impl Db {
         duration_ms: i64,
     ) -> Result<OpLog> {
         let agent = agent.trim().to_lowercase();
-        let provider = normalize_provider(provider)?;
+        let provider = normalize_level_provider(provider)?;
         let outcome = outcome.trim().to_lowercase();
         if !OPS_OUTCOMES.contains(&outcome.as_str()) {
             anyhow::bail!("outcome must be one of: {}", OPS_OUTCOMES.join(", "));
@@ -4610,6 +4731,24 @@ fn normalize_file_project(project: &str) -> Result<String> {
         anyhow::bail!("project must not be empty");
     }
     Ok(project)
+}
+
+/// One of `PROVIDERS` or the mailbox, lowercased: what the level table,
+/// the operations log and removing a vault row accept. Reading and
+/// writing a service credential stays with `normalize_provider`, so the
+/// HTTP path can never pick up the mailbox's row.
+fn normalize_level_provider(provider: &str) -> Result<String> {
+    let provider = provider.trim().to_lowercase();
+    if provider == MAIL_PROVIDER {
+        Ok(provider)
+    } else {
+        normalize_provider(&provider).map_err(|_| {
+            anyhow::anyhow!(
+                "provider must be one of: {}, {MAIL_PROVIDER}",
+                PROVIDERS.join(", ")
+            )
+        })
+    }
 }
 
 /// One of `PROVIDERS`, lowercased: the fixed list everywhere a provider
@@ -7411,6 +7550,84 @@ mod tests {
         assert_eq!(db.get(1).unwrap().unwrap().title, "old");
         assert_eq!(db.ops_log(10).unwrap().len(), 1);
         assert!(db.vault("dokploy").unwrap().is_some());
+    }
+
+    /// A database from before the mailbox (schema 2: the vault without
+    /// host, port and account) opens with every row, its credentials still
+    /// decrypt, and it gains the columns and the mailbox.
+    #[test]
+    fn a_vault_from_before_the_mailbox_keeps_its_rows() {
+        let dir = test_dir("mail-migrate");
+        let path = dir.join("lore.db");
+        let key = vault_key();
+        let (nonce, secret) = key.encrypt("gitlab", "https://git.example.com", "glpat-old-1");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,
+                 kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+                 tags TEXT NOT NULL DEFAULT '', files TEXT NOT NULL DEFAULT '',
+                 agent TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT 'x',
+                 updated_at TEXT, embedding BLOB);
+                 INSERT INTO entries (project, kind, title, body) VALUES ('p', 'note', 'old', 'entry');
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+                 CREATE TABLE vault (provider TEXT PRIMARY KEY, base_url TEXT NOT NULL DEFAULT '',
+                 nonce BLOB NOT NULL, secret BLOB NOT NULL, hint TEXT NOT NULL DEFAULT '',
+                 updated_at TEXT NOT NULL);
+                 CREATE TABLE ops_permissions (agent TEXT NOT NULL, provider TEXT NOT NULL,
+                 level TEXT NOT NULL, PRIMARY KEY (agent, provider));
+                 INSERT INTO ops_permissions VALUES ('claude', 'gitlab', 'read');",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO vault (provider, base_url, nonce, secret, hint, updated_at)
+                 VALUES ('gitlab', 'https://git.example.com', ?1, ?2, 'ld-1', 'then')",
+                params![nonce, secret],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(schema_version(&db.lock()).unwrap(), SCHEMA_VERSION);
+        assert_eq!(db.get(1).unwrap().unwrap().title, "old");
+        let stored = db.vault("gitlab").unwrap().unwrap();
+        assert_eq!(
+            (
+                stored.base_url.as_str(),
+                stored.hint.as_str(),
+                stored.updated_at.as_str()
+            ),
+            ("https://git.example.com", "ld-1", "then")
+        );
+        assert_eq!(
+            key.decrypt("gitlab", &stored.base_url, &stored.nonce, &stored.secret)
+                .unwrap()
+                .expose(),
+            "glpat-old-1"
+        );
+        assert_eq!(db.ops_level("claude", "gitlab").unwrap(), "read");
+        // No mailbox yet, and it is off for everyone.
+        assert!(db.mail_vault().unwrap().is_none());
+        assert_eq!(db.ops_level("claude", "mail").unwrap(), "off");
+        let columns: Vec<String> = db
+            .lock()
+            .prepare("SELECT name FROM pragma_table_info('vault')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for column in ["host", "port", "account"] {
+            assert!(columns.iter().any(|name| name == column), "{column}");
+        }
+        db.set_mail_vault("imap.example.com", 993, "me@example.com", b"n", b"s", "")
+            .unwrap();
+        // Opening it again changes nothing.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert!(db.vault("gitlab").unwrap().is_some());
+        assert_eq!(db.mail_vault().unwrap().unwrap().account, "me@example.com");
+        assert_eq!(db.vault_status().unwrap().len(), PROVIDERS.len());
     }
 
     /// A fresh, empty directory for one test.

@@ -751,6 +751,7 @@ a.button-link:hover { background: rgba(255, 255, 255, 0.11); }
 }
 .integration-form { display: grid; gap: 8px; padding-top: 8px; margin-top: 2px; }
 .int-url-view { margin: 2px 0 0; }
+.int-pair { display: grid; grid-template-columns: minmax(0, 1fr) 96px; gap: 8px; }
 .int-result { margin: 4px 0 0; color: var(--muted); }
 .int-result.ok { color: var(--ok); }
 .int-result.bad { color: var(--danger); }

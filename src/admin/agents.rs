@@ -124,6 +124,9 @@ pub(super) async fn consent_request(
             "username": me.username,
             "services": services,
             "services_enabled": state.db.ops_enabled()?,
+            // The mailbox is not among them: it is off for a new agent
+            // until someone with `integrations` grants it.
+            "mailbox": state.db.mail_vault()?.is_some(),
             "existing": existing,
             "avatars": avatars::ids(),
             "suggested_name": suggested,

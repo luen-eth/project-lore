@@ -43,6 +43,7 @@ const TOOLS = {
   github_org: { verb: "called GitHub (organization)", tone: "write" },
   git_server: { verb: "called the git server", tone: "write" },
   dokploy: { verb: "called Dokploy", tone: "write" },
+  mail: { verb: "looked at the mailbox", tone: "read" },
   git_fetch: { verb: "fetched a repository", tone: "read" },
   git_push: { verb: "pushed to a repository", tone: "write" },
   users: { verb: "changed the users", tone: "write" },
@@ -2589,7 +2590,7 @@ $("file-form").addEventListener("submit", async (event) => {
    refresh while the admin is pasting a credential only replaces the
    status lines, the permission table and the operations log. */
 const LEVELS = [["off", "Off"], ["read", "Read"], ["full", "Full"]];
-const OPS_TOOLS = new Set(["integrations", "cloudflare", "github", "github_org", "git_server", "dokploy"]);
+const OPS_TOOLS = new Set(["integrations", "cloudflare", "github", "github_org", "git_server", "dokploy", "mail"]);
 const integrationsState = {
   data: null, loading: null, again: false, timer: null,
 };
@@ -2625,7 +2626,7 @@ function autofilled(input) {
 function resetIntegrations() {
   Object.assign(integrationsState, { data: null, loading: null, again: false });
   clearTimeout(integrationsState.timer);
-  for (const input of $("integrations").querySelectorAll(".int-secret, .int-url")) input.value = "";
+  for (const input of $("integrations").querySelectorAll(".int-secret, .int-url, .int-host, .int-port, .int-account")) input.value = "";
   for (const result of $("integrations").querySelectorAll(".int-result")) {
     result.textContent = "";
     result.className = "int-result small-text";
@@ -2701,16 +2702,25 @@ function renderIntegrations() {
 
     const status = item.querySelector(".int-status");
     const unreadable = isSet && data.vault_enabled && !row.readable;
+    const isMail = !!(row && row.kind === "mail");
+    // A password has no hint: the mailbox says whose it is instead.
     status.textContent = !isSet
       ? "Not set"
       : unreadable
         ? "Set · cannot be decrypted with the current key · enter it again"
-        : `Set · ends in ••••${row.hint} · updated ${ago(row.updated_at)}`;
+        : isMail
+          ? `Set · updated ${ago(row.updated_at)}`
+          : `Set · ends in ••••${row.hint} · updated ${ago(row.updated_at)}`;
     status.title = isSet ? `saved ${shortDate(row.updated_at)}` : "";
 
     const urlView = item.querySelector(".int-url-view");
-    // A viewer reads the URL as text; the admin has the input for it.
-    urlView.textContent = isSet && row && row.base_url ? row.base_url : "";
+    // A viewer reads the URL (or the mailbox) as text; the admin has the
+    // inputs for it.
+    urlView.textContent = !isSet || !row
+      ? ""
+      : isMail
+        ? `${row.account} at ${row.host}:${row.port}`
+        : row.base_url || "";
     urlView.hidden = admin;
 
     const form = item.querySelector(".integration-form");
@@ -2720,6 +2730,12 @@ function renderIntegrations() {
       // when it is empty, and the credential field is never pre-filled.
       const urlInput = form.querySelector(".int-url");
       if (urlInput && !urlInput.value.trim() && row && row.base_url) urlInput.value = row.base_url;
+      if (isMail && isSet) {
+        for (const [selector, value] of [[".int-host", row.host], [".int-port", row.port], [".int-account", row.account]]) {
+          const input = form.querySelector(selector);
+          if (input && !String(input.value).trim() && value) input.value = value;
+        }
+      }
       item.querySelector(".int-test").hidden = !isSet;
       item.querySelector(".int-remove").hidden = !isSet;
     }
@@ -2757,10 +2773,14 @@ function renderPermissions(admin) {
     row.append(el("th", "", agent));
     for (const provider of data.providers) {
       const cell = el("td");
-      const level = byKey.get(`${agent}|${provider.id}`) || "full";
+      // Each provider has its own levels and default: the services are
+      // full without a row, the mailbox is off and knows only off/read.
+      const allowed = provider.levels || ["off", "read", "full"];
+      let level = byKey.get(`${agent}|${provider.id}`) || provider.default_level || "full";
+      if (!allowed.includes(level)) level = allowed[allowed.length - 1];
       if (admin) {
         const select = el("select");
-        fillSelect(select, LEVELS);
+        fillSelect(select, LEVELS.filter(([value]) => allowed.includes(value)));
         select.value = level;
         select.dataset.level = level;
         select.dataset.agent = agent;
@@ -2858,6 +2878,10 @@ async function saveIntegration(provider, form) {
     integrationsStatus("The browser filled the credential in by itself; paste the credential.", "bad");
     return;
   }
+  if (provider === "mail") {
+    saveMailbox(form, secretField);
+    return;
+  }
   const secret = secretField.value.trim();
   const urlField = form.querySelector(".int-url");
   const payload = { secret, base_url: urlField ? urlField.value.trim() : "" };
@@ -2886,6 +2910,44 @@ async function saveIntegration(provider, form) {
     await loadIntegrations();
   } catch (_) {
     integrationsStatus("The credential could not be saved.", "bad");
+  }
+}
+
+/* The mailbox card: host, port, account and the password, which is
+   always entered again (all four are sealed together). */
+async function saveMailbox(form, secretField) {
+  const portText = form.querySelector(".int-port").value.trim();
+  const payload = {
+    host: form.querySelector(".int-host").value.trim(),
+    port: portText ? Number(portText) : null,
+    account: form.querySelector(".int-account").value.trim(),
+    // Not trimmed: spaces may belong to a password.
+    secret: secretField.value,
+  };
+  if (!payload.host || !payload.account) {
+    integrationsStatus("Enter the server host and the account.", "bad");
+    return;
+  }
+  if (!payload.secret) {
+    integrationsStatus("Enter the password; changing the host, port or account needs it again.", "bad");
+    return;
+  }
+  try {
+    const response = await api("/admin/api/integrations/mail", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      integrationsStatus(result.error || "The mailbox could not be saved.", "bad");
+      return;
+    }
+    secretField.value = "";
+    integrationsStatus("Saved the mailbox.", "ok");
+    await loadIntegrations();
+  } catch (_) {
+    integrationsStatus("The mailbox could not be saved.", "bad");
   }
 }
 

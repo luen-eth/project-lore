@@ -46,6 +46,7 @@ use crate::{
     },
     embed::Embedder,
     events::Events,
+    mail,
     oauth::OAuth,
     ops,
     users::{self, ADMIN_USER, Perm, Perms, VIEWER_USER},
@@ -2263,8 +2264,9 @@ impl RuleForm {
 }
 
 /// Everything the Integrations panel shows: the vault state, the kill
-/// switch, the four providers, the agents with their permissions and the
-/// latest operations. No credential in any of it.
+/// switch, the HTTP providers and the mailbox (each with its own levels
+/// and default level), the agents with their permissions and the latest
+/// operations. No credential in any of it.
 async fn integrations(State(admin): State<Arc<Admin>>) -> Response {
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
@@ -2299,8 +2301,33 @@ async fn integrations(State(admin): State<Arc<Admin>>) -> Response {
                 "base_url": row.base_url,
                 "hint": row.hint,
                 "updated_at": row.updated_at,
+                "kind": "http",
+                "levels": OPS_LEVELS,
+                "default_level": "full",
             }));
         }
+        // The mailbox: not an HTTP provider, read-only, off by default.
+        let stored = state.db.mail_vault()?;
+        let readable = match (&stored, state.vault.as_ref()) {
+            (Some(stored), Some(key)) => mail::Mailbox::open(key, stored).is_ok(),
+            _ => false,
+        };
+        providers.push(json!({
+            "id": mail::ID,
+            "label": mail::LABEL,
+            "needs_url": false,
+            "configured": stored.is_some(),
+            "readable": readable,
+            "base_url": "",
+            "hint": "",
+            "updated_at": stored.as_ref().map(|row| row.updated_at.clone()).unwrap_or_default(),
+            "kind": "mail",
+            "host": stored.as_ref().map(|row| row.host.clone()).unwrap_or_default(),
+            "port": stored.as_ref().map_or(mail::DEFAULT_PORT, |row| row.port),
+            "account": stored.as_ref().map(|row| row.account.clone()).unwrap_or_default(),
+            "levels": db::MAIL_LEVELS,
+            "default_level": db::MAIL_DEFAULT_LEVEL,
+        }));
         Ok(json!({
             "vault_enabled": state.vault.is_some(),
             "enabled": enabled,
@@ -2320,6 +2347,13 @@ struct IntegrationForm {
     secret: String,
     #[serde(default)]
     base_url: String,
+    /// The mailbox only: server host, port and account.
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    port: Option<u32>,
+    #[serde(default)]
+    account: String,
 }
 
 /// Stores one provider's credential, or changes the server URL of one
@@ -2330,6 +2364,9 @@ async fn save_integration(
     Path(provider_id): Path<String>,
     Json(form): Json<IntegrationForm>,
 ) -> Response {
+    if provider_id.trim().eq_ignore_ascii_case(mail::ID) {
+        return save_mail(admin, form).await;
+    }
     let Some(provider) = ops::Provider::find(&provider_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2405,21 +2442,26 @@ async fn save_integration(
     }
 }
 
-/// Removes one provider's credential.
+/// Removes one provider's credential, or the mailbox.
 async fn delete_integration(
     State(admin): State<Arc<Admin>>,
     Path(provider_id): Path<String>,
 ) -> Response {
-    let Some(provider) = ops::Provider::find(&provider_id) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let id = if provider_id.trim().eq_ignore_ascii_case(mail::ID) {
+        mail::ID
+    } else {
+        match ops::Provider::find(&provider_id) {
+            Some(provider) => provider.id,
+            None => return StatusCode::NOT_FOUND.into_response(),
+        }
     };
     let state = admin.clone();
     let result =
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
-            if !state.db.delete_vault(provider.id)? {
+            if !state.db.delete_vault(id)? {
                 return Ok(None);
             }
-            let summary = format!("removed the {} credential", provider.id);
+            let summary = format!("removed the {id} credential");
             if let Ok(activity) =
                 state
                     .db
@@ -2448,6 +2490,9 @@ async fn test_integration(
     State(admin): State<Arc<Admin>>,
     Path(provider_id): Path<String>,
 ) -> Response {
+    if provider_id.trim().eq_ignore_ascii_case(mail::ID) {
+        return test_mail(admin).await;
+    }
     let Some(provider) = ops::Provider::find(&provider_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2607,6 +2652,179 @@ async fn test_integration(
     Json(json!({ "ok": ok, "status": status, "message": message })).into_response()
 }
 
+/// Stores the mailbox: host, port and account in clear, the password
+/// encrypted with all three sealed in as associated data, so it can never
+/// be pointed at another server or account. The password is always
+/// entered again, and no answer, log line or activity note carries it.
+async fn save_mail(admin: Arc<Admin>, form: IntegrationForm) -> Response {
+    let Some(key) = admin.vault.clone() else {
+        return bad_request(
+            "the vault is not enabled: set LORE_VAULT_KEY on the server to store credentials",
+        );
+    };
+    if !form.base_url.trim().is_empty() {
+        return bad_request("the mailbox takes a host and a port, not a URL");
+    }
+    let host = match mail::normalize_host(&form.host) {
+        Ok(host) => host,
+        Err(message) => return bad_request(&message),
+    };
+    let port = match mail::normalize_port(form.port) {
+        Ok(port) => port,
+        Err(message) => return bad_request(&message),
+    };
+    let account = match mail::normalize_account(&form.account) {
+        Ok(account) => account,
+        Err(message) => return bad_request(&message),
+    };
+    // The password is not trimmed: spaces may be part of it.
+    let password = form.secret;
+    if let Err(message) = mail::check_password(&password) {
+        return bad_request(&message);
+    }
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let mailbox = mail::Mailbox {
+            host,
+            port,
+            account,
+        };
+        let (nonce, ciphertext) = key.encrypt(mail::ID, &mailbox.sealed_with(), &password);
+        // No hint: the end of a password is not shown anywhere.
+        state.db.set_mail_vault(
+            &mailbox.host,
+            mailbox.port,
+            &mailbox.account,
+            &nonce,
+            &ciphertext,
+            "",
+        )?;
+        let summary = format!("saved the {} credential", mail::ID);
+        if let Ok(activity) =
+            state
+                .db
+                .record_activity(ADMIN_ACTOR, "integrations", "", None, None, &[], &summary)
+        {
+            state.events.publish(activity);
+        }
+        Ok(json!({ "ok": true }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "saving the mailbox failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// The mailbox's Test: log in and count the folders. Read-only like every
+/// mailbox call; logged as a `folders` call by the administrator.
+async fn test_mail(admin: Arc<Admin>) -> Response {
+    let prepared = {
+        let state = admin.clone();
+        tokio::task::spawn_blocking(
+            move || -> anyhow::Result<Result<(mail::Mailbox, Secret), String>> {
+                let refuse = |detail: &str| {
+                    state.db.log_op(
+                        ADMIN_ACTOR,
+                        None,
+                        mail::ID,
+                        "folders",
+                        "",
+                        0,
+                        "denied",
+                        detail,
+                        0,
+                    )
+                };
+                let Some(key) = state.vault.as_ref() else {
+                    refuse("the vault is not enabled")?;
+                    return Ok(Err(
+                        "Set LORE_VAULT_KEY on the server to store credentials.".into(),
+                    ));
+                };
+                let Some(stored) = state.db.mail_vault()? else {
+                    refuse("no credential is stored")?;
+                    return Ok(Err("No mailbox is stored.".into()));
+                };
+                match mail::Mailbox::open(key, &stored) {
+                    Ok(pair) => Ok(Ok(pair)),
+                    Err(_) => {
+                        refuse("the stored credential cannot be decrypted")?;
+                        Ok(Err(
+                            "The stored mailbox password cannot be decrypted with the \
+                                current LORE_VAULT_KEY; enter it again."
+                                .into(),
+                        ))
+                    }
+                }
+            },
+        )
+        .await
+    };
+    let (mailbox, password) = match prepared {
+        Ok(Ok(Ok(pair))) => pair,
+        Ok(Ok(Err(message))) => {
+            return Json(json!({ "ok": false, "status": 0, "message": message })).into_response();
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "reading the vault failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "the vault task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let started = Instant::now();
+    let outcome = mail::test(&mailbox, &password, &admin.guard).await;
+    let (ok, message, log_outcome, detail) = match &outcome {
+        Ok(count) => (
+            true,
+            format!(
+                "Logged in to {}: {count} folder{}.",
+                mailbox.host,
+                if *count == 1 { "" } else { "s" }
+            ),
+            "ok",
+            String::new(),
+        ),
+        Err(reason) => (false, format!("{reason}."), "error", reason.clone()),
+    };
+    let summary = format!("tested {} ({})", mail::ID, if ok { "ok" } else { "failed" });
+    let state = admin.clone();
+    let log = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let duration = started.elapsed().as_millis() as i64;
+        state.db.log_op(
+            ADMIN_ACTOR,
+            None,
+            mail::ID,
+            "folders",
+            "",
+            0,
+            log_outcome,
+            &detail,
+            duration,
+        )?;
+        if let Ok(activity) =
+            state
+                .db
+                .record_activity(ADMIN_ACTOR, "integrations", "", None, None, &[], &summary)
+        {
+            state.events.publish(activity);
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(error) = log {
+        tracing::warn!(%error, "writing the ops log failed");
+    }
+    Json(json!({ "ok": ok, "status": 0, "message": message })).into_response()
+}
+
 #[derive(Deserialize)]
 struct PermissionForm {
     #[serde(default)]
@@ -2626,17 +2844,30 @@ async fn save_permission(
     if agent.is_empty() {
         return bad_request("agent must not be empty");
     }
-    let Some(provider) = ops::Provider::find(&form.provider) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let provider = if form.provider.trim().eq_ignore_ascii_case(mail::ID) {
+        mail::ID
+    } else {
+        match ops::Provider::find(&form.provider) {
+            Some(provider) => provider.id,
+            None => return StatusCode::NOT_FOUND.into_response(),
+        }
     };
-    let level = form.level.trim().to_lowercase();
-    if !OPS_LEVELS.contains(&level.as_str()) {
+    let mut level = form.level.trim().to_lowercase();
+    if provider == mail::ID {
+        // The mailbox is read-only: `full` means read.
+        if level == "full" {
+            level = "read".into();
+        }
+        if !db::MAIL_LEVELS.contains(&level.as_str()) {
+            return bad_request("the mailbox level must be one of: off, read");
+        }
+    } else if !OPS_LEVELS.contains(&level.as_str()) {
         return bad_request("level must be one of: off, read, full");
     }
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
-        state.db.set_ops_level(&agent, provider.id, &level)?;
-        let summary = format!("{} → {}: {}", agent, provider.id, level);
+        state.db.set_ops_level(&agent, provider, &level)?;
+        let summary = format!("{agent} → {provider}: {level}");
         if let Ok(activity) =
             state
                 .db
@@ -3590,7 +3821,30 @@ mod tests {
         let first: serde_json::Value = response.json().await.unwrap();
         assert_eq!(first["vault_enabled"], true);
         assert_eq!(first["enabled"], true);
-        assert_eq!(first["providers"].as_array().unwrap().len(), 5);
+        // The five HTTP services, then the mailbox with its own levels
+        // and its own default.
+        let providers = first["providers"].as_array().unwrap();
+        let ids: Vec<&str> = providers
+            .iter()
+            .map(|provider| provider["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "cloudflare",
+                "github",
+                "github_org",
+                "gitlab",
+                "dokploy",
+                "mail"
+            ]
+        );
+        assert_eq!(providers[1]["default_level"], "full");
+        assert_eq!(providers[1]["levels"], json!(["off", "read", "full"]));
+        assert_eq!(providers[5]["kind"], "mail");
+        assert_eq!(providers[5]["default_level"], "off");
+        assert_eq!(providers[5]["levels"], json!(["off", "read"]));
+        assert_eq!(providers[5]["configured"], false);
         assert!(first["permissions"].as_array().unwrap().is_empty());
         assert!(first["log"].as_array().unwrap().is_empty());
         let names: Vec<&str> = first["agents"]
@@ -4021,6 +4275,182 @@ mod tests {
                 .any(|row| row["agent"] == "admin" && row["provider"] == "cloudflare"),
             "the refused test was not logged"
         );
+    }
+
+    /// The mailbox goes through the same routes as the services, with its
+    /// own form (host, port, account, password), its own levels and its
+    /// own default; the password never comes back.
+    #[tokio::test]
+    async fn the_mailbox_is_stored_tested_and_granted_on_its_own_terms() {
+        let (base, admin) = serve().await;
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: &str, token: &str| {
+            client
+                .request(method, format!("{base}{path}"))
+                .header(header::COOKIE, format!("{COOKIE}={token}"))
+        };
+        // A port nothing listens on: the Test fails locally and never
+        // reaches a real server.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let password = "mail app password 1";
+        let good = json!({
+            "host": "127.0.0.1", "port": closed, "account": "me@example.com", "secret": password
+        });
+
+        // The viewer may not store it.
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/mail",
+            "viewer-token",
+        )
+        .json(&good)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 403);
+        for bad in [
+            json!({ "host": "", "account": "me@example.com", "secret": password }),
+            json!({ "host": "imaps://imap.example.com", "account": "me@example.com", "secret": password }),
+            json!({ "host": "imap.example.com", "port": 0, "account": "me@example.com", "secret": password }),
+            json!({ "host": "imap.example.com", "account": "", "secret": password }),
+            json!({ "host": "imap.example.com", "account": "me@example.com", "secret": "" }),
+            json!({ "host": "imap.example.com", "account": "me@example.com", "secret": "a\r\nb" }),
+            json!({ "host": "imap.example.com", "account": "me@example.com", "secret": password, "base_url": "https://x.example" }),
+        ] {
+            let response = call(
+                reqwest::Method::PUT,
+                "/admin/api/integrations/mail",
+                "admin-token",
+            )
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), 400, "{bad}");
+            let text = response.text().await.unwrap();
+            assert!(!text.contains(password), "{text}");
+        }
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/MAIL",
+            "admin-token",
+        )
+        .json(&good)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Stored in the vault, sealed to host, port and account; the HTTP
+        // path cannot read the row.
+        let stored = admin.db.mail_vault().unwrap().unwrap();
+        assert_eq!(
+            (stored.host.as_str(), stored.port, stored.account.as_str()),
+            ("127.0.0.1", closed, "me@example.com")
+        );
+        let (_, opened) = mail::Mailbox::open(&test_vault_key(), &stored).unwrap();
+        assert_eq!(opened.expose(), password);
+        assert!(admin.db.vault("mail").is_err());
+
+        let shown = call(
+            reqwest::Method::GET,
+            "/admin/api/integrations",
+            "viewer-token",
+        )
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+        assert!(!shown.contains(password), "{shown}");
+        let shown: serde_json::Value = serde_json::from_str(&shown).unwrap();
+        let row = &shown["providers"][5];
+        assert_eq!(row["id"], "mail");
+        assert_eq!(row["configured"], true);
+        assert_eq!(row["readable"], true);
+        assert_eq!(row["host"], "127.0.0.1");
+        assert_eq!(row["port"], closed);
+        assert_eq!(row["account"], "me@example.com");
+        assert_eq!(row["hint"], "");
+
+        // Levels: off and read only; full is read.
+        for (level, status) in [("full", 200), ("sometimes", 400)] {
+            let response = call(
+                reqwest::Method::PUT,
+                "/admin/api/integrations/permissions",
+                "admin-token",
+            )
+            .json(&json!({ "agent": "claude", "provider": "mail", "level": level }))
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), status, "{level}");
+        }
+        assert_eq!(admin.db.ops_level("claude", "mail").unwrap(), "read");
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/permissions",
+            "viewer-token",
+        )
+        .json(&json!({ "agent": "claude", "provider": "mail", "level": "off" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(admin.db.ops_level("claude", "mail").unwrap(), "read");
+
+        // Test: logs in (here: fails to connect) and says so, logged as a
+        // `folders` call of the administrator.
+        let tested: serde_json::Value = call(
+            reqwest::Method::POST,
+            "/admin/api/integrations/mail/test",
+            "admin-token",
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(tested["ok"], false);
+        assert!(
+            tested["message"]
+                .as_str()
+                .unwrap()
+                .contains("could not be reached"),
+            "{tested}"
+        );
+        let row = &admin.db.ops_log(1).unwrap()[0];
+        assert_eq!(
+            (
+                row.provider.as_str(),
+                row.method.as_str(),
+                row.path.as_str()
+            ),
+            ("mail", "folders", "")
+        );
+        assert_eq!(row.outcome, "error");
+
+        // Remove, then it is gone.
+        for status in [200, 404] {
+            let response = call(
+                reqwest::Method::DELETE,
+                "/admin/api/integrations/mail",
+                "admin-token",
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), status);
+        }
+        assert!(admin.db.mail_vault().unwrap().is_none());
+        // The activity notes never carry the password.
+        let activity = admin.db.activity(50).unwrap();
+        assert!(activity.iter().all(|row| !row.summary.contains(password)));
     }
 
     #[tokio::test]

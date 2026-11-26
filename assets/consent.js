@@ -138,6 +138,9 @@ function render() {
   } else {
     grants.append(el("li", "", "Full access to every service configured later, unless its level is lowered in the admin view. None is configured now."));
   }
+  if (data.mailbox) {
+    grants.append(el("li", "", "Not the mailbox: a new agent cannot look at it until someone with the integrations permission sets its mail level to read."));
+  }
 
   const select = $("existing-agent");
   select.replaceChildren();
