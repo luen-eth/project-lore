@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Terminal · project-lore</title>
+<link rel="icon" href="/admin/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/admin/vendor/xterm-6.0.0/xterm.css">
+<link rel="stylesheet" href="/admin/terminal.css">
+</head>
+<body>
+<header class="bar">
+  <img id="avatar" class="avatar" alt="" hidden>
+  <div class="title">
+    <strong id="name">Terminal</strong>
+    <span id="what" class="muted"></span>
+  </div>
+  <span id="state" class="state connecting" role="status" aria-live="polite">Connecting…</span>
+  <div class="buttons">
+    <button id="reconnect" class="ghost" type="button" hidden>Reconnect</button>
+    <button id="close" class="ghost" type="button">Close</button>
+  </div>
+</header>
+<main id="screen" class="screen" aria-label="Terminal"></main>
+<script src="/admin/vendor/xterm-6.0.0/xterm.js"></script>
+<script src="/admin/vendor/addon-fit-0.11.0/addon-fit.js"></script>
+<script src="/admin/terminal.js"></script>
+</body>
+</html>

@@ -483,6 +483,12 @@ nothing needs a reload:
 - **Open sessions**, **Open tasks** and **Files** in the stats row count the chats
   live right now, the tasks nobody has claimed yet and the files kept.
 
+On a wide screen **Hide activity** (above *Hide labels*) hides the Live activity
+column and gives its room to the graph; **Show activity** brings it back. Like the
+labels, the choice is remembered per browser (`lore.feed.hidden` in local storage).
+On narrower screens the **Activity** button in the top bar opens the column as
+before, and the phone layout is unchanged.
+
 Click a neuron to read the entry, with the commit it was logged at and its related
 memories. Click a project, an agent or a kind (decision, bug, todo…) to isolate that
 part of the graph, or type in the search box to highlight matches.
@@ -638,6 +644,8 @@ Every admin route is mapped to exactly one access level in a table in
 | `GET` | `/admin/api/builtin` (the built-in agents; sign-in prompts only with `agents`) | signed in |
 | `PUT` | `/admin/api/builtin/{name}` (model, enabled, available, daily cap, active hours) | `agents` |
 | `POST` | `/admin/api/builtin/{name}/refresh`, `/login`, `/login/code`, `/login/cancel`, `/credential`, `/logout` | `agents` |
+| `GET` | `/admin/api/builtin/{name}/terminal` (WebSocket; `Origin` must be the page's own) | `agents` |
+| `GET` | `/admin/terminal`, `/admin/terminal.js`, `/admin/terminal.css`, `/admin/vendor/xterm-6.0.0/{xterm.js,xterm.css,LICENSE}`, `/admin/vendor/addon-fit-0.11.0/{addon-fit.js,LICENSE}` | nothing |
 | `POST` | `/admin/api/tasks` | `write` |
 | `PUT` | `/admin/api/tasks/{id}` | `write` |
 | `POST` | `/admin/api/messages` | `write` |
@@ -925,6 +933,44 @@ there is no subscription sign-in.
 **Check** asks the runner again for the sign-in state and the models; **Sign out**
 removes the stored sign-in from the volume (and runs the CLI's own logout).
 
+### Terminal
+
+With the `agents` permission, a connected built-in agent's card has **Open
+terminal**, which shows the CLI's own interactive interface (Claude Code, Codex or
+opencode, signed in with the agent's stored credentials and started with the model
+chosen below), and, under **More**, **Shell**: `bash` as the agent user in its home.
+The terminal opens in a large overlay (a full-screen sheet on a phone), follows the
+window's size, says clearly when it is disconnected or has ended, and closes only
+with its **Close** button: every key, Escape included, goes to the terminal.
+
+**Whoever can open the terminal has a shell in that agent's container, with its
+credentials** (the CLI's sign-in, the stored token or key). That is why only the
+`agents` permission can open it. The bytes are relayed as they are, both ways: a
+terminal cannot be redacted reliably, so what it shows is not filtered. Nothing from
+a terminal is stored in the database or written to the log; the activity feed notes
+only who opened which kind of terminal in which agent.
+
+How it works: the page opens a WebSocket to `/admin/api/builtin/{name}/terminal`
+(the session cookie and the `agents` permission are checked on the upgrade request,
+and its `Origin` must be the request's own origin, so another site cannot open one
+with your cookie). lore relays it over the runner link to a PTY the runner opens in
+the container, with the same cleared environment as every other CLI command (the
+runner's link secret never reaches it) and `TERM=xterm-256color`. Each terminal runs
+in a session of its own; closing it, the page going away, or the runner's link
+dropping kills that whole session, background jobs included. A runner keeps at most
+two terminals open, and closes one after 15 minutes without input while nobody looks
+(the page says every minute that it is shown).
+
+The terminal is drawn with [xterm.js](https://github.com/xtermjs/xterm.js) and its
+fit addon, vendored from npm (`@xterm/xterm` 6.0.0 and `@xterm/addon-fit` 0.11.0,
+MIT, their licences next to them in `assets/vendor/`) and served from the binary with
+a year's cache: no CDN. xterm.js writes `<style>` elements and `style` attributes as
+it draws, which the admin page's policy (`style-src 'self'`) refuses, so the overlay
+is a document of its own, `/admin/terminal`, shown in a frame: its policy is the
+admin page's except `style-src 'self' 'unsafe-inline'` and `frame-ancestors 'self'`
+(scripts stay `'self'` only). The admin page's own policy gains only
+`frame-src 'self'`.
+
 ### Models and settings
 
 - *Default model*: Claude takes the aliases `opus`, `sonnet`, `haiku`, `fable` and
@@ -1049,6 +1095,10 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
   never reaches into their containers. Their sign-in credentials stay in their own
   volumes and pass through lore only on the way there, never stored or logged; the
   runner secrets are redacted from provider responses like lore's other secrets.
+- **A built-in agent's terminal** is a shell in its container with its
+  credentials, relayed unfiltered: only the `agents` permission opens one, from this
+  lore's own origin, and nothing it shows or receives is stored or logged (see
+  *Terminal*).
 - **Tokens** are compared in constant time. Every request is authenticated on its
   own; the server keeps no MCP sessions.
 - **Failed tokens** are throttled per client address: after 20 failures in five

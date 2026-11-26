@@ -816,6 +816,11 @@ a.button-link:hover { background: rgba(255, 255, 255, 0.11); }
 .key.agent { border-radius: 3px; background: #ffd479; transform: rotate(45deg); }
 
 .labels-toggle { position: fixed; left: calc(var(--side) + 36px); bottom: 44px; z-index: 1; }
+/* Hides the Live activity column on wide screens; below that width the
+   Activity button in the top bar opens it instead. */
+.feed-hide { position: fixed; left: calc(var(--side) + 36px); bottom: 78px; z-index: 1; }
+@media (min-width: 1181px) { #app.feed-hidden .feed { display: none; } }
+@media (max-width: 1180px) { .feed-hide { display: none; } }
 
 .only-narrow, .only-medium { display: none; }
 

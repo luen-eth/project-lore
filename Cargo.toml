@@ -35,6 +35,9 @@ mail-parser = "1.0.2"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
 # Already built as part of tokio-tungstenite; named here for its Sink/Stream helpers.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Already built (through tempfile); named here for the runner's terminals: a PTY,
+# its window size, a new session for the shell, and killing that session.
+rustix = { version = "1", features = ["pty", "termios", "process"] }
 
 [profile.release]
 opt-level = 3

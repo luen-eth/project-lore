@@ -2,26 +2,80 @@
 //! settings, and the sign-in flows, which the page drives and the agents'
 //! runners carry out. A pasted credential passes through here to the
 //! runner and is dropped: it is never stored, logged or sent back.
+//!
+//! The terminal (part 6d) is a WebSocket between the page and one PTY in
+//! an agent's container. Its bytes are relayed as they are, never stored
+//! or logged; a terminal cannot be redacted reliably, so whoever may open
+//! one (`agents`) has a shell in that container with its credentials.
 
 use super::*;
+use axum::extract::ws::{
+    Message as WsMessage, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection,
+};
+use base64::Engine;
+
 use crate::{
     avatars,
-    builtin::{Hub, HubError},
+    builtin::{Hub, HubError, TerminalEvent},
     db::{BuiltinSettings, MAX_DAILY_CAP},
     runner::{
         drivers::{CLAUDE_MODELS, DEEPSEEK_MODELS, MAX_CREDENTIAL_BYTES},
-        protocol::{CredentialKind, FromRunner, Kind, LoginMethod, Secret, ToRunner},
+        protocol::{CredentialKind, FromRunner, Kind, LoginMethod, Secret, TerminalMode, ToRunner},
     },
 };
 
 pub(super) const SCRIPT: &str = include_str!("../../assets/builtin.js");
 pub(super) const STYLE: &str = include_str!("../../assets/builtin.css");
 
+/// The terminal overlay: a document of its own, shown in a frame of the
+/// admin page, so the style relaxation xterm.js needs stays out of the
+/// admin page's policy.
+pub(super) const TERMINAL_PAGE: &str = include_str!("../../assets/terminal.html");
+pub(super) const TERMINAL_SCRIPT: &str = include_str!("../../assets/terminal.js");
+pub(super) const TERMINAL_STYLE: &str = include_str!("../../assets/terminal.css");
+
+/// xterm.js and its fit addon, vendored from npm (`@xterm/xterm` 6.0.0,
+/// `@xterm/addon-fit` 0.11.0) with their licences. The version is in the
+/// path, so they are cached for a year.
+const XTERM_SCRIPT: &str = include_str!("../../assets/vendor/xterm-6.0.0/xterm.js");
+const XTERM_STYLE: &str = include_str!("../../assets/vendor/xterm-6.0.0/xterm.css");
+const XTERM_LICENSE: &str = include_str!("../../assets/vendor/xterm-6.0.0/LICENSE");
+const FIT_SCRIPT: &str = include_str!("../../assets/vendor/addon-fit-0.11.0/addon-fit.js");
+const FIT_LICENSE: &str = include_str!("../../assets/vendor/addon-fit-0.11.0/LICENSE");
+
+/// The terminal document's policy: the admin page's, except that styles
+/// may also be inline (xterm.js writes `<style>` elements and `style`
+/// attributes as it draws; scripts stay `'self'` only) and that the admin
+/// page may frame it.
+pub(super) const TERMINAL_CSP: &str = "default-src 'none'; script-src 'self'; \
+style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
+
+/// Largest frame a terminal page may send (typed or pasted input).
+const TERMINAL_FRAME_BYTES: usize = 64 * 1024;
+
+/// How long the page has to say what to open.
+const TERMINAL_OPEN_WAIT: Duration = Duration::from_secs(15);
+
 /// The built-in agents' routes and who may reach them; `access` reads this
 /// table after the main one.
 pub(super) const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/admin/builtin.js", Access::Public),
     ("GET", "/admin/builtin.css", Access::Public),
+    ("GET", "/admin/terminal", Access::Public),
+    ("GET", "/admin/terminal.js", Access::Public),
+    ("GET", "/admin/terminal.css", Access::Public),
+    ("GET", "/admin/vendor/xterm-6.0.0/{file}", Access::Public),
+    (
+        "GET",
+        "/admin/vendor/addon-fit-0.11.0/{file}",
+        Access::Public,
+    ),
+    (
+        "GET",
+        "/admin/api/builtin/{name}/terminal",
+        Access::Needs(Perm::Agents),
+    ),
     ("GET", "/admin/api/builtin", Access::SignedIn),
     (
         "PUT",
@@ -99,6 +153,276 @@ pub(super) fn routes() -> Router<Arc<Admin>> {
             post(credential).layer(DefaultBodyLimit::max(2 * MAX_CREDENTIAL_BYTES)),
         )
         .route("/admin/api/builtin/{name}/logout", post(logout))
+        .route("/admin/terminal", get(terminal_page))
+        .route(
+            "/admin/terminal.js",
+            get(|| async { asset("text/javascript; charset=utf-8", TERMINAL_SCRIPT) }),
+        )
+        .route(
+            "/admin/terminal.css",
+            get(|| async { asset("text/css; charset=utf-8", TERMINAL_STYLE) }),
+        )
+        .route("/admin/vendor/xterm-6.0.0/{file}", get(xterm_file))
+        .route("/admin/vendor/addon-fit-0.11.0/{file}", get(fit_file))
+        .route("/admin/api/builtin/{name}/terminal", get(terminal))
+}
+
+/// `GET /admin/terminal`: the terminal overlay's document, with its own
+/// policy (the security headers keep a policy a route set).
+async fn terminal_page() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, TERMINAL_CSP),
+            (header::X_FRAME_OPTIONS, "SAMEORIGIN"),
+        ],
+        TERMINAL_PAGE,
+    )
+        .into_response()
+}
+
+fn vendored(content_type: &'static str, body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn xterm_file(Path(file): Path<String>) -> Response {
+    match file.as_str() {
+        "xterm.js" => vendored("text/javascript; charset=utf-8", XTERM_SCRIPT),
+        "xterm.css" => vendored("text/css; charset=utf-8", XTERM_STYLE),
+        "LICENSE" => vendored("text/plain; charset=utf-8", XTERM_LICENSE),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn fit_file(Path(file): Path<String>) -> Response {
+    match file.as_str() {
+        "addon-fit.js" => vendored("text/javascript; charset=utf-8", FIT_SCRIPT),
+        "LICENSE" => vendored("text/plain; charset=utf-8", FIT_LICENSE),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Whether a request's `Origin` is the request's own origin: its host
+/// (and port) is the `Host` the request was sent to. Browsers always send
+/// `Origin` with a WebSocket, so a missing one is refused too.
+fn same_origin(headers: &HeaderMap) -> bool {
+    let header_text = |name| {
+        headers
+            .get(name)
+            .and_then(|value: &HeaderValue| value.to_str().ok())
+            .map(|value| value.trim().to_ascii_lowercase())
+    };
+    let (Some(origin), Some(host)) = (header_text(header::ORIGIN), header_text(header::HOST))
+    else {
+        return false;
+    };
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    let default_port = match scheme {
+        "https" => ":443",
+        "http" => ":80",
+        _ => return false,
+    };
+    if authority.is_empty() || authority.contains(['/', '@', '?', '#']) {
+        return false;
+    }
+    let plain = |value: &str| {
+        value
+            .strip_suffix(default_port)
+            .unwrap_or(value)
+            .to_string()
+    };
+    plain(authority) == plain(&host)
+}
+
+/// What the terminal page sends as text; typed bytes come as binary
+/// frames.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PageFrame {
+    Open {
+        mode: TerminalMode,
+        cols: u16,
+        rows: u16,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    /// The page is shown: someone is looking, so the terminal is not idle.
+    Alive,
+    Close,
+}
+
+/// `GET /admin/api/builtin/{name}/terminal`: a WebSocket to a terminal in
+/// the agent's container. The guard has already checked the session
+/// cookie and the `agents` permission on the upgrade request; this checks
+/// that the page asking is this lore's own.
+async fn terminal(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    let (hub, name) = match target(&admin, &name) {
+        Ok(found) => found,
+        Err(status) => return status.into_response(),
+    };
+    if !same_origin(&headers) {
+        tracing::warn!(agent = %name, user = %me.username, "a terminal request from another origin was refused");
+        return forbidden("the terminal opens only from this lore's own admin page");
+    }
+    let upgrade = match upgrade {
+        Ok(upgrade) => upgrade,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let state = admin.clone();
+    let agent = name.clone();
+    let model = tokio::task::spawn_blocking(move || state.db.builtin_agent(&agent))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .map(|agent| agent.model)
+        .filter(|model| !model.is_empty());
+    upgrade
+        .max_message_size(TERMINAL_FRAME_BYTES)
+        .max_frame_size(TERMINAL_FRAME_BYTES)
+        .on_upgrade(move |socket| relay(admin, hub, name, me.username, model, socket))
+}
+
+/// Sends one small JSON frame to the page.
+async fn tell(socket: &mut WebSocket, value: serde_json::Value) -> bool {
+    socket
+        .send(WsMessage::text(value.to_string()))
+        .await
+        .is_ok()
+}
+
+/// One page and one terminal, from the page's `open` to either side's end.
+async fn relay(
+    admin: Arc<Admin>,
+    hub: Arc<Hub>,
+    agent: String,
+    who: String,
+    model: Option<String>,
+    mut socket: WebSocket,
+) {
+    let open = tokio::time::timeout(TERMINAL_OPEN_WAIT, async {
+        while let Some(Ok(frame)) = socket.recv().await {
+            match frame {
+                WsMessage::Text(text) => {
+                    return serde_json::from_str::<PageFrame>(text.as_str()).ok();
+                }
+                WsMessage::Close(_) => return None,
+                _ => {}
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(PageFrame::Open { mode, cols, rows }) = open else {
+        tell(
+            &mut socket,
+            json!({ "type": "error", "message": "the page did not say what to open" }),
+        )
+        .await;
+        return;
+    };
+    let (term_id, mut events) = match hub.terminal_open(&agent, mode, cols, rows, model).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            tell(
+                &mut socket,
+                json!({ "type": "error", "message": error.to_string() }),
+            )
+            .await;
+            return;
+        }
+    };
+    let what = match mode {
+        TerminalMode::Cli => "the CLI's terminal",
+        TerminalMode::Shell => "a shell",
+    };
+    note_activity(
+        &admin,
+        "builtin",
+        &format!("{who} opened {what} in {agent}"),
+    );
+    tracing::info!(%agent, user = %who, %term_id, ?mode, "a terminal opened");
+    let mut ended = false;
+    if tell(&mut socket, json!({ "type": "opened" })).await {
+        loop {
+            tokio::select! {
+                frame = socket.recv() => {
+                    let command = match frame {
+                        Some(Ok(WsMessage::Binary(bytes))) => ToRunner::TerminalInput {
+                            term_id: term_id.clone(),
+                            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        },
+                        Some(Ok(WsMessage::Text(text))) => match serde_json::from_str::<PageFrame>(text.as_str()) {
+                            Ok(PageFrame::Resize { cols, rows }) => ToRunner::TerminalResize {
+                                term_id: term_id.clone(),
+                                cols,
+                                rows,
+                            },
+                            // An empty input types nothing and keeps the
+                            // terminal from being closed as idle.
+                            Ok(PageFrame::Alive) => ToRunner::TerminalInput {
+                                term_id: term_id.clone(),
+                                data: String::new(),
+                            },
+                            Ok(PageFrame::Close) => break,
+                            Ok(PageFrame::Open { .. }) | Err(_) => continue,
+                        },
+                        Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => continue,
+                    };
+                    if hub.terminal_send(&term_id, command).await.is_err() {
+                        break;
+                    }
+                }
+                event = events.recv() => match event {
+                    Some(TerminalEvent::Output(bytes)) => {
+                        if socket.send(WsMessage::Binary(bytes.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(TerminalEvent::Exit { code, message }) => {
+                        ended = true;
+                        tell(&mut socket, json!({ "type": "exit", "code": code, "message": message })).await;
+                        break;
+                    }
+                    None => {
+                        ended = true;
+                        tell(&mut socket, json!({
+                            "type": "exit",
+                            "code": null,
+                            "message": "the terminal ended: the agent's container disconnected, or this page fell behind",
+                        }))
+                        .await;
+                        break;
+                    }
+                },
+            }
+        }
+    }
+    if !ended {
+        hub.terminal_close(&term_id).await;
+    }
+    let _ = socket.send(WsMessage::Close(None)).await;
+    tracing::info!(%agent, %term_id, "a terminal's page closed");
 }
 
 /// The hub and a built-in agent's name from a path, or the answer to send.

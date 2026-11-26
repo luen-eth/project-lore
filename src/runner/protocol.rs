@@ -241,26 +241,30 @@ pub enum ToRunner {
     /// when a run ends).
     #[allow(dead_code, reason = "sent from part 6b on")]
     CleanWorkdir { run_id: String },
-    /// Part 6d: open a terminal.
-    #[allow(dead_code, reason = "sent from part 6d on")]
+    /// Open a terminal: a PTY running the CLI's own interface or a shell.
+    /// Answered by `TerminalOutput` frames and, when it ends or cannot be
+    /// opened, one `TerminalExit`.
     TerminalOpen {
         term_id: String,
         mode: TerminalMode,
         cols: u16,
         rows: u16,
+        /// The model the owner chose, for the CLI's interface; empty or
+        /// missing for the CLI's default.
+        #[serde(default)]
+        model: Option<String>,
     },
-    /// Part 6d: bytes typed into a terminal, base64.
-    #[allow(dead_code, reason = "sent from part 6d on")]
+    /// Bytes typed into a terminal, base64. Empty data types nothing: it
+    /// says someone is still looking, which keeps the terminal from being
+    /// closed as idle.
     TerminalInput { term_id: String, data: String },
-    /// Part 6d: the terminal's size changed.
-    #[allow(dead_code, reason = "sent from part 6d on")]
+    /// The terminal's size changed.
     TerminalResize {
         term_id: String,
         cols: u16,
         rows: u16,
     },
-    /// Part 6d: close a terminal.
-    #[allow(dead_code, reason = "sent from part 6d on")]
+    /// Close a terminal: its whole session is killed.
     TerminalClose { term_id: String },
 }
 
@@ -390,16 +394,19 @@ pub enum FromRunner {
         #[serde(default)]
         work_free_bytes: Option<u64>,
     },
-    /// Part 6d: terminal bytes, base64.
+    /// Terminal bytes, base64.
     TerminalOutput {
         term_id: String,
         data: String,
     },
-    /// Part 6d: a terminal closed.
+    /// A terminal closed, or could not be opened.
     TerminalExit {
         term_id: String,
         #[serde(default)]
         code: Option<i32>,
+        /// Why, when it was not the program ending by itself.
+        #[serde(default)]
+        message: Option<String>,
     },
 }
 
@@ -483,6 +490,7 @@ mod tests {
                 mode: TerminalMode::Cli,
                 cols: 80,
                 rows: 24,
+                model: Some("opus".into()),
             },
             ToRunner::TerminalInput {
                 term_id: "t1".into(),
@@ -577,6 +585,7 @@ mod tests {
             FromRunner::TerminalExit {
                 term_id: "t1".into(),
                 code: None,
+                message: Some("closed".into()),
             },
         ];
         for message in from {
@@ -595,6 +604,18 @@ mod tests {
         let status: FromRunner =
             decode(r#"{"type":"status","signed_in":false,"later":"field"}"#).unwrap();
         assert_eq!(status.answers(), None);
+        // The terminal fields added in part 6d are optional, so a peer
+        // built before them still reads and writes these messages.
+        let open: ToRunner =
+            decode(r#"{"type":"terminal_open","term_id":"t1","mode":"shell","cols":80,"rows":24}"#)
+                .unwrap();
+        assert!(matches!(open, ToRunner::TerminalOpen { model: None, .. }));
+        let exit: FromRunner =
+            decode(r#"{"type":"terminal_exit","term_id":"t1","code":0}"#).unwrap();
+        assert!(matches!(
+            exit,
+            FromRunner::TerminalExit { message: None, .. }
+        ));
     }
 
     #[test]

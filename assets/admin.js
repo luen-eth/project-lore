@@ -207,7 +207,7 @@ class Graph {
       minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
     }
     const padLeft = this.chrome && this.width > 760 ? 336 : 40;
-    const padRight = this.chrome && this.width > 1180 ? 380 : 40;
+    const padRight = this.chrome && this.width > 1180 && !this.feedHidden ? 380 : 40;
     const padTop = this.chrome ? 84 : 40, padBottom = this.chrome ? 84 : 48;
     const w = Math.max(this.width - padLeft - padRight, 100);
     const h = Math.max(this.height - padTop - padBottom, 100);
@@ -754,6 +754,25 @@ function setLabels(show, remember) {
   setLabels(stored !== "0", false);
 }
 $("labels-toggle").addEventListener("click", () => setLabels(!graph.showLabels, true));
+
+// The Live activity column can be hidden on wide screens, giving its room
+// to the graph; the choice is remembered per browser like the labels.
+const FEED_KEY = "lore.feed.hidden";
+function setFeedHidden(hidden, remember) {
+  graph.feedHidden = hidden;
+  $("app").classList.toggle("feed-hidden", hidden);
+  const button = $("feed-hide");
+  button.textContent = hidden ? "Show activity" : "Hide activity";
+  button.setAttribute("aria-pressed", String(!hidden));
+  if (remember) { try { localStorage.setItem(FEED_KEY, hidden ? "1" : "0"); } catch { /* private mode */ } }
+  graph.resize();
+}
+{
+  let stored = null;
+  try { stored = localStorage.getItem(FEED_KEY); } catch { /* private mode */ }
+  setFeedHidden(stored === "1", false);
+}
+$("feed-hide").addEventListener("click", () => setFeedHidden(!graph.feedHidden, true));
 
 /* The scene follows the camera: far layers move less than near ones. */
 {

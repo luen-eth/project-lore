@@ -5,7 +5,9 @@
 //! per agent, routes answers to whoever asked, and records what the
 //! runners report (connection, CLI version, sign-in state) in
 //! `builtin_agents`. It never stores or logs a credential: a pasted token
-//! passes through it to the runner and is dropped.
+//! passes through it to the runner and is dropped. Terminal bytes (part
+//! 6d) pass through it between a runner and one admin page, and are never
+//! stored or logged either.
 //!
 //! Without `LORE_RUNNER_TOKENS` there is no hub, no listener and no route:
 //! lore behaves as it did before built-in agents existed.
@@ -31,6 +33,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use base64::Engine;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
@@ -40,7 +43,7 @@ use crate::{
     db::{BuiltinStatus, Db},
     runner::{
         AGENT_HEADER,
-        protocol::{self, FromRunner, Kind, PROTOCOL_VERSION, Resources, ToRunner},
+        protocol::{self, FromRunner, Kind, PROTOCOL_VERSION, Resources, TerminalMode, ToRunner},
     },
 };
 
@@ -51,6 +54,14 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(90);
 
 /// Shortest runner secret accepted.
 const MIN_SECRET_LEN: usize = 24;
+
+/// Terminals one built-in agent may have open at once (its runner keeps
+/// the same limit).
+pub const MAX_TERMINALS: usize = crate::runner::terminal::MAX_TERMINALS;
+
+/// Output frames waiting for a page that does not read them; a page that
+/// falls this far behind loses its terminal.
+const TERMINAL_BACKLOG: usize = 1024;
 
 /// A runner secret and the built-in agent it belongs to.
 pub struct RunnerToken {
@@ -130,6 +141,8 @@ pub enum HubError {
     Timeout,
     /// The link closed before the answer came.
     Closed,
+    /// The agent already has as many terminals open as it may.
+    TooManyTerminals,
 }
 
 impl std::fmt::Display for HubError {
@@ -141,6 +154,9 @@ impl std::fmt::Display for HubError {
             }
             HubError::Timeout => "the agent's container did not answer in time",
             HubError::Closed => "the link to the agent's container closed",
+            HubError::TooManyTerminals => {
+                "this agent already has two terminals open; close one first"
+            }
         })
     }
 }
@@ -168,6 +184,22 @@ pub struct ModelList {
     pub source: String,
 }
 
+/// What a terminal's page hears from the runner.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TerminalEvent {
+    Output(Vec<u8>),
+    Exit {
+        code: Option<i32>,
+        message: Option<String>,
+    },
+}
+
+/// An open terminal: the agent it runs in and the page that shows it.
+struct Terminal {
+    agent: String,
+    tx: mpsc::Sender<TerminalEvent>,
+}
+
 /// A connected runner.
 struct Link {
     generation: u64,
@@ -183,6 +215,7 @@ struct Inner {
     logins: HashMap<String, LoginState>,
     models: HashMap<String, ModelList>,
     resources: HashMap<String, Resources>,
+    terminals: HashMap<String, Terminal>,
 }
 
 /// Every built-in agent's runner link.
@@ -290,6 +323,143 @@ impl Hub {
         }
     }
 
+    /// Opens a terminal in an agent's container for one page: answers the
+    /// terminal's id and where its output and its end arrive. The channel
+    /// closes without an `Exit` when the agent's container disconnects.
+    pub async fn terminal_open(
+        &self,
+        agent: &str,
+        mode: TerminalMode,
+        cols: u16,
+        rows: u16,
+        model: Option<String>,
+    ) -> Result<(String, mpsc::Receiver<TerminalEvent>), HubError> {
+        let term_id = format!("t{}", self.next_id());
+        let (tx, rx) = mpsc::channel(TERMINAL_BACKLOG);
+        let link = {
+            let mut inner = self.inner();
+            let Some(link) = inner.links.get(agent) else {
+                return Err(HubError::NotConnected);
+            };
+            let link = link.tx.clone();
+            let open = inner
+                .terminals
+                .values()
+                .filter(|terminal| terminal.agent == agent)
+                .count();
+            if open >= MAX_TERMINALS {
+                return Err(HubError::TooManyTerminals);
+            }
+            inner.terminals.insert(
+                term_id.clone(),
+                Terminal {
+                    agent: agent.to_string(),
+                    tx,
+                },
+            );
+            link
+        };
+        let open = ToRunner::TerminalOpen {
+            term_id: term_id.clone(),
+            mode,
+            cols,
+            rows,
+            model,
+        };
+        if link.send(open).await.is_err() {
+            self.inner().terminals.remove(&term_id);
+            return Err(HubError::Closed);
+        }
+        Ok((term_id, rx))
+    }
+
+    /// Sends a terminal command (input, resize) to the runner of the agent
+    /// the terminal runs in.
+    pub async fn terminal_send(&self, term_id: &str, command: ToRunner) -> Result<(), HubError> {
+        let link = {
+            let inner = self.inner();
+            let Some(terminal) = inner.terminals.get(term_id) else {
+                return Err(HubError::Closed);
+            };
+            let Some(link) = inner.links.get(&terminal.agent) else {
+                return Err(HubError::NotConnected);
+            };
+            link.tx.clone()
+        };
+        link.send(command).await.map_err(|_| HubError::Closed)
+    }
+
+    /// The page went: the terminal is forgotten and its runner told to
+    /// close it.
+    pub async fn terminal_close(&self, term_id: &str) {
+        let link = {
+            let mut inner = self.inner();
+            let Some(terminal) = inner.terminals.remove(term_id) else {
+                return;
+            };
+            inner.links.get(&terminal.agent).map(|link| link.tx.clone())
+        };
+        if let Some(link) = link {
+            let _ = link
+                .send(ToRunner::TerminalClose {
+                    term_id: term_id.to_string(),
+                })
+                .await;
+        }
+    }
+
+    /// How many terminals are open, in every agent.
+    #[cfg(test)]
+    pub fn terminal_count(&self) -> usize {
+        self.inner().terminals.len()
+    }
+
+    /// Terminal bytes from a runner, for the page that shows them. Only
+    /// the runner the terminal was opened in may write to it.
+    fn on_terminal_output(&self, agent: &str, term_id: &str, data: &str) {
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) else {
+            return;
+        };
+        let mut inner = self.inner();
+        let Some(terminal) = inner.terminals.get(term_id) else {
+            return;
+        };
+        if terminal.agent != agent {
+            return;
+        }
+        if terminal.tx.try_send(TerminalEvent::Output(bytes)).is_err() {
+            // The page does not keep up (or went): it loses the terminal
+            // rather than holding up the agent's whole link.
+            inner.terminals.remove(term_id);
+            let link = inner.links.get(agent).map(|link| link.tx.clone());
+            drop(inner);
+            tracing::warn!(%agent, %term_id, "a terminal's page fell behind; closing it");
+            if let Some(link) = link {
+                let _ = link.try_send(ToRunner::TerminalClose {
+                    term_id: term_id.to_string(),
+                });
+            }
+        }
+    }
+
+    fn on_terminal_exit(
+        &self,
+        agent: &str,
+        term_id: &str,
+        code: Option<i32>,
+        message: Option<String>,
+    ) {
+        let mut inner = self.inner();
+        if inner
+            .terminals
+            .get(term_id)
+            .is_some_and(|terminal| terminal.agent == agent)
+            && let Some(terminal) = inner.terminals.remove(term_id)
+        {
+            let _ = terminal.tx.try_send(TerminalEvent::Exit { code, message });
+        }
+    }
+
     /// Notes a sign-in the page started, before its prompt arrives.
     pub fn login_started(&self, agent: &str, id: u64, method: &str) {
         self.inner().logins.insert(
@@ -389,6 +559,14 @@ impl Hub {
             FromRunner::Unsupported { command, .. } => {
                 tracing::warn!(%agent, %command, "the runner does not support a command");
             }
+            FromRunner::TerminalOutput { term_id, data } => {
+                self.on_terminal_output(agent, term_id, data);
+            }
+            FromRunner::TerminalExit {
+                term_id,
+                code,
+                message: said,
+            } => self.on_terminal_exit(agent, term_id, *code, said.clone()),
             _ => {}
         }
         if let Some(id) = message.answers() {
@@ -511,6 +689,10 @@ impl Hub {
             if current {
                 inner.links.remove(&agent);
                 inner.resources.remove(&agent);
+                // Its terminals' pages see their channel close.
+                inner
+                    .terminals
+                    .retain(|_, terminal| terminal.agent != agent);
                 // Whoever waits on this runner hears that it went.
                 inner.pending.retain(|_, (owner, _)| owner != &agent);
                 if let Some(login) = inner.logins.get_mut(&agent)
@@ -1399,6 +1581,238 @@ esac
         let wal = std::fs::read(pair.dir.join("lore.db-wal")).unwrap_or_default();
         assert!(!String::from_utf8_lossy(&bytes).contains(token));
         assert!(!String::from_utf8_lossy(&wal).contains(token));
+    }
+
+    /// A WebSocket to the terminal route, with the given cookie and Origin.
+    async fn terminal_socket(
+        base: &str,
+        cookie: Option<&str>,
+        origin: Option<&str>,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        u16,
+    > {
+        use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+        let url = format!(
+            "{}/admin/api/builtin/claude-builtin/terminal",
+            base.replace("http://", "ws://")
+        );
+        let mut request = url.into_client_request().unwrap();
+        if let Some(cookie) = cookie {
+            request
+                .headers_mut()
+                .insert(header::COOKIE, cookie.parse().unwrap());
+        }
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert(header::ORIGIN, origin.parse().unwrap());
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((socket, _)) => Ok(socket),
+            Err(tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_page_opens_a_terminal_through_the_hub() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as Ws;
+        let pair = listen().await;
+        let base = admin_server(&pair).await;
+        let mut config = config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET);
+        // A fake CLI whose interactive side prints its arguments and its
+        // window size, echoes a line and exits 5.
+        let program = pair.dir.join("claude-tui");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ncase \"$1\" in --version) echo \"2.1.328 (Claude Code)\"; exit 0;; \
+             auth) echo \"Not logged in\"; exit 1;; esac\n\
+             echo \"args:$*\"; stty size; read line; echo \"got:$line\"; stty size; read more; exit 5\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        config.settings.program = program;
+        start(config);
+        connected(&pair.hub, "claude-builtin").await;
+        pair.db
+            .add_user(&crate::db::NewUser {
+                username: "writer".into(),
+                email: None,
+                password_hash: crate::users::hash_password("writer-password").unwrap(),
+                permissions: crate::users::Perms::parse(&["write"]).unwrap(),
+                created_by: "admin".into(),
+            })
+            .unwrap();
+        let http = reqwest::Client::new();
+        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let writer = sign_in(&http, &base, "writer", "writer-password").await;
+        let saved = http
+            .put(format!("{base}/admin/api/builtin/claude-builtin"))
+            .header(header::COOKIE, &admin)
+            .json(&serde_json::json!({ "model": "opus" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), 200);
+        let origin = base.clone();
+
+        // Refused: no session, no `agents`, another origin, no origin.
+        assert_eq!(
+            terminal_socket(&base, None, Some(&origin)).await.err(),
+            Some(401)
+        );
+        assert_eq!(
+            terminal_socket(&base, Some(&writer), Some(&origin))
+                .await
+                .err(),
+            Some(403)
+        );
+        assert_eq!(
+            terminal_socket(&base, Some(&admin), Some("https://evil.example"))
+                .await
+                .err(),
+            Some(403)
+        );
+        let other_port = format!("{base}1");
+        assert_eq!(
+            terminal_socket(&base, Some(&admin), Some(&other_port))
+                .await
+                .err(),
+            Some(403)
+        );
+        assert_eq!(
+            terminal_socket(&base, Some(&admin), None).await.err(),
+            Some(403)
+        );
+        assert_eq!(pair.hub.terminal_count(), 0);
+
+        // The owner's page: open, see output, resize, type, see the end.
+        let mut socket = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        socket
+            .send(Ws::text(
+                r#"{"type":"open","mode":"cli","cols":90,"rows":20}"#,
+            ))
+            .await
+            .unwrap();
+        async fn until(
+            socket: &mut (
+                     impl StreamExt<Item = Result<Ws, tokio_tungstenite::tungstenite::Error>> + Unpin
+                 ),
+            text: &mut String,
+            wanted: &str,
+        ) -> Option<serde_json::Value> {
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(15), socket.next())
+                    .await
+                    .unwrap_or_else(|_| panic!("waited for {wanted:?}; got {text:?}"))
+                    .unwrap()
+                    .unwrap();
+                match frame {
+                    Ws::Binary(bytes) => {
+                        text.push_str(&String::from_utf8_lossy(&bytes));
+                        if !wanted.is_empty() && text.contains(wanted) {
+                            return None;
+                        }
+                    }
+                    Ws::Text(json) => {
+                        let value: serde_json::Value = serde_json::from_str(json.as_str()).unwrap();
+                        if value["type"] != "opened" || wanted == "opened" {
+                            return Some(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut text = String::new();
+        assert_eq!(
+            until(&mut socket, &mut text, "opened").await.unwrap()["type"],
+            "opened"
+        );
+        until(&mut socket, &mut text, "20 90").await;
+        assert!(text.contains("args:--model opus"), "{text}");
+        assert_eq!(pair.hub.terminal_count(), 1);
+        socket
+            .send(Ws::text(r#"{"type":"resize","cols":100,"rows":33}"#))
+            .await
+            .unwrap();
+        socket.send(Ws::text(r#"{"type":"alive"}"#)).await.unwrap();
+        socket
+            .send(Ws::binary(b"typed-but-never-stored\r".to_vec()))
+            .await
+            .unwrap();
+        until(&mut socket, &mut text, "33 100").await;
+        assert!(text.contains("got:typed-but-never-stored"), "{text}");
+        socket.send(Ws::binary(b"\r".to_vec())).await.unwrap();
+        let exit = until(&mut socket, &mut text, "").await.unwrap();
+        assert_eq!(exit["type"], "exit");
+        assert_eq!(exit["code"], 5);
+        assert_eq!(pair.hub.terminal_count(), 0);
+
+        // A page that goes closes its terminal; two at most per agent.
+        let mut first = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        let mut second = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        let mut third = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        for socket in [&mut first, &mut second] {
+            socket
+                .send(Ws::text(
+                    r#"{"type":"open","mode":"cli","cols":80,"rows":24}"#,
+                ))
+                .await
+                .unwrap();
+            let mut text = String::new();
+            until(socket, &mut text, "24 80").await;
+        }
+        third
+            .send(Ws::text(
+                r#"{"type":"open","mode":"cli","cols":80,"rows":24}"#,
+            ))
+            .await
+            .unwrap();
+        let refused = until(&mut third, &mut String::new(), "").await.unwrap();
+        assert_eq!(refused["type"], "error");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("two terminals")
+        );
+        assert_eq!(pair.hub.terminal_count(), 2);
+        drop(first);
+        second.close(None).await.unwrap();
+        for _ in 0..250 {
+            if pair.hub.terminal_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(pair.hub.terminal_count(), 0);
+
+        // Who opened it is noted; what was typed or shown is not kept.
+        let feed = format!("{:?}", pair.db.activity(20).unwrap());
+        assert!(
+            feed.contains("opened the CLI's terminal in claude-builtin"),
+            "{feed}"
+        );
+        for file in ["lore.db", "lore.db-wal"] {
+            let bytes = std::fs::read(pair.dir.join(file)).unwrap_or_default();
+            assert!(!String::from_utf8_lossy(&bytes).contains("typed-but-never-stored"));
+        }
     }
 
     #[test]

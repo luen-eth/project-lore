@@ -6,7 +6,13 @@
    Pasted credentials go straight to the server, which hands them to the
    agent's container; the fields are cleared at once and nothing is kept
    in the page. Self-contained: it watches the Agents panel and draws into
-   #builtin-section, so the rest of the page does not know about it. */
+   #builtin-section, so the rest of the page does not know about it.
+
+   With the agents permission, a connected agent also opens a terminal: the
+   CLI's own interface, or (behind "More") a shell. It is shown in an
+   overlay holding /admin/terminal in a frame, a document with its own
+   policy because xterm.js writes inline styles; the frame asks to be closed
+   with a message, since every key, Escape too, belongs to the terminal. */
 (() => {
   "use strict";
 
@@ -182,6 +188,7 @@
     if (!manage) return item;
     if (agent.login) item.append(loginBox(agent));
     item.append(signInActions(agent));
+    if (agent.connected) item.append(terminalActions(agent));
     if (ui.credential[agent.name]) item.append(credentialForm(agent, ui.credential[agent.name]));
     item.append(settingsForm(agent));
     return item;
@@ -476,6 +483,56 @@
     });
     return form;
   }
+
+  /* ---------- Terminal ---------- */
+
+  let overlay = null;
+
+  function terminalActions(agent) {
+    const row = el("div", "board-actions builtin-actions builtin-terminal");
+    row.append(button("Open terminal", "", () => openTerminal(agent, "cli")));
+    const more = el("details", "builtin-more");
+    more.append(el("summary", "", "More"));
+    const inside = el("div", "builtin-more-body");
+    inside.append(
+      button("Shell", "", () => openTerminal(agent, "shell")),
+      el("span", "muted small-text", "bash as the agent user, with its sign-in"),
+    );
+    more.append(inside);
+    row.append(more);
+    return row;
+  }
+
+  function openTerminal(agent, mode) {
+    closeTerminal();
+    overlay = el("div", "terminal-overlay");
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", `${mode === "shell" ? "Shell" : "Terminal"} of ${agent.name}`);
+    const frame = el("iframe", "terminal-frame");
+    frame.title = `${mode === "shell" ? "Shell" : "Terminal"} of ${agent.name}`;
+    const query = new URLSearchParams({ agent: agent.name, mode, avatar: agent.avatar || "" });
+    frame.src = "/admin/terminal?" + query.toString();
+    frame.addEventListener("load", () => frame.focus());
+    overlay.append(frame);
+    document.body.append(overlay);
+    document.documentElement.classList.add("terminal-open");
+  }
+
+  /* Removing the frame closes its socket, which closes the terminal. */
+  function closeTerminal() {
+    if (!overlay) return;
+    overlay.remove();
+    overlay = null;
+    document.documentElement.classList.remove("terminal-open");
+  }
+
+  window.addEventListener("message", (event) => {
+    if (!overlay || event.origin !== location.origin) return;
+    const frame = overlay.querySelector("iframe");
+    if (!frame || event.source !== frame.contentWindow) return;
+    if (event.data && event.data.type === "lore-terminal-close") closeTerminal();
+  });
 
   /* Loads when the Agents panel opens; stops polling when it closes. */
   new MutationObserver(() => {

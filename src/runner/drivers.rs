@@ -20,7 +20,7 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 
-use super::protocol::{CredentialKind, FromRunner, Kind, LoginMethod, Secret};
+use super::protocol::{CredentialKind, FromRunner, Kind, LoginMethod, Secret, TerminalMode};
 
 /// The models Claude Code accepts as aliases; it has no command that lists
 /// them.
@@ -248,7 +248,53 @@ impl Driver {
 
     /// A command for the CLI with the cleared environment.
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(&self.settings.program);
+        self.command_for(&self.settings.program, args)
+    }
+
+    /// What a terminal runs (part 6d): the CLI's own interactive interface
+    /// with the model the owner chose, or `shell`, both with the CLI's
+    /// cleared environment and its stored credentials, and a terminal type
+    /// that allows colour.
+    pub fn terminal_command(
+        &self,
+        mode: TerminalMode,
+        model: Option<&str>,
+        shell: &Path,
+    ) -> Command {
+        // A model is a plain name (lore checks it); one that looks like an
+        // option is left out rather than passed on.
+        let model = model
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && !model.starts_with('-'));
+        let mut args: Vec<String> = Vec::new();
+        if let (TerminalMode::Cli, Some(model)) = (mode, model) {
+            match self.kind() {
+                Kind::Claude => args.extend(["--model".into(), model.into()]),
+                Kind::Codex => args.extend(["-m".into(), model.into()]),
+                Kind::Opencode => {
+                    let model = if model.contains('/') {
+                        model.to_string()
+                    } else {
+                        format!("{}/{model}", self.settings.provider)
+                    };
+                    args.extend(["--model".into(), model]);
+                }
+            }
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut command = match mode {
+            TerminalMode::Cli => self.command(&args),
+            TerminalMode::Shell => self.command_for(shell, &[]),
+        };
+        command
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env_remove("NO_COLOR");
+        command
+    }
+
+    fn command_for(&self, program: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
         command.args(args).env_clear();
         if let Ok(path) = std::env::var("PATH") {
             command.env("PATH", path);

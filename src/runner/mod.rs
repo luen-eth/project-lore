@@ -3,7 +3,8 @@
 //! It dials out to lore over the compose network (a WebSocket to
 //! `/runner/ws` on lore's internal listener), says who it is, and then
 //! carries out lore's commands with the CLI it was built with: report the
-//! sign-in state, sign in and out, list the models. lore never reaches into
+//! sign-in state, sign in and out, list the models, open terminals
+//! (`terminal`). lore never reaches into
 //! the container: no Docker socket, no inbound port. When the link drops
 //! the runner dials again, waiting a little longer each time.
 //!
@@ -23,6 +24,7 @@
 
 pub mod drivers;
 pub mod protocol;
+pub mod terminal;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -250,6 +252,9 @@ pub async fn session(config: &Config, driver: Arc<Driver>) -> Result<End> {
     tracing::info!("connected to lore");
 
     let (out_tx, mut out_rx) = mpsc::channel::<FromRunner>(256);
+    // Closed with the link: dropping it kills every terminal's session.
+    let terminals =
+        terminal::Terminals::new(driver.clone(), out_tx.clone(), terminal::Limits::default());
     {
         let (driver, out) = (driver.clone(), out_tx.clone());
         tokio::spawn(async move {
@@ -266,7 +271,13 @@ pub async fn session(config: &Config, driver: Arc<Driver>) -> Result<End> {
                 last_heard = tokio::time::Instant::now();
                 match frame? {
                     Message::Text(text) => match protocol::decode::<ToRunner>(&text) {
-                        Ok(command) => handle(command, &driver, &out_tx),
+                        Ok(command) => {
+                            // Terminal commands are carried out in order,
+                            // here; everything else in a task of its own.
+                            if let Some(command) = terminals.handle(command) {
+                                handle(command, &driver, &out_tx);
+                            }
+                        }
                         Err(error) => {
                             tracing::warn!(%error, "a command from lore could not be read");
                             let _ = out_tx.try_send(FromRunner::Error {
@@ -397,6 +408,8 @@ fn handle(command: ToRunner, driver: &Arc<Driver>, out: &mpsc::Sender<FromRunner
                 command: "clean_workdir".into(),
                 target: Some(run_id),
             },
+            // `session` gives these to its `Terminals` before they reach
+            // here.
             ToRunner::TerminalOpen { term_id, .. }
             | ToRunner::TerminalInput { term_id, .. }
             | ToRunner::TerminalResize { term_id, .. }

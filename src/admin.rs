@@ -88,7 +88,7 @@ const CONSENT_STYLE: &str = include_str!("../assets/consent.css");
 /// The page's Content Security Policy; the OAuth consent page uses it too.
 pub(crate) const CSP: &str = "default-src 'none'; script-src 'self' https://www.google.com/recaptcha/ \
 https://www.gstatic.com/recaptcha/; style-src 'self'; img-src 'self' data:; connect-src 'self'; \
-frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/; \
+frame-src 'self' https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/; \
 base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 pub struct Recaptcha {
@@ -613,11 +613,14 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CSP),
-    );
-    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    // A route may set a policy of its own (the terminal document); every
+    // other response gets the page's.
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static(CSP));
+    headers
+        .entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
