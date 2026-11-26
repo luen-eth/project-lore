@@ -609,6 +609,20 @@ pub async fn call(
     guard: &Guard,
     req: &OpsRequest,
 ) -> Result<OpsResponse, OpsError> {
+    call_with_limit(client, base, secret, guard, req, MAX_BODY_CHARS).await
+}
+
+/// `call`, with the answer cut at `max_chars` characters instead of
+/// `MAX_BODY_CHARS` (the 2 MiB read cap still holds): for lore's own tools
+/// that parse a provider's JSON before showing a shorter answer.
+pub async fn call_with_limit(
+    client: &reqwest::Client,
+    base: &str,
+    secret: &Secret,
+    guard: &Guard,
+    req: &OpsRequest,
+    max_chars: usize,
+) -> Result<OpsResponse, OpsError> {
     let method = normalize_method(&req.method)?;
     validate(req)?;
     guard.check(req)?;
@@ -722,9 +736,9 @@ pub async fn call(
         ),
         Some(text) => {
             let text = guard.redact(text, secret.expose());
-            let truncated = too_big || text.chars().count() > MAX_BODY_CHARS;
+            let truncated = too_big || text.chars().count() > max_chars;
             let text: String = if truncated {
-                text.chars().take(MAX_BODY_CHARS).collect()
+                text.chars().take(max_chars).collect()
             } else {
                 text
             };

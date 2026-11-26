@@ -89,6 +89,7 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `github_org` | Call the GitHub REST API with the organization account's token; preferred for repositories that belong to the organization |
 | `git_server` | Call the REST API of the self-hosted GitLab server (projects, merge requests, issues, …) |
 | `dokploy` | Call the Dokploy API of the deployment server (projects, applications, deployments, …) |
+| `repo_tree`, `repo_read`, `repo_search`, `repo_commit` | List, read, search and commit files of a GitHub repository without a checkout (see [Reading and changing code without a checkout](#reading-and-changing-code-without-a-checkout)) |
 | `mail` | Look at the stored mailbox, read-only: `folders`, `list` (newest first, with filters) and `read` one message |
 
 Every tool except `hello` takes the `session_id` that `hello` returned and
@@ -553,6 +554,39 @@ repository public (when allowed) publishes its existing history unchecked, and a
 repository made public on GitHub's own website is treated as private for up to a
 minute.
 
+### Reading and changing code without a checkout
+
+Clients without a shell or a checkout (a chat web app, see
+[Connecting a chat web app](#connecting-a-chat-web-app)) can work on a GitHub
+repository through four tools, which wrap the GitHub REST API so a model does not
+have to build raw calls or handle base64:
+
+| Tool | What it does | Level |
+|---|---|---|
+| `repo_tree` | lists a directory (`path`, `depth` up to 10, `limit` up to 2000) at a branch, tag or commit, with the commit sha | read |
+| `repo_read` | reads 1 to 10 files from one commit, with line numbers (`start_line`/`end_line` for one file); binary files and files over 1 MiB by size only | read |
+| `repo_search` | GitHub code search inside the repository (`path`, `extension`); it only covers the default branch and may lag | read |
+| `repo_commit` | writes 1 to 50 changes (text, base64 or a deletion; 8 MiB in all) as **one** commit straight onto a branch, optionally creating it (`create_from`) and refusing when the branch moved (`expected_head`) | full |
+
+All four take `repo` (`owner/name`) and `account` (`personal`, the default, or
+`organization`), which picks the `github` or the `github_org` credential, level and
+log rows; lore never switches accounts by itself, but when the personal credential
+cannot see a repository and the organization's can, the error says so. They need a
+session from `hello` (an implicit session is not enough) and go through the same
+gates as `github`: the vault, the master switch, the agent's level, the credential
+added on the server side, every stored secret redacted from the answer, the 100 000
+character output cap, and one row per tool call in the operations log (for example
+`GET repo_read owner/repo:src/main.rs@main`; a search query is never logged).
+
+`repo_commit` uses the Git Data API (the branch's ref, its commit and tree, one blob
+per written file, a tree on top of the old one, a commit, then the ref moved without
+force, or created). The leak scan of
+[Keeping secrets out of public repositories](#keeping-secrets-out-of-public-repositories)
+runs before anything is written: when the repository is public, or its visibility
+cannot be read, every written file's name and content, the message and the branch
+name are scanned, and one finding refuses the whole commit with a `denied` row.
+Protected-branch and permission errors from GitHub are passed on as they come.
+
 ## The admin view
 
 `/admin` is a live window into the brain. Every entry is a neuron: colour is the
@@ -888,6 +922,19 @@ meaningful change, decision or bug fix. Every `log` call includes `path`
 (project directory), `repo` (`git remote get-url origin`) and `commit`
 (`git rev-parse HEAD`, read right before logging).
 ```
+
+### Connecting a chat web app
+
+Chat web apps can use lore as a remote MCP connector through the OAuth flow above.
+In claude.ai, add `https://<your lore host>/mcp` as a custom connector; in ChatGPT,
+add it as a connector in developer mode. The app opens lore's consent page, where
+you sign in and approve it as an agent of its own. Such a client has no shell and
+no checkout, so it reads and changes code through `repo_tree`, `repo_read`,
+`repo_search` and `repo_commit`. Consider giving it `read` rather than `full` on
+Dokploy and Cloudflare in the Integrations panel. lore's side was built with these
+clients in mind, but each vendor's connector settings change over time and are not
+under lore's control: if a step above no longer matches, follow the vendor's own
+documentation for adding a remote MCP server.
 
 ## Configuration
 
