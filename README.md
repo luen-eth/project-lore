@@ -148,13 +148,19 @@ A client reads the tool list once, when a chat starts, so a chat opened before l
 had sessions still knows only `recall`, `log`, `recent`, `projects`, `get`, `amend`
 and `forget`, without `session_id`. Those seven tools therefore still work without
 one: lore serves the call through an **implicit session** for the token's agent
-(reused until it closes), returns the `hello` briefing with the first such call,
-and puts a short notice in front of every such answer that names the tools the
-client is missing and the `session_id` to pass from now on. Every other tool still
-requires a `session_id`, and the access is exactly that of the token. The admin
-page marks these sessions "implicit", and a later `hello` from the same agent
-closes its implicit session. This is only a fallback: the real fix is to start a
-new chat or restart the MCP client so it loads the current tool list.
+(with the shared token, for the agent `log` names, else `shared`; reused until it
+closes), returns the `hello` briefing with the first such call, and puts a short
+notice in front of every such answer. The notice serves both kinds of client: one
+that has `hello` is told to call it and pass the `session_id` it returns; one that
+does not is told which tools it is missing, to restart, and which `session_id` to
+pass meanwhile. That briefing only shows handoff notes and unread messages: they
+stay waiting for the next session opened with `hello`. An implicit session ends
+with `bye` or after inactivity (`hello` leaves it alone, since it may still serve
+another chat of the same agent); when it has closed, passing its id opens a fresh
+one instead of failing. Every other tool still requires a `session_id`, and the
+access is exactly that of the token. The admin page marks these sessions
+"implicit". This is only a fallback: the real fix is to start a new chat or
+restart the MCP client so it loads the current tool list.
 
 The **Profile** dialog on the admin page is where the administrator edits all of
 this: the default form of address, the reply language, one form of address per

@@ -14,9 +14,9 @@ use serde::Deserialize;
 use crate::{
     auth::{Agent, SHARED_AGENT},
     db::{
-        BODY_MAX_CHARS, Db, Entry, FileInfo, KINDS, Message, NOTE_MAX_CHARS, NewEntry, NewFile,
-        NewMessage, NewSession, NewTask, Patch, Rule, Session, TASK_ACTIONS, TASK_TITLE_MAX_CHARS,
-        Task,
+        BODY_MAX_CHARS, Db, Entry, FileInfo, Implicit, KINDS, Message, NOTE_MAX_CHARS, NewEntry,
+        NewFile, NewMessage, NewSession, NewTask, Patch, Rule, Session, TASK_ACTIONS,
+        TASK_TITLE_MAX_CHARS, Task,
     },
     embed::Embedder,
     events::Events,
@@ -425,11 +425,14 @@ pub struct OpsArgs {
 }
 
 /// Where a legacy tool call says it comes from, for the implicit session it
-/// may open: the call's `project`, and from `log` also the directory and
-/// git state.
+/// may open: the call's `project`, and from `log` also the directory, the
+/// git state and the agent name the call gives itself.
 #[derive(Debug, Default)]
 struct CallPlace {
     project: Option<String>,
+    /// The agent the call says it is (`log`'s `agent`); only used with the
+    /// shared token, which does not name one.
+    declared: Option<String>,
     path: String,
     repo: String,
     commit: String,
@@ -443,6 +446,21 @@ impl CallPlace {
             ..Self::default()
         }
     }
+}
+
+/// A self-declared agent name usable for an implicit session: lowercase
+/// letters, digits, `-`, `_` and `.`, at most 64 characters, and not one of
+/// the names lore uses itself.
+fn declared_agent(name: &str) -> Option<String> {
+    let name = name.trim().to_lowercase();
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && name != SHARED_AGENT
+        && name != "admin";
+    valid.then_some(name)
 }
 
 /// A legacy tool's result with the implicit-session text in front of it,
@@ -494,10 +512,12 @@ impl Lore {
 
     /// The session a call to one of the seven legacy tools runs in, and the
     /// text to put before its result. With a `session_id` this is exactly
-    /// `require_session` and the text is empty. Without one, the agent's
-    /// open implicit session is reused or a new one is opened from `place`;
-    /// the text is then the notice about the outdated tool list, preceded
-    /// by the `hello` briefing when this call opened the session.
+    /// `require_session` and the text is empty, except that a closed
+    /// implicit session of the caller is replaced by a fresh one. Without
+    /// one, the agent's open implicit session is reused or a new one is
+    /// opened from `place`; the text is then the notice about the outdated
+    /// tool list, preceded by the `hello` briefing when this call opened
+    /// the session.
     fn legacy_session(
         &self,
         given: &str,
@@ -506,11 +526,40 @@ impl Lore {
         place: CallPlace,
     ) -> Result<(Session, String), String> {
         let given = given.trim();
+        let mut replaced = None;
         if !given.is_empty() {
-            return Ok((self.require_session(given, agent, shared)?, String::new()));
+            match self.require_session(given, agent, shared) {
+                Ok(session) => return Ok((session, String::new())),
+                Err(error) => {
+                    // An implicit session that has closed since (a `hello`,
+                    // `bye` or inactivity) must not lock out a client that
+                    // cannot call `hello`: it continues in a fresh one. Real
+                    // sessions and unknown ids keep the error.
+                    let replaceable = self
+                        .db
+                        .session(given)
+                        .map_err(internal)?
+                        .is_some_and(|row| row.implicit && (shared || row.agent == agent));
+                    if !replaceable {
+                        return Err(error);
+                    }
+                    replaced = Some(given.to_string());
+                }
+            }
         }
+        // A per-agent token names the agent; with the shared token the
+        // session goes by the name the call gives itself, if any.
+        let owner = if shared {
+            place
+                .declared
+                .as_deref()
+                .and_then(declared_agent)
+                .unwrap_or_else(|| SHARED_AGENT.to_string())
+        } else {
+            agent.to_string()
+        };
         let new = NewSession {
-            agent: agent.to_string(),
+            agent: owner,
             project: normalize_project_filter(place.project).unwrap_or_else(|| "unknown".into()),
             path: place.path.trim().to_string(),
             repo: optional_ref(&place.repo),
@@ -519,27 +568,51 @@ impl Lore {
             title: IMPLICIT_TITLE.to_string(),
             implicit: true,
         };
-        let (session, opened) = self
+        let (session, opened) = match self
             .db
             .implicit_session(&new, self.idle_hours)
-            .map_err(internal)?;
-        let session = self.require_session(&session.id, agent, shared)?;
-        let mut preface = String::new();
-        if opened {
-            // Stale sessions never show as open in the briefing.
-            self.db
-                .close_idle_sessions(self.idle_hours)
-                .map_err(internal)?;
-            preface.push_str(&format!(
-                "You called lore without a session, so lore opened one for you: {}.\n\n",
-                session.id
-            ));
-            preface.push_str(&self.open_briefing(&session, agent)?);
+            .map_err(internal)?
+        {
+            Implicit::Reused(session) => (session, false),
+            Implicit::Opened(session) => (session, true),
+        };
+        let id = session.id.clone();
+        let answer = (|| {
+            let session = self.require_session(&id, agent, shared)?;
+            let mut preface = String::new();
+            if let Some(old) = &replaced {
+                preface.push_str(&format!(
+                    "Session {old} has closed, so lore continues in {}.\n\n",
+                    session.id
+                ));
+            }
+            if opened {
+                // Stale sessions never show as open in the briefing.
+                self.db
+                    .close_idle_sessions(self.idle_hours)
+                    .map_err(internal)?;
+                preface.push_str(&format!(
+                    "You called lore without a session, so lore opened one for you: {}.\n\n",
+                    session.id
+                ));
+                preface.push_str(&self.open_briefing(&session, agent, false)?);
+                preface.push_str("\n\n");
+            }
+            preface.push_str(&self.outdated_notice(&session.id));
             preface.push_str("\n\n");
+            Ok((session, preface))
+        })();
+        // A session whose briefing could not be built is closed, so the
+        // next call opens a fresh one and gets the briefing after all.
+        if opened
+            && answer.is_err()
+            && let Err(error) = self
+                .db
+                .close_session(&id, "closed: the briefing could not be built")
+        {
+            tracing::warn!(%error, "closing an implicit session failed");
         }
-        preface.push_str(&self.outdated_notice(&session.id));
-        preface.push_str("\n\n");
-        Ok((session, preface))
+        answer
     }
 
     /// The paragraph that tells a client with an outdated tool list what it
@@ -554,9 +627,11 @@ impl Lore {
             .filter(|name| !LEGACY_TOOLS.contains(&name.as_str()))
             .collect();
         format!(
-            "Your client is using an outdated lore tool list. lore now also has: {}. Start a \
-             new chat or restart the MCP client to load them, then begin with `hello`. Until \
-             then pass \"session_id\": \"{session_id}\" on every lore call.",
+            "This call came without a `session_id`, so lore used the implicit session \
+             {session_id}. If your tool list has `hello`, call it once for this chat and pass \
+             the `session_id` it returns. If it does not, your client holds an outdated lore \
+             tool list; lore now also has: {}. Start a new chat or restart the MCP client to \
+             load them. Until then pass \"session_id\": \"{session_id}\" on every lore call.",
             names.join(", ")
         )
     }
@@ -686,6 +761,7 @@ impl Lore {
         let actor = agent_of(&parts);
         let shared = actor == SHARED_AGENT;
         let session_id = args.session_id.trim().to_string();
+        let declared = args.agent.clone();
         let agent = match parts.extensions.get::<Agent>() {
             Some(Agent(name)) if name != SHARED_AGENT => name.clone(),
             _ => args.agent.unwrap_or_default().trim().to_lowercase(),
@@ -698,6 +774,7 @@ impl Lore {
                 shared,
                 CallPlace {
                     project: Some(args.project.clone()),
+                    declared,
                     path: args.path.clone(),
                     repo: args.repo.clone(),
                     commit: args.commit.clone(),
@@ -1028,17 +1105,11 @@ impl Lore {
             this.db
                 .close_idle_sessions(this.idle_hours)
                 .map_err(internal)?;
+            // Implicit sessions are left alone: one may still serve another
+            // chat of this agent whose client cannot call `hello`. They end
+            // with `bye` or after inactivity.
             let session = this.db.open_session(&new).map_err(internal)?;
-            // The implicit session this agent used before it learned about
-            // `hello` is done: the admin page shows only the real one.
-            this.db
-                .close_implicit_sessions(
-                    &actor,
-                    &session.id,
-                    &format!("superseded by {}", session.id),
-                )
-                .map_err(internal)?;
-            this.open_briefing(&session, &actor)
+            this.open_briefing(&session, &actor, true)
         })
         .await
     }
@@ -2128,10 +2199,17 @@ impl Lore {
 
     /// The briefing for a session that was just opened: the profile, the
     /// rules, the board, the other open sessions and where the project was
-    /// left off. Marks the listed messages read and delivers the handoff
-    /// notes, so it is built once per session. `actor` is the agent the
-    /// token names.
-    fn open_briefing(&self, session: &Session, actor: &str) -> Result<String, String> {
+    /// left off. With `deliver` (a session from `hello`) it marks the
+    /// listed messages read and delivers the handoff notes, so it is built
+    /// once per session; an implicit session only shows them, and they
+    /// stay waiting for the next `hello`. `actor` is the agent the token
+    /// names.
+    fn open_briefing(
+        &self,
+        session: &Session,
+        actor: &str,
+        deliver: bool,
+    ) -> Result<String, String> {
         let address = self.db.address_for(&session.agent).map_err(internal)?;
         let language = self.db.profile().map_err(internal)?.language;
         let rules = self
@@ -2188,20 +2266,26 @@ impl Lore {
             .db
             .unread_messages(feed_agent, None, 10)
             .map_err(internal)?;
-        let ids: Vec<i64> = unread.iter().map(|message| message.id).collect();
-        let marked = self.db.mark_read(feed_agent, &ids).map_err(internal)?;
-        unread.retain(|message| marked.contains(&message.id));
-        let unread_more = self.db.unread_message_count(feed_agent).map_err(internal)?;
         let mut handoffs = self
             .db
             .pending_handoffs(&session.project, &session.id)
             .map_err(internal)?;
-        let ids: Vec<i64> = handoffs.iter().map(|message| message.id).collect();
-        let delivered = self
-            .db
-            .deliver_handoffs(&ids, feed_agent, &session.id)
-            .map_err(internal)?;
-        handoffs.retain(|message| delivered.contains(&message.id));
+        let unread_more = if deliver {
+            let ids: Vec<i64> = unread.iter().map(|message| message.id).collect();
+            let marked = self.db.mark_read(feed_agent, &ids).map_err(internal)?;
+            unread.retain(|message| marked.contains(&message.id));
+            self.db.unread_message_count(feed_agent).map_err(internal)?
+        } else {
+            self.db.unread_message_count(feed_agent).map_err(internal)? - unread.len() as i64
+        };
+        if deliver {
+            let ids: Vec<i64> = handoffs.iter().map(|message| message.id).collect();
+            let delivered = self
+                .db
+                .deliver_handoffs(&ids, feed_agent, &session.id)
+                .map_err(internal)?;
+            handoffs.retain(|message| delivered.contains(&message.id));
+        }
         self.note(
             feed_agent,
             "hello",
@@ -2225,6 +2309,7 @@ impl Lore {
                 file_count: file_count.max(0) as usize,
                 latest_files: &latest_files,
                 services: &services,
+                held: !deliver,
             },
             &other_rows,
             &entries,
@@ -2524,6 +2609,9 @@ struct BriefingBoard<'a> {
     latest_files: &'a [FileInfo],
     /// The services this agent can operate, as `integrations` names them.
     services: &'a str,
+    /// True for an implicit session: the handoff notes and messages are
+    /// shown but left waiting for the next session opened with `hello`.
+    held: bool,
 }
 
 /// The text `hello` returns: the session, the profile, the rules, the board,
@@ -2570,6 +2658,11 @@ fn briefing(
             "Notes left for whoever works on {} next:",
             session.project
         )];
+        if board.held {
+            lines.push(
+                "(Shown only: they are delivered when a session is opened with `hello`.)".into(),
+            );
+        }
         for note in board.handoffs {
             lines.push(format!(
                 "- from {} · {}: {}",
@@ -2580,6 +2673,11 @@ fn briefing(
     }
     if !board.unread.is_empty() {
         let mut lines = vec!["Unread messages:".to_string()];
+        if board.held {
+            lines.push(
+                "(Left unread: they are marked read when a session is opened with `hello`.)".into(),
+            );
+        }
         for message in board.unread {
             let addressed = if message.to_agent.is_empty() {
                 "to everyone"
@@ -2864,7 +2962,8 @@ mod tests {
     }
 
     const OPENED: &str = "You called lore without a session, so lore opened one for you: ";
-    const OUTDATED: &str = "Your client is using an outdated lore tool list.";
+    const OUTDATED: &str =
+        "This call came without a `session_id`, so lore used the implicit session";
 
     /// The session id an implicit answer names in its notice.
     fn notice_id(text: &str) -> String {
@@ -2985,7 +3084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agents_get_their_own_implicit_session_and_hello_closes_it() {
+    async fn agents_get_their_own_implicit_session_and_hello_leaves_it() {
         let lore = test_lore("agents");
         let claude = notice_id(
             &lore
@@ -3024,11 +3123,11 @@ mod tests {
             .await
             .unwrap();
         let real = hello.split_whitespace().nth(1).unwrap().to_string();
-        let closed = lore.db.session(&claude).unwrap().unwrap();
-        assert_eq!(closed.status, "closed");
-        assert_eq!(closed.summary, format!("superseded by {real}"));
-        assert_eq!(lore.db.session(&codex).unwrap().unwrap().status, "open");
-        assert_eq!(lore.db.session(&shared).unwrap().unwrap().status, "open");
+        // `hello` closes no implicit session: one may still serve another
+        // chat of this agent whose client cannot call `hello`.
+        for id in [&claude, &codex, &shared] {
+            assert_eq!(lore.db.session(id).unwrap().unwrap().status, "open");
+        }
 
         // With a real session id the tools answer exactly as before.
         let plain = lore
@@ -3036,13 +3135,197 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plain, "No entries yet.");
-        // The next call without one opens a fresh implicit session.
-        let again = lore
+        // Without one, the call still runs in the implicit session, and
+        // the notice tells a current client to call `hello`.
+        let forgot = lore
             .recent(args(json!({})), as_agent(Some("claude")))
             .await
             .unwrap();
-        assert!(again.starts_with(OPENED));
-        assert_ne!(notice_id(&again), claude);
+        assert!(
+            forgot.starts_with(OUTDATED) && !forgot.contains(OPENED),
+            "{forgot}"
+        );
+        assert!(forgot.contains("If your tool list has `hello`, call it once for this chat"));
+        assert_eq!(notice_id(&forgot), claude);
+
+        // A `hello` through the shared token leaves it open as well.
+        lore.hello(
+            args(json!({
+                "project": "shop", "path": "/work", "repo": "none",
+                "commit": "none", "title": "shared chat", "agent": "gemini"
+            })),
+            as_agent(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lore.db.session(&shared).unwrap().unwrap().status, "open");
+    }
+
+    #[tokio::test]
+    async fn a_closed_implicit_session_is_replaced_not_refused() {
+        let lore = test_lore("replace");
+        let first = lore
+            .recent(args(json!({})), as_agent(Some("claude")))
+            .await
+            .unwrap();
+        let old = notice_id(&first);
+        lore.db.close_session(&old, "done").unwrap();
+        let answer = lore
+            .recent(args(json!({"session_id": old})), as_agent(Some("claude")))
+            .await
+            .unwrap();
+        let fresh = notice_id(&answer);
+        assert_ne!(fresh, old);
+        assert!(
+            answer.starts_with(&format!(
+                "Session {old} has closed, so lore continues in {fresh}."
+            )),
+            "{answer}"
+        );
+        assert!(answer.contains(OPENED) && answer.contains(OUTDATED));
+        assert!(lore.db.session(&fresh).unwrap().unwrap().implicit);
+
+        // Another agent cannot take it over, and a closed real session or
+        // an unknown id still fails.
+        lore.db.close_session(&fresh, "done").unwrap();
+        let error = lore
+            .recent(args(json!({"session_id": fresh})), as_agent(Some("codex")))
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("no open session"), "{error}");
+        let real = lore
+            .db
+            .open_session(&NewSession {
+                agent: "codex".into(),
+                project: "shop".into(),
+                title: "real".into(),
+                ..NewSession::default()
+            })
+            .unwrap();
+        lore.db.close_session(&real.id, "done").unwrap();
+        let error = lore
+            .recent(
+                args(json!({"session_id": real.id})),
+                as_agent(Some("codex")),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("it is closed") && !error.contains(OUTDATED),
+            "{error}"
+        );
+
+        // The shared token may replace any closed implicit session.
+        let answer = lore
+            .recent(args(json!({"session_id": fresh})), as_agent(None))
+            .await
+            .unwrap();
+        assert!(
+            answer.starts_with(&format!("Session {fresh} has closed")),
+            "{answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_shared_token_names_the_implicit_session_after_the_caller() {
+        let lore = test_lore("declared");
+        let log = |agent: &str| {
+            args::<LogArgs>(json!({
+                "project": "shop", "kind": "note", "title": "t", "body": "b",
+                "path": "/work/shop", "repo": "none", "commit": "none", "agent": agent
+            }))
+        };
+        let codex = lore.log(log(" Codex "), as_agent(None)).await.unwrap();
+        assert!(codex.contains("opened for codex on shop"), "{codex}");
+        let codex_id = notice_id(&codex);
+        assert_eq!(lore.db.session(&codex_id).unwrap().unwrap().agent, "codex");
+        // The same name reuses it; a different one gets its own.
+        let again = lore.log(log("codex"), as_agent(None)).await.unwrap();
+        assert_eq!(notice_id(&again), codex_id);
+        assert!(!again.contains(OPENED));
+        let gemini = notice_id(&lore.log(log("gemini"), as_agent(None)).await.unwrap());
+        assert_ne!(gemini, codex_id);
+        // A name lore cannot use, or none, falls back to `shared`.
+        for bad in ["bad name!", "admin", "shared", ""] {
+            let answer = lore.log(log(bad), as_agent(None)).await.unwrap();
+            let id = notice_id(&answer);
+            assert_eq!(lore.db.session(&id).unwrap().unwrap().agent, SHARED_AGENT);
+        }
+        // A per-agent token ignores the name the call gives.
+        let claude = notice_id(
+            &lore
+                .log(log("codex"), as_agent(Some("claude")))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(lore.db.session(&claude).unwrap().unwrap().agent, "claude");
+    }
+
+    #[tokio::test]
+    async fn an_implicit_briefing_leaves_handoffs_and_messages_waiting() {
+        let lore = test_lore("held");
+        let note = |kind: &str, to: &str, body: &str| NewMessage {
+            kind: kind.into(),
+            project: "shop".into(),
+            from_agent: "codex".into(),
+            to_agent: to.into(),
+            body: body.into(),
+            session_id: None,
+        };
+        lore.db
+            .add_message(&note("handoff", "", "finish the checkout"))
+            .unwrap();
+        lore.db
+            .add_message(&note("message", "claude", "look at #3"))
+            .unwrap();
+        let answer = lore
+            .recent(args(json!({"project": "shop"})), as_agent(Some("claude")))
+            .await
+            .unwrap();
+        assert!(answer.contains("finish the checkout") && answer.contains("look at #3"));
+        assert!(answer.contains("(Shown only: they are delivered when a session is opened"));
+        assert!(answer.contains("(Left unread: they are marked read when a session is opened"));
+        assert_eq!(lore.db.pending_handoffs("shop", "s_none").unwrap().len(), 1);
+        assert_eq!(lore.db.unread_message_count("claude").unwrap(), 1);
+
+        // The next `hello` gets them, and delivers them.
+        let hello = lore
+            .hello(
+                args(json!({
+                    "project": "shop", "path": "/work", "repo": "none",
+                    "commit": "none", "title": "real chat"
+                })),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap();
+        assert!(hello.contains("finish the checkout") && hello.contains("look at #3"));
+        assert!(!hello.contains("Shown only") && !hello.contains("Left unread"));
+        assert!(
+            lore.db
+                .pending_handoffs("shop", "s_none")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(lore.db.unread_message_count("claude").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_implicit_session_without_its_briefing_is_closed() {
+        let lore = test_lore("broken");
+        // Break the briefing: the agent addresses live in this table.
+        lore.db.execute_for_test("DROP TABLE agent_profiles;");
+        let error = lore
+            .recent(args(json!({})), as_agent(Some("claude")))
+            .await
+            .unwrap_err();
+        assert!(!error.contains(OUTDATED), "{error}");
+        let sessions = lore.db.sessions(None, None, 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            (sessions[0].status.as_str(), sessions[0].summary.as_str()),
+            ("closed", "closed: the briefing could not be built")
+        );
     }
 
     #[tokio::test]

@@ -503,6 +503,15 @@ pub struct NewSession {
     pub implicit: bool,
 }
 
+/// What `Db::implicit_session` found or did.
+#[derive(Debug)]
+pub enum Implicit {
+    /// The agent's open implicit session, reused.
+    Reused(Session),
+    /// A new implicit session, opened by this call.
+    Opened(Session),
+}
+
 /// One `checkin` on a session.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionUpdate {
@@ -1087,6 +1096,12 @@ impl Db {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Runs raw SQL, for tests that need to break the database on purpose.
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(&self, sql: &str) {
+        self.lock().execute_batch(sql).unwrap();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -1963,12 +1978,11 @@ impl Db {
     }
 
     /// The agent's open implicit session, or a new one opened from `new`
-    /// when it has none. The second value is true when the session was
-    /// opened by this call. Lookup and insert happen under one lock, so two
+    /// when it has none. Lookup and insert happen under one lock, so two
     /// calls at the same moment cannot open two sessions for one agent. An
     /// implicit session idle for longer than `idle_hours` is closed first
     /// and never reused.
-    pub fn implicit_session(&self, new: &NewSession, idle_hours: u32) -> Result<(Session, bool)> {
+    pub fn implicit_session(&self, new: &NewSession, idle_hours: u32) -> Result<Implicit> {
         let conn = self.lock();
         conn.execute(
             "UPDATE sessions SET status = 'closed', summary = 'closed after inactivity',
@@ -1990,25 +2004,13 @@ impl Db {
             .optional()?;
         if let Some(id) = existing {
             let session = get_session(&conn, &id)?.context("session vanished after lookup")?;
-            return Ok((session, false));
+            return Ok(Implicit::Reused(session));
         }
         let new = NewSession {
             implicit: true,
             ..new.clone()
         };
-        Ok((insert_session(&conn, &new)?, true))
-    }
-
-    /// Closes the agent's open implicit sessions, except `keep`, with
-    /// `summary`, and returns how many were closed.
-    pub fn close_implicit_sessions(&self, agent: &str, keep: &str, summary: &str) -> Result<usize> {
-        Ok(self.lock().execute(
-            "UPDATE sessions SET status = 'closed', summary = ?3,
-                 ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                 last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-             WHERE status = 'open' AND implicit = 1 AND agent = ?1 AND id <> ?2",
-            params![agent, keep, summary],
-        )?)
+        Ok(Implicit::Opened(insert_session(&conn, &new)?))
     }
 
     /// One session by its id.
@@ -4606,44 +4608,45 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn an_implicit_session_is_reused_per_agent_and_closed_when_idle() {
-        let db = temp_db();
-        let new = |agent: &str| NewSession {
+    /// The implicit session `implicit_session` hands out, and whether it
+    /// opened it.
+    fn implicit(db: &Db, agent: &str) -> (Session, bool) {
+        let new = NewSession {
             implicit: true,
             ..session(agent, "unknown", "Implicit")
         };
-        let (first, opened) = db.implicit_session(&new("claude"), 12).unwrap();
+        match db.implicit_session(&new, 12).unwrap() {
+            Implicit::Opened(session) => (session, true),
+            Implicit::Reused(session) => (session, false),
+        }
+    }
+
+    #[test]
+    fn an_implicit_session_is_reused_per_agent_and_closed_when_idle() {
+        let db = temp_db();
+        let (first, opened) = implicit(&db, "claude");
         assert!(opened && first.implicit);
-        let (again, opened) = db.implicit_session(&new("claude"), 12).unwrap();
+        let (again, opened) = implicit(&db, "claude");
         assert!(!opened);
         assert_eq!(again.id, first.id);
         // Another agent gets its own; a real session is never reused.
-        let (other, opened) = db.implicit_session(&new("codex"), 12).unwrap();
+        let (other, opened) = implicit(&db, "codex");
         assert!(opened && other.id != first.id);
         let real = db.open_session(&session("gemini", "shop", "Real")).unwrap();
         assert!(!real.implicit);
-        let (gemini, opened) = db.implicit_session(&new("gemini"), 12).unwrap();
+        let (gemini, opened) = implicit(&db, "gemini");
         assert!(opened && gemini.id != real.id);
         // An idle one is closed, not reused.
         backdate(&db, 13);
-        let (fresh, opened) = db.implicit_session(&new("claude"), 12).unwrap();
+        let (fresh, opened) = implicit(&db, "claude");
         assert!(opened && fresh.id != first.id);
         let stale = db.session(&first.id).unwrap().unwrap();
         assert_eq!(stale.status, "closed");
-        // Closing an agent's implicit sessions spares the one to keep and
-        // other agents' sessions.
-        assert_eq!(
-            db.close_implicit_sessions("claude", "s_none", "superseded by s_x")
-                .unwrap(),
-            1
-        );
-        let closed = db.session(&fresh.id).unwrap().unwrap();
-        assert_eq!(
-            (closed.status.as_str(), closed.summary.as_str()),
-            ("closed", "superseded by s_x")
-        );
-        assert_eq!(db.session(&real.id).unwrap().unwrap().status, "open");
+        // A real session of the same agent leaves the implicit one alone,
+        // and it keeps being reused.
+        let hello = db.open_session(&session("claude", "shop", "Real")).unwrap();
+        let (same, opened) = implicit(&db, "claude");
+        assert!(!opened && same.id == fresh.id && same.id != hello.id);
     }
 
     #[test]
@@ -4652,13 +4655,7 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let db = db.clone();
-                std::thread::spawn(move || {
-                    let new = NewSession {
-                        implicit: true,
-                        ..session("claude", "unknown", "Implicit")
-                    };
-                    db.implicit_session(&new, 12).unwrap()
-                })
+                std::thread::spawn(move || implicit(&db, "claude"))
             })
             .collect();
         let results: Vec<(Session, bool)> =
@@ -4671,15 +4668,7 @@ mod tests {
     #[test]
     fn the_implicit_flag_survives_backups_and_old_backups_restore() {
         let db = temp_db();
-        let (implicit, _) = db
-            .implicit_session(
-                &NewSession {
-                    implicit: true,
-                    ..session("claude", "unknown", "Implicit")
-                },
-                12,
-            )
-            .unwrap();
+        let (implicit, _) = implicit(&db, "claude");
         let real = db.open_session(&session("codex", "shop", "Real")).unwrap();
         let backup = db.export().unwrap();
         assert_eq!(backup.version, BACKUP_VERSION);
