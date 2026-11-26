@@ -298,6 +298,18 @@ provider) and its own rows in the operations log. Neither ever sends the other's
 credential. A database without a `github_org` credential simply shows it as not
 configured; the stored `github` credential and its levels are unchanged.
 
+Which owners each account covers is not configured anywhere: lore learns it with the
+stored credential (`GET /user` and `GET /user/orgs`, one `account owners` row in the
+operations log per lookup) and keeps it in memory only, for ten minutes, forgotten as
+soon as that credential is saved again or removed. `integrations` shows it under each
+GitHub account the agent may use (`owners: someuser (user), acme (organization)`), the
+briefing names it next to each account once known (`hello` never waits for GitHub: the
+first lookup runs in the background), and a 404 for `/repos/{owner}/{repo}` whose owner
+the account does not cover ends with a hint naming the owners it covers and, when the
+other account (that the agent may read) covers that owner, the tool or `account` to use
+instead. The hint is advice: lore never switches accounts or retries by itself, and an
+agent with no access to an account never sees its owners.
+
 **How a credential is stored.** The administrator enters it once, on the **Integrations**
 panel of the admin view; the server encrypts it immediately (XChaCha20-Poly1305, a fresh
 nonce per write, the provider id and the server URL bound in) and keeps only the

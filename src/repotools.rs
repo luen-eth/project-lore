@@ -556,6 +556,10 @@ fn encode_path(path: &str) -> String {
 struct Failure {
     message: String,
     not_found: bool,
+    /// The upstream HTTP status when GitHub refused the call, 0 otherwise.
+    status: u16,
+    /// GitHub's own short reason (its `message`), for the log row.
+    reason: String,
 }
 
 impl Failure {
@@ -563,7 +567,18 @@ impl Failure {
         Self {
             message: message.into(),
             not_found: false,
+            status: 0,
+            reason: String::new(),
         }
+    }
+
+    /// GitHub's `message`, one line and short, already redacted.
+    fn reason_of(answer: &Value) -> String {
+        answer
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|message| super::clip(&super::log_text(message, 200), 200))
+            .unwrap_or_default()
     }
 
     /// GitHub's refusal in plain words, with its own message (already
@@ -600,6 +615,8 @@ impl Failure {
         Self {
             message,
             not_found: status == 404,
+            status,
+            reason: Self::reason_of(answer),
         }
     }
 }
@@ -634,6 +651,11 @@ struct Upstream<'a> {
     name: String,
     /// The status of the last answer, for the log row.
     status: u16,
+    /// The start of the last refused answer (redacted, one line), for the
+    /// log row when GitHub gave no `message`.
+    excerpt: String,
+    /// Which step of `repo_commit` is running, for the log row.
+    step: &'static str,
 }
 
 impl Upstream<'_> {
@@ -681,6 +703,11 @@ impl Upstream<'_> {
             )),
         })?;
         self.status = response.status;
+        self.excerpt = if (200..300).contains(&response.status) {
+            String::new()
+        } else {
+            super::clip(&super::log_text(&response.body, 200), 200)
+        };
         let value = if response.truncated {
             Value::Null
         } else {
@@ -749,6 +776,8 @@ impl Upstream<'_> {
                         self.provider.label
                     ),
                     not_found: status == 404,
+                    status,
+                    reason: Failure::reason_of(&value),
                 });
             }
             _ => return Err(Failure::http(status, &value, &what, &self.provider)),
@@ -971,6 +1000,8 @@ impl Lore {
             owner,
             name,
             status: 0,
+            excerpt: String::new(),
+            step: "",
         };
         let started = Instant::now();
         let outcome = match plan {
@@ -1031,27 +1062,61 @@ impl Lore {
             },
         };
         let outcome = match outcome {
-            Err(mut failure)
-                if failure.not_found
-                    && !named
+            Err(mut failure) if failure.not_found => {
+                let mut hint = None;
+                if !named
                     && provider.id == ops::GITHUB.id
                     && scope
                         .as_ref()
-                        .is_none_or(|scope| scope.check_read(ops::GITHUB_ORG.id).is_ok()) =>
-            {
-                if let Some(hint) = self
-                    .organization_hint(&mut upstream, &agent, &actor, &label, &session_id)
-                    .await
+                        .is_none_or(|scope| scope.check_read(ops::GITHUB_ORG.id).is_ok())
                 {
+                    hint = self
+                        .organization_hint(&mut upstream, &agent, &actor, &label, &session_id)
+                        .await;
+                }
+                // Otherwise, which owners the account covers, when the
+                // repository's owner is not one of them.
+                if hint.is_none() {
+                    let caller = super::accounts::Caller {
+                        token_agent: &agent,
+                        actor: &actor,
+                        label: &label,
+                        session_id: Some(&session_id),
+                    };
+                    hint = self
+                        .owner_hint(
+                            provider,
+                            &upstream.owner,
+                            &caller,
+                            super::accounts::Style::Repo,
+                        )
+                        .await
+                        .map(|hint| format!(" {hint}"));
+                }
+                if let Some(hint) = hint {
                     failure.message.push_str(&hint);
                 }
                 Err(failure)
             }
             other => other,
         };
-        let status = upstream.status as i64;
+        let mut status = upstream.status as i64;
         let (went, detail) = match &outcome {
             Ok(_) => ("ok", String::new()),
+            // Refused upstream: the status and GitHub's short reason (and
+            // the step of `repo_commit`), so the log tells a 403 from a 422.
+            Err(failure) if failure.status != 0 => {
+                status = failure.status as i64;
+                let mut reason = [&failure.reason, &upstream.excerpt]
+                    .into_iter()
+                    .find(|reason| !reason.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "no reason given".into());
+                if !upstream.step.is_empty() {
+                    reason.push_str(&format!(" (step: {})", upstream.step));
+                }
+                ("error", reason)
+            }
             Err(failure) => ("error", failure.message.clone()),
         };
         let this = self.clone();
@@ -1626,6 +1691,7 @@ async fn repo_search(
 /// the branch moved to it without force (or created at it).
 async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<String, Failure> {
     let branch_ref = format!("/git/ref/heads/{}", encode_path(&plan.branch));
+    upstream.step = "ref";
     let (status, value, _) = upstream
         .send("GET", upstream.repo_path(&branch_ref), &[], None)
         .await?;
@@ -1656,6 +1722,8 @@ async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<S
                         plan.branch, upstream.owner, upstream.name
                     ),
                     not_found: true,
+                    status,
+                    reason: Failure::reason_of(&value),
                 });
             }
         },
@@ -1693,6 +1761,7 @@ async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<S
         .to_string();
     // The current entries keep a file's mode (executable, symlink) and
     // catch a path that is a directory or a deletion of nothing.
+    upstream.step = "tree";
     let (entries, whole) = upstream.tree(&base_tree, true).await?;
     let known: HashMap<&str, &TreeEntry> = entries
         .iter()
@@ -1724,6 +1793,7 @@ async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<S
                 changed.push(format!("deleted  {path}"));
             }
             Some(bytes) => {
+                upstream.step = "blob";
                 let blob = upstream
                     .json(
                         "POST",
@@ -1752,6 +1822,7 @@ async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<S
             }
         }
     }
+    upstream.step = "tree";
     let new_tree = upstream
         .json(
             "POST",
@@ -1766,6 +1837,7 @@ async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<S
         .and_then(Value::as_str)
         .ok_or_else(|| Failure::plain("GitHub's answer for the tree named no sha"))?
         .to_string();
+    upstream.step = "commit";
     let new_commit = upstream
         .json(
             "POST",
@@ -1780,6 +1852,7 @@ async fn repo_commit(upstream: &mut Upstream<'_>, plan: &CommitPlan) -> Result<S
         .and_then(Value::as_str)
         .ok_or_else(|| Failure::plain("GitHub's answer for the commit named no sha"))?
         .to_string();
+    upstream.step = "update";
     let (status, value, _) = match &created {
         Some(_) => {
             upstream

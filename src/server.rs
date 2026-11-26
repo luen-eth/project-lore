@@ -25,6 +25,8 @@ use crate::{
     vault::VaultKey,
 };
 
+#[path = "accounts.rs"]
+mod accounts;
 #[path = "repotools.rs"]
 mod repotools;
 
@@ -2209,6 +2211,16 @@ impl Lore {
                 };
                 out.push_str(&line);
                 out.push('\n');
+                let label = ops::acting_as(&agent, actor);
+                let caller = accounts::Caller {
+                    token_agent: &agent,
+                    actor,
+                    label: &label,
+                    session_id: Some(&session.id),
+                };
+                if let Some(owners) = this.owners_line(*provider, row.configured, level, &caller) {
+                    out.push_str(&owners);
+                }
                 // The git providers the agent may use also say how to
                 // clone through lore: the URL pattern, with the request's
                 // public origin or the placeholder in it, and which token
@@ -2296,7 +2308,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Call the GitHub REST API through lore with the user's personal GitHub account: repositories, pull requests, issues and anything else the personal account's token allows. For repositories that belong to the GitHub organization, use `github_org` instead. Examples: `GET /user/repos?per_page=10` lists your repositories; `POST /repos/{owner}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The GitHub credential is added by lore on the server side: never ask the user for it, and never send one yourself. Writes to a public repository (and to a public gist) are scanned first: lore refuses any that would publish a key, token, password or private file it can recognise, and refuses creating a public repository or making one public unless the administrator allows it."
+        description = "Call the GitHub REST API through lore with the user's personal GitHub account: repositories, pull requests, issues and anything else the personal account's token allows. For repositories that belong to the GitHub organization, use `github_org` instead. `integrations` lists the owners (user and organizations) each account covers; an organization's repositories live under the organization's name (`/repos/{org}/{repo}`), not the user's. Examples: `GET /user/repos?per_page=10` lists your repositories; `POST /repos/{owner}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The GitHub credential is added by lore on the server side: never ask the user for it, and never send one yourself. Writes to a public repository (and to a public gist) are scanned first: lore refuses any that would publish a key, token, password or private file it can recognise, and refuses creating a public repository or making one public unless the administrator allows it."
     )]
     async fn github(
         &self,
@@ -2307,7 +2319,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Call the GitHub REST API through lore with the GitHub organization account's token (kept apart from the personal account). Prefer it for repositories, pull requests, issues, teams and settings that belong to the organization; use `github` for the user's personal repositories. Same arguments as `github`. Examples: `GET /orgs/{org}/repos?per_page=10` lists the organization's repositories; `POST /repos/{org}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The credential is added by lore on the server side: never ask the user for it, and never send one yourself. Writes to a public repository (and to a public gist) are scanned first: lore refuses any that would publish a key, token, password or private file it can recognise, and refuses creating a public repository or making one public unless the administrator allows it."
+        description = "Call the GitHub REST API through lore with the GitHub organization account's token (kept apart from the personal account). Prefer it for repositories, pull requests, issues, teams and settings that belong to the organization; use `github` for the user's personal repositories. Same arguments as `github`. `integrations` lists the owners this account covers: the organization's repositories live under the organization's name (`/repos/{org}/{repo}`), not the user's login. Examples: `GET /orgs/{org}/repos?per_page=10` lists the organization's repositories; `POST /repos/{org}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The credential is added by lore on the server side: never ask the user for it, and never send one yourself. Writes to a public repository (and to a public gist) are scanned first: lore refuses any that would publish a key, token, password or private file it can recognise, and refuses creating a public repository or making one public unless the administrator allows it."
     )]
     async fn github_org(
         &self,
@@ -2928,7 +2940,7 @@ impl Lore {
             Ok(response) => (
                 response.status as i64,
                 "ok",
-                String::new(),
+                accounts::upstream_reason(&response),
                 Ok(render_ops_response(&response)),
             ),
             Err(error) => {
@@ -2941,6 +2953,15 @@ impl Lore {
                 (0, "error", error.message().to_string(), Err(message))
             }
         };
+        let caller = accounts::Caller {
+            token_agent: &agent,
+            actor: &actor,
+            label: &label,
+            session_id: Some(&session.id),
+        };
+        let answer = self
+            .with_owner_hint(provider, &path, status, answer, caller)
+            .await;
         let this = self.clone();
         let session_id = session.id.clone();
         let log = blocking(move || {
@@ -3038,7 +3059,9 @@ impl Lore {
             tracing::warn!(%error, "writing the ops log failed");
         }
         // The mailbox has no HTTP status: its calls say how they went.
-        let went = if outcome == "ok" && status != 0 {
+        let went = if status >= 400 && !detail.is_empty() {
+            format!("{status} {}", clip(detail, 200))
+        } else if outcome == "ok" && status != 0 {
             status.to_string()
         } else {
             outcome.to_string()
@@ -3122,6 +3145,9 @@ impl Lore {
             }
             _ => String::new(),
         };
+        if deliver {
+            self.prefetch_briefing_owners(actor, feed_agent);
+        }
         // Up to ten unread messages are listed and marked read, and
         // handoff notes for whoever works on this project next arrive
         // here, exactly once. Only what this call marked or delivered
@@ -3205,7 +3231,8 @@ impl Lore {
             if level == "off" {
                 continue;
             }
-            usable.push(format!("{} ({})", provider.id, level));
+            let owners = self.briefing_owners(*provider);
+            usable.push(format!("{} ({}{owners})", provider.id, level));
         }
         // The mailbox only when it is stored and this agent was granted it.
         if self.db.mail_vault().map_err(internal)?.is_some()
