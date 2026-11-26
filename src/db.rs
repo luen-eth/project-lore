@@ -1014,6 +1014,16 @@ impl std::fmt::Debug for StoredMail {
     }
 }
 
+/// The leak scan switches (see `Db::leak_scan_settings`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeakScanSettings {
+    /// Scan writes to public GitHub repositories (default on).
+    pub scan: bool,
+    /// Agents may create public repositories or make one public (default
+    /// off).
+    pub allow_public: bool,
+}
+
 /// One agent's permission on one provider: off, read or full.
 #[derive(Debug, serde::Serialize)]
 pub struct OpsPermission {
@@ -1350,12 +1360,19 @@ impl Db {
 
     /// A fresh path for a temporary database file next to the database.
     pub fn temp_path(&self, label: &str) -> Result<PathBuf> {
+        self.temp_path_with(label, "sqlite")
+    }
+
+    /// A fresh path for a temporary file with this extension next to the
+    /// database; whatever an interrupted run leaves there is removed at
+    /// the next start.
+    pub fn temp_path_with(&self, label: &str, extension: &str) -> Result<PathBuf> {
         let mut bytes = [0u8; 8];
         getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("no randomness: {error}"))?;
         let random: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         Ok(self
             .data_dir()
-            .join(format!("{TEMP_PREFIX}{label}-{random}.sqlite")))
+            .join(format!("{TEMP_PREFIX}{label}-{random}.{extension}")))
     }
 
     /// Removes what an interrupted full backup or restore left behind.
@@ -3688,6 +3705,38 @@ impl Db {
     pub fn set_ops_enabled(&self, enabled: bool) -> Result<()> {
         let conn = self.lock();
         set_meta(&conn, "ops.enabled", if enabled { "1" } else { "0" })
+    }
+
+    /// The two leak scan switches: `meta` keys `leakscan.enabled` (missing
+    /// means on; only "0" turns it off, so a damaged value keeps the scan)
+    /// and `leakscan.allow_public` (only "1" allows; missing or damaged
+    /// refuses public repositories).
+    pub fn leak_scan_settings(&self) -> Result<LeakScanSettings> {
+        let conn = self.lock();
+        Ok(LeakScanSettings {
+            scan: meta_value(&conn, "leakscan.enabled")? != "0",
+            allow_public: meta_value(&conn, "leakscan.allow_public")? == "1",
+        })
+    }
+
+    /// Sets either leak scan switch; `None` leaves it as it is.
+    pub fn set_leak_scan_settings(
+        &self,
+        scan: Option<bool>,
+        allow_public: Option<bool>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        if let Some(scan) = scan {
+            set_meta(&conn, "leakscan.enabled", if scan { "1" } else { "0" })?;
+        }
+        if let Some(allow) = allow_public {
+            set_meta(
+                &conn,
+                "leakscan.allow_public",
+                if allow { "1" } else { "0" },
+            )?;
+        }
+        Ok(())
     }
 
     /// Records one provider call — allowed or refused — and keeps the log
@@ -6829,7 +6878,7 @@ mod tests {
             );
         }
         let key =
-            "notes\n-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n";
+            "notes\n-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n"; // lore:allow-secret
         let error = db
             .save_file(&new_file("shop", "notes.md", key))
             .unwrap_err()
@@ -6859,13 +6908,13 @@ mod tests {
     #[test]
     fn only_real_pem_private_key_headers_are_refused() {
         for header in [
-            "-----BEGIN PRIVATE KEY-----",
-            "-----BEGIN RSA PRIVATE KEY-----",
-            "-----BEGIN OPENSSH PRIVATE KEY-----",
-            "-----BEGIN EC PRIVATE KEY-----",
-            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
-            "-----BEGIN DSA2 PRIVATE KEY-----",
-            "text before -----BEGIN RSA PRIVATE KEY----- text after",
+            "-----BEGIN PRIVATE KEY-----",           // lore:allow-secret
+            "-----BEGIN RSA PRIVATE KEY-----",       // lore:allow-secret
+            "-----BEGIN OPENSSH PRIVATE KEY-----",   // lore:allow-secret
+            "-----BEGIN EC PRIVATE KEY-----",        // lore:allow-secret
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----", // lore:allow-secret
+            "-----BEGIN DSA2 PRIVATE KEY-----",      // lore:allow-secret
+            "text before -----BEGIN RSA PRIVATE KEY----- text after", // lore:allow-secret
         ] {
             let content = format!("notes\n{header}\nMIIEabc\n");
             assert!(
@@ -7521,6 +7570,27 @@ mod tests {
         // A damaged value fails closed.
         set_meta(&db.lock(), "ops.enabled", "yes please").unwrap();
         assert!(!db.ops_enabled().unwrap());
+
+        // The leak scan: on by default, public repositories refused by
+        // default, and a damaged value keeps both on the safe side.
+        let defaults = LeakScanSettings {
+            scan: true,
+            allow_public: false,
+        };
+        assert_eq!(db.leak_scan_settings().unwrap(), defaults);
+        db.set_leak_scan_settings(Some(false), None).unwrap();
+        assert!(!db.leak_scan_settings().unwrap().scan);
+        db.set_leak_scan_settings(None, Some(true)).unwrap();
+        assert_eq!(
+            db.leak_scan_settings().unwrap(),
+            LeakScanSettings {
+                scan: false,
+                allow_public: true
+            }
+        );
+        set_meta(&db.lock(), "leakscan.enabled", "nope").unwrap();
+        set_meta(&db.lock(), "leakscan.allow_public", "yes").unwrap();
+        assert_eq!(db.leak_scan_settings().unwrap(), defaults);
     }
 
     #[test]

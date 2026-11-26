@@ -264,6 +264,11 @@ const ROUTES: &[(&str, &str, Access)] = &[
         "/admin/api/integrations/enabled",
         Access::Needs(Perm::Integrations),
     ),
+    (
+        "PUT",
+        "/admin/api/integrations/leakscan",
+        Access::Needs(Perm::Integrations),
+    ),
     ("GET", "/admin/api/users", Access::Needs(Perm::Users)),
     ("POST", "/admin/api/users", Access::Needs(Perm::Users)),
     ("PUT", "/admin/api/users/{id}", Access::Needs(Perm::Users)),
@@ -566,6 +571,10 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
         .route(
             "/admin/api/integrations/enabled",
             put(set_integration_enabled).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/integrations/leakscan",
+            put(set_leak_scan).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
         )
         .route(
             "/admin/api/users",
@@ -2433,6 +2442,7 @@ async fn integrations(State(admin): State<Arc<Admin>>) -> Response {
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         let vault = state.db.vault_status()?;
         let enabled = state.db.ops_enabled()?;
+        let leak = state.db.leak_scan_settings()?;
         let agents: Vec<String> = state
             .db
             .agents(&state.configured_agents)?
@@ -2492,6 +2502,8 @@ async fn integrations(State(admin): State<Arc<Admin>>) -> Response {
         Ok(json!({
             "vault_enabled": state.vault.is_some(),
             "enabled": enabled,
+            "leak_scan": leak.scan,
+            "allow_public_repos": leak.allow_public,
             "providers": providers,
             "agents": agents,
             "permissions": permissions,
@@ -3100,6 +3112,66 @@ async fn set_integration_enabled(
         Ok(Err(error)) => bad_request(&error.to_string()),
         Err(error) => {
             tracing::error!(%error, "switching operations failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LeakScanForm {
+    #[serde(default)]
+    scan: Option<bool>,
+    #[serde(default)]
+    allow_public: Option<bool>,
+}
+
+/// Sets the leak scan switches: whether writes to public GitHub
+/// repositories are scanned, and whether agents may create public
+/// repositories or make one public. Either may be sent alone.
+async fn set_leak_scan(
+    State(admin): State<Arc<Admin>>,
+    Json(form): Json<LeakScanForm>,
+) -> Response {
+    if form.scan.is_none() && form.allow_public.is_none() {
+        return bad_request("scan or allow_public must be true or false");
+    }
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        state
+            .db
+            .set_leak_scan_settings(form.scan, form.allow_public)?;
+        let mut changes = Vec::new();
+        if let Some(scan) = form.scan {
+            changes.push(if scan {
+                "switched the scan of writes to public repositories on"
+            } else {
+                "switched the scan of writes to public repositories off"
+            });
+        }
+        if let Some(allow) = form.allow_public {
+            changes.push(if allow {
+                "allowed agents to create public repositories"
+            } else {
+                "stopped agents from creating public repositories"
+            });
+        }
+        let summary = changes.join("; ");
+        if let Ok(activity) =
+            state
+                .db
+                .record_activity(ADMIN_ACTOR, "integrations", "", None, None, &[], &summary)
+        {
+            state.events.publish(activity);
+        }
+        let leak = state.db.leak_scan_settings()?;
+        Ok(json!({ "ok": true, "leak_scan": leak.scan, "allow_public_repos": leak.allow_public }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "saving the leak scan switches failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -3967,7 +4039,7 @@ mod tests {
 
     #[tokio::test]
     async fn integrations_reads_and_writes_follow_the_roles() {
-        let (base, _admin) = serve().await;
+        let (base, admin) = serve().await;
         let client = reqwest::Client::new();
         let call = |method: reqwest::Method, path: String, token: Option<&str>| {
             let mut request = client.request(method, format!("{base}{path}"));
@@ -4381,6 +4453,61 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), 200);
+
+        // The leak scan switches: on and closed by default, either one
+        // settable alone, and an empty form refused.
+        let shown: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/integrations".into(),
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(
+            (&shown["leak_scan"], &shown["allow_public_repos"]),
+            (&json!(true), &json!(false))
+        );
+        for (body, expected) in [
+            (json!({ "allow_public": true }), 200),
+            (json!({ "scan": false }), 200),
+            (json!({}), 400),
+        ] {
+            let response = call(
+                reqwest::Method::PUT,
+                "/admin/api/integrations/leakscan".into(),
+                Some("admin-token"),
+            )
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), expected, "{body}");
+        }
+        assert_eq!(
+            admin.db.leak_scan_settings().unwrap(),
+            crate::db::LeakScanSettings {
+                scan: false,
+                allow_public: true
+            }
+        );
+        let response = call(
+            reqwest::Method::PUT,
+            "/admin/api/integrations/leakscan".into(),
+            Some("viewer-token"),
+        )
+        .json(&json!({ "scan": true }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 403);
+        admin
+            .db
+            .set_leak_scan_settings(Some(true), Some(false))
+            .unwrap();
 
         // A test call against a provider with nothing stored says so, and
         // records itself in the log with the admin's name.

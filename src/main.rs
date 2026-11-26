@@ -7,9 +7,11 @@ mod db;
 mod embed;
 mod events;
 mod gitproxy;
+mod leakscan;
 mod mail;
 mod oauth;
 mod ops;
+mod packscan;
 mod server;
 mod users;
 mod vault;
@@ -316,6 +318,8 @@ fn app(
     } else {
         config.with_allowed_hosts(auth.allowed_hosts.clone())
     };
+    // The git proxy's leak scan looks for lore's own secrets too.
+    let guard = lore.guard();
     let mcp = StreamableHttpService::new(
         move || Ok(lore.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -334,7 +338,7 @@ fn app(
         // its own lore token and adds the stored credential upstream,
         // where the agent's machine never sees it.
         .merge(gitproxy::router(Arc::new(GitProxy::new(
-            auth, vault, events,
+            auth, vault, events, guard,
         ))));
     if let (Some(admin), Some(oauth)) = (admin, oauth) {
         app = app

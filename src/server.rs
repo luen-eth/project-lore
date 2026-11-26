@@ -20,7 +20,7 @@ use crate::{
     },
     embed::Embedder,
     events::Events,
-    mail, ops,
+    leakscan, mail, ops,
     vault::VaultKey,
 };
 
@@ -108,6 +108,9 @@ pub struct Lore {
     /// The HTTP client provider calls go through: no redirects, so a
     /// credential is never forwarded to another host.
     http: reqwest::Client,
+    /// Where the two GitHub providers are called instead of their fixed
+    /// API base: `None` in production; the tests point it at a local mock.
+    github_api_base: Option<String>,
     /// The tools this server offers; the notice for clients with an
     /// outdated tool list names them.
     tool_router: ToolRouter<Self>,
@@ -532,8 +535,14 @@ impl Lore {
             vault,
             guard,
             http: ops::client(),
+            github_api_base: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// lore's own secrets and protected ids, for the git proxy's leak scan.
+    pub fn guard(&self) -> ops::Guard {
+        self.guard.clone()
     }
 
     /// Verifies the chat's session is open, current and this agent's, or tells
@@ -2045,7 +2054,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Call the GitHub REST API through lore with the user's personal GitHub account: repositories, pull requests, issues and anything else the personal account's token allows. For repositories that belong to the GitHub organization, use `github_org` instead. Examples: `GET /user/repos?per_page=10` lists your repositories; `POST /repos/{owner}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The GitHub credential is added by lore on the server side: never ask the user for it, and never send one yourself."
+        description = "Call the GitHub REST API through lore with the user's personal GitHub account: repositories, pull requests, issues and anything else the personal account's token allows. For repositories that belong to the GitHub organization, use `github_org` instead. Examples: `GET /user/repos?per_page=10` lists your repositories; `POST /repos/{owner}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The GitHub credential is added by lore on the server side: never ask the user for it, and never send one yourself. Writes to a public repository (and to a public gist) are scanned first: lore refuses any that would publish a key, token, password or private file it can recognise, and refuses creating a public repository or making one public unless the administrator allows it."
     )]
     async fn github(
         &self,
@@ -2056,7 +2065,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Call the GitHub REST API through lore with the GitHub organization account's token (kept apart from the personal account). Prefer it for repositories, pull requests, issues, teams and settings that belong to the organization; use `github` for the user's personal repositories. Same arguments as `github`. Examples: `GET /orgs/{org}/repos?per_page=10` lists the organization's repositories; `POST /repos/{org}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The credential is added by lore on the server side: never ask the user for it, and never send one yourself."
+        description = "Call the GitHub REST API through lore with the GitHub organization account's token (kept apart from the personal account). Prefer it for repositories, pull requests, issues, teams and settings that belong to the organization; use `github` for the user's personal repositories. Same arguments as `github`. Examples: `GET /orgs/{org}/repos?per_page=10` lists the organization's repositories; `POST /repos/{org}/{repo}/pulls` with body {\"title\":\"Add refunds\",\"head\":\"feature/refunds\",\"base\":\"main\"} opens a pull request. The credential is added by lore on the server side: never ask the user for it, and never send one yourself. Writes to a public repository (and to a public gist) are scanned first: lore refuses any that would publish a key, token, password or private file it can recognise, and refuses creating a public repository or making one public unless the administrator allows it."
     )]
     async fn github_org(
         &self,
@@ -2224,7 +2233,7 @@ impl Lore {
         // credential is never even decrypted. Every row of this call is
         // logged under the same name: the session's agent, with the token's
         // agent added when they differ.
-        let (session, label, method, path, granted, guard) = {
+        let (session, label, method, path, granted, guard, leak) = {
             let (agent, session_id, request) = (agent.clone(), session_id.clone(), request.clone());
             blocking(move || {
                 let session = this.require_session(&session_id, &agent, shared)?;
@@ -2288,7 +2297,13 @@ impl Lore {
                             ),
                             None => this.guard.clone(),
                         };
-                        Ok((session, label, method, path, granted, guard))
+                        // The leak scan's switches, for a GitHub write.
+                        let leak = if provider.service() == ops::GITHUB.id && method != "GET" {
+                            Some(this.db.leak_scan_settings().map_err(internal)?)
+                        } else {
+                            None
+                        };
+                        Ok((session, label, method, path, granted, guard, leak))
                     }
                     Err(denied) => {
                         this.log_op_call(
@@ -2310,15 +2325,52 @@ impl Lore {
             .await?
         };
         let actor = session_agent(&agent, &session).to_string();
+        let api_base = match &self.github_api_base {
+            Some(base) if provider.service() == ops::GITHUB.id => base.clone(),
+            _ => granted.api_base.clone(),
+        };
+        // A write to a public GitHub repository is scanned before anything
+        // is sent: a secret lore can recognise never reaches it, and
+        // neither does a new public repository unless the administrator
+        // allows them.
+        if let Some(leak) = leak.filter(|leak| leak.scan) {
+            let scanner = leakscan::Scanner::new(&guard);
+            let checked = leakscan::check_rest(&leakscan::RestCall {
+                client: &self.http,
+                api_base: &api_base,
+                provider: &provider,
+                secret: &granted.secret,
+                scanner: &scanner,
+                allow_public: leak.allow_public,
+                method: &method,
+                path: &path,
+                body: request.body.as_ref(),
+            })
+            .await;
+            if let Err(refusal) = checked {
+                let this = self.clone();
+                let session_id = session.id.clone();
+                let _ = blocking(move || {
+                    this.log_op_call(
+                        &label,
+                        &actor,
+                        Some(&session_id),
+                        provider,
+                        &method,
+                        &path,
+                        "denied",
+                        &refusal.detail,
+                        0,
+                        0,
+                    );
+                    Ok(())
+                })
+                .await;
+                return Err(refusal.message);
+            }
+        }
         let started = Instant::now();
-        let outcome = ops::call(
-            &self.http,
-            &granted.api_base,
-            &granted.secret,
-            &guard,
-            &request,
-        )
-        .await;
+        let outcome = ops::call(&self.http, &api_base, &granted.secret, &guard, &request).await;
         let (status, went, detail, answer) = match outcome {
             Ok(response) => (
                 response.status as i64,
@@ -3946,5 +3998,247 @@ mod tests {
         for odd in [None, Some("evil.example/x"), Some("a b"), Some("")] {
             assert_eq!(public_host(&parts(odd)), "<this lore host>", "{odd:?}");
         }
+    }
+
+    /// The mock GitHub for the leak scan: `GET /repos/{owner}/{repo}`
+    /// says a repository whose name starts with `public` is public and any
+    /// other private; every other request is recorded (method, path, body)
+    /// and answered 201. A local mock, never GitHub.
+    async fn github_mock() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::{Router, extract::Request, routing::any};
+        let sent: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let log = sent.clone();
+        let router = Router::new().route(
+            "/{*rest}",
+            any(move |request: Request| {
+                let log = log.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let path = parts.uri.path().to_string();
+                    let segments: Vec<&str> = path.split('/').collect();
+                    if parts.method == axum::http::Method::GET
+                        && segments.len() == 4
+                        && segments[1] == "repos"
+                    {
+                        let public = segments[3].starts_with("public");
+                        return (
+                            axum::http::StatusCode::OK,
+                            format!("{{\"private\":{}}}", !public),
+                        );
+                    }
+                    let body = axum::body::to_bytes(body, 1024 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    log.lock().unwrap().push(format!(
+                        "{} {} {}",
+                        parts.method,
+                        path,
+                        String::from_utf8_lossy(&body)
+                    ));
+                    (axum::http::StatusCode::CREATED, "{}".to_string())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service())
+                .await
+                .unwrap();
+        });
+        (base, sent)
+    }
+
+    /// Writes to a public repository through `github` are scanned before
+    /// anything is sent; the same write to a private one passes; public
+    /// repositories are refused unless the administrator allows them; and
+    /// the switch turns all of it off.
+    #[tokio::test]
+    async fn writes_to_public_github_repositories_are_scanned() {
+        use base64::Engine;
+        let mut lore = test_lore("leakscan");
+        let key = VaultKey::from_env_value(&"ef".repeat(32)).unwrap().unwrap();
+        let (nonce, secret) = key.encrypt("github", "", "ghp_personal-credential");
+        lore.db
+            .set_vault("github", "", &nonce, &secret, "tial")
+            .unwrap();
+        lore.vault = Some(key);
+        let (api, sent) = github_mock().await;
+        lore.github_api_base = Some(api);
+        let first = lore
+            .recent(args(json!({})), as_agent(Some("claude")))
+            .await
+            .unwrap();
+        let session = notice_id(&first);
+        let token = ["gh", "p_", "Zq8Lm2Xv9Rt4Wp6Ky3Nb7Hc5Jd1Fg0Ts8QeA"].concat();
+        let encode = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+        let call = |method: &str, path: &str, body: serde_json::Value| {
+            args::<OpsArgs>(json!({
+                "session_id": session, "method": method, "path": path, "body": body
+            }))
+        };
+        let leak =
+            json!({ "message": "add config", "content": encode(&format!("KEY = '{token}'\n")) });
+
+        // A public repository: refused, logged, nothing sent.
+        let refused = lore
+            .github(
+                call(
+                    "PUT",
+                    "/repos/me/public-site/contents/config.py",
+                    leak.clone(),
+                ),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            "lore refused this call: it would put a secret or a private file into a public \
+             GitHub repository (github-token in `config.py` (field `content`), base64-decoded, \
+             line 1). lore does not let secrets or private files reach a public repository: \
+             remove it, or ask the user."
+        );
+        assert!(sent.lock().unwrap().is_empty());
+        let row = &lore.db.ops_log(1).unwrap()[0];
+        assert_eq!(
+            (
+                row.provider.as_str(),
+                row.method.as_str(),
+                row.outcome.as_str()
+            ),
+            ("github", "PUT", "denied")
+        );
+        assert_eq!(
+            row.detail,
+            "leak scan: github-token in `config.py` (field `content`), base64-decoded, line 1"
+        );
+
+        // The same write to a private repository is sent as is.
+        let answer = lore
+            .github(
+                call(
+                    "PUT",
+                    "/repos/me/private-shop/contents/config.py",
+                    leak.clone(),
+                ),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap();
+        assert!(answer.starts_with("HTTP 201"), "{answer}");
+        assert_eq!(sent.lock().unwrap().len(), 1);
+
+        // A `.env` file is refused by its name; an issue comment by its
+        // text; a clean write passes.
+        let refused = lore
+            .github(
+                call(
+                    "PUT",
+                    "/repos/me/public-site/contents/deploy/.env",
+                    json!({ "message": "x", "content": encode("A=1\n") }),
+                ),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("(env-file in `deploy/.env`)"), "{refused}");
+        let refused = lore
+            .github(
+                call(
+                    "POST",
+                    "/repos/me/public-site/issues/1/comments",
+                    json!({ "body": format!("try with {token}") }),
+                ),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("(github-token in field `body`, line 1)"),
+            "{refused}"
+        );
+        lore.github(
+            call(
+                "POST",
+                "/repos/me/public-site/issues/1/comments",
+                json!({ "body": "Fixed in #2." }),
+            ),
+            as_agent(Some("claude")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 2);
+
+        // Creating a public repository, or making one public: refused
+        // until the administrator allows it. A private one is fine.
+        for (method, path, body) in [
+            ("POST", "/user/repos", json!({ "name": "new" })),
+            (
+                "PATCH",
+                "/repos/me/private-shop",
+                json!({ "private": false }),
+            ),
+        ] {
+            let refused = lore
+                .github(call(method, path, body), as_agent(Some("claude")))
+                .await
+                .unwrap_err();
+            assert!(
+                refused.contains(
+                    "the administrator has not allowed agents to create public \
+                                  repositories or make one public"
+                ),
+                "{refused}"
+            );
+        }
+        lore.github(
+            call(
+                "POST",
+                "/user/repos",
+                json!({ "name": "new", "private": true }),
+            ),
+            as_agent(Some("claude")),
+        )
+        .await
+        .unwrap();
+        lore.db.set_leak_scan_settings(None, Some(true)).unwrap();
+        lore.github(
+            call(
+                "PATCH",
+                "/repos/me/private-shop",
+                json!({ "private": false }),
+            ),
+            as_agent(Some("claude")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 4);
+
+        // Switched off: nothing is checked.
+        lore.db
+            .set_leak_scan_settings(Some(false), Some(false))
+            .unwrap();
+        lore.github(
+            call("PUT", "/repos/me/public-site/contents/config.py", leak),
+            as_agent(Some("claude")),
+        )
+        .await
+        .unwrap();
+        lore.github(
+            call("POST", "/user/repos", json!({ "name": "open" })),
+            as_agent(Some("claude")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 6);
+
+        // The token is in no log row and no activity note.
+        let all = format!(
+            "{:?}{:?}",
+            lore.db.ops_log(100).unwrap(),
+            lore.db.activity(100).unwrap()
+        );
+        assert!(!all.contains(&token));
     }
 }

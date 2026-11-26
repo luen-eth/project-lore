@@ -460,6 +460,99 @@ responses for `/git/` (lore itself accepts pushes up to 2 GiB and imposes no
 overall timeout — a clone may take minutes), or big pushes and slow clones will
 be cut short in front of lore without any hint from lore itself.
 
+### Keeping secrets out of public repositories
+
+Whatever an agent writes to a **public** GitHub repository through lore is checked
+first, and refused when it carries a secret lore can recognise. This is the
+enforcement behind the rule that agents never publish keys.
+
+**What is checked.** For both GitHub accounts (`github`, `github_org` and
+`/git/github/…`, `/git/github-org/…`):
+
+- every write (`POST`, `PUT`, `PATCH`, `DELETE`) under `/repos/{owner}/{repo}/…`
+  to a public repository: every string of the JSON body at any depth, the
+  base64-decoded `content` of the Contents and Blobs APIs, the file name of
+  `PUT …/contents/{path}` and of every tree entry that adds content;
+- writes to `/gists` unless the body says `"public": false`, file names included;
+- every push (`git-receive-pack`) to a public repository: the command list, then
+  the packfile, every commit, tree, blob and tag inflated and scanned; trees give
+  each blob its path. Deltas are rebuilt on their base when the base is in the
+  pack.
+
+A repository counts as public unless GitHub says it is private: lore asks
+`GET /repos/{owner}/{repo}` with the same stored credential and trusts the
+answer for 60 seconds. A network error, a 404, a redirect or an answer without a
+`private` field all count as **public** (fail closed). A push to a private
+repository streams through untouched, as before; a push to a public one is
+spooled to a temporary file in the data directory (removed afterwards, and at
+the next start if lore stopped mid-push), checked off the async workers one at a
+time, and only then forwarded upstream, byte for byte as the agent sent it.
+GitLab, fetch and clone are not affected.
+
+**What is recognised.**
+
+- every value lore itself holds: its start-up secrets (agent tokens, both
+  passwords, the reCAPTCHA secret, the vault key) and every stored credential, in
+  the same plain, JSON-escaped, percent-encoded and base64 forms it redacts from
+  answers (rule `known-secret`);
+- private key blocks (`-----BEGIN … PRIVATE KEY-----`, OpenSSH and PGP
+  included), GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
+  `github_pat_`), GitLab `glpat-`, AWS access key ids, Google API keys, Slack
+  `xox?-` tokens, Stripe live keys, OpenAI and Anthropic keys, Telegram bot tokens,
+  npm tokens, SendGrid keys, JWTs (three base64url parts whose header is JSON with
+  an `alg`), 64-hex private keys and 12–24 word seed phrases assigned to a name
+  like `private_key`, `secret_key` or `mnemonic`, passwords in URLs
+  (`scheme://user:password@host`), and quoted `password`/`secret`/`token`/`api_key`
+  assignments of eight characters or more — placeholders (`changeme`, `example`,
+  `xxxx`, `<…>`, `${…}`, `your_…`), environment lookups, paths, URLs and prose
+  are left alone;
+- file names that must never be public: `.env` and `.env.*` (not `.env.example`,
+  `.env.sample`, `.env.template`, `.env.dist`), `*.env`, `id_rsa`, `id_ed25519`,
+  `id_ecdsa` and their kin, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keystore`,
+  `*.jks`, `*.ppk`, `.netrc`, `.pgpass`, `.git-credentials`, SQLite databases
+  (`*.sqlite`, `*.sqlite3`, `*.db`, lore's own `lore-full-*.sqlite` and
+  `pre-restore-*.sqlite` among them) and SQL dumps (`dump.sql`, `backup*.sql`,
+  `*dump*.sql`). In a push, a file is judged by its name when its content is part
+  of the push.
+
+**What the agent sees.** A refused REST call answers with one sentence naming
+the rule and where it fired (file, JSON field, line), never the secret: *lore
+refused this call: it would put a secret or a private file into a public GitHub
+repository (github-token in `config.py` (field `content`), base64-decoded, line 1).
+lore does not let secrets or private files reach a public repository: remove it,
+or ask the user.* A refused push is answered in the git protocol, so `git push`
+prints the reason under `remote:` and marks each ref `[remote rejected]`. Both
+land in the operations log and the activity feed with outcome `denied` and the
+rule and location as detail.
+
+**Also refused, fail closed:** a push larger than 256 MiB ("push it in smaller
+parts"), a pack that cannot be read, an object over 32 MiB, more than 1 GiB of
+inflated content or a delta chain deeper than 250 ("too large to check"), and a
+signed push (push certificate).
+
+**The allow marker.** A line holding `lore:allow-secret` is skipped by the format
+rules, so documentation and tests can carry fake tokens (lore's own repository
+uses it for its test fixtures). It never hides a value lore actually holds.
+
+**Two switches** on the Integrations panel, next to the master switch (stored in
+the database, no restart): **"Scan writes to public repositories"** (on by
+default; off turns this whole check off) and **"Agents may create public
+repositories or make one public"** (off by default). While it is off,
+`POST /user/repos`, `POST /orgs/{org}/repos` and
+`POST /repos/{owner}/{template}/generate` are refused unless the body asks for a
+private (or internal) repository, and `PATCH /repos/{owner}/{repo}` with
+`"private": false` or `"visibility": "public"` is refused.
+
+**Its limits, plainly.** It only sees what goes through lore: an agent with its
+own credentials, or a human, is not checked. It recognises known formats and the
+values lore holds, not private data in general — a customer list, a personal
+address or a secret in an unknown format passes. A delta in a thin pack whose
+base is already in the repository is only partly visible: the text it inserts is
+scanned, the rest of the file is not, and its file name is not known. Making a
+repository public (when allowed) publishes its existing history unchecked, and a
+repository made public on GitHub's own website is treated as private for up to a
+minute.
+
 ## The admin view
 
 `/admin` is a live window into the brain. Every entry is a neuron: colour is the
@@ -650,6 +743,7 @@ Every admin route is mapped to exactly one access level in a table in
 | `POST` | `/admin/api/integrations/{provider}/test` | `integrations` |
 | `PUT` | `/admin/api/integrations/permissions` | `integrations` |
 | `PUT` | `/admin/api/integrations/enabled` | `integrations` |
+| `PUT` | `/admin/api/integrations/leakscan` | `integrations` |
 | `GET`, `POST` | `/admin/api/users` | `users` |
 | `PUT`, `DELETE` | `/admin/api/users/{id}` | `users` |
 
@@ -894,6 +988,13 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
   reported as a 502 so git never prompts for a password. Both bodies stream through
   (a request is capped at 2 GiB) and are never buffered whole, and each request lands
   in the operations log with the repository path only.
+- **Secrets stay out of public repositories.** Every write through lore to a
+  public GitHub repository or gist — REST calls and `git push` alike — is scanned
+  for the values lore holds, known credential formats and private file names, and
+  refused before anything is sent when one is found; what cannot be checked (an
+  unknown visibility, an unreadable or oversized push) is refused too. Agents may
+  not create public repositories or make one public unless the administrator
+  allows it. See *Keeping secrets out of public repositories*.
 - **Activity is recorded.** Every tool call is stored with the agent that made it,
   including search queries, so the admin view can show who did what.
 - **The container** runs as an unprivileged user.
