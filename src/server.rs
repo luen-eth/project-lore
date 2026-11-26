@@ -25,6 +25,9 @@ use crate::{
     vault::VaultKey,
 };
 
+#[path = "repotools.rs"]
+mod repotools;
+
 const INSTRUCTIONS: &str = "\
 Lore is the user's shared long-term memory across coding agents and sessions.
 
@@ -2043,6 +2046,11 @@ impl Lore {
             out.push_str(&line);
             out.push('\n');
             out.push_str(
+                "\nFor GitHub repositories, `repo_tree`, `repo_read`, `repo_search` and \
+                 `repo_commit` list, read, search and commit files without a checkout, with the \
+                 same access levels.\n",
+            );
+            out.push_str(
                 "\nThe credential is added by lore on the server side: never ask the user \
                  for one, and never send one yourself.",
             );
@@ -2113,6 +2121,54 @@ impl Lore {
         Extension(parts): Extension<Parts>,
     ) -> Result<String, String> {
         self.operate(&parts, ops::DOKPLOY, args).await
+    }
+
+    #[tool(
+        description = "List the files and directories of a GitHub repository without cloning it: one line per entry (`dir/`, or `file  size` in bytes), sorted, with the resolved ref and its commit sha at the top. Use it to find your way around a repository before reading files with `repo_read`. `repo` is `owner/name`; `ref` is a branch, tag or commit (default: the default branch); `path` lists one directory (default: the root); `depth` is how many levels below it (default 2, at most 10); `limit` caps the entries (default 300, at most 2000). `account` picks the GitHub credential: `personal` (the default) or `organization` for repositories of the GitHub organization. Needs `read` on that account; the credential is added by lore on the server side."
+    )]
+    async fn repo_tree(
+        &self,
+        Parameters(args): Parameters<repotools::RepoTreeArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.repo_tool(&parts, repotools::RepoCall::Tree(args))
+            .await
+    }
+
+    #[tool(
+        description = "Read up to 10 files of a GitHub repository without cloning it: for each file its path, size and blob sha, then its text with line numbers. All files come from the same commit, named at the top. With a single path, `start_line` and `end_line` show a part of a long file. Binary files and files over 1 MiB are reported by size and type only; very long answers are cut and say which files were cut. `repo` is `owner/name`; `ref` is a branch, tag or commit (default: the default branch). `account` picks the GitHub credential: `personal` (the default) or `organization`. Needs `read` on that account; the credential is added by lore on the server side."
+    )]
+    async fn repo_read(
+        &self,
+        Parameters(args): Parameters<repotools::RepoReadArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.repo_tool(&parts, repotools::RepoCall::Read(args))
+            .await
+    }
+
+    #[tool(
+        description = "Search the code of one GitHub repository with GitHub code search, to find where something is defined or used before reading it with `repo_read`. Lists the matching file paths. `query` is words or an identifier (GitHub code search syntax; lore adds the repository); `path` keeps files under one directory, `extension` files of one type (e.g. `rs`); `limit` caps the results (default 20, at most 50). GitHub code search only indexes the default branch and may lag behind recent pushes: for another branch, or for something just pushed, use `repo_tree` and `repo_read`. `account` picks the GitHub credential: `personal` (the default) or `organization`. Needs `read` on that account."
+    )]
+    async fn repo_search(
+        &self,
+        Parameters(args): Parameters<repotools::RepoSearchArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.repo_tool(&parts, repotools::RepoCall::Search(args))
+            .await
+    }
+
+    #[tool(
+        description = "Change files of a GitHub repository without a checkout: writes 1 to 50 changes as ONE commit straight onto the named branch (no pull request; open one with `github` if the change needs review). Each change is {\"path\", \"content\"} (text, written as is), {\"path\", \"content_base64\"} (bytes) or {\"path\", \"delete\": true}; at most 8 MiB in all. The branch must exist, unless `create_from` names a branch, tag or commit to create it from. Pass `expected_head` (the commit sha you read the files at) so lore refuses instead of overwriting someone else's push. The branch is only ever moved forward, never force-pushed; protected-branch and permission errors from GitHub are passed on. Never write a secret (a key, token, password, `.env` or private key file) to a repository: for a public repository lore scans every change first and refuses the whole commit when it finds one. Answers with the new commit sha, the branch, a compare link and the changed paths. `account` picks the GitHub credential: `personal` (the default) or `organization`. Needs `full` on that account."
+    )]
+    async fn repo_commit(
+        &self,
+        Parameters(args): Parameters<repotools::RepoCommitArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.repo_tool(&parts, repotools::RepoCall::Commit(args))
+            .await
     }
 
     #[tool(
