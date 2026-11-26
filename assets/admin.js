@@ -2715,6 +2715,12 @@ function renderIntegrations() {
   $("integrations-vault").hidden = !data || data.vault_enabled;
   $("integrations-switch").hidden = !admin || !data;
   if (data) $("integrations-enabled").checked = data.enabled;
+  $("integrations-leakscan-switch").hidden = !admin || !data;
+  $("integrations-public-switch").hidden = !admin || !data;
+  if (data) {
+    $("integrations-leakscan").checked = data.leak_scan !== false;
+    $("integrations-public").checked = data.allow_public_repos === true;
+  }
 
   let configured = 0;
   for (const item of $("integrations-list").children) {
@@ -3048,6 +3054,47 @@ $("integrations-enabled").addEventListener("change", async (event) => {
     integrationsStatus("The switch could not be saved.", "bad");
   }
 });
+
+/* The leak scan's two switches: scanning writes to public repositories,
+   and letting agents create public repositories or make one public. */
+async function saveLeakScan(field, checkbox, onText, offText) {
+  const value = checkbox.checked;
+  try {
+    const response = await api("/admin/api/integrations/leakscan", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [field]: value }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      checkbox.checked = !value;
+      integrationsStatus(result.error || "The switch could not be saved.", "bad");
+      return;
+    }
+    integrationsStatus(value ? onText : offText, "ok");
+  } catch (_) {
+    checkbox.checked = !value;
+    integrationsStatus("The switch could not be saved.", "bad");
+  }
+}
+
+$("integrations-leakscan").addEventListener("change", (event) =>
+  saveLeakScan(
+    "scan",
+    event.target,
+    "Writes to public repositories are scanned for secrets.",
+    "Writes to public repositories are no longer scanned."
+  )
+);
+
+$("integrations-public").addEventListener("change", (event) =>
+  saveLeakScan(
+    "allow_public",
+    event.target,
+    "Agents may create public repositories or make one public.",
+    "Agents may not create public repositories or make one public."
+  )
+);
 
 /* ---------- Your password (stored users) ---------- */
 

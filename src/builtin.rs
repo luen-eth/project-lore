@@ -991,7 +991,7 @@ esac
         };
         assert!(!signed_in);
 
-        let token = "sk-ant-oat01-a-very-secret-setup-token-value";
+        let token = "sk-ant-oat01-a-very-secret-setup-token-value"; // lore:allow-secret (fake test value)
         let answer = pair
             .hub
             .request(
@@ -1451,7 +1451,7 @@ esac
         let http = reqwest::Client::new();
         let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
         let writer = sign_in(&http, &base, "writer", "writer-password").await;
-        let token = "sk-ant-oat01-page-pasted-secret-token-value";
+        let token = "sk-ant-oat01-page-pasted-secret-token-value"; // lore:allow-secret (fake test value)
 
         // Reading needs a sign-in only; changing needs `agents`.
         let list: serde_json::Value = http

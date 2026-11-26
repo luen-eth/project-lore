@@ -854,6 +854,14 @@ impl Guard {
         }
     }
 
+    /// Every form (see `secret_forms`) of every secret this guard knows:
+    /// what the leak scan (`leakscan::Scanner`) looks for, so a value lore
+    /// redacts from an answer is also one it keeps out of a public
+    /// repository. Never printed or logged.
+    pub fn known_forms(&self) -> &[String] {
+        &self.secret_forms
+    }
+
     /// How many protected Dokploy ids there are; for the start-up log.
     pub fn protected_count(&self) -> usize {
         self.dokploy_protected.len()
@@ -982,7 +990,7 @@ fn percent_encode(text: &str) -> String {
 }
 
 /// What lore calls itself to the services it operates.
-const USER_AGENT: &str = concat!("lore/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("lore/", env!("CARGO_PKG_VERSION"));
 
 /// The HTTP client every provider call goes through: no redirects, so a
 /// credential is never forwarded to another host, no proxy from the
@@ -1871,7 +1879,7 @@ mod tests {
     #[test]
     fn redaction_covers_encoded_forms() {
         use base64::Engine;
-        let secret = "tok/en+1=x";
+        let secret = "tok/en+1=x"; // lore:allow-secret
         let text = format!(
             "{secret} {} {} {}",
             serde_json::to_string(secret).unwrap(),

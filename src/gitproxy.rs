@@ -8,7 +8,10 @@
 
 use std::{
     net::SocketAddr,
-    sync::Arc,
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -21,12 +24,15 @@ use axum::{
     routing::any,
 };
 use base64::Engine;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 
 use crate::{
     auth::{McpAuth, Refused, client_ip, too_many_requests},
     db::Db,
     events::Events,
+    leakscan,
     ops::{self, transport_reason},
+    packscan::{self, Verdict},
     vault::{Secret, VaultKey},
 };
 
@@ -65,6 +71,12 @@ const PASSED_HEADERS: [&str; 5] = [
 ];
 /// The Basic realm git is told about when the lore token is missing.
 const REALM: &str = r#"Basic realm="lore git""#;
+/// GitHub's REST API, where the leak scan asks whether a repository is
+/// public. Held in the proxy state so the tests can point it at a mock.
+pub const GITHUB_API_BASE: &str = "https://api.github.com";
+/// How long a push to a public repository waits for its turn to be
+/// checked before it is refused as busy.
+const SCAN_WAIT: Duration = Duration::from_secs(120);
 
 /// The git proxy state: the tokens and the throttling it shares with the
 /// `/mcp` middleware, the vault key, and the upstream client.
@@ -82,18 +94,35 @@ pub struct GitProxy {
     pub http: reqwest::Client,
     /// Fan-out of the activity notes to open admin pages.
     pub events: Events,
+    /// lore's own secrets, which the leak scan keeps out of a public
+    /// repository together with every stored credential.
+    pub guard: ops::Guard,
+    /// GitHub's REST API base for the visibility check; overridable so
+    /// the tests can point it at a local mock.
+    pub github_api_base: String,
+    /// The largest push to a public repository that is checked; a larger
+    /// one is refused. 256 MiB; the tests lower it.
+    pub max_scanned_push: usize,
 }
 
 impl GitProxy {
     /// The state as `main` builds it: the real GitHub base, the shared
     /// `/mcp` authentication, and the vault key.
-    pub fn new(auth: Arc<McpAuth>, vault: Option<VaultKey>, events: Events) -> Self {
+    pub fn new(
+        auth: Arc<McpAuth>,
+        vault: Option<VaultKey>,
+        events: Events,
+        guard: ops::Guard,
+    ) -> Self {
         Self {
             auth,
             vault,
             github_web_base: GITHUB_WEB_BASE.to_string(),
             http: client(),
             events,
+            guard,
+            github_api_base: GITHUB_API_BASE.to_string(),
+            max_scanned_push: packscan::LIMITS.max_request,
         }
     }
 }
@@ -438,6 +467,7 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
         let db = state.auth.db.clone();
         let vault = state.vault.clone();
         let github_base = state.github_web_base.clone();
+        let guard = state.guard.clone();
         let (agent, git, push) = (agent.clone(), git.clone(), is_push(git.endpoint, query));
         tokio::task::spawn_blocking(move || {
             // A git request has no MCP session: the token's agent is the
@@ -459,7 +489,17 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
                     } else {
                         granted.server_url
                     };
-                    Ok((base, granted.secret))
+                    // A push to GitHub may need the leak scan: its switch,
+                    // and every secret lore knows to look for.
+                    let leak = if git.endpoint == Endpoint::ReceivePack
+                        && git.provider.service() == "github"
+                    {
+                        scan_guard(&db, vault.as_ref(), guard)
+                            .map_err(|error| format!("internal error: {error}"))?
+                    } else {
+                        None
+                    };
+                    Ok((base, granted.secret, leak))
                 }
                 Err(denied) => Err(denied.reason),
             }
@@ -470,8 +510,8 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
         tracing::error!("the git access check panicked");
         return plain(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
     };
-    let (base, secret) = match authorized {
-        Ok(pair) => pair,
+    let (base, secret, leak) = match authorized {
+        Ok(granted) => granted,
         Err(reason) => {
             conclude(
                 &state,
@@ -486,6 +526,49 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
             return plain(StatusCode::FORBIDDEN, &reason);
         }
     };
+
+    // The leak scan: a push to a public GitHub repository is read whole
+    // and checked before a byte of it goes upstream. A push to a private
+    // repository streams through untouched.
+    let mut spooled: Option<SpoolStream> = None;
+    let mut body = Some(body);
+    if let Some(guard) = leak {
+        let (owner, repo) = git.repo.split_once('/').unwrap_or((git.repo.as_str(), ""));
+        let public = leakscan::visibility()
+            .is_public(
+                &state.http,
+                &state.github_api_base,
+                &git.provider,
+                &secret,
+                owner,
+                repo,
+            )
+            .await;
+        if public {
+            let encoding = parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let taken = body.take().expect("the body is read once");
+            match check_push(&state, taken, encoding, guard).await {
+                Ok(stream) => spooled = Some(stream),
+                Err(refused) => {
+                    conclude(
+                        &state,
+                        &agent,
+                        &git,
+                        0,
+                        refused.outcome,
+                        &refused.detail,
+                        elapsed_ms(started),
+                    )
+                    .await;
+                    return *refused.response;
+                }
+            }
+        }
+    }
 
     // Forwarding: the upstream URL, the credential as the upstream expects
     // it, the six harmless headers, and a body that streams through.
@@ -543,8 +626,15 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
     }
     if git.endpoint.method() == Method::POST {
         // The pack streams through in both directions; it is never
-        // buffered whole.
-        forwarded = forwarded.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+        // buffered whole. A checked push streams from its spool file,
+        // byte for byte what the agent sent.
+        forwarded = match (spooled, body) {
+            (Some(stream), _) => forwarded.body(reqwest::Body::wrap_stream(stream)),
+            (None, Some(body)) => {
+                forwarded.body(reqwest::Body::wrap_stream(body.into_data_stream()))
+            }
+            (None, None) => forwarded,
+        };
     }
 
     let sent = forwarded.send().await;
@@ -661,6 +751,286 @@ fn over_body_limit(error: &reqwest::Error) -> bool {
         source = current.source();
     }
     false
+}
+
+/// The guard the leak scan of a push uses — lore's own secrets plus every
+/// stored credential — or `None` when the administrator switched the scan
+/// off. Runs on the blocking pool.
+fn scan_guard(
+    db: &Db,
+    vault: Option<&VaultKey>,
+    guard: ops::Guard,
+) -> anyhow::Result<Option<ops::Guard>> {
+    if !db.leak_scan_settings()?.scan {
+        return Ok(None);
+    }
+    Ok(Some(match vault {
+        Some(key) => guard.with_secrets(&ops::stored_secrets(db, key)?),
+        None => guard,
+    }))
+}
+
+/// The pushes checked at once: one. Reading a pack holds up to 256 MiB in
+/// memory plus the objects kept as delta bases.
+fn scan_slots() -> Arc<tokio::sync::Semaphore> {
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
+/// A spooled push on disk, removed when the last holder lets go.
+struct Spool(PathBuf);
+
+impl Drop for Spool {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A checked push streaming upstream from its spool file. The file goes
+/// with the stream.
+struct SpoolStream {
+    file: tokio::fs::File,
+    buffer: Vec<u8>,
+    _spool: Spool,
+}
+
+impl tokio_stream::Stream for SpoolStream {
+    type Item = std::io::Result<axum::body::Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let mut read = tokio::io::ReadBuf::new(&mut this.buffer);
+        match Pin::new(&mut this.file).poll_read(cx, &mut read) {
+            Poll::Ready(Ok(())) if read.filled().is_empty() => Poll::Ready(None),
+            Poll::Ready(Ok(())) => {
+                Poll::Ready(Some(Ok(axum::body::Bytes::copy_from_slice(read.filled()))))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// A push the leak scan refused: the answer for git, and the outcome and
+/// detail of the log row (rule and location, never the secret).
+struct PushRefused {
+    response: Box<Response>,
+    outcome: &'static str,
+    detail: String,
+}
+
+impl PushRefused {
+    fn plain(status: StatusCode, outcome: &'static str, text: &str, detail: &str) -> Self {
+        Self {
+            response: Box::new(plain(status, text)),
+            outcome,
+            detail: detail.to_string(),
+        }
+    }
+}
+
+/// The sentence every secret refusal ends with.
+const KEEP_OUT: &str = "lore does not let secrets or private files reach a public repository. \
+                        Remove them from the commits (rewrite the commits if needed), or ask \
+                        the user.";
+
+/// Reads a push to a public repository to the end, into a spool file in
+/// the data directory (at most `max_scanned_push` bytes), checks it on the
+/// blocking pool, and hands back a stream of exactly those bytes when
+/// nothing was found. Anything else is refused, in the protocol when the
+/// command list could be read (git then shows the reason under
+/// `remote:` and marks the refs rejected), as a plain 403 otherwise.
+async fn check_push(
+    state: &GitProxy,
+    body: Body,
+    encoding: Option<String>,
+    guard: ops::Guard,
+) -> Result<SpoolStream, PushRefused> {
+    let permit = match tokio::time::timeout(SCAN_WAIT, scan_slots().acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            return Err(PushRefused::plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "error",
+                "lore is busy checking other pushes to public repositories for secrets; try again \
+                 in a minute",
+                "leak scan: busy",
+            ));
+        }
+    };
+    let internal = |error: &dyn std::fmt::Display| {
+        tracing::error!(%error, "spooling a push failed");
+        PushRefused::plain(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "error",
+            "internal error: the push could not be checked for secrets",
+            "leak scan: the push could not be spooled",
+        )
+    };
+    let spool = Spool(
+        state
+            .auth
+            .db
+            .temp_path_with("push", "pack")
+            .map_err(|error| internal(&error))?,
+    );
+    let cap = state.max_scanned_push;
+    let mut written = 0usize;
+    let mut over = false;
+    {
+        let mut file = tokio::fs::File::create(&spool.0)
+            .await
+            .map_err(|error| internal(&error))?;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = tokio_stream::StreamExt::next(&mut stream).await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let (status, reason) = if error.to_string().contains("length limit exceeded") {
+                        (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "the request body is larger than 2 GiB",
+                        )
+                    } else {
+                        (StatusCode::BAD_REQUEST, "the push could not be read")
+                    };
+                    return Err(PushRefused::plain(status, "error", reason, reason));
+                }
+            };
+            // Past the cap the rest is read and dropped, so git gets the
+            // answer instead of a broken connection.
+            if over {
+                continue;
+            }
+            let room = cap - written;
+            let keep = chunk.len().min(room);
+            file.write_all(&chunk[..keep])
+                .await
+                .map_err(|error| internal(&error))?;
+            written += keep;
+            over = chunk.len() > room;
+        }
+        file.flush().await.map_err(|error| internal(&error))?;
+    }
+
+    let path = spool.0.clone();
+    let limits = packscan::Limits {
+        max_request: cap,
+        ..packscan::LIMITS
+    };
+    let checked = tokio::task::spawn_blocking(move || -> std::io::Result<packscan::Checked> {
+        let bytes = std::fs::read(&path)?;
+        if over {
+            return Ok(packscan::Checked {
+                commands: packscan::read_commands(&bytes).ok(),
+                verdict: Verdict::TooLarge,
+            });
+        }
+        let scanner = leakscan::Scanner::new(&guard);
+        Ok(packscan::check_request(
+            &bytes,
+            encoding.as_deref(),
+            &scanner,
+            &limits,
+        ))
+    })
+    .await;
+    drop(permit);
+    let checked = match checked {
+        Ok(Ok(checked)) => checked,
+        Ok(Err(error)) => return Err(internal(&error)),
+        Err(error) => return Err(internal(&error)),
+    };
+
+    let limit = if cap >= 1024 * 1024 {
+        format!("{} MiB", cap / (1024 * 1024))
+    } else {
+        format!("{cap} bytes")
+    };
+    let (lines, reason, detail) = match &checked.verdict {
+        Verdict::Clean => {
+            let file = tokio::fs::File::open(&spool.0)
+                .await
+                .map_err(|error| internal(&error))?;
+            return Ok(SpoolStream {
+                file,
+                buffer: vec![0; 64 * 1024],
+                _spool: spool,
+            });
+        }
+        Verdict::Found(findings) => {
+            let mut lines = vec![
+                "lore refused this push: it would put a secret or a private file into a public \
+                 GitHub repository:"
+                    .to_string(),
+            ];
+            for finding in findings.iter().take(10) {
+                lines.push(format!("  - {finding}"));
+            }
+            if findings.len() > 10 {
+                lines.push(format!("  - and {} more", findings.len() - 10));
+            }
+            lines.push(KEEP_OUT.to_string());
+            (
+                lines,
+                format!("lore: secret or private file found ({})", findings[0]),
+                format!("leak scan: {}", leakscan::summarize(findings)),
+            )
+        }
+        Verdict::TooLarge if over => (
+            vec![format!(
+                "lore refused this push: it is larger than {limit}, too large to check for \
+                 secrets before it reaches a public repository. Push it in smaller parts, or ask \
+                 the user."
+            )],
+            format!("lore: push larger than {limit}, too large to check"),
+            format!("leak scan: the push is larger than {limit}"),
+        ),
+        Verdict::TooLarge => (
+            vec![
+                "lore refused this push: it is too large to check for secrets (an object over \
+                 32 MiB, or more than 1 GiB of content), and the repository is public. Push it \
+                 in smaller parts, or ask the user."
+                    .to_string(),
+            ],
+            "lore: too large to check for secrets".to_string(),
+            "leak scan: too large to check".to_string(),
+        ),
+        Verdict::Malformed(why) => (
+            vec![format!(
+                "lore refused this push: it could not be read to check it for secrets ({why}), \
+                 and the repository is public. Ask the user."
+            )],
+            "lore: the push could not be checked for secrets".to_string(),
+            format!("leak scan: the push could not be read: {why}"),
+        ),
+    };
+    let report = checked
+        .commands
+        .as_ref()
+        .and_then(|commands| packscan::refusal_report(commands, &lines, &reason));
+    let response = match report {
+        Some(body) => (
+            StatusCode::OK,
+            [
+                (
+                    header::CONTENT_TYPE,
+                    "application/x-git-receive-pack-result",
+                ),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            body,
+        )
+            .into_response(),
+        None => plain(StatusCode::FORBIDDEN, &lines.join("\n")),
+    };
+    Err(PushRefused {
+        response: Box::new(response),
+        outcome: "denied",
+        detail,
+    })
 }
 
 /// Milliseconds since the request arrived, for the ops log row.
@@ -783,7 +1153,7 @@ mod tests {
     const TOKEN: &str = "test-lore-token-0123456789abcdef";
     /// The stored credentials, as the upstream must receive them.
     const GITHUB_CREDENTIAL: &str = "ghp_test-upstream-credential";
-    const GITLAB_CREDENTIAL: &str = "glpat-test-upstream-credential";
+    const GITLAB_CREDENTIAL: &str = "glpat-test-upstream-credential"; // lore:allow-secret
 
     /// One request the mock upstream saw.
     #[derive(Debug, Clone, Default)]
@@ -868,10 +1238,58 @@ mod tests {
     /// Serves the proxy itself, with the GitHub base pointed at the mock
     /// upstream and a gitlab row pointing at it too.
     async fn serve_proxy(upstream: &str, vault: Option<VaultKey>) -> (String, Db) {
+        let (base, db, _) = serve_proxy_with(upstream, vault, usize::MAX).await;
+        (base, db)
+    }
+
+    /// The mock GitHub API the leak scan asks about visibility: a
+    /// repository whose name starts with `public` is public, one starting
+    /// with `broken` answers 500, every other one is private. Every
+    /// question is counted.
+    async fn visibility_api() -> (String, Arc<Mutex<Vec<String>>>) {
+        let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .route(
+                "/repos/{owner}/{repo}",
+                any(
+                    |State(asked): State<Arc<Mutex<Vec<String>>>>,
+                     axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
+                     headers: HeaderMap| async move {
+                        let authorized = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            == Some(&format!("Bearer {GITHUB_CREDENTIAL}") as &str);
+                        asked.lock().unwrap().push(format!("{owner}/{repo}"));
+                        if !authorized || repo.starts_with("broken") {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
+                        }
+                        let public = repo.starts_with("public");
+                        (
+                            StatusCode::OK,
+                            format!(
+                                "{{\"full_name\":\"{owner}/{repo}\",\"private\":{}}}",
+                                !public
+                            ),
+                        )
+                    },
+                ),
+            )
+            .with_state(asked.clone());
+        (serve(router).await, asked)
+    }
+
+    /// `serve_proxy` with the visibility API mocked, the push size cap
+    /// set, and the questions the API was asked handed back.
+    async fn serve_proxy_with(
+        upstream: &str,
+        vault: Option<VaultKey>,
+        max_scanned_push: usize,
+    ) -> (String, Db, Arc<Mutex<Vec<String>>>) {
         let dir = std::env::temp_dir().join(format!(
-            "lore-gitproxy-test-{}-{:?}",
+            "lore-gitproxy-test-{}-{:?}-{}",
             std::process::id(),
-            std::thread::current().id()
+            std::thread::current().id(),
+            upstream.rsplit(':').next().unwrap_or("")
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let db = Db::open(&dir.join("lore.db")).unwrap();
@@ -887,15 +1305,19 @@ mod tests {
             db.clone(),
             false,
         ));
+        let (api, asked) = visibility_api().await;
         let state = Arc::new(GitProxy {
             auth,
             vault,
             github_web_base: upstream.to_string(),
             http: client(),
             events: Events::new(),
+            guard: ops::Guard::default(),
+            github_api_base: api,
+            max_scanned_push: max_scanned_push.min(packscan::LIMITS.max_request),
         });
         let base = serve(router(state)).await;
-        (base, db)
+        (base, db, asked)
     }
 
     /// The fixture most tests start from: a working mock upstream, the
@@ -1899,5 +2321,396 @@ mod tests {
         assert_eq!(with_git("owner/repo"), "owner/repo.git");
         assert_eq!(with_git("owner/repo.git"), "owner/repo.git");
         assert_eq!(with_git("owner/repo"), "owner/repo.git");
+    }
+
+    // ---------- The leak scan of pushes ----------
+
+    /// A mock GitHub that speaks just enough of receive-pack: an empty
+    /// repository's ref advertisement, and `ok` for every push. It records
+    /// what it is sent. A local mock, never GitHub.
+    fn receive_pack_upstream(log: &Log) -> Router {
+        Router::new().route(
+            "/{*rest}",
+            any(|State(log): State<Log>, request: Request| async move {
+                let (parts, raw) = request.into_parts();
+                let body = axum::body::to_bytes(raw, 64 * 1024 * 1024)
+                    .await
+                    .unwrap_or_default();
+                log.lock().unwrap().push(Seen {
+                    method: parts.method.to_string(),
+                    path: parts.uri.path().to_string(),
+                    query: parts.uri.query().unwrap_or_default().to_string(),
+                    body: body.to_vec(),
+                    ..Default::default()
+                });
+                let pkt = |text: &[u8]| {
+                    let mut out = format!("{:04x}", text.len() + 4).into_bytes();
+                    out.extend_from_slice(text);
+                    out
+                };
+                if parts.uri.path().ends_with("/info/refs") {
+                    let mut out = pkt(b"# service=git-receive-pack\n");
+                    out.extend_from_slice(b"0000");
+                    out.extend(pkt(
+                        b"0000000000000000000000000000000000000000 capabilities^{}\0report-status \
+                          report-status-v2 delete-refs side-band-64k quiet ofs-delta \
+                          agent=git/mock\n",
+                    ));
+                    out.extend_from_slice(b"0000");
+                    (
+                        [(
+                            header::CONTENT_TYPE,
+                            "application/x-git-receive-pack-advertisement",
+                        )],
+                        out,
+                    )
+                        .into_response()
+                } else {
+                    let mut status = pkt(b"unpack ok\n");
+                    status.extend(pkt(b"ok refs/heads/main\n"));
+                    status.extend_from_slice(b"0000");
+                    let mut band = vec![1u8];
+                    band.extend_from_slice(&status);
+                    let mut out = pkt(&band);
+                    out.extend_from_slice(b"0000");
+                    (
+                        [(
+                            header::CONTENT_TYPE,
+                            "application/x-git-receive-pack-result",
+                        )],
+                        out,
+                    )
+                        .into_response()
+                }
+            })
+            .with_state(log.clone()),
+        )
+    }
+
+    /// Runs git with no user or system configuration, no prompts and a
+    /// fixed identity.
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=lore test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "credential.helper=",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("git runs")
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    /// A fresh repository with these files in one commit.
+    fn work_repo(name: &str, files: &[(&str, String)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lore-push-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(git(&dir, &["init", "-q"]).status.success());
+        for (path, content) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        assert!(git(&dir, &["add", "-A"]).status.success());
+        assert!(git(&dir, &["commit", "-q", "-m", "work"]).status.success());
+        dir
+    }
+
+    /// `git push <url> HEAD:refs/heads/main`, on the blocking pool so the
+    /// servers keep running.
+    async fn push(dir: &std::path::Path, url: String) -> std::process::Output {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || git(&dir, &["push", &url, "HEAD:refs/heads/main"]))
+            .await
+            .unwrap()
+    }
+
+    /// A GitHub-shaped token built at run time, so this file holds none.
+    fn fake_token() -> String {
+        ["gh", "p_", "Zq8Lm2Xv9Rt4Wp6Ky3Nb7Hc5Jd1Fg0Ts8QeA"].concat()
+    }
+
+    fn posts(log: &Log) -> Vec<Seen> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| seen.method == "POST")
+            .cloned()
+            .collect()
+    }
+
+    /// The request body git sends for a push of `files`, captured by
+    /// pushing straight to the mock.
+    async fn captured_push(name: &str, files: &[(&str, String)]) -> Vec<u8> {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let upstream = serve(receive_pack_upstream(&log)).await;
+        let dir = work_repo(name, files);
+        let out = push(&dir, format!("{upstream}/owner/capture.git")).await;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        posts(&log).pop().expect("git sent a pack").body
+    }
+
+    /// A real `git push` through the proxy: refused with the reason under
+    /// `remote:` and the ref rejected when the public repository would get
+    /// a secret; forwarded when the push is clean or the repository is
+    /// private.
+    #[tokio::test]
+    async fn a_real_git_push_is_checked_when_the_repository_is_public() {
+        if !git_available() {
+            eprintln!("git is not installed; skipped");
+            return;
+        }
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let upstream = serve(receive_pack_upstream(&log)).await;
+        let (base, db, asked) = serve_proxy_with(&upstream, Some(key()), usize::MAX).await;
+        let url = |repo: &str| {
+            format!(
+                "http://lore:{TOKEN}@{}/git/github/owner/{repo}.git",
+                base.trim_start_matches("http://")
+            )
+        };
+        let leak = work_repo(
+            "leak",
+            &[
+                ("README.md", "# Shop\n".to_string()),
+                ("config/app.py", format!("GITHUB = '{}'\n", fake_token())),
+            ],
+        );
+
+        let out = push(&leak, url("public-site")).await;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        eprintln!("--- what git printed ---\n{stderr}--- end ---");
+        assert!(!out.status.success());
+        assert!(
+            stderr.contains(
+                "remote: lore refused this push: it would put a secret or a private file into a \
+                 public GitHub repository:"
+            ),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("remote:   - github-token in `config/app.py`, line 1"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("[remote rejected]"), "{stderr}");
+        assert!(!stderr.contains(&fake_token()));
+        assert!(posts(&log).is_empty(), "the push reached the upstream");
+        assert!(
+            asked
+                .lock()
+                .unwrap()
+                .contains(&"owner/public-site".to_string())
+        );
+        let row = &db.ops_log(1).unwrap()[0];
+        assert_eq!(
+            (row.outcome.as_str(), row.path.as_str()),
+            ("denied", "git:owner/public-site.git:receive-pack")
+        );
+        assert_eq!(
+            row.detail,
+            "leak scan: github-token in `config/app.py`, line 1"
+        );
+        let all = format!(
+            "{:?}{:?}",
+            db.ops_log(100).unwrap(),
+            db.activity(100).unwrap()
+        );
+        assert!(!all.contains(&fake_token()));
+
+        // The same push to a private repository streams through.
+        let out = push(&leak, url("repo")).await;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(posts(&log).len(), 1);
+
+        // A clean push to the public repository goes through, checked.
+        let clean = work_repo("clean", &[("README.md", "# Shop\n".to_string())]);
+        let out = push(&clean, url("public-site")).await;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(posts(&log).len(), 2);
+        assert_eq!(db.ops_log(1).unwrap()[0].outcome, "ok");
+    }
+
+    /// The bytes git sends reach the upstream unchanged: checked for a
+    /// public repository, streamed for a private one. A stored credential
+    /// is recognised as such.
+    #[tokio::test]
+    async fn checked_pushes_are_forwarded_byte_identical() {
+        if !git_available() {
+            eprintln!("git is not installed; skipped");
+            return;
+        }
+        let leak = captured_push(
+            "bytes-leak",
+            &[("deploy/notes.txt", format!("use {GITLAB_CREDENTIAL}\n"))],
+        )
+        .await;
+        let clean = captured_push("bytes-clean", &[("a.txt", "hello\n".to_string())]).await;
+
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let upstream = serve(receive_pack_upstream(&log)).await;
+        let (base, _db, _) = serve_proxy_with(&upstream, Some(key()), usize::MAX).await;
+        let client = reqwest::Client::new();
+        let send = |repo: &str, body: Vec<u8>| {
+            call(
+                &client,
+                &base,
+                Method::POST,
+                &format!("/git/github/owner/{repo}.git/git-receive-pack"),
+            )
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-git-receive-pack-request",
+            )
+            .body(body)
+            .send()
+        };
+
+        // A stored credential in a public repository: refused in the
+        // protocol, nothing sent.
+        let response = send("public-docs", leak.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/x-git-receive-pack-result"
+        );
+        let answer = String::from_utf8_lossy(&response.bytes().await.unwrap()).into_owned();
+        assert!(
+            answer.contains("known-secret in `deploy/notes.txt`, line 1"),
+            "{answer}"
+        );
+        assert!(answer.contains("ng refs/heads/main lore: "), "{answer}");
+        assert!(!answer.contains(GITLAB_CREDENTIAL));
+        assert!(posts(&log).is_empty());
+
+        // The same bytes to a private repository arrive unchanged.
+        let response = send("repo", leak.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(posts(&log).last().unwrap().body, leak);
+
+        // A clean push to a public repository arrives unchanged too.
+        let response = send("public-docs", clean.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(posts(&log).last().unwrap().body, clean);
+        assert_eq!(posts(&log).len(), 2);
+    }
+
+    /// A push that cannot be read, one over the size cap, and a repository
+    /// whose visibility cannot be learned are refused; with the scan
+    /// switched off, everything streams as before.
+    #[tokio::test]
+    async fn unreadable_oversized_and_unknown_pushes_fail_closed() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let upstream = serve(receive_pack_upstream(&log)).await;
+        let (base, db, _) = serve_proxy_with(&upstream, Some(key()), 4096).await;
+        let client = reqwest::Client::new();
+        let send = |repo: &str, body: Vec<u8>| {
+            call(
+                &client,
+                &base,
+                Method::POST,
+                &format!("/git/github/owner/{repo}.git/git-receive-pack"),
+            )
+            .body(body)
+            .send()
+        };
+        let command = |pack: &[u8]| {
+            let line = format!(
+                "{} {} refs/heads/main\0report-status side-band-64k\n",
+                "0".repeat(40),
+                "1".repeat(40)
+            );
+            let mut body = format!("{:04x}", line.len() + 4).into_bytes();
+            body.extend_from_slice(line.as_bytes());
+            body.extend_from_slice(b"0000");
+            body.extend_from_slice(pack);
+            body
+        };
+
+        // A damaged pack: refused in the protocol.
+        let response = send("public-x", command(b"PACK\0\0\0\x02junk"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let answer = String::from_utf8_lossy(&response.bytes().await.unwrap()).into_owned();
+        assert!(answer.contains("could not be read to check it"), "{answer}");
+        assert!(answer.contains("ng refs/heads/main"), "{answer}");
+        // No command list at all: a plain 403.
+        let response = send("public-x", b"garbage".to_vec()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("could not be read to check it")
+        );
+        // Over the cap (4096 bytes here, 256 MiB in production).
+        let big = command(&noise(10_000));
+        let response = send("public-x", big.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let answer = String::from_utf8_lossy(&response.bytes().await.unwrap()).into_owned();
+        assert!(
+            answer.contains("larger than 4096 bytes, too large to check")
+                && answer.contains("Push it in smaller parts, or ask the user."),
+            "{answer}"
+        );
+        // A repository the API will not describe counts as public.
+        let response = send("broken-x", big.clone()).await.unwrap();
+        let answer = String::from_utf8_lossy(&response.bytes().await.unwrap()).into_owned();
+        assert!(answer.contains("too large to check"), "{answer}");
+        assert!(posts(&log).is_empty());
+        let row = &db.ops_log(1).unwrap()[0];
+        assert_eq!(row.outcome, "denied");
+        assert_eq!(row.detail, "leak scan: the push is larger than 4096 bytes");
+        // No spool file is left behind.
+        let left: Vec<_> = std::fs::read_dir(db.data_dir())
+            .unwrap()
+            .flatten()
+            .filter(|item| item.file_name().to_string_lossy().contains("push"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+
+        // Switched off: nothing is checked, everything streams.
+        db.set_leak_scan_settings(Some(false), None).unwrap();
+        let response = send("public-x", big.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(posts(&log).last().unwrap().body, big);
     }
 }
