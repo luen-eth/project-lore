@@ -750,11 +750,16 @@ fn percent_encode(text: &str) -> String {
     out
 }
 
+/// What lore calls itself to the services it operates.
+const USER_AGENT: &str = concat!("lore/", env!("CARGO_PKG_VERSION"));
+
 /// The HTTP client every provider call goes through: no redirects, so a
 /// credential is never forwarded to another host, no proxy from the
-/// environment, and 60 s per call.
+/// environment, and 60 s per call. It names itself, because GitHub answers
+/// 403 to any request without a `User-Agent`.
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .timeout(Duration::from_secs(60))
@@ -853,7 +858,8 @@ mod tests {
     type Log = Arc<Mutex<Vec<Seen>>>;
 
     /// The headers worth checking, lowercased as HTTP names are.
-    const WATCHED: [&str; 5] = [
+    const WATCHED: [&str; 6] = [
+        "user-agent",
         "authorization",
         "accept",
         "x-github-api-version",
@@ -955,6 +961,7 @@ mod tests {
                 CLOUDFLARE,
                 format!("{base}/client/v4"),
                 headers(&[
+                    ("user-agent", USER_AGENT),
                     ("authorization", "Bearer test-credential-value"),
                     // reqwest's own default Accept.
                     ("accept", "*/*"),
@@ -964,6 +971,7 @@ mod tests {
                 GITHUB,
                 base.clone(),
                 headers(&[
+                    ("user-agent", USER_AGENT),
                     ("authorization", "Bearer test-credential-value"),
                     ("accept", "application/vnd.github+json"),
                     ("x-github-api-version", "2022-11-28"),
@@ -973,6 +981,7 @@ mod tests {
                 GITLAB,
                 format!("{base}/api/v4"),
                 headers(&[
+                    ("user-agent", USER_AGENT),
                     ("accept", "*/*"),
                     ("private-token", "test-credential-value"),
                 ]),
@@ -980,7 +989,11 @@ mod tests {
             (
                 DOKPLOY,
                 format!("{base}/api"),
-                headers(&[("accept", "*/*"), ("x-api-key", "test-credential-value")]),
+                headers(&[
+                    ("user-agent", USER_AGENT),
+                    ("accept", "*/*"),
+                    ("x-api-key", "test-credential-value"),
+                ]),
             ),
         ];
         for (provider, api_base, headers) in cases {
