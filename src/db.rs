@@ -70,7 +70,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     summary      TEXT NOT NULL DEFAULT '',
     started_at   TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
-    ended_at     TEXT
+    ended_at     TEXT,
+    implicit     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS session_updates (
@@ -214,7 +215,8 @@ const COLUMNS: &str = "id, project, kind, title, body, tags, files, agent, creat
 
 /// The columns of a session row, in the order `Session::from_row` reads them.
 const SESSION_COLUMNS: &str = "id, agent, project, path, repo, commit_hash, branch, \
-                                title, status, summary, started_at, last_seen_at, ended_at";
+                                title, status, summary, started_at, last_seen_at, ended_at, \
+                                implicit";
 
 const RULE_COLUMNS: &str = "id, scope, target, body, enabled, position, created_at, updated_at";
 
@@ -290,6 +292,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("entries", "dirty", "INTEGER NOT NULL DEFAULT 0"),
     ("entries", "session_id", "TEXT"),
     ("activity", "session_id", "TEXT"),
+    ("sessions", "implicit", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -453,6 +456,10 @@ pub struct Session {
     /// Set when the session was closed.
     #[serde(default)]
     pub ended_at: Option<String>,
+    /// True when lore opened the session itself, for a client whose tool
+    /// list predates sessions and so never called `hello`.
+    #[serde(default)]
+    pub implicit: bool,
     /// How many check-ins the session has.
     #[serde(default)]
     pub updates: u32,
@@ -475,13 +482,14 @@ impl Session {
             started_at: row.get(10)?,
             last_seen_at: row.get(11)?,
             ended_at: row.get(12)?,
-            updates: row.get(13)?,
+            implicit: row.get(13)?,
+            updates: row.get(14)?,
         })
     }
 }
 
 /// A session as `hello` opens it; the id and the times are assigned here.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct NewSession {
     pub agent: String,
     pub project: String,
@@ -490,6 +498,9 @@ pub struct NewSession {
     pub commit: String,
     pub branch: String,
     pub title: String,
+    /// True when lore opens the session itself for a client whose tool
+    /// list predates sessions.
+    pub implicit: bool,
 }
 
 /// One `checkin` on a session.
@@ -1452,8 +1463,9 @@ impl Db {
         for session in &backup.sessions {
             tx.execute(
                 "INSERT INTO sessions (id, agent, project, path, repo, commit_hash, branch,
-                                       title, status, summary, started_at, last_seen_at, ended_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                       title, status, summary, started_at, last_seen_at, ended_at,
+                                       implicit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     session.id,
                     session.agent,
@@ -1467,7 +1479,8 @@ impl Db {
                     session.summary,
                     session.started_at,
                     session.last_seen_at,
-                    session.ended_at
+                    session.ended_at,
+                    session.implicit
                 ],
             )?;
         }
@@ -1669,8 +1682,9 @@ impl Db {
             }
             tx.execute(
                 "INSERT INTO sessions (id, agent, project, path, repo, commit_hash, branch,
-                                       title, status, summary, started_at, last_seen_at, ended_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                       title, status, summary, started_at, last_seen_at, ended_at,
+                                       implicit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     session.id,
                     session.agent,
@@ -1684,7 +1698,8 @@ impl Db {
                     session.summary,
                     session.started_at,
                     session.last_seen_at,
-                    session.ended_at
+                    session.ended_at,
+                    session.implicit
                 ],
             )?;
             arrived.insert(session.id.as_str());
@@ -1944,26 +1959,56 @@ impl Db {
     /// Opens the session for a new chat and returns it. The id is "s_" plus
     /// 24 random hex characters.
     pub fn open_session(&self, new: &NewSession) -> Result<Session> {
+        insert_session(&self.lock(), new)
+    }
+
+    /// The agent's open implicit session, or a new one opened from `new`
+    /// when it has none. The second value is true when the session was
+    /// opened by this call. Lookup and insert happen under one lock, so two
+    /// calls at the same moment cannot open two sessions for one agent. An
+    /// implicit session idle for longer than `idle_hours` is closed first
+    /// and never reused.
+    pub fn implicit_session(&self, new: &NewSession, idle_hours: u32) -> Result<(Session, bool)> {
         let conn = self.lock();
-        let id = new_session_id()?;
         conn.execute(
-            "INSERT INTO sessions (id, agent, project, path, repo, commit_hash, branch,
-                                    title, status, summary, started_at, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', '',
-                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
-            params![
-                id,
-                new.agent,
-                new.project,
-                new.path,
-                new.repo,
-                new.commit,
-                new.branch,
-                new.title
-            ],
+            "UPDATE sessions SET status = 'closed', summary = 'closed after inactivity',
+                     ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE status = 'open' AND implicit = 1 AND agent = ?1
+                   AND COALESCE(CAST(strftime('%s', 'now') AS INTEGER)
+                                - CAST(strftime('%s', last_seen_at) AS INTEGER), 0)
+                       >= ?2 * 3600",
+            params![new.agent, idle_hours as i64],
         )?;
-        get_session(&conn, &id)?.context("session vanished after insert")
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM sessions
+                 WHERE status = 'open' AND implicit = 1 AND agent = ?1
+                 ORDER BY last_seen_at DESC, id DESC LIMIT 1",
+                params![new.agent],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            let session = get_session(&conn, &id)?.context("session vanished after lookup")?;
+            return Ok((session, false));
+        }
+        let new = NewSession {
+            implicit: true,
+            ..new.clone()
+        };
+        Ok((insert_session(&conn, &new)?, true))
+    }
+
+    /// Closes the agent's open implicit sessions, except `keep`, with
+    /// `summary`, and returns how many were closed.
+    pub fn close_implicit_sessions(&self, agent: &str, keep: &str, summary: &str) -> Result<usize> {
+        Ok(self.lock().execute(
+            "UPDATE sessions SET status = 'closed', summary = ?3,
+                 ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                 last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE status = 'open' AND implicit = 1 AND agent = ?1 AND id <> ?2",
+            params![agent, keep, summary],
+        )?)
     }
 
     /// One session by its id.
@@ -1992,7 +2037,7 @@ impl Db {
         );
         let found: Option<(Session, i64)> = conn
             .query_row(&sql, params![id], |row| {
-                Ok((Session::from_row(row)?, row.get(14)?))
+                Ok((Session::from_row(row)?, row.get(15)?))
             })
             .optional()?;
         let Some((session, idle_seconds)) = found else {
@@ -3774,6 +3819,32 @@ fn get_entry(conn: &Connection, id: i64) -> Result<Option<Entry>> {
         .optional()?)
 }
 
+/// Inserts a new open session and returns it. The id is "s_" plus 24
+/// random hex characters.
+fn insert_session(conn: &Connection, new: &NewSession) -> Result<Session> {
+    let id = new_session_id()?;
+    conn.execute(
+        "INSERT INTO sessions (id, agent, project, path, repo, commit_hash, branch,
+                                title, status, summary, started_at, last_seen_at,
+                                implicit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', '',
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?9)",
+        params![
+            id,
+            new.agent,
+            new.project,
+            new.path,
+            new.repo,
+            new.commit,
+            new.branch,
+            new.title,
+            new.implicit
+        ],
+    )?;
+    get_session(conn, &id)?.context("session vanished after insert")
+}
+
 /// One session row plus its check-in count.
 fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
     let sql = format!(
@@ -4302,6 +4373,12 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
+    fn temp_db_named(name: &str) -> Db {
+        let dir = std::env::temp_dir().join(format!("lore-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Db::open(&dir.join("lore.db")).unwrap()
+    }
+
     fn temp_db() -> Db {
         let dir = std::env::temp_dir().join(format!(
             "lore-test-{}-{:?}",
@@ -4527,6 +4604,109 @@ mod tests {
                 [],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn an_implicit_session_is_reused_per_agent_and_closed_when_idle() {
+        let db = temp_db();
+        let new = |agent: &str| NewSession {
+            implicit: true,
+            ..session(agent, "unknown", "Implicit")
+        };
+        let (first, opened) = db.implicit_session(&new("claude"), 12).unwrap();
+        assert!(opened && first.implicit);
+        let (again, opened) = db.implicit_session(&new("claude"), 12).unwrap();
+        assert!(!opened);
+        assert_eq!(again.id, first.id);
+        // Another agent gets its own; a real session is never reused.
+        let (other, opened) = db.implicit_session(&new("codex"), 12).unwrap();
+        assert!(opened && other.id != first.id);
+        let real = db.open_session(&session("gemini", "shop", "Real")).unwrap();
+        assert!(!real.implicit);
+        let (gemini, opened) = db.implicit_session(&new("gemini"), 12).unwrap();
+        assert!(opened && gemini.id != real.id);
+        // An idle one is closed, not reused.
+        backdate(&db, 13);
+        let (fresh, opened) = db.implicit_session(&new("claude"), 12).unwrap();
+        assert!(opened && fresh.id != first.id);
+        let stale = db.session(&first.id).unwrap().unwrap();
+        assert_eq!(stale.status, "closed");
+        // Closing an agent's implicit sessions spares the one to keep and
+        // other agents' sessions.
+        assert_eq!(
+            db.close_implicit_sessions("claude", "s_none", "superseded by s_x")
+                .unwrap(),
+            1
+        );
+        let closed = db.session(&fresh.id).unwrap().unwrap();
+        assert_eq!(
+            (closed.status.as_str(), closed.summary.as_str()),
+            ("closed", "superseded by s_x")
+        );
+        assert_eq!(db.session(&real.id).unwrap().unwrap().status, "open");
+    }
+
+    #[test]
+    fn concurrent_implicit_calls_open_one_session() {
+        let db = temp_db();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    let new = NewSession {
+                        implicit: true,
+                        ..session("claude", "unknown", "Implicit")
+                    };
+                    db.implicit_session(&new, 12).unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<(Session, bool)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(_, opened)| *opened).count(), 1);
+        assert!(results.iter().all(|(s, _)| s.id == results[0].0.id));
+        assert_eq!(db.sessions(Some("open"), None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_implicit_flag_survives_backups_and_old_backups_restore() {
+        let db = temp_db();
+        let (implicit, _) = db
+            .implicit_session(
+                &NewSession {
+                    implicit: true,
+                    ..session("claude", "unknown", "Implicit")
+                },
+                12,
+            )
+            .unwrap();
+        let real = db.open_session(&session("codex", "shop", "Real")).unwrap();
+        let backup = db.export().unwrap();
+        assert_eq!(backup.version, BACKUP_VERSION);
+        db.restore(&backup).unwrap();
+        assert!(db.session(&implicit.id).unwrap().unwrap().implicit);
+        assert!(!db.session(&real.id).unwrap().unwrap().implicit);
+
+        // A backup written before the flag existed has no `implicit` key:
+        // it restores, and merges into an empty database, as not implicit.
+        let mut value = serde_json::to_value(&backup).unwrap();
+        for session in value["sessions"].as_array_mut().unwrap() {
+            assert!(
+                session
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("implicit")
+                    .is_some()
+            );
+        }
+        let old: Backup = serde_json::from_value(value).unwrap();
+        db.restore(&old).unwrap();
+        assert!(!db.session(&implicit.id).unwrap().unwrap().implicit);
+        assert_eq!(db.sessions(None, None, 10).unwrap().len(), 2);
+
+        let other = temp_db_named("implicit-merge");
+        other.merge(&backup).unwrap();
+        assert!(other.session(&implicit.id).unwrap().unwrap().implicit);
     }
 
     #[test]
@@ -5481,7 +5661,11 @@ mod tests {
         let db = Db::open(&path).unwrap();
         // Nothing was lost, and the board works right away.
         assert_eq!(db.get(1).unwrap().unwrap().title, "old");
-        assert_eq!(db.session("s_old").unwrap().unwrap().agent, "claude");
+        let old = db.session("s_old").unwrap().unwrap();
+        assert_eq!(old.agent, "claude");
+        // The session gained the implicit flag, unset.
+        assert!(!old.implicit);
+        assert_eq!(db.sessions(None, None, 10).unwrap().len(), 1);
         db.add_task(&task("shop", "fresh")).unwrap();
         let sent = db
             .add_message(&message("message", "claude", "", "fresh too"))

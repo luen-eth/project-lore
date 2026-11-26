@@ -334,6 +334,7 @@ button:focus-visible, [tabindex]:focus-visible {
 }
 .pill.open { color: var(--ok); }
 .pill.closed { color: var(--muted); }
+.pill.implicit { color: var(--warn); }
 
 /* Right column: live activity */
 .feed {

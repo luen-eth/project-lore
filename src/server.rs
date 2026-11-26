@@ -71,6 +71,16 @@ When the briefing lists services you can operate, call them through their tools 
 credentials are stored by the administrator and added by lore on the server side: \
 never ask the user for one, and never send one yourself.";
 
+/// The tools that existed before sessions. A client whose tool list
+/// predates sessions may call them without `session_id`; lore then serves
+/// the call through an implicit session.
+const LEGACY_TOOLS: [&str; 7] = [
+    "recall", "log", "recent", "projects", "get", "amend", "forget",
+];
+
+/// The title of a session lore opens itself for such a client.
+const IMPLICIT_TITLE: &str = "Implicit session (client with an outdated tool list)";
+
 /// Longest body returned inline by `recall` and `recent`; `get` returns everything.
 const PREVIEW_CHARS: usize = 700;
 
@@ -91,13 +101,33 @@ pub struct Lore {
     /// The HTTP client provider calls go through: no redirects, so a
     /// credential is never forwarded to another host.
     http: reqwest::Client,
-    #[expect(dead_code, reason = "read by the tool_handler macro")]
+    /// The tools this server offers; the notice for clients with an
+    /// outdated tool list names them.
     tool_router: ToolRouter<Self>,
 }
 
+/// Keeps `session_id` listed as required in the schema of a legacy tool
+/// whose `session_id` deserializes when missing (`#[serde(default)]`,
+/// which schemars would otherwise mark optional), so new clients still
+/// always send it.
+fn require_session_id(schema: &mut schemars::Schema) {
+    if let Some(object) = schema.as_object_mut() {
+        let required = object
+            .entry("required")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(list) = required.as_array_mut()
+            && !list.iter().any(|name| name == "session_id")
+        {
+            list.insert(0, "session_id".into());
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(transform = require_session_id)]
 pub struct RecallArgs {
     /// Session id returned by `hello` for this chat.
+    #[serde(default)]
     pub session_id: String,
     /// What you want to know, in natural language or keywords. Any language.
     pub query: String,
@@ -110,8 +140,10 @@ pub struct RecallArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(transform = require_session_id)]
 pub struct LogArgs {
     /// Session id returned by `hello` for this chat.
+    #[serde(default)]
     pub session_id: String,
     /// Repository or folder name in lowercase, e.g. `project-lore`.
     pub project: String,
@@ -145,8 +177,10 @@ pub struct LogArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(transform = require_session_id)]
 pub struct RecentArgs {
     /// Session id returned by `hello` for this chat.
+    #[serde(default)]
     pub session_id: String,
     /// Restrict to one project. Omit for every project.
     pub project: Option<String>,
@@ -157,22 +191,28 @@ pub struct RecentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(transform = require_session_id)]
 pub struct ProjectsArgs {
     /// Session id returned by `hello` for this chat.
+    #[serde(default)]
     pub session_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(transform = require_session_id)]
 pub struct IdArgs {
     /// Session id returned by `hello` for this chat.
+    #[serde(default)]
     pub session_id: String,
     /// Entry id, as shown in `recall` and `recent` results.
     pub id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(transform = require_session_id)]
 pub struct AmendArgs {
     /// Session id returned by `hello` for this chat.
+    #[serde(default)]
     pub session_id: String,
     /// Id of the entry to change.
     pub id: i64,
@@ -384,6 +424,39 @@ pub struct OpsArgs {
     pub body: Option<serde_json::Value>,
 }
 
+/// Where a legacy tool call says it comes from, for the implicit session it
+/// may open: the call's `project`, and from `log` also the directory and
+/// git state.
+#[derive(Debug, Default)]
+struct CallPlace {
+    project: Option<String>,
+    path: String,
+    repo: String,
+    commit: String,
+    branch: String,
+}
+
+impl CallPlace {
+    fn project(project: Option<&str>) -> Self {
+        Self {
+            project: project.map(str::to_string),
+            ..Self::default()
+        }
+    }
+}
+
+/// A legacy tool's result with the implicit-session text in front of it,
+/// on success and on failure alike, so a briefing is never lost.
+fn with_preface(preface: String, result: Result<String, String>) -> Result<String, String> {
+    if preface.is_empty() {
+        return result;
+    }
+    match result {
+        Ok(text) => Ok(preface + &text),
+        Err(error) => Err(preface + &error),
+    }
+}
+
 #[tool_router]
 impl Lore {
     pub fn new(
@@ -419,6 +492,75 @@ impl Lore {
             })
     }
 
+    /// The session a call to one of the seven legacy tools runs in, and the
+    /// text to put before its result. With a `session_id` this is exactly
+    /// `require_session` and the text is empty. Without one, the agent's
+    /// open implicit session is reused or a new one is opened from `place`;
+    /// the text is then the notice about the outdated tool list, preceded
+    /// by the `hello` briefing when this call opened the session.
+    fn legacy_session(
+        &self,
+        given: &str,
+        agent: &str,
+        shared: bool,
+        place: CallPlace,
+    ) -> Result<(Session, String), String> {
+        let given = given.trim();
+        if !given.is_empty() {
+            return Ok((self.require_session(given, agent, shared)?, String::new()));
+        }
+        let new = NewSession {
+            agent: agent.to_string(),
+            project: normalize_project_filter(place.project).unwrap_or_else(|| "unknown".into()),
+            path: place.path.trim().to_string(),
+            repo: optional_ref(&place.repo),
+            commit: normalize_commit(&place.commit).unwrap_or_default(),
+            branch: place.branch.trim().to_string(),
+            title: IMPLICIT_TITLE.to_string(),
+            implicit: true,
+        };
+        let (session, opened) = self
+            .db
+            .implicit_session(&new, self.idle_hours)
+            .map_err(internal)?;
+        let session = self.require_session(&session.id, agent, shared)?;
+        let mut preface = String::new();
+        if opened {
+            // Stale sessions never show as open in the briefing.
+            self.db
+                .close_idle_sessions(self.idle_hours)
+                .map_err(internal)?;
+            preface.push_str(&format!(
+                "You called lore without a session, so lore opened one for you: {}.\n\n",
+                session.id
+            ));
+            preface.push_str(&self.open_briefing(&session, agent)?);
+            preface.push_str("\n\n");
+        }
+        preface.push_str(&self.outdated_notice(&session.id));
+        preface.push_str("\n\n");
+        Ok((session, preface))
+    }
+
+    /// The paragraph that tells a client with an outdated tool list what it
+    /// is missing and how to get it. The tool names come from the router,
+    /// so the list stays current.
+    fn outdated_notice(&self, session_id: &str) -> String {
+        let names: Vec<String> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .filter(|name| !LEGACY_TOOLS.contains(&name.as_str()))
+            .collect();
+        format!(
+            "Your client is using an outdated lore tool list. lore now also has: {}. Start a \
+             new chat or restart the MCP client to load them, then begin with `hello`. Until \
+             then pass \"session_id\": \"{session_id}\" on every lore call.",
+            names.join(", ")
+        )
+    }
+
     #[tool(
         description = "Search the shared memory for past work, decisions, bugs and notes related to a topic. Call this before starting work to learn what was already done. Combines keyword and semantic search."
     )]
@@ -432,93 +574,101 @@ impl Lore {
         let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
-            let session = this.require_session(&session_id, &agent, shared)?;
-            let query = args.query.trim().to_string();
-            if query.is_empty() {
-                return Err("query must not be empty".into());
-            }
-            let project = normalize_project_filter(args.project);
-            let kind = normalize_kind_filter(args.kind)?;
-            let limit = args.limit.unwrap_or(8).clamp(1, 25) as usize;
-            let vector = this.embedder.embed_query(&query).unwrap_or_else(|error| {
-                tracing::warn!(%error, "query embedding failed");
-                None
-            });
-            let hits = this
-                .db
-                .search(
-                    &query,
-                    vector.as_deref(),
-                    project.as_deref(),
-                    kind.as_deref(),
-                    limit,
-                    this.min_similarity,
-                )
-                .map_err(internal)?;
-            let found: Vec<i64> = hits.iter().map(|hit| hit.entry.id).collect();
-            this.note(
+            let (session, preface) = this.legacy_session(
+                &session_id,
                 &agent,
-                "recall",
-                project.as_deref().unwrap_or(""),
-                Some(&session.id),
-                None,
-                &found,
-                &format!("\"{}\" → {} found", clip(&query, 90), found.len()),
-            );
-            // Files the query matches come after the entries; a failure here
-            // only costs the hint.
-            let related = this
-                .db
-                .search_files(
-                    &query,
-                    project.as_deref(),
-                    vector.as_deref(),
-                    this.min_similarity,
-                    3,
-                )
-                .unwrap_or_else(|error| {
-                    tracing::warn!(%error, "file search failed");
-                    Vec::new()
-                });
-            let mut related_text = String::new();
-            if !related.is_empty() {
-                related_text.push_str("\nRelated files:\n");
-                for hit in &related {
-                    related_text.push_str(&format!(
-                        "- #{} {}/{} v{} — {}\n",
-                        hit.file.id,
-                        hit.file.project,
-                        hit.file.path,
-                        hit.file.version,
-                        clip(&hit.file.description, 160)
-                    ));
+                shared,
+                CallPlace::project(args.project.as_deref()),
+            )?;
+            let result = (|| {
+                let query = args.query.trim().to_string();
+                if query.is_empty() {
+                    return Err("query must not be empty".into());
                 }
-                related_text.push_str("Read one with `file_get`.\n");
-            }
-            if hits.is_empty() {
-                let scope = project
-                    .map(|p| format!(" in project `{p}`"))
-                    .unwrap_or_default();
-                let mut out = format!("No entries found for \"{query}\"{scope}.");
-                out.push_str(&related_text);
-                return Ok(out);
-            }
-            let mut out = format!("{} entries for \"{query}\":\n", hits.len());
-            for hit in &hits {
-                out.push('\n');
-                let matched = match hit.similarity {
-                    Some(similarity) => format!("{} ({similarity:.2})", hit.matched),
-                    None => hit.matched.to_string(),
-                };
-                out.push_str(&render(&hit.entry, Some(&matched), true));
-            }
-            out.push_str(&related_text);
-            if !this.embedder.is_ready() {
-                out.push_str(
-                    "\n(Semantic search is still warming up; results are keyword-only.)\n",
+                let project = normalize_project_filter(args.project);
+                let kind = normalize_kind_filter(args.kind)?;
+                let limit = args.limit.unwrap_or(8).clamp(1, 25) as usize;
+                let vector = this.embedder.embed_query(&query).unwrap_or_else(|error| {
+                    tracing::warn!(%error, "query embedding failed");
+                    None
+                });
+                let hits = this
+                    .db
+                    .search(
+                        &query,
+                        vector.as_deref(),
+                        project.as_deref(),
+                        kind.as_deref(),
+                        limit,
+                        this.min_similarity,
+                    )
+                    .map_err(internal)?;
+                let found: Vec<i64> = hits.iter().map(|hit| hit.entry.id).collect();
+                this.note(
+                    &agent,
+                    "recall",
+                    project.as_deref().unwrap_or(""),
+                    Some(&session.id),
+                    None,
+                    &found,
+                    &format!("\"{}\" → {} found", clip(&query, 90), found.len()),
                 );
-            }
-            Ok(out)
+                // Files the query matches come after the entries; a failure here
+                // only costs the hint.
+                let related = this
+                    .db
+                    .search_files(
+                        &query,
+                        project.as_deref(),
+                        vector.as_deref(),
+                        this.min_similarity,
+                        3,
+                    )
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "file search failed");
+                        Vec::new()
+                    });
+                let mut related_text = String::new();
+                if !related.is_empty() {
+                    related_text.push_str("\nRelated files:\n");
+                    for hit in &related {
+                        related_text.push_str(&format!(
+                            "- #{} {}/{} v{} — {}\n",
+                            hit.file.id,
+                            hit.file.project,
+                            hit.file.path,
+                            hit.file.version,
+                            clip(&hit.file.description, 160)
+                        ));
+                    }
+                    related_text.push_str("Read one with `file_get`.\n");
+                }
+                if hits.is_empty() {
+                    let scope = project
+                        .map(|p| format!(" in project `{p}`"))
+                        .unwrap_or_default();
+                    let mut out = format!("No entries found for \"{query}\"{scope}.");
+                    out.push_str(&related_text);
+                    return Ok(out);
+                }
+                let mut out = format!("{} entries for \"{query}\":\n", hits.len());
+                for hit in &hits {
+                    out.push('\n');
+                    let matched = match hit.similarity {
+                        Some(similarity) => format!("{} ({similarity:.2})", hit.matched),
+                        None => hit.matched.to_string(),
+                    };
+                    out.push_str(&render(&hit.entry, Some(&matched), true));
+                }
+                out.push_str(&related_text);
+                if !this.embedder.is_ready() {
+                    out.push_str(
+                        "\n(Semantic search is still warming up; results are keyword-only.)\n",
+                    );
+                }
+                Ok(out)
+            })();
+            with_preface(preface, result)
         })
         .await
     }
@@ -542,47 +692,61 @@ impl Lore {
         };
         let this = self.clone();
         blocking(move || {
-            let session = this.require_session(&session_id, &actor, shared)?;
-            let new = NewEntry {
-                project: normalize_project(&args.project)?,
-                kind: normalize_kind(&args.kind)?,
-                title: required("title", &args.title)?,
-                body: required("body", &args.body)?,
-                tags: join_list(args.tags),
-                files: join_list(args.files),
-                agent,
-                path: required("path", &args.path)?,
-                repo: optional_ref(&args.repo),
-                commit: normalize_commit(&args.commit)?,
-                branch: args.branch.unwrap_or_default().trim().to_string(),
-                dirty: args.dirty.unwrap_or(false),
-                session_id: Some(session.id.clone()),
-            };
-            let entry = this.db.insert(&new).map_err(internal)?;
-            this.embed_entry(&entry);
-            let actor = if entry.agent.is_empty() {
-                &actor
-            } else {
-                &entry.agent
-            };
-            this.note(
-                actor,
-                "log",
-                &entry.project,
-                Some(&session.id),
-                Some(entry.id),
-                &[],
-                &format!("[{}] {}", entry.kind, entry.title),
-            );
-            let at = if entry.commit.is_empty() {
-                " (no commit recorded)".to_string()
-            } else {
-                format!(" at {}", describe_commit(&entry))
-            };
-            Ok(format!(
-                "Logged #{} in `{}` ({}){at}: {}",
-                entry.id, entry.project, entry.kind, entry.title
-            ))
+            let (session, preface) = this.legacy_session(
+                &session_id,
+                &actor,
+                shared,
+                CallPlace {
+                    project: Some(args.project.clone()),
+                    path: args.path.clone(),
+                    repo: args.repo.clone(),
+                    commit: args.commit.clone(),
+                    branch: args.branch.clone().unwrap_or_default(),
+                },
+            )?;
+            let result = (|| {
+                let new = NewEntry {
+                    project: normalize_project(&args.project)?,
+                    kind: normalize_kind(&args.kind)?,
+                    title: required("title", &args.title)?,
+                    body: required("body", &args.body)?,
+                    tags: join_list(args.tags),
+                    files: join_list(args.files),
+                    agent,
+                    path: required("path", &args.path)?,
+                    repo: optional_ref(&args.repo),
+                    commit: normalize_commit(&args.commit)?,
+                    branch: args.branch.unwrap_or_default().trim().to_string(),
+                    dirty: args.dirty.unwrap_or(false),
+                    session_id: Some(session.id.clone()),
+                };
+                let entry = this.db.insert(&new).map_err(internal)?;
+                this.embed_entry(&entry);
+                let actor = if entry.agent.is_empty() {
+                    &actor
+                } else {
+                    &entry.agent
+                };
+                this.note(
+                    actor,
+                    "log",
+                    &entry.project,
+                    Some(&session.id),
+                    Some(entry.id),
+                    &[],
+                    &format!("[{}] {}", entry.kind, entry.title),
+                );
+                let at = if entry.commit.is_empty() {
+                    " (no commit recorded)".to_string()
+                } else {
+                    format!(" at {}", describe_commit(&entry))
+                };
+                Ok(format!(
+                    "Logged #{} in `{}` ({}){at}: {}",
+                    entry.id, entry.project, entry.kind, entry.title
+                ))
+            })();
+            with_preface(preface, result)
         })
         .await
     }
@@ -600,33 +764,41 @@ impl Lore {
         let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
-            let session = this.require_session(&session_id, &agent, shared)?;
-            let project = normalize_project_filter(args.project);
-            let kind = normalize_kind_filter(args.kind)?;
-            let limit = args.limit.unwrap_or(10).clamp(1, 50) as usize;
-            let entries = this
-                .db
-                .recent(project.as_deref(), kind.as_deref(), limit)
-                .map_err(internal)?;
-            let seen: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
-            this.note(
+            let (session, preface) = this.legacy_session(
+                &session_id,
                 &agent,
-                "recent",
-                project.as_deref().unwrap_or(""),
-                Some(&session.id),
-                None,
-                &seen,
-                &format!("{} newest entries", seen.len()),
-            );
-            if entries.is_empty() {
-                return Ok("No entries yet.".to_string());
-            }
-            let mut out = format!("{} most recent entries:\n", entries.len());
-            for entry in &entries {
-                out.push('\n');
-                out.push_str(&render(entry, None, true));
-            }
-            Ok(out)
+                shared,
+                CallPlace::project(args.project.as_deref()),
+            )?;
+            let result = (|| {
+                let project = normalize_project_filter(args.project);
+                let kind = normalize_kind_filter(args.kind)?;
+                let limit = args.limit.unwrap_or(10).clamp(1, 50) as usize;
+                let entries = this
+                    .db
+                    .recent(project.as_deref(), kind.as_deref(), limit)
+                    .map_err(internal)?;
+                let seen: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+                this.note(
+                    &agent,
+                    "recent",
+                    project.as_deref().unwrap_or(""),
+                    Some(&session.id),
+                    None,
+                    &seen,
+                    &format!("{} newest entries", seen.len()),
+                );
+                if entries.is_empty() {
+                    return Ok("No entries yet.".to_string());
+                }
+                let mut out = format!("{} most recent entries:\n", entries.len());
+                for entry in &entries {
+                    out.push('\n');
+                    out.push_str(&render(entry, None, true));
+                }
+                Ok(out)
+            })();
+            with_preface(preface, result)
         })
         .await
     }
@@ -644,51 +816,55 @@ impl Lore {
         let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
-            let session = this.require_session(&session_id, &agent, shared)?;
-            let projects = this.db.projects().map_err(internal)?;
-            this.note(
-                &agent,
-                "projects",
-                "",
-                Some(&session.id),
-                None,
-                &[],
-                &format!("{} projects", projects.len()),
-            );
-            if projects.is_empty() {
-                return Ok("No projects yet.".to_string());
-            }
-            let mut out = String::from("Projects (most recently active first):\n");
-            for p in projects {
-                out.push_str(&format!(
-                    "- `{}`: {} entries, last activity {}\n",
-                    p.project, p.entries, p.last_activity
-                ));
-                for head in &p.heads {
-                    let agent = if head.agent.is_empty() {
-                        "unknown agent"
-                    } else {
-                        &head.agent
-                    };
-                    let branch = if head.branch.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" on {}", head.branch)
-                    };
-                    let dirty = if head.dirty {
-                        ", with uncommitted changes"
-                    } else {
-                        ""
-                    };
-                    out.push_str(&format!(
-                        "    {agent} last logged at commit {}{branch}{dirty} ({}, entry #{})\n",
-                        short(&head.commit),
-                        head.at,
-                        head.entry_id
-                    ));
+            let (session, preface) =
+                this.legacy_session(&session_id, &agent, shared, CallPlace::default())?;
+            let result = (|| {
+                let projects = this.db.projects().map_err(internal)?;
+                this.note(
+                    &agent,
+                    "projects",
+                    "",
+                    Some(&session.id),
+                    None,
+                    &[],
+                    &format!("{} projects", projects.len()),
+                );
+                if projects.is_empty() {
+                    return Ok("No projects yet.".to_string());
                 }
-            }
-            Ok(out)
+                let mut out = String::from("Projects (most recently active first):\n");
+                for p in projects {
+                    out.push_str(&format!(
+                        "- `{}`: {} entries, last activity {}\n",
+                        p.project, p.entries, p.last_activity
+                    ));
+                    for head in &p.heads {
+                        let agent = if head.agent.is_empty() {
+                            "unknown agent"
+                        } else {
+                            &head.agent
+                        };
+                        let branch = if head.branch.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" on {}", head.branch)
+                        };
+                        let dirty = if head.dirty {
+                            ", with uncommitted changes"
+                        } else {
+                            ""
+                        };
+                        out.push_str(&format!(
+                            "    {agent} last logged at commit {}{branch}{dirty} ({}, entry #{})\n",
+                            short(&head.commit),
+                            head.at,
+                            head.entry_id
+                        ));
+                    }
+                }
+                Ok(out)
+            })();
+            with_preface(preface, result)
         })
         .await
     }
@@ -706,8 +882,9 @@ impl Lore {
         let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
-            let session = this.require_session(&session_id, &agent, shared)?;
-            match this.db.get(args.id).map_err(internal)? {
+            let (session, preface) =
+                this.legacy_session(&session_id, &agent, shared, CallPlace::default())?;
+            let result = (|| match this.db.get(args.id).map_err(internal)? {
                 Some(entry) => {
                     this.note(
                         &agent,
@@ -721,7 +898,8 @@ impl Lore {
                     Ok(render(&entry, None, false))
                 }
                 None => Err(format!("No entry with id {}.", args.id)),
-            }
+            })();
+            with_preface(preface, result)
         })
         .await
     }
@@ -739,38 +917,42 @@ impl Lore {
         let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
-            let session = this.require_session(&session_id, &agent, shared)?;
-            let patch = Patch {
-                kind: args.kind.as_deref().map(normalize_kind).transpose()?,
-                title: args
-                    .title
-                    .as_deref()
-                    .map(|t| required("title", t))
-                    .transpose()?,
-                body: args
-                    .body
-                    .as_deref()
-                    .map(|b| required("body", b))
-                    .transpose()?,
-                tags: args.tags.map(|t| join_list(Some(t))),
-                files: args.files.map(|f| join_list(Some(f))),
-            };
-            match this.db.amend(args.id, &patch).map_err(internal)? {
-                Some(entry) => {
-                    this.embed_entry(&entry);
-                    this.note(
-                        &agent,
-                        "amend",
-                        &entry.project,
-                        Some(&session.id),
-                        Some(entry.id),
-                        &[],
-                        &entry.title,
-                    );
-                    Ok(format!("Updated #{}: {}", entry.id, entry.title))
+            let (session, preface) =
+                this.legacy_session(&session_id, &agent, shared, CallPlace::default())?;
+            let result = (|| {
+                let patch = Patch {
+                    kind: args.kind.as_deref().map(normalize_kind).transpose()?,
+                    title: args
+                        .title
+                        .as_deref()
+                        .map(|t| required("title", t))
+                        .transpose()?,
+                    body: args
+                        .body
+                        .as_deref()
+                        .map(|b| required("body", b))
+                        .transpose()?,
+                    tags: args.tags.map(|t| join_list(Some(t))),
+                    files: args.files.map(|f| join_list(Some(f))),
+                };
+                match this.db.amend(args.id, &patch).map_err(internal)? {
+                    Some(entry) => {
+                        this.embed_entry(&entry);
+                        this.note(
+                            &agent,
+                            "amend",
+                            &entry.project,
+                            Some(&session.id),
+                            Some(entry.id),
+                            &[],
+                            &entry.title,
+                        );
+                        Ok(format!("Updated #{}: {}", entry.id, entry.title))
+                    }
+                    None => Err(format!("No entry with id {}.", args.id)),
                 }
-                None => Err(format!("No entry with id {}.", args.id)),
-            }
+            })();
+            with_preface(preface, result)
         })
         .await
     }
@@ -788,25 +970,29 @@ impl Lore {
         let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
-            let session = this.require_session(&session_id, &agent, shared)?;
-            let existing = this.db.get(args.id).map_err(internal)?;
-            if this.db.delete(args.id).map_err(internal)? {
-                let (project, title) = existing
-                    .map(|entry| (entry.project, entry.title))
-                    .unwrap_or_default();
-                this.note(
-                    &agent,
-                    "forget",
-                    &project,
-                    Some(&session.id),
-                    Some(args.id),
-                    &[],
-                    &title,
-                );
-                Ok(format!("Deleted #{}.", args.id))
-            } else {
-                Err(format!("No entry with id {}.", args.id))
-            }
+            let (session, preface) =
+                this.legacy_session(&session_id, &agent, shared, CallPlace::default())?;
+            let result = (|| {
+                let existing = this.db.get(args.id).map_err(internal)?;
+                if this.db.delete(args.id).map_err(internal)? {
+                    let (project, title) = existing
+                        .map(|entry| (entry.project, entry.title))
+                        .unwrap_or_default();
+                    this.note(
+                        &agent,
+                        "forget",
+                        &project,
+                        Some(&session.id),
+                        Some(args.id),
+                        &[],
+                        &title,
+                    );
+                    Ok(format!("Deleted #{}.", args.id))
+                } else {
+                    Err(format!("No entry with id {}.", args.id))
+                }
+            })();
+            with_preface(preface, result)
         })
         .await
     }
@@ -836,109 +1022,23 @@ impl Lore {
                 commit: normalize_commit(&args.commit)?,
                 branch: args.branch.unwrap_or_default().trim().to_string(),
                 title: one_line("title", &args.title)?,
+                implicit: false,
             };
             // Stale sessions never show as open in the briefing.
             this.db
                 .close_idle_sessions(this.idle_hours)
                 .map_err(internal)?;
             let session = this.db.open_session(&new).map_err(internal)?;
-            let address = this.db.address_for(&session.agent).map_err(internal)?;
-            let language = this.db.profile().map_err(internal)?.language;
-            let rules = this
-                .db
-                .briefing_rules(&session.agent, &session.project)
+            // The implicit session this agent used before it learned about
+            // `hello` is done: the admin page shows only the real one.
+            this.db
+                .close_implicit_sessions(
+                    &actor,
+                    &session.id,
+                    &format!("superseded by {}", session.id),
+                )
                 .map_err(internal)?;
-            let mut others = this
-                .db
-                .sessions(Some("open"), Some(&session.project), 9)
-                .map_err(internal)?;
-            others.retain(|other| other.id != session.id);
-            let mut other_rows = Vec::new();
-            for other in others {
-                let latest = this.db.latest_session_update(&other.id).map_err(internal)?;
-                other_rows.push((other, latest));
-            }
-            let entries = this
-                .db
-                .recent(Some(&session.project), None, 5)
-                .map_err(internal)?;
-            let feed_agent = if session.agent.is_empty() {
-                &actor
-            } else {
-                &session.agent
-            };
-            // The open tasks show what is waiting; tasks meant for this
-            // agent come first.
-            let mut open_tasks = this
-                .db
-                .tasks(Some(&session.project), &["open", "claimed"], 100)
-                .map_err(internal)?;
-            open_tasks.sort_by_key(|task| task.assignee.as_str() != feed_agent);
-            open_tasks.truncate(10);
-            // The files kept for the project: how many, and the newest three.
-            let file_count = this
-                .db
-                .project_file_count(&session.project)
-                .map_err(internal)?;
-            let latest_files = if file_count > 0 {
-                this.db.files(Some(&session.project), 3).map_err(internal)?
-            } else {
-                Vec::new()
-            };
-            // The services this agent may operate, named when there is one.
-            let services = this.usable_services(&actor, feed_agent)?;
-            // Up to ten unread messages are listed and marked read, and
-            // handoff notes for whoever works on this project next arrive
-            // here, exactly once. Only what this call marked or delivered
-            // is shown, so a session opening at the same moment cannot show
-            // it too. Handoffs go last, with nothing that can fail after
-            // them: a delivered note cannot be fetched again, while a
-            // message marked read still shows in `inbox` with include_read.
-            let mut unread = this
-                .db
-                .unread_messages(feed_agent, None, 10)
-                .map_err(internal)?;
-            let ids: Vec<i64> = unread.iter().map(|message| message.id).collect();
-            let marked = this.db.mark_read(feed_agent, &ids).map_err(internal)?;
-            unread.retain(|message| marked.contains(&message.id));
-            let unread_more = this.db.unread_message_count(feed_agent).map_err(internal)?;
-            let mut handoffs = this
-                .db
-                .pending_handoffs(&session.project, &session.id)
-                .map_err(internal)?;
-            let ids: Vec<i64> = handoffs.iter().map(|message| message.id).collect();
-            let delivered = this
-                .db
-                .deliver_handoffs(&ids, feed_agent, &session.id)
-                .map_err(internal)?;
-            handoffs.retain(|message| delivered.contains(&message.id));
-            this.note(
-                feed_agent,
-                "hello",
-                &session.project,
-                Some(&session.id),
-                None,
-                &[],
-                &clip(&session.title, 90),
-            );
-            Ok(briefing(
-                &session,
-                &address,
-                &language,
-                &rules,
-                &BriefingBoard {
-                    handoffs: &handoffs,
-                    unread: &unread,
-                    unread_more: unread_more.max(0) as usize,
-                    agent: feed_agent,
-                    open_tasks: &open_tasks,
-                    file_count: file_count.max(0) as usize,
-                    latest_files: &latest_files,
-                    services: &services,
-                },
-                &other_rows,
-                &entries,
-            ))
+            this.open_briefing(&session, &actor)
         })
         .await
     }
@@ -2026,6 +2126,111 @@ impl Lore {
         );
     }
 
+    /// The briefing for a session that was just opened: the profile, the
+    /// rules, the board, the other open sessions and where the project was
+    /// left off. Marks the listed messages read and delivers the handoff
+    /// notes, so it is built once per session. `actor` is the agent the
+    /// token names.
+    fn open_briefing(&self, session: &Session, actor: &str) -> Result<String, String> {
+        let address = self.db.address_for(&session.agent).map_err(internal)?;
+        let language = self.db.profile().map_err(internal)?.language;
+        let rules = self
+            .db
+            .briefing_rules(&session.agent, &session.project)
+            .map_err(internal)?;
+        let mut others = self
+            .db
+            .sessions(Some("open"), Some(&session.project), 9)
+            .map_err(internal)?;
+        others.retain(|other| other.id != session.id);
+        let mut other_rows = Vec::new();
+        for other in others {
+            let latest = self.db.latest_session_update(&other.id).map_err(internal)?;
+            other_rows.push((other, latest));
+        }
+        let entries = self
+            .db
+            .recent(Some(&session.project), None, 5)
+            .map_err(internal)?;
+        let feed_agent = if session.agent.is_empty() {
+            actor
+        } else {
+            &session.agent
+        };
+        // The open tasks show what is waiting; tasks meant for this
+        // agent come first.
+        let mut open_tasks = self
+            .db
+            .tasks(Some(&session.project), &["open", "claimed"], 100)
+            .map_err(internal)?;
+        open_tasks.sort_by_key(|task| task.assignee.as_str() != feed_agent);
+        open_tasks.truncate(10);
+        // The files kept for the project: how many, and the newest three.
+        let file_count = self
+            .db
+            .project_file_count(&session.project)
+            .map_err(internal)?;
+        let latest_files = if file_count > 0 {
+            self.db.files(Some(&session.project), 3).map_err(internal)?
+        } else {
+            Vec::new()
+        };
+        // The services this agent may operate, named when there is one.
+        let services = self.usable_services(actor, feed_agent)?;
+        // Up to ten unread messages are listed and marked read, and
+        // handoff notes for whoever works on this project next arrive
+        // here, exactly once. Only what this call marked or delivered
+        // is shown, so a session opening at the same moment cannot show
+        // it too. Handoffs go last, with nothing that can fail after
+        // them: a delivered note cannot be fetched again, while a
+        // message marked read still shows in `inbox` with include_read.
+        let mut unread = self
+            .db
+            .unread_messages(feed_agent, None, 10)
+            .map_err(internal)?;
+        let ids: Vec<i64> = unread.iter().map(|message| message.id).collect();
+        let marked = self.db.mark_read(feed_agent, &ids).map_err(internal)?;
+        unread.retain(|message| marked.contains(&message.id));
+        let unread_more = self.db.unread_message_count(feed_agent).map_err(internal)?;
+        let mut handoffs = self
+            .db
+            .pending_handoffs(&session.project, &session.id)
+            .map_err(internal)?;
+        let ids: Vec<i64> = handoffs.iter().map(|message| message.id).collect();
+        let delivered = self
+            .db
+            .deliver_handoffs(&ids, feed_agent, &session.id)
+            .map_err(internal)?;
+        handoffs.retain(|message| delivered.contains(&message.id));
+        self.note(
+            feed_agent,
+            "hello",
+            &session.project,
+            Some(&session.id),
+            None,
+            &[],
+            &clip(&session.title, 90),
+        );
+        Ok(briefing(
+            session,
+            &address,
+            &language,
+            &rules,
+            &BriefingBoard {
+                handoffs: &handoffs,
+                unread: &unread,
+                unread_more: unread_more.max(0) as usize,
+                agent: feed_agent,
+                open_tasks: &open_tasks,
+                file_count: file_count.max(0) as usize,
+                latest_files: &latest_files,
+                services: &services,
+            },
+            &other_rows,
+            &entries,
+        ))
+    }
+
     /// The services this agent may operate, as the briefing names them:
     /// `cloudflare (full), github (read)`. Empty when there are none, so
     /// the briefing leaves the line out.
@@ -2624,6 +2829,264 @@ fn render(entry: &Entry, matched: Option<&str>, preview: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
+
+    fn test_lore(name: &str) -> Lore {
+        let dir =
+            std::env::temp_dir().join(format!("lore-server-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        db.set_profile(&crate::db::ProfileInput {
+            address: "Boss".into(),
+            language: "English".into(),
+            agents: Vec::new(),
+        })
+        .unwrap();
+        Lore::new(db, Embedder::disabled(), 0.5, Events::new(), 12, None)
+    }
+
+    /// A request authenticated as `agent`, or with the shared token.
+    fn as_agent(agent: Option<&str>) -> Extension<Parts> {
+        let mut parts = axum::http::Request::builder()
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        if let Some(agent) = agent {
+            parts.extensions.insert(Agent(agent.to_string()));
+        }
+        Extension(parts)
+    }
+
+    fn args<T: DeserializeOwned>(value: serde_json::Value) -> Parameters<T> {
+        Parameters(serde_json::from_value(value).unwrap())
+    }
+
+    const OPENED: &str = "You called lore without a session, so lore opened one for you: ";
+    const OUTDATED: &str = "Your client is using an outdated lore tool list.";
+
+    /// The session id an implicit answer names in its notice.
+    fn notice_id(text: &str) -> String {
+        let marker = "pass \"session_id\": \"";
+        let start = text.find(marker).unwrap() + marker.len();
+        text[start..].split('"').next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn the_seven_tools_work_without_a_session_id() {
+        let lore = test_lore("seven");
+        let claude = || as_agent(Some("claude"));
+        let first = lore
+            .log(
+                args(json!({
+                    "project": "Shop", "kind": "note", "title": "t", "body": "b",
+                    "path": "/work/shop", "repo": "none", "commit": "abc1234",
+                    "branch": "main"
+                })),
+                claude(),
+            )
+            .await
+            .unwrap();
+        // The first call carries the briefing, then the notice, then the result.
+        assert!(first.starts_with(OPENED), "{first}");
+        assert!(first.contains("Reply to the user in: English"), "{first}");
+        assert!(first.contains("How to address the user: Boss"), "{first}");
+        assert!(first.contains(OUTDATED));
+        assert!(first.trim_end().ends_with(": t"), "{first}");
+        let id = notice_id(&first);
+        assert!(first.contains(&format!("{OPENED}{id}.")));
+        let session = lore.db.session(&id).unwrap().unwrap();
+        assert!(session.implicit);
+        assert_eq!(
+            (
+                session.agent.as_str(),
+                session.project.as_str(),
+                session.path.as_str(),
+                session.commit.as_str(),
+                session.branch.as_str(),
+                session.title.as_str()
+            ),
+            (
+                "claude",
+                "shop",
+                "/work/shop",
+                "abc1234",
+                "main",
+                IMPLICIT_TITLE
+            )
+        );
+        let entry = lore.db.recent(None, None, 1).unwrap().remove(0);
+        assert_eq!(entry.session_id.as_deref(), Some(id.as_str()));
+
+        let later = [
+            lore.recent(args(json!({})), claude()).await,
+            lore.recall(args(json!({"query": "t"})), claude()).await,
+            lore.projects(args(json!({})), claude()).await,
+            lore.get(args(json!({"id": entry.id})), claude()).await,
+            lore.amend(args(json!({"id": entry.id, "title": "t2"})), claude())
+                .await,
+            lore.forget(args(json!({"id": entry.id, "session_id": "  "})), claude())
+                .await,
+        ];
+        for answer in later {
+            let answer = answer.unwrap();
+            assert!(answer.starts_with(OUTDATED), "{answer}");
+            assert!(!answer.contains(OPENED) && !answer.contains("Reply to the user"));
+            assert_eq!(notice_id(&answer), id);
+            // Exactly one paragraph, then a blank line, then the result.
+            assert_eq!(answer.matches(OUTDATED).count(), 1);
+            assert!(!answer.split("\n\n").next().unwrap().contains('\n'));
+        }
+        // Every call ran in the implicit session.
+        let activity = lore.db.activity(20).unwrap();
+        assert!(
+            activity
+                .iter()
+                .filter(|a| a.tool != "hello")
+                .all(|a| a.session_id.as_deref() == Some(id.as_str())),
+        );
+        // A failing call still carries the notice.
+        let failed = lore
+            .get(args(json!({"id": 999_999})), claude())
+            .await
+            .unwrap_err();
+        assert!(failed.starts_with(OUTDATED) && failed.ends_with("No entry with id 999999."));
+    }
+
+    #[tokio::test]
+    async fn the_notice_lists_the_new_tools_only() {
+        let lore = test_lore("notice");
+        let notice = lore.outdated_notice("s_x");
+        let list = notice
+            .split("lore now also has: ")
+            .nth(1)
+            .unwrap()
+            .split(". Start")
+            .next()
+            .unwrap();
+        let names: Vec<&str> = list.split(", ").collect();
+        for wanted in [
+            "hello",
+            "checkin",
+            "bye",
+            "tasks",
+            "task_add",
+            "file_save",
+            "files",
+        ] {
+            assert!(names.contains(&wanted), "{wanted} missing from {list}");
+        }
+        for legacy in LEGACY_TOOLS {
+            assert!(!names.contains(&legacy), "{legacy} listed in {list}");
+        }
+        assert_eq!(names.len(), Lore::tool_router().list_all().len() - 7);
+        assert!(notice.ends_with("pass \"session_id\": \"s_x\" on every lore call."));
+    }
+
+    #[tokio::test]
+    async fn agents_get_their_own_implicit_session_and_hello_closes_it() {
+        let lore = test_lore("agents");
+        let claude = notice_id(
+            &lore
+                .recent(args(json!({})), as_agent(Some("claude")))
+                .await
+                .unwrap(),
+        );
+        let codex = notice_id(
+            &lore
+                .recent(args(json!({})), as_agent(Some("codex")))
+                .await
+                .unwrap(),
+        );
+        assert_ne!(claude, codex);
+        // The shared token gets one too, with the same access as before.
+        let shared = lore
+            .recent(args(json!({"project": "shop"})), as_agent(None))
+            .await
+            .unwrap();
+        assert!(shared.starts_with(OPENED));
+        let shared = notice_id(&shared);
+        assert_eq!(
+            lore.db.session(&shared).unwrap().unwrap().agent,
+            SHARED_AGENT
+        );
+        assert_eq!(lore.db.session(&shared).unwrap().unwrap().project, "shop");
+
+        let hello = lore
+            .hello(
+                args(json!({
+                    "project": "shop", "path": "/work", "repo": "none",
+                    "commit": "none", "title": "real chat"
+                })),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap();
+        let real = hello.split_whitespace().nth(1).unwrap().to_string();
+        let closed = lore.db.session(&claude).unwrap().unwrap();
+        assert_eq!(closed.status, "closed");
+        assert_eq!(closed.summary, format!("superseded by {real}"));
+        assert_eq!(lore.db.session(&codex).unwrap().unwrap().status, "open");
+        assert_eq!(lore.db.session(&shared).unwrap().unwrap().status, "open");
+
+        // With a real session id the tools answer exactly as before.
+        let plain = lore
+            .recent(args(json!({"session_id": real})), as_agent(Some("claude")))
+            .await
+            .unwrap();
+        assert_eq!(plain, "No entries yet.");
+        // The next call without one opens a fresh implicit session.
+        let again = lore
+            .recent(args(json!({})), as_agent(Some("claude")))
+            .await
+            .unwrap();
+        assert!(again.starts_with(OPENED));
+        assert_ne!(notice_id(&again), claude);
+    }
+
+    #[tokio::test]
+    async fn unknown_sessions_and_newer_tools_still_fail() {
+        let lore = test_lore("refuse");
+        let error = lore
+            .recent(
+                args(json!({"session_id": "s_nope"})),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("no open session `s_nope`: call `hello` first"),
+            "{error}"
+        );
+        assert!(!error.contains(OUTDATED));
+        // Tools that came with sessions still need the field.
+        for missing in [
+            serde_json::from_value::<TasksArgs>(json!({})).is_err(),
+            serde_json::from_value::<CheckinArgs>(json!({"note": "x"})).is_err(),
+            serde_json::from_value::<FileSaveArgs>(json!({})).is_err(),
+            serde_json::from_value::<IntegrationsArgs>(json!({})).is_err(),
+            serde_json::from_value::<OpsArgs>(json!({"method": "GET", "path": "/"})).is_err(),
+        ] {
+            assert!(missing);
+        }
+        assert!(lore.db.sessions(None, None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_schema_still_requires_a_session_id() {
+        let router = Lore::tool_router();
+        for name in LEGACY_TOOLS {
+            let schema = &router.get(name).unwrap().input_schema;
+            let required = schema.get("required").and_then(|r| r.as_array()).unwrap();
+            assert!(
+                required.iter().any(|field| field == "session_id"),
+                "{name}: {required:?}"
+            );
+            let doc = &schema["properties"]["session_id"]["description"];
+            assert_eq!(doc, "Session id returned by `hello` for this chat.");
+        }
+    }
 
     #[test]
     fn logged_agent_text_is_one_bounded_line() {

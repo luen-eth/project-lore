@@ -1010,6 +1010,11 @@ function renderSessions() {
     const sub = el("span", "sub");
     sub.textContent = `${session.project} · ${session.title}`;
     sub.append(el("span", "pill " + (open ? "open" : "closed"), open ? "open" : "closed"));
+    if (session.implicit) {
+      const pill = el("span", "pill implicit", "implicit");
+      pill.title = "Opened by lore for a client with an outdated tool list";
+      sub.append(pill);
+    }
     item.title = `${session.title} · started ${shortDate(session.started_at)}`;
     item.append(avatar, name, when, sub);
     clickable(item, () => openSessionDetail(session));
@@ -1036,7 +1041,9 @@ async function openSessionDetail(session) {
   box.replaceChildren();
   const open = data.status === "open";
   const badge = el("span", "pill " + (open ? "open" : "closed"), open ? "open" : "closed");
-  box.append(badge, el("h3", "", data.title || "(untitled chat)"));
+  box.append(badge);
+  if (data.implicit) box.append(el("span", "pill implicit", "implicit"));
+  box.append(el("h3", "", data.title || "(untitled chat)"));
   const meta = [
     `by ${data.agent || "unknown agent"}`,
     data.project,

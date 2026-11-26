@@ -90,7 +90,8 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `dokploy` | Call the Dokploy API of the deployment server (projects, applications, deployments, …) |
 
 Every tool except `hello` takes the `session_id` that `hello` returned and
-refuses to work without a live session.
+refuses to work without a live session (the seven original tools fall back to an
+implicit session for clients with an outdated tool list; see below).
 
 ### Who is ahead, who is behind
 
@@ -142,6 +143,18 @@ ends. Every other lore tool takes the `session_id` that `hello` returned.
 A session that sees no activity for `LORE_SESSION_IDLE_HOURS` hours (default 12)
 is closed automatically with the summary "closed after inactivity", so stale
 sessions never show as open.
+
+A client reads the tool list once, when a chat starts, so a chat opened before lore
+had sessions still knows only `recall`, `log`, `recent`, `projects`, `get`, `amend`
+and `forget`, without `session_id`. Those seven tools therefore still work without
+one: lore serves the call through an **implicit session** for the token's agent
+(reused until it closes), returns the `hello` briefing with the first such call,
+and puts a short notice in front of every such answer that names the tools the
+client is missing and the `session_id` to pass from now on. Every other tool still
+requires a `session_id`, and the access is exactly that of the token. The admin
+page marks these sessions "implicit", and a later `hello` from the same agent
+closes its implicit session. This is only a fallback: the real fix is to start a
+new chat or restart the MCP client so it loads the current tool list.
 
 The **Profile** dialog on the admin page is where the administrator edits all of
 this: the default form of address, the reply language, one form of address per
