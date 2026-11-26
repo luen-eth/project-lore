@@ -98,6 +98,8 @@ pub struct Lore {
     /// The vault key, when the administrator set one. Without it no
     /// credential exists and the provider tools say so.
     vault: Option<VaultKey>,
+    /// lore's own secrets and protected Dokploy ids, built at start-up.
+    guard: ops::Guard,
     /// The HTTP client provider calls go through: no redirects, so a
     /// credential is never forwarded to another host.
     http: reqwest::Client,
@@ -484,6 +486,7 @@ impl Lore {
         events: Events,
         idle_hours: u32,
         vault: Option<VaultKey>,
+        guard: ops::Guard,
     ) -> Self {
         Self {
             db,
@@ -492,6 +495,7 @@ impl Lore {
             idle_hours,
             events,
             vault,
+            guard,
             http: ops::client(),
             tool_router: Self::tool_router(),
         }
@@ -2055,7 +2059,11 @@ impl Lore {
                         return Err(error.message().to_string());
                     }
                 };
-                let path = match ops::validate(&request) {
+                // A write naming lore's own Dokploy deployment is refused
+                // here, and logged the way a denylisted path is.
+                let checked = ops::validate(&request)
+                    .and_then(|path| this.guard.check(&request).map(|()| path));
+                let path = match checked {
                     Ok(path) => path,
                     Err(error) => {
                         this.log_op_call(
@@ -2103,7 +2111,14 @@ impl Lore {
         };
         let actor = session_agent(&agent, &session).to_string();
         let started = Instant::now();
-        let outcome = ops::call(&self.http, &granted.api_base, &granted.secret, &request).await;
+        let outcome = ops::call(
+            &self.http,
+            &granted.api_base,
+            &granted.secret,
+            &self.guard,
+            &request,
+        )
+        .await;
         let (status, went, detail, answer) = match outcome {
             Ok(response) => (
                 response.status as i64,
@@ -2941,7 +2956,15 @@ mod tests {
             agents: Vec::new(),
         })
         .unwrap();
-        Lore::new(db, Embedder::disabled(), 0.5, Events::new(), 12, None)
+        Lore::new(
+            db,
+            Embedder::disabled(),
+            0.5,
+            Events::new(),
+            12,
+            None,
+            ops::Guard::default(),
+        )
     }
 
     /// A request authenticated as `agent`, or with the shared token.
@@ -3159,6 +3182,42 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(lore.db.session(&shared).unwrap().unwrap().status, "open");
+    }
+
+    #[tokio::test]
+    async fn a_write_to_lore_s_own_dokploy_deployment_is_refused_and_logged() {
+        let mut lore = test_lore("protected");
+        lore.guard = ops::Guard::new(
+            Vec::<String>::new(),
+            ops::parse_protected("lore-app_Xk29fQ").unwrap(),
+        );
+        let first = lore
+            .recent(args(json!({})), as_agent(Some("claude")))
+            .await
+            .unwrap();
+        let session = notice_id(&first);
+        let refused = lore
+            .dokploy(
+                args(json!({
+                    "session_id": session, "method": "POST",
+                    "path": "/application.saveEnvironment",
+                    "body": {"applicationId": "lore-app_Xk29fQ", "env": "X=1"}
+                })),
+                as_agent(Some("claude")),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            "lore does not let agents change its own Dokploy deployment (lore-app_Xk29fQ). \
+             Ask the user to do this themselves."
+        );
+        let row = &lore.db.ops_log(1).unwrap()[0];
+        assert_eq!(row.provider, "dokploy");
+        assert_eq!(row.method, "POST");
+        assert_eq!(row.path, "/application.saveEnvironment");
+        assert_eq!(row.outcome, "error");
+        assert_eq!(row.detail, refused);
     }
 
     #[tokio::test]

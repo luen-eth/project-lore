@@ -295,6 +295,28 @@ backup ever carries a credential. The call is made by lore, which refuses to fol
 redirect (so the credential is never forwarded to another host) and replaces every
 occurrence of the credential in a response with `[redacted]` before the agent sees it.
 
+**lore's own secrets are redacted too.** When lore runs on Dokploy, reading its own
+application returns its environment, and with it every secret lore was started with.
+So every provider response, from all four services, is also cleaned of the values of
+`LORE_TOKENS` (each token), `LORE_TOKEN`, `LORE_ADMIN_PASSWORD`, `LORE_VIEWER_PASSWORD`,
+`LORE_RECAPTCHA_SECRET_KEY` and `LORE_VAULT_KEY`, in the same plain, JSON-escaped,
+percent-encoded and base64 forms as the credential. Values shorter than 8 characters
+are skipped, so they cannot blank out ordinary text.
+
+**lore's own Dokploy deployment is read-only to agents.** Set `LORE_DOKPLOY_PROTECTED`
+to the ids of lore's own deployment (application, project, environment, domain, mount
+ids, anything), comma separated. A `dokploy` call whose method is not `GET` is refused
+before anything is sent when one of those ids appears as a whole value anywhere in the
+request: a string at any depth of the body (inside arrays too), an object key, a query
+value or a path segment. The refusal is the sentence `lore does not let agents change
+its own Dokploy deployment (<id>). Ask the user to do this themselves.` and lands in the
+operations log like a refused credential endpoint. A `GET` naming the id still works
+(its answer is redacted as above), and every other Dokploy project stays fully readable
+and writable, env included. This guards the obvious path, not every one: **full Dokploy
+access still means control of the host lore runs on** (a new application or a compose
+file can reach the server and its volumes), so agents that should not have that must be
+set to **read** or **off** for Dokploy in the permissions table.
+
 **Who may do what.** Each agent has a level per provider — **off**, **read** (GET only)
 or **full** (the default) — set on the same panel, one row per known agent. A call
 gets the stricter of two levels: that of the token it authenticated with, and that of
@@ -539,6 +561,7 @@ meaningful change, decision or bug fix. Every `log` call includes `path`
 | `LORE_RECAPTCHA_SITE_KEY`, `LORE_RECAPTCHA_SECRET_KEY` | | reCAPTCHA v3 keys for the admin sign-in. Unset skips the check. |
 | `LORE_RECAPTCHA_MIN_SCORE` | `0.5` | Lowest reCAPTCHA score accepted. |
 | `LORE_VAULT_KEY` | | Key the service credentials are encrypted with: exactly 64 hex characters (`openssl rand -hex 32`). Unset disables the credential vault: no credential can be stored and the provider tools refuse. Losing it means entering the credentials again. |
+| `LORE_DOKPLOY_PROTECTED` | | Comma-separated Dokploy ids of lore's own deployment (each at least 8 characters of `A-Z a-z 0-9 _ -`). Agents may read them but no non-GET `dokploy` call naming one is sent. Anything else refuses to start. |
 | `LORE_EMBEDDING_MODEL` | `bge-m3` | `bge-m3`, `e5-large`, `e5-base` or `e5-small`. Changing it re-embeds every entry. |
 | `LORE_EMBEDDINGS` | `on` | `off` gives keyword-only search with no model download. |
 | `LORE_MIN_SIMILARITY` | per model | Similarity below which a meaning-only match is dropped. |
@@ -587,6 +610,14 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
   in a response is replaced with `[redacted]` before an agent sees it. Each call is
   checked against the agent's permission level and recorded in the operations log
   with the path only — no query, no body, no response.
+- **lore's own secrets never travel either.** Every agent token, both passwords, the
+  reCAPTCHA secret key and the vault key are replaced with `[redacted]` in every
+  provider response, in the same encoded forms as a credential, so reading lore's own
+  Dokploy application does not reveal them. With `LORE_DOKPLOY_PROTECTED` set, an agent
+  cannot change or delete lore's own Dokploy deployment: any non-GET call naming one of
+  its ids is refused and logged. Full Dokploy access still means control of the host
+  lore runs on, so agents that should not have that must be set to **read** or **off**
+  for Dokploy in the permissions table.
 - **The git proxy never hands out a credential either.** An agent authenticates with
   its own lore token (compared in constant time, throttled like `/mcp`), the request
   is checked against the same permission levels, and the stored credential is added

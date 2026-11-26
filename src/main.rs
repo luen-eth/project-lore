@@ -78,6 +78,34 @@ async fn main() -> Result<()> {
         );
     }
 
+    // lore's own secrets, redacted from every provider response (the env
+    // of lore's own Dokploy application holds them all), and the Dokploy
+    // ids of its own deployment, which no agent write may name. Built once
+    // here; neither is ever logged.
+    let dokploy_protected = ops::parse_protected(&env_or("LORE_DOKPLOY_PROTECTED", ""))?;
+    let guard = {
+        let own_secrets: Vec<String> = tokens
+            .iter()
+            .map(|token| token.secret().to_string())
+            .chain(
+                [
+                    "LORE_ADMIN_PASSWORD",
+                    "LORE_VIEWER_PASSWORD",
+                    "LORE_RECAPTCHA_SECRET_KEY",
+                    "LORE_VAULT_KEY",
+                ]
+                .map(|name| env_or(name, "")),
+            )
+            .collect();
+        ops::Guard::new(&own_secrets, dokploy_protected)
+    };
+    if guard.protected_count() > 0 {
+        tracing::info!(
+            ids = guard.protected_count(),
+            "agents may not change lore's own Dokploy deployment (LORE_DOKPLOY_PROTECTED)"
+        );
+    }
+
     let db = Db::open(&data_dir.join("lore.db"))?;
     let semantic = flag("LORE_EMBEDDINGS", true);
     let embedder = if semantic {
@@ -117,7 +145,7 @@ async fn main() -> Result<()> {
     let events = Events::new();
     let mcp = {
         let (db, embedder, events) = (db.clone(), embedder.clone(), events.clone());
-        let vault = vault.clone();
+        let (vault, guard) = (vault.clone(), guard.clone());
         StreamableHttpService::new(
             move || {
                 Ok(Lore::new(
@@ -127,6 +155,7 @@ async fn main() -> Result<()> {
                     events.clone(),
                     idle_hours,
                     vault.clone(),
+                    guard.clone(),
                 ))
             },
             Arc::new(LocalSessionManager::default()),
@@ -173,6 +202,7 @@ async fn main() -> Result<()> {
                 embedder.clone(),
                 idle_hours,
                 vault.clone(),
+                guard.clone(),
             );
             app = app.merge(admin::router(Arc::new(admin)));
             tracing::info!("admin view enabled at /admin");

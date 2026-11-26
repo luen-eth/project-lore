@@ -110,6 +110,8 @@ pub struct Admin {
     /// The vault key, when the administrator set one. Without it no
     /// credential can be stored, and the integrations panel says so.
     pub vault: Option<VaultKey>,
+    /// lore's own secrets, redacted from the Test button's answer too.
+    guard: ops::Guard,
     sessions: Mutex<HashMap<String, (Instant, Role)>>,
     logins: RateLimiter,
     http: reqwest::Client,
@@ -135,6 +137,7 @@ impl Admin {
         embedder: Embedder,
         idle_hours: u32,
         vault: Option<VaultKey>,
+        guard: ops::Guard,
     ) -> Self {
         Self {
             db,
@@ -149,6 +152,7 @@ impl Admin {
             events,
             embedder,
             vault,
+            guard,
             sessions: Mutex::new(HashMap::new()),
             // Five wrong attempts lock the address out for fifteen minutes.
             logins: RateLimiter::new(5, Duration::from_secs(15 * 60)),
@@ -1578,7 +1582,7 @@ async fn test_integration(
     };
     let request = provider.test_request();
     let started = Instant::now();
-    let outcome = ops::call(&admin.ops_http, &base, &secret, &request).await;
+    let outcome = ops::call(&admin.ops_http, &base, &secret, &admin.guard, &request).await;
     // What the test found, ready to answer and to log.
     let (ok, status, message, log_status, log_outcome, log_detail) = match &outcome {
         Ok(response) => {
@@ -1939,6 +1943,7 @@ mod tests {
             Embedder::disabled(),
             12,
             vault,
+            ops::Guard::default(),
         ));
         {
             let mut sessions = admin.sessions.lock().unwrap();

@@ -3,7 +3,7 @@
 //! for. The credential is added here, on the server side, and every
 //! response is redacted before it travels back.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use serde_json::Value;
 
@@ -558,16 +558,20 @@ fn decode_for_match(path: &str) -> String {
 }
 
 /// Makes one provider call: the credential is added here, the response is
-/// redacted and cut, and redirects are never followed (that is the
-/// client's doing; `client` builds it that way).
+/// redacted (the credential and lore's own secrets, see `Guard`) and cut,
+/// and redirects are never followed (that is the client's doing; `client`
+/// builds it that way). A Dokploy write naming a protected id is refused
+/// before anything is sent.
 pub async fn call(
     client: &reqwest::Client,
     base: &str,
     secret: &Secret,
+    guard: &Guard,
     req: &OpsRequest,
 ) -> Result<OpsResponse, OpsError> {
     let method = normalize_method(&req.method)?;
     validate(req)?;
+    guard.check(req)?;
 
     // The final URL is always the API base plus the path: parse both and
     // refuse anything that would send the credential to another host, or
@@ -664,7 +668,9 @@ pub async fn call(
         Err(_) => None,
     };
     // A provider that echoes the credential back must not hand it to the
-    // agent: every occurrence goes before the text leaves this function.
+    // agent, and neither must one of lore's own secrets (the env of lore's
+    // own Dokploy application holds them all): every occurrence goes
+    // before the text leaves this function.
     let (text, truncated) = match text {
         None => (
             format!(
@@ -675,7 +681,7 @@ pub async fn call(
             false,
         ),
         Some(text) => {
-            let text = redact(text, secret.expose());
+            let text = guard.redact(text, secret.expose());
             let truncated = too_big || text.chars().count() > MAX_BODY_CHARS;
             let text: String = if truncated {
                 text.chars().take(MAX_BODY_CHARS).collect()
@@ -706,16 +712,16 @@ pub fn sensitive_header(value: &str) -> Result<reqwest::header::HeaderValue, Ops
     Ok(header)
 }
 
-/// Every occurrence of the credential in a response, also in the encoded
-/// forms a service may echo it in (JSON-escaped, percent-encoded,
-/// base64), replaced with `[redacted]`.
-pub fn redact(text: &str, secret: &str) -> String {
+/// The forms a service may echo a secret in: as is, JSON-escaped,
+/// percent-encoded and base64 (padded, unpadded, URL-safe). Empty forms
+/// are left out.
+fn secret_forms(secret: &str) -> Vec<String> {
     use base64::Engine;
     if secret.is_empty() {
-        return text.to_string();
+        return Vec::new();
     }
     let json = serde_json::to_string(secret).unwrap_or_default();
-    let mut forms = vec![
+    let forms = [
         secret.to_string(),
         json.strip_prefix('"')
             .and_then(|inner| inner.strip_suffix('"'))
@@ -726,14 +732,159 @@ pub fn redact(text: &str, secret: &str) -> String {
         base64::engine::general_purpose::STANDARD_NO_PAD.encode(secret),
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret),
     ];
+    forms.into_iter().filter(|form| !form.is_empty()).collect()
+}
+
+/// Every occurrence of any of `forms` in `text` replaced with `[redacted]`.
+fn redact_forms(text: &str, mut forms: Vec<String>) -> String {
     // Longest first, so a form that contains another goes whole.
-    forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
+    forms.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     forms.dedup();
     let mut text = text.to_string();
-    for form in forms.iter().filter(|form| !form.is_empty()) {
+    for form in &forms {
         text = text.replace(form.as_str(), REDACTED);
     }
     text
+}
+
+/// Own secrets shorter than this are not redacted: so short a value
+/// would blank out ordinary text.
+const MIN_OWN_SECRET_CHARS: usize = 8;
+/// The shortest id `LORE_DOKPLOY_PROTECTED` accepts.
+const MIN_PROTECTED_ID_CHARS: usize = 8;
+
+/// What lore keeps of its own deployment out of the agents' reach, built
+/// once at start-up and never changed: its own secrets (agent tokens,
+/// passwords, the reCAPTCHA secret, the vault key), redacted from every
+/// provider response exactly like the stored credential, and the Dokploy
+/// ids of its own deployment, which no write may name. The secrets are
+/// never printed or logged: `Debug` says `[redacted]`.
+#[derive(Clone, Default)]
+pub struct Guard {
+    /// Every form (see `secret_forms`) of every own secret.
+    secret_forms: Arc<[String]>,
+    /// `LORE_DOKPLOY_PROTECTED`: the ids of lore's own Dokploy deployment.
+    dokploy_protected: Arc<[String]>,
+}
+
+impl std::fmt::Debug for Guard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Guard([redacted])")
+    }
+}
+
+impl Guard {
+    /// The guard for lore's own secrets (values shorter than 8 characters
+    /// are skipped) and its protected Dokploy ids (see `parse_protected`).
+    pub fn new<S: AsRef<str>>(
+        own_secrets: impl IntoIterator<Item = S>,
+        dokploy_protected: Vec<String>,
+    ) -> Self {
+        let mut forms: Vec<String> = Vec::new();
+        for secret in own_secrets {
+            let secret = secret.as_ref();
+            if secret.chars().count() >= MIN_OWN_SECRET_CHARS {
+                forms.extend(secret_forms(secret));
+            }
+        }
+        forms.sort();
+        forms.dedup();
+        Self {
+            secret_forms: forms.into(),
+            dokploy_protected: dokploy_protected.into(),
+        }
+    }
+
+    /// How many protected Dokploy ids there are; for the start-up log.
+    pub fn protected_count(&self) -> usize {
+        self.dokploy_protected.len()
+    }
+
+    /// Every occurrence of the stored credential and of each of lore's own
+    /// secrets in a response, also in the encoded forms a service may echo
+    /// them in (JSON-escaped, percent-encoded, base64), replaced with
+    /// `[redacted]`.
+    pub fn redact(&self, text: &str, credential: &str) -> String {
+        let mut forms = secret_forms(credential);
+        forms.extend(self.secret_forms.iter().cloned());
+        redact_forms(text, forms)
+    }
+
+    /// Refuses a Dokploy write that names a protected id anywhere: a string
+    /// (or number) value at any depth of the body, an object key, a query
+    /// value or a path segment, compared whole. A GET passes; its answer
+    /// is redacted. Other providers are never refused here.
+    pub fn check(&self, req: &OpsRequest) -> Result<(), OpsError> {
+        if req.provider.id != DOKPLOY.id || self.dokploy_protected.is_empty() {
+            return Ok(());
+        }
+        if normalize_method(&req.method)? == "GET" {
+            return Ok(());
+        }
+        let segments: Vec<String> = decode_for_match(&req.path)
+            .split('/')
+            .map(str::to_string)
+            .collect();
+        for id in self.dokploy_protected.iter() {
+            let in_path = segments.iter().any(|segment| *segment == id.to_lowercase());
+            let in_query = req
+                .query
+                .as_ref()
+                .is_some_and(|query| query.values().any(|value| names_id(value, id)));
+            let in_body = req.body.as_ref().is_some_and(|body| names_id(body, id));
+            if in_path || in_query || in_body {
+                return Err(OpsError::Invalid(format!(
+                    "lore does not let agents change its own Dokploy deployment ({id}). \
+                     Ask the user to do this themselves."
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// True when `value`, or anything inside it, is exactly `id`: a string
+/// (surrounding whitespace ignored), a number written the same, or an
+/// object key.
+fn names_id(value: &Value, id: &str) -> bool {
+    match value {
+        Value::String(text) => text.trim() == id,
+        Value::Number(number) => number.to_string() == id,
+        Value::Array(items) => items.iter().any(|item| names_id(item, id)),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, item)| key.trim() == id || names_id(item, id)),
+        Value::Bool(_) | Value::Null => false,
+    }
+}
+
+/// `LORE_DOKPLOY_PROTECTED`: comma-separated Dokploy ids of lore's own
+/// deployment. Entries are trimmed and empty ones ignored; each must be at
+/// least 8 characters of `A-Z a-z 0-9 _ -`. The error names the variable
+/// and the entry's position, never its value.
+pub fn parse_protected(value: &str) -> anyhow::Result<Vec<String>> {
+    let mut ids: Vec<String> = Vec::new();
+    for (index, entry) in value.split(',').map(str::trim).enumerate() {
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.chars().count() < MIN_PROTECTED_ID_CHARS
+            || !entry
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            anyhow::bail!(
+                "LORE_DOKPLOY_PROTECTED must be a comma-separated list of Dokploy ids, each at \
+                 least {MIN_PROTECTED_ID_CHARS} characters of A-Z, a-z, 0-9, `_` and `-` \
+                 (entry {} is not). Copy the ids from the Dokploy dashboard.",
+                index + 1
+            );
+        }
+        if !ids.iter().any(|id| id == entry) {
+            ids.push(entry.to_string());
+        }
+    }
+    Ok(ids)
 }
 
 /// Every byte outside the unreserved set as `%XX`, as a query string or a
@@ -1001,6 +1152,7 @@ mod tests {
                 &client,
                 &api_base,
                 &secret,
+                &Guard::default(),
                 &request(provider, "get", "/zones"),
             )
             .await
@@ -1028,6 +1180,7 @@ mod tests {
             &client,
             &base,
             &Secret::new("test-credential-value"),
+            &Guard::default(),
             &OpsRequest {
                 provider: GITHUB,
                 method: "POST".into(),
@@ -1078,7 +1231,11 @@ mod tests {
                 body: None,
             },
         ] {
-            assert!(call(&client, &base, &Secret::new("x"), &req).await.is_err());
+            assert!(
+                call(&client, &base, &Secret::new("x"), &Guard::default(), &req)
+                    .await
+                    .is_err()
+            );
         }
         assert_eq!(log.lock().unwrap().len(), 1);
     }
@@ -1111,6 +1268,7 @@ mod tests {
             &client(),
             &base,
             &Secret::new("test-credential-value"),
+            &Guard::default(),
             &request(GITHUB, "GET", "//api.example.com/user"),
         )
         .await
@@ -1140,6 +1298,7 @@ mod tests {
             &client(),
             &format!("{base}/api"),
             &Secret::new("test-credential-value"),
+            &Guard::default(),
             &request(GITHUB, "GET", "/user"),
         )
         .await
@@ -1158,6 +1317,7 @@ mod tests {
             &client(),
             &base,
             &Secret::new(secret),
+            &Guard::default(),
             &request(GITHUB, "GET", "/user"),
         )
         .await
@@ -1177,6 +1337,7 @@ mod tests {
             &client(),
             &base,
             &Secret::new("test-credential-value"),
+            &Guard::default(),
             &request(DOKPLOY, "GET", "/project.all"),
         )
         .await
@@ -1191,6 +1352,7 @@ mod tests {
             &client(),
             &base,
             &Secret::new("test-credential-value"),
+            &Guard::default(),
             &request(DOKPLOY, "GET", "/project.all"),
         )
         .await
@@ -1205,6 +1367,7 @@ mod tests {
             &client(),
             &base,
             &Secret::new("test-credential-value"),
+            &Guard::default(),
             &request(DOKPLOY, "GET", "/project.all"),
         )
         .await
@@ -1218,6 +1381,7 @@ mod tests {
             &client(),
             &base,
             &Secret::new("test-credential-value"),
+            &Guard::default(),
             &request(DOKPLOY, "GET", "/project.all"),
         )
         .await
@@ -1235,6 +1399,7 @@ mod tests {
             &client(),
             &base,
             &Secret::new("test-credential-value"),
+            &Guard::default(),
             &request(GITLAB, "GET", "/projects"),
         )
         .await
@@ -1510,9 +1675,201 @@ mod tests {
             "tok%2Fen%2B1%3Dx",
             base64::engine::general_purpose::STANDARD.encode(secret)
         );
-        let out = redact(&text, secret);
+        let guard = Guard::default();
+        let out = guard.redact(&text, secret);
         assert!(!out.contains("tok"), "{out}");
-        assert_eq!(redact("nothing here", secret), "nothing here");
+        assert_eq!(guard.redact("nothing here", secret), "nothing here");
+        // An own secret goes in every form the credential does.
+        let own = Guard::new([secret], Vec::new());
+        let out = own.redact(&text, "unrelated-credential");
+        assert!(!out.contains("tok"), "{out}");
+    }
+
+    /// The protected id of lore's own Dokploy application in the tests.
+    const OWN_APP: &str = "lore-app_Xk29fQ";
+
+    fn own_guard() -> Guard {
+        Guard::new(
+            [
+                "0123456789abcdef".repeat(4).as_str(),
+                "admin-password-42",
+                "agent-token-0123456789abcdef",
+                // Too short to be treated as a secret.
+                "short",
+            ],
+            vec![OWN_APP.to_string(), "lore-project-77".to_string()],
+        )
+    }
+
+    #[tokio::test]
+    async fn own_secrets_are_redacted_from_every_response() {
+        use base64::Engine;
+        let vault_key = "0123456789abcdef".repeat(4);
+        let env = format!(
+            "LORE_VAULT_KEY={vault_key}\nLORE_ADMIN_PASSWORD=admin-password-42\nLORE_MODE=short"
+        );
+        let body = serde_json::json!({
+            "env": env,
+            "vaultKeyB64": base64::engine::general_purpose::STANDARD.encode(&vault_key),
+            "adminB64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("admin-password-42"),
+            "other": { "env": "DATABASE_URL=postgres://app:other-app-secret@db/app" },
+        })
+        .to_string();
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(recording_router(&log, StatusCode::OK, body)).await;
+        let guard = own_guard();
+        let response = call(
+            &client(),
+            &format!("{base}/api"),
+            &Secret::new("test-credential-value"),
+            &guard,
+            &OpsRequest {
+                provider: DOKPLOY,
+                method: "GET".into(),
+                path: "/application.one".into(),
+                query: Some(serde_json::Map::from_iter([(
+                    "applicationId".to_string(),
+                    Value::from(OWN_APP),
+                )])),
+                body: None,
+            },
+        )
+        .await
+        .unwrap();
+        let out: Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(
+            out["env"],
+            "LORE_VAULT_KEY=[redacted]\nLORE_ADMIN_PASSWORD=[redacted]\nLORE_MODE=short"
+        );
+        // Their base64 forms went too.
+        assert_eq!(out["vaultKeyB64"], "[redacted]");
+        assert_eq!(out["adminB64"], "[redacted]");
+        // Another application's env is left alone, and a short value is
+        // not treated as a secret.
+        assert_eq!(
+            out["other"]["env"],
+            "DATABASE_URL=postgres://app:other-app-secret@db/app"
+        );
+        assert!(response.body.contains("LORE_MODE=short"));
+        // A GET naming the protected id went through.
+        assert_eq!(log.lock().unwrap().len(), 1);
+        // The guard never prints what it holds.
+        assert_eq!(format!("{guard:?}"), "Guard([redacted])");
+        assert!(!format!("{guard:?}").contains("admin-password"));
+    }
+
+    #[tokio::test]
+    async fn writes_naming_lore_s_own_deployment_are_refused() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(recording_router(&log, StatusCode::OK, "{}")).await;
+        let guard = own_guard();
+        let refusal = format!(
+            "lore does not let agents change its own Dokploy deployment ({OWN_APP}). \
+             Ask the user to do this themselves."
+        );
+        let dokploy =
+            |method: &str, path: &str, query: Option<Value>, body: Option<Value>| OpsRequest {
+                provider: DOKPLOY,
+                method: method.into(),
+                path: path.into(),
+                query: query.and_then(|value| value.as_object().cloned()),
+                body,
+            };
+        // A nested body field, an id inside an array, a query value: all
+        // refused, and nothing reaches the mock.
+        for req in [
+            dokploy(
+                "POST",
+                "/application.saveEnvironment",
+                None,
+                Some(serde_json::json!({"data": {"target": {"applicationId": OWN_APP}}})),
+            ),
+            dokploy(
+                "post",
+                "/application.delete",
+                None,
+                Some(serde_json::json!({"ids": ["other-app-1234", OWN_APP]})),
+            ),
+            dokploy(
+                "DELETE",
+                "/application.delete",
+                Some(serde_json::json!({"applicationId": OWN_APP})),
+                None,
+            ),
+            dokploy(
+                "POST",
+                "/application.delete",
+                None,
+                Some(Value::from(OWN_APP)),
+            ),
+        ] {
+            match call(&client(), &base, &Secret::new("x"), &guard, &req).await {
+                Err(OpsError::Invalid(reason)) => assert_eq!(reason, refusal, "{req:?}"),
+                other => panic!("{req:?} was not refused: {other:?}"),
+            }
+            assert!(guard.check(&req).is_err());
+        }
+        assert_eq!(log.lock().unwrap().len(), 0);
+
+        // A GET naming the id passes; a write for another application
+        // passes; an id that only contains the protected one passes.
+        for req in [
+            dokploy(
+                "GET",
+                "/application.one",
+                Some(serde_json::json!({"applicationId": OWN_APP})),
+                None,
+            ),
+            dokploy(
+                "POST",
+                "/application.deploy",
+                None,
+                Some(serde_json::json!({"applicationId": "other-app-1234"})),
+            ),
+            dokploy(
+                "POST",
+                "/application.update",
+                None,
+                Some(serde_json::json!({"description": format!("copy of {OWN_APP}")})),
+            ),
+        ] {
+            call(&client(), &base, &Secret::new("x"), &guard, &req)
+                .await
+                .unwrap();
+        }
+        assert_eq!(log.lock().unwrap().len(), 3);
+
+        // The same id for another provider is never refused.
+        let github = OpsRequest {
+            provider: GITHUB,
+            method: "POST".into(),
+            path: "/repos/owner/repo/issues".into(),
+            query: None,
+            body: Some(serde_json::json!({"title": OWN_APP})),
+        };
+        assert!(guard.check(&github).is_ok());
+        call(&client(), &base, &Secret::new("x"), &guard, &github)
+            .await
+            .unwrap();
+        assert_eq!(log.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn protected_ids_are_parsed_strictly() {
+        assert_eq!(parse_protected("").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_protected(" abcd-1234_XY , ,lore-project-77,abcd-1234_XY ").unwrap(),
+            vec!["abcd-1234_XY".to_string(), "lore-project-77".to_string()]
+        );
+        for bad in [
+            "short",
+            "abcd-1234,has space1",
+            "abcdefgh,id/with/slash",
+            "ünicode-id",
+        ] {
+            let error = parse_protected(bad).unwrap_err().to_string();
+            assert!(error.contains("LORE_DOKPLOY_PROTECTED"), "{bad}: {error}");
+        }
     }
 
     #[test]
@@ -1543,6 +1900,7 @@ mod tests {
             &client(),
             "http://127.0.0.1:1/api",
             &Secret::new("test-credential-value"),
+            &Guard::default(),
             &request(DOKPLOY, "GET", "/project.all"),
         )
         .await;

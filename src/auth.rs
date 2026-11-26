@@ -32,6 +32,14 @@ pub struct Token {
     secret: String,
 }
 
+impl Token {
+    /// The token's secret, for the set of lore's own secrets that every
+    /// provider response is redacted against. Never logged.
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+}
+
 /// Reads `LORE_TOKEN` (one shared secret) and `LORE_TOKENS`
 /// (`agent:secret,agent:secret`, one secret per agent). Either or both may be set.
 pub fn load_tokens(shared: &str, per_agent: &str) -> Result<Vec<Token>> {
