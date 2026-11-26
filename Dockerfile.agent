@@ -5,11 +5,20 @@
 #   claude    Claude Code (@anthropic-ai/claude-code)
 #   codex     the Codex CLI (@openai/codex)
 #   deepseek  opencode 2.x (@opencode/cli) pointed at DeepSeek
-# The container runs `lore runner`, which dials out to lore and drives the
-# CLI. It never runs as root, keeps its sign-in in /home/agent (a named
-# volume) and clones repositories into /work (a size-limited tmpfs).
+#
+# The container runs `lore runner` as root with only the capabilities
+# SETUID, SETGID, CHOWN and KILL (compose drops every other one), which
+# dials out to lore and starts every CLI process as the unprivileged user
+# `agent` (uid 10002, no capabilities), each time in a fresh home under
+# /work/.homes. The stored sign-in lives in /var/lib/lore-runner (a named
+# volume, root's, mode 0700), where the agent user can neither write nor
+# look. See "How a built-in agent is kept apart" in the README.
+#
+# Everything is pinned: the base images by digest, the CLIs and graphify by
+# exact version, graphify's Python dependencies by a constraints list. To
+# bump one, see "Updating the pinned versions" in the README.
 
-FROM rust:1-trixie AS build
+FROM rust:1.100-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -18,13 +27,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked && cp target/release/lore /lore
 
-FROM node:22-trixie-slim
+FROM node:22-trixie-slim@sha256:f0960f8dc047f358e3fb428f36ccba21732194fa5f0cac849f401e63e62fb9e6
 ARG AGENT=claude
 # Pinned CLI versions: raise them on purpose, after reading the changelog.
 ARG CLAUDE_CODE_VERSION=2.1.328
 ARG CODEX_VERSION=0.166.0
 ARG OPENCODE_VERSION=2.3.2
-ARG GRAPHIFY_SPEC="graphifyy[solidity,sql]"
+ARG GRAPHIFY_VERSION=0.9.120
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
@@ -32,33 +41,74 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN case "$AGENT" in \
-      claude)   npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" ;; \
-      codex)    npm install -g "@openai/codex@${CODEX_VERSION}" ;; \
-      deepseek) npm install -g "@opencode/cli@${OPENCODE_VERSION}" ;; \
+      claude)   npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" ;; \
+      codex)    npm install -g --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" ;; \
+      deepseek) npm install -g --no-fund --no-audit "@opencode/cli@${OPENCODE_VERSION}" ;; \
       *) echo "AGENT must be claude, codex or deepseek" >&2; exit 1 ;; \
     esac \
     && npm cache clean --force
 
-# graphify, for the graph update the owner's procedure asks for.
-RUN PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install "${GRAPHIFY_SPEC}" \
-    && rm -rf /root/.cache
+# graphify, for the graph update the owner's procedure asks for, with its
+# dependencies held to the versions it was checked with (`pip freeze` of
+# the graphify environment; regenerate it when GRAPHIFY_VERSION changes).
+COPY <<EOF /tmp/graphify-constraints.txt
+networkx==3.7
+numpy==2.5.5
+PyYAML==6.0.4
+RapidFuzz==3.14.6
+tree-sitter==0.25.2
+tree-sitter-bash==0.25.1
+tree-sitter-c==0.24.2
+tree-sitter-c-sharp==0.24.0
+tree-sitter-cpp==0.23.4
+tree-sitter-elixir==0.3.5
+tree-sitter-fortran==0.6.0
+tree-sitter-go==0.25.0
+tree-sitter-groovy==0.1.2
+tree-sitter-java==0.23.5
+tree-sitter-javascript==0.25.0
+tree-sitter-json==0.24.8
+tree-sitter-julia==0.23.1
+tree-sitter-kotlin==1.1.0
+tree-sitter-lua==0.5.0
+tree-sitter-objc==3.0.2
+tree-sitter-php==0.24.1
+tree-sitter-powershell==0.26.4
+tree-sitter-python==0.25.0
+tree-sitter-ruby==0.23.1
+tree-sitter-rust==0.24.2
+tree-sitter-scala==0.26.14
+tree-sitter-solidity==1.2.13
+tree-sitter-sql==0.3.13
+tree-sitter-swift==0.7.4
+tree-sitter-typescript==0.23.2
+tree-sitter-verilog==1.0.3
+tree-sitter-zig==1.1.2
+EOF
+RUN PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin \
+       pipx install --pip-args="--constraint /tmp/graphify-constraints.txt" \
+       "graphifyy[solidity,sql]==${GRAPHIFY_VERSION}" \
+    && rm -rf /root/.cache /tmp/graphify-constraints.txt
 
-# The node image's own user has uid 1000; the agent gets its own.
-RUN useradd --uid 10002 --user-group --create-home --home-dir /home/agent --shell /bin/bash agent \
-    && mkdir -p /work && chown agent:agent /work && chmod 0700 /home/agent
+# The node image's own user has uid 1000; the agent gets its own. Its
+# "home" in the image is never used: every CLI command gets a fresh one.
+RUN useradd --uid 10002 --user-group --no-create-home --home-dir /nonexistent \
+       --shell /bin/bash agent \
+    && mkdir -p /work /var/lib/lore-runner \
+    && chmod 0711 /work \
+    && chmod 0700 /var/lib/lore-runner
 
 COPY --from=build /lore /usr/local/bin/lore
 
-ENV HOME=/home/agent \
-    LORE_RUNNER_HOME=/home/agent \
+ENV HOME=/var/lib/lore-runner/home \
+    LORE_RUNNER_STATE=/var/lib/lore-runner \
+    LORE_RUNNER_AGENT_UID=10002 \
+    LORE_RUNNER_AGENT_GID=10002 \
     LORE_RUNNER_WORK=/work \
     LORE_RUNNER_IMAGE_AGENT=${AGENT} \
-    CLAUDE_CONFIG_DIR=/home/agent/.claude \
-    CODEX_HOME=/home/agent/.codex \
     DISABLE_AUTOUPDATER=1 \
     OPENCODE_DISABLE_AUTOUPDATE=1 \
     NPM_CONFIG_UPDATE_NOTIFIER=false
 
-USER agent
-WORKDIR /home/agent
+WORKDIR /
 ENTRYPOINT ["lore", "runner"]

@@ -1685,7 +1685,12 @@ async fn pulse(State(admin): State<Arc<Admin>>) -> Response {
 /// Server-sent events: one `activity` event per agent action, as it happens.
 async fn events(
     State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // A run's output (its lines, and the summary of its end) needs the
+    // `agents` permission; everyone signed in sees that a run started and
+    // ended, for the graph.
+    let agents = me.perms.contains(Perm::Agents);
     let activity = BroadcastStream::new(admin.events.subscribe()).filter_map(|message| {
         // A listener that fell behind skips what it missed; the page's
         // periodic refresh catches up.
@@ -1698,13 +1703,31 @@ async fn events(
     });
     // The built-in agents' runs: started, a line of output, ended. Lines
     // are redacted before they are published.
-    let runs = BroadcastStream::new(admin.events.subscribe_runs()).filter_map(|message| {
+    let runs = BroadcastStream::new(admin.events.subscribe_runs()).filter_map(move |message| {
         let run = message.ok()?;
+        let run = if agents {
+            Some(run)
+        } else {
+            run_event_for_viewers(run)
+        }?;
         let event = Event::default().event("run").json_data(&run).ok()?;
         Some(Ok(event))
     });
     let stream = activity.merge(runs);
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
+}
+
+/// A run event as a user without the `agents` permission gets it: no
+/// output lines, and no summary or last words of a run's end.
+fn run_event_for_viewers(mut run: serde_json::Value) -> Option<serde_json::Value> {
+    if run["type"] == "output" {
+        return None;
+    }
+    if let Some(map) = run.as_object_mut() {
+        map.remove("summary");
+        map.remove("line");
+    }
+    Some(run)
 }
 
 /// Downloads the whole store as one JSON file.
@@ -2048,8 +2071,44 @@ struct TaskForm {
     cloudflare_zone: String,
 }
 
+/// The identity a task added or touched on the admin page is recorded
+/// under: the signed-in user.
+fn page_author(me: &SignedIn) -> String {
+    match me.user_id {
+        Some(id) => format!("user:{id}"),
+        None => format!("user:{}", me.username),
+    }
+}
+
+/// The refusal of task targets from a user without `integrations`: a task
+/// may name only what its author could change.
+fn targets_refusal(repo: &str, dokploy: &str, cloudflare: &str, me: &SignedIn) -> Option<Response> {
+    let named =
+        !(repo.trim().is_empty() && dokploy.trim().is_empty() && cloudflare.trim().is_empty());
+    (named && !me.perms.contains(Perm::Integrations)).then(|| {
+        forbidden(
+            "setting a task's repository, Dokploy project or Cloudflare zone needs the \
+             integrations permission: a built-in agent may change only what the task's author \
+             could change",
+        )
+    })
+}
+
 /// Adds a task as the admin. The created task is returned.
-async fn add_task(State(admin): State<Arc<Admin>>, Json(form): Json<TaskForm>) -> Response {
+async fn add_task(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    Json(form): Json<TaskForm>,
+) -> Response {
+    if let Some(refused) = targets_refusal(
+        &form.repo,
+        &form.dokploy_project_id,
+        &form.cloudflare_zone,
+        &me,
+    ) {
+        return refused;
+    }
+    let author = page_author(&me);
     let input = NewTask {
         project: form.project,
         title: form.title,
@@ -2066,6 +2125,7 @@ async fn add_task(State(admin): State<Arc<Admin>>, Json(form): Json<TaskForm>) -
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Task> {
         let task = state.db.add_task(&input)?;
+        state.db.set_task_author(task.id, &author)?;
         let summary = format!("task #{}: {}", task.id, task.title);
         if let Ok(activity) = state.db.record_activity(
             ADMIN_ACTOR,
@@ -2112,9 +2172,20 @@ struct TaskUpdateForm {
 /// goes.
 async fn update_task(
     State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
     Path(id): Path<i64>,
     Json(form): Json<TaskUpdateForm>,
 ) -> Response {
+    if form.action.trim() == "targets"
+        && let Some(refused) = targets_refusal(
+            &form.repo,
+            &form.dokploy_project_id,
+            &form.cloudflare_zone,
+            &me,
+        )
+    {
+        return refused;
+    }
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Task>> {
         if form.action.trim() == "targets" {
@@ -2126,6 +2197,9 @@ async fn update_task(
             let Some(task) = state.db.set_task_targets(id, &targets)? else {
                 return Ok(None);
             };
+            // A signed-in user's touch re-queues the task, with its
+            // automatic attempts counted afresh.
+            state.db.requeue_task(task.id, true)?;
             let summary = format!("task #{} targets set", task.id);
             if let Ok(activity) = state.db.record_activity(
                 ADMIN_ACTOR,
@@ -2149,6 +2223,7 @@ async fn update_task(
         else {
             return Ok(None);
         };
+        state.db.requeue_task(task.id, true)?;
         let summary = format!("task #{} {}", task.id, form.action);
         if let Ok(activity) = state.db.record_activity(
             ADMIN_ACTOR,
@@ -2612,6 +2687,7 @@ async fn integrations(State(admin): State<Arc<Admin>>) -> Response {
             "enabled": enabled,
             "leak_scan": leak.scan,
             "allow_public_repos": leak.allow_public,
+            "runs_may_change_ci": state.db.runs_may_change_ci()?,
             "providers": providers,
             "agents": agents,
             "permissions": permissions,
@@ -3231,6 +3307,10 @@ struct LeakScanForm {
     scan: Option<bool>,
     #[serde(default)]
     allow_public: Option<bool>,
+    /// Whether built-in agents' runs may add, change or remove CI
+    /// definitions (off by default).
+    #[serde(default)]
+    runs_may_change_ci: Option<bool>,
 }
 
 /// Sets the leak scan switches: whether writes to public GitHub
@@ -3240,15 +3320,25 @@ async fn set_leak_scan(
     State(admin): State<Arc<Admin>>,
     Json(form): Json<LeakScanForm>,
 ) -> Response {
-    if form.scan.is_none() && form.allow_public.is_none() {
-        return bad_request("scan or allow_public must be true or false");
+    if form.scan.is_none() && form.allow_public.is_none() && form.runs_may_change_ci.is_none() {
+        return bad_request("scan, allow_public or runs_may_change_ci must be true or false");
     }
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         state
             .db
             .set_leak_scan_settings(form.scan, form.allow_public)?;
+        if let Some(allow) = form.runs_may_change_ci {
+            state.db.set_runs_may_change_ci(allow)?;
+        }
         let mut changes = Vec::new();
+        if let Some(allow) = form.runs_may_change_ci {
+            changes.push(if allow {
+                "allowed built-in agents' runs to change CI definitions"
+            } else {
+                "stopped built-in agents' runs from changing CI definitions"
+            });
+        }
         if let Some(scan) = form.scan {
             changes.push(if scan {
                 "switched the scan of writes to public repositories on"
@@ -3272,7 +3362,12 @@ async fn set_leak_scan(
             state.events.publish(activity);
         }
         let leak = state.db.leak_scan_settings()?;
-        Ok(json!({ "ok": true, "leak_scan": leak.scan, "allow_public_repos": leak.allow_public }))
+        Ok(json!({
+            "ok": true,
+            "leak_scan": leak.scan,
+            "allow_public_repos": leak.allow_public,
+            "runs_may_change_ci": state.db.runs_may_change_ci()?,
+        }))
     })
     .await;
     match result {

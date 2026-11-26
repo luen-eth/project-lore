@@ -9,8 +9,18 @@
 //! the runner dials again, waiting a little longer each time.
 //!
 //! Configuration, from the environment:
-//! - `LORE_RUNNER_TOKEN` (required): this runner's secret, the same value
-//!   lore has for it in `LORE_RUNNER_TOKENS`.
+//! - `LORE_RUNNER_TOKEN` (required), or `LORE_RUNNER_TOKEN_FILE` naming a
+//!   file that holds it: this runner's secret, the same value lore has for
+//!   it in `LORE_RUNNER_TOKENS`. Both variables are removed from the
+//!   runner's environment once read, and the runner makes itself
+//!   non-dumpable, so the CLI cannot read the secret from `/proc`.
+//! - `LORE_RUNNER_STATE`: the runner's own directory (stored sign-in,
+//!   transcripts). When set, every CLI command runs in a fresh home under
+//!   `<work>/.homes` (see `drivers::Isolation`); the image sets it.
+//! - `LORE_RUNNER_AGENT_UID`, `LORE_RUNNER_AGENT_GID`: the unprivileged
+//!   user the CLI runs as. The runner must then run as root with only the
+//!   capabilities `SETUID`, `SETGID` and `CHOWN`; a runner running as root
+//!   without an agent user refuses to start (see `sandbox`).
 //! - `LORE_RUNNER_KIND`: `claude`, `codex` or `opencode`; by default what
 //!   the image was built for (`LORE_RUNNER_IMAGE_AGENT`, where `deepseek`
 //!   means opencode pointed at DeepSeek).
@@ -26,7 +36,9 @@
 
 pub mod drivers;
 pub mod protocol;
+pub mod proxy;
 pub mod runs;
+pub mod sandbox;
 pub mod terminal;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -36,7 +48,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest, http::HeaderValue};
 
-use drivers::{Driver, Settings};
+use drivers::{Driver, Fresh, Isolation, Settings};
 use protocol::{FromRunner, Kind, PROTOCOL_VERSION, Resources, Secret, ToRunner};
 
 /// The header that names the agent a runner speaks for.
@@ -102,7 +114,8 @@ impl Config {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         };
-        let token = var("LORE_RUNNER_TOKEN").context("LORE_RUNNER_TOKEN is not set")?;
+        let token = sandbox::take_secret("LORE_RUNNER_TOKEN", "LORE_RUNNER_TOKEN_FILE")?
+            .context("LORE_RUNNER_TOKEN (or LORE_RUNNER_TOKEN_FILE) is not set")?;
         if token.len() < 24 {
             bail!("LORE_RUNNER_TOKEN must be at least 24 characters (openssl rand -hex 32)");
         }
@@ -160,17 +173,67 @@ impl Config {
     }
 }
 
+/// How CLI commands are kept apart, from `LORE_RUNNER_STATE` and
+/// `LORE_RUNNER_AGENT_UID` / `_GID`. Changes `settings.home` to the
+/// runner's own home inside the state directory when fresh homes are used.
+pub fn isolation_from_env(settings: &mut Settings, work: &std::path::Path) -> Result<Isolation> {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+    let user = sandbox::AgentUser::from_values(
+        var("LORE_RUNNER_AGENT_UID").as_deref(),
+        var("LORE_RUNNER_AGENT_GID").as_deref(),
+    )?;
+    let root = sandbox::can_switch_user();
+    if root && user.is_none() {
+        bail!(
+            "the runner runs as root but LORE_RUNNER_AGENT_UID is not set: the CLI must never run \
+             as root"
+        );
+    }
+    if user.is_some() && !root {
+        bail!(
+            "LORE_RUNNER_AGENT_UID is set but the runner is not root: it needs root with the \
+             capabilities SETUID, SETGID and CHOWN to start the CLI as the agent user"
+        );
+    }
+    let Some(state) = var("LORE_RUNNER_STATE").map(PathBuf::from) else {
+        if user.is_some() {
+            bail!("LORE_RUNNER_AGENT_UID needs LORE_RUNNER_STATE too");
+        }
+        return Ok(Isolation::Shared);
+    };
+    settings.home = state.join("home");
+    sandbox::make_dir(&settings.home, 0o700)?;
+    Ok(Isolation::Fresh(Fresh {
+        state,
+        homes: work.join(".homes"),
+        user,
+    }))
+}
+
 /// `lore runner`: connects for ever.
 pub async fn main_from_env() -> Result<()> {
-    let config = Config::from_env()?;
+    // First of all: closed to every other process, the CLI's included.
+    sandbox::harden()?;
+    let mut config = Config::from_env()?;
+    let isolation = isolation_from_env(&mut config.settings, &config.work)?;
     tracing::info!(
         agent = %config.agent,
         kind = config.settings.kind.id(),
         provider = %config.settings.provider,
         url = %config.url,
+        isolation = match &isolation {
+            Isolation::Shared => "one home",
+            Isolation::Fresh(Fresh { user: Some(_), .. }) => "fresh homes, agent user",
+            Isolation::Fresh(Fresh { user: None, .. }) => "fresh homes, one user",
+        },
         "runner starting"
     );
-    let driver = Arc::new(Driver::new(config.settings.clone()));
+    if let Isolation::Fresh(Fresh { user: Some(_), .. }) = &isolation {
+        // The work area is the runner's: the agent user gets only what is
+        // handed to it.
+        sandbox::make_dir(&config.work, 0o711)?;
+    }
+    let driver = Arc::new(Driver::with_isolation(config.settings.clone(), isolation));
     if let Err(error) = driver.prepare() {
         tracing::warn!(%error, "preparing the CLI's state directory failed");
     }
@@ -259,9 +322,14 @@ pub async fn session(config: &Config, driver: Arc<Driver>) -> Result<End> {
     tracing::info!("connected to lore");
 
     let (out_tx, mut out_rx) = mpsc::channel::<FromRunner>(256);
+    let occupancy = Arc::new(sandbox::Occupancy::default());
     // Closed with the link: dropping it kills every terminal's session.
-    let terminals =
-        terminal::Terminals::new(driver.clone(), out_tx.clone(), terminal::Limits::default());
+    let terminals = terminal::Terminals::new(
+        driver.clone(),
+        out_tx.clone(),
+        terminal::Limits::default(),
+        occupancy.clone(),
+    );
     // Closed with the link too: dropping it stops the run, which still
     // deletes its work directory.
     let runs = runs::Runs::new(
@@ -270,6 +338,7 @@ pub async fn session(config: &Config, driver: Arc<Driver>) -> Result<End> {
         config.work.clone(),
         config.git.clone(),
         config.agent.clone(),
+        occupancy,
     );
     {
         let (driver, out) = (driver.clone(), out_tx.clone());
@@ -313,7 +382,10 @@ pub async fn session(config: &Config, driver: Arc<Driver>) -> Result<End> {
                 sink.send(Message::text(protocol::encode(&message))).await?;
             }
             _ = resources.tick() => {
-                let reading = read_resources(&config.work).await;
+                let mut reading = read_resources(&config.work).await;
+                if driver.is_fresh() {
+                    reading.state_bytes = Some(driver.state_bytes());
+                }
                 let _ = out_tx.try_send(FromRunner::Resources(reading));
             }
             _ = silence.tick() => {
@@ -467,6 +539,7 @@ pub async fn read_resources(work: &std::path::Path) -> Resources {
         mem_used_bytes,
         mem_limit_bytes,
         work_free_bytes,
+        state_bytes: None,
     }
 }
 

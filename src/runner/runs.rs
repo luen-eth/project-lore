@@ -15,7 +15,14 @@
 //!
 //! A CLI runs in a session of its own (`setsid`), `nice`d, and under
 //! `ionice -c 3` when the image has it. Ending a run interrupts the whole
-//! session, waits, then kills it.
+//! session, waits, then kills it; with an agent user, every process of that
+//! user is ended before the run starts and after it ends (`sandbox`).
+//!
+//! Runner git (the clone, the before/after look at the default branch) is
+//! hermetic: no global or system configuration, no hooks, no file
+//! transport, never a stored credential, never inside a checkout the CLI
+//! touched. The CLI's git gets the token header, an identity, and a rule
+//! that sends the checkout's GitHub `origin` through lore.
 
 use std::{
     collections::HashMap,
@@ -35,9 +42,15 @@ use tokio::{
 };
 
 use super::{
-    drivers::{Driver, redact_with, shorten},
+    drivers::{CliHome, Driver, redact_with, shorten},
     protocol::{FromRunner, Kind, RunKind, RunSpec, ToRunner},
+    sandbox::{self, Occupancy},
 };
+
+/// The start of the reason a refused `run_start` is answered with when the
+/// container is only busy (another run, a terminal, processes of the agent
+/// user that would not end): lore may try again later.
+pub const BUSY: &str = "busy: ";
 
 /// How long the clone may take.
 const CLONE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -65,6 +78,8 @@ pub struct Runs {
     agent: String,
     /// Dropping a run's sender stops it.
     active: Arc<Mutex<HashMap<String, watch::Sender<Option<String>>>>>,
+    /// Shared with the terminals: a run does not start while one is open.
+    occupancy: Arc<Occupancy>,
 }
 
 impl Runs {
@@ -74,6 +89,7 @@ impl Runs {
         work: PathBuf,
         git: PathBuf,
         agent: String,
+        occupancy: Arc<Occupancy>,
     ) -> Self {
         Self {
             driver,
@@ -82,6 +98,7 @@ impl Runs {
             git,
             agent,
             active: Arc::default(),
+            occupancy,
         }
     }
 
@@ -117,26 +134,20 @@ impl Runs {
         let run_id = spec.run_id.clone();
         let dir_name = spec.workdir.clone().unwrap_or_else(|| run_id.clone());
         let refusal = if !valid_run_id(&run_id) || !valid_run_id(&dir_name) {
-            Some("the run id is not a plain name".to_string())
+            Some("failed: the run id is not a plain name".to_string())
         } else if !self.active().is_empty() {
-            Some("another run is still going in this container".to_string())
+            Some(format!(
+                "{BUSY}another run is still going in this container"
+            ))
+        } else if let Err(why) = self.occupancy.start_run() {
+            Some(format!("{BUSY}{why}"))
         } else {
             None
         };
         if let Some(reason) = refusal {
             let out = self.out.clone();
             tokio::spawn(async move {
-                let _ = out
-                    .send(FromRunner::RunExit {
-                        run_id,
-                        code: None,
-                        pushed: false,
-                        head: None,
-                        work_free_bytes: None,
-                        reason: Some(format!("failed: {reason}")),
-                        answer: None,
-                    })
-                    .await;
+                let _ = out.send(refused(run_id, reason)).await;
             });
             return;
         }
@@ -155,14 +166,35 @@ impl Runs {
             answer: None,
             spec,
         };
-        let active = self.active.clone();
+        let (active, occupancy, out) = (
+            self.active.clone(),
+            self.occupancy.clone(),
+            self.out.clone(),
+        );
         tokio::spawn(async move {
-            run.execute(stop_rx).await;
+            let exit = run.execute(stop_rx).await;
+            // The slot is free before lore hears that the run ended, so a
+            // follow-up lore starts at once is not refused.
             active
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&run_id);
+            occupancy.end_run();
+            let _ = out.send(exit).await;
         });
+    }
+}
+
+/// The answer to a `run_start` that was not carried out.
+fn refused(run_id: String, reason: String) -> FromRunner {
+    FromRunner::RunExit {
+        run_id,
+        code: None,
+        pushed: false,
+        head: None,
+        work_free_bytes: None,
+        reason: Some(reason),
+        answer: None,
     }
 }
 
@@ -210,9 +242,20 @@ struct Ended {
 }
 
 impl Run {
-    async fn execute(mut self, mut stop: watch::Receiver<Option<String>>) {
+    async fn execute(mut self, mut stop: watch::Receiver<Option<String>>) -> FromRunner {
         self.secrets = self.driver.secrets();
         self.secrets.push(self.spec.token.expose().to_string());
+        // Nothing of an earlier run or terminal may be alive when this
+        // one's token arrives in the container.
+        if let Some(user) = self.driver.user()
+            && let Err(error) = sandbox::sweep(user).await
+        {
+            tracing::warn!(%error, "a run was refused: the agent user's processes would not end");
+            return refused(
+                self.spec.run_id.clone(),
+                format!("{BUSY}processes of the agent user would not end"),
+            );
+        }
         let (ended, pushed, head) = match self.work_through(&mut stop).await {
             Ok(result) => result,
             Err(error) => {
@@ -229,7 +272,7 @@ impl Run {
             }
         };
         // The work directory goes, whatever happened.
-        if let Err(error) = remove_dir(&self.dir) {
+        if let Err(error) = sandbox::remove_tree(&self.dir) {
             self.say(
                 "error",
                 &format!("the work directory could not be deleted: {error}"),
@@ -243,18 +286,15 @@ impl Run {
             .take()
             .map(|answer| shorten(&self.redact(&answer), ANSWER_CHARS))
             .filter(|answer| !answer.trim().is_empty());
-        let _ = self
-            .out
-            .send(FromRunner::RunExit {
-                run_id: self.spec.run_id.clone(),
-                code: ended.code,
-                pushed,
-                head,
-                work_free_bytes: free,
-                reason,
-                answer,
-            })
-            .await;
+        FromRunner::RunExit {
+            run_id: self.spec.run_id.clone(),
+            code: ended.code,
+            pushed,
+            head,
+            work_free_bytes: free,
+            reason,
+            answer,
+        }
     }
 
     fn redact(&self, text: &str) -> String {
@@ -285,11 +325,13 @@ impl Run {
         &mut self,
         stop: &mut watch::Receiver<Option<String>>,
     ) -> Result<(Ended, bool, Option<String>)> {
-        let _ = std::fs::remove_dir_all(&self.dir);
-        create_private_dir(&self.dir)?;
+        let _ = sandbox::remove_tree(&self.dir);
+        // The run's directory is the runner's: the agent user reaches the
+        // checkout in it, and cannot add anything next to it.
+        sandbox::make_dir(&self.dir, 0o711)?;
         let repo = self.dir.join("repo");
         let conf = self.dir.join("lore");
-        create_private_dir(&conf)?;
+        sandbox::make_dir(&conf, 0o755)?;
 
         self.say("lore", "checking that lore's MCP server answers")
             .await;
@@ -302,10 +344,13 @@ impl Run {
         if self.spec.clone_url.trim().is_empty() {
             let chat = self.dir.join("chat");
             create_private_dir(&chat)?;
+            sandbox::hand_over(&chat, self.driver.user())?;
             self.say("lore", "a conversation without a checkout").await;
+            let home = self.cli_home()?;
             let (program, args, env) = self.cli_command(&chat, &conf)?;
-            let command = self.cli_process(&program, &args, env, &chat);
+            let command = self.cli_process(&program, &args, env, &chat, &home);
             let ended = self.run_cli(command, stop, None).await?;
+            self.after_cli(&home).await;
             return Ok((ended, false, None));
         }
         self.say("lore", "cloning the repository through lore")
@@ -319,13 +364,15 @@ impl Run {
                     self.spec.clone_url.clone(),
                     repo.display().to_string(),
                 ],
-                &self.dir,
+                Path::new("/"),
                 CLONE_TIMEOUT,
             )
             .await?;
         if !clone.0 {
             bail!("cloning failed: {}", shorten(&self.redact(&clone.1), 400));
         }
+        // The fresh checkout is still the runner's: nothing in it was
+        // written by the CLI yet.
         let branch = self
             .git(
                 &[
@@ -353,6 +400,20 @@ impl Run {
         } else {
             branch
         };
+        // `origin` names the repository by its GitHub address (what the
+        // agent reports as its repo); the CLI's git reaches it through
+        // lore (`url.<lore>.insteadOf`).
+        if let Some((origin, _)) = github_address(&self.spec.clone_url) {
+            let _ = self
+                .git(
+                    &["remote".into(), "set-url".into(), "origin".into(), origin],
+                    &repo,
+                    GIT_TIMEOUT,
+                )
+                .await;
+        }
+        sandbox::hand_over(&repo, self.driver.user())
+            .context("handing the checkout to the agent user")?;
         self.say(
             "lore",
             &format!(
@@ -362,17 +423,22 @@ impl Run {
         )
         .await;
 
+        let home = self.cli_home()?;
         let (program, args, env) = self.cli_command(&repo, &conf)?;
-        let command = self.cli_process(&program, &args, env, &repo);
+        let command = self.cli_process(&program, &args, env, &repo, &home);
         let base_sent = (base.len() >= 40).then(|| base.clone());
         let ended = self.run_cli(command, stop, base_sent).await?;
+        self.after_cli(&home).await;
+        drop(home);
 
         // A conversation pushes nothing (lore refuses it), so there is
         // nothing to look at.
         if self.spec.kind == RunKind::Chat {
             return Ok((ended, false, None));
         }
-        // Did the default branch move? Asked through lore, with the token.
+        // Did the default branch move? Asked through lore, with the token,
+        // at the address the runner was given (never the checkout's
+        // remote, which the CLI could have changed), outside the checkout.
         let head = if branch == "HEAD" {
             None
         } else {
@@ -380,10 +446,11 @@ impl Run {
                 .git(
                     &[
                         "ls-remote".into(),
-                        "origin".into(),
+                        "--".into(),
+                        self.spec.clone_url.clone(),
                         format!("refs/heads/{branch}"),
                     ],
-                    &repo,
+                    Path::new("/"),
                     GIT_TIMEOUT,
                 )
                 .await
@@ -410,17 +477,61 @@ impl Run {
         Ok((ended, pushed, head))
     }
 
+    /// The CLI's home for this run; a conversation's earlier transcripts
+    /// are put back in it.
+    fn cli_home(&self) -> Result<CliHome> {
+        let home = self.driver.home()?;
+        if self.spec.kind == RunKind::Chat
+            && let Some(name) = &self.spec.workdir
+        {
+            self.driver.restore_transcripts(name, &home)?;
+        }
+        Ok(home)
+    }
+
+    /// After the CLI: every process of the agent user ends, then a
+    /// credential the CLI refreshed is taken back (checked), and a
+    /// conversation keeps its transcripts. Nothing else of the home stays.
+    async fn after_cli(&mut self, home: &CliHome) {
+        if let Some(user) = self.driver.user()
+            && let Err(error) = sandbox::sweep(user).await
+        {
+            self.say("error", &format!("after the run: {error}")).await;
+        }
+        if let Err(error) = self.driver.harvest(home, false) {
+            tracing::warn!(%error, "a refreshed credential could not be stored");
+        }
+        if self.spec.kind == RunKind::Chat
+            && let Some(name) = self.spec.workdir.clone()
+            && let Err(error) = self.driver.keep_transcripts(&name, home)
+        {
+            tracing::warn!(%error, "a conversation's transcripts could not be kept");
+        }
+    }
+
     /// The CLI's process: its environment (the token, git's settings,
     /// what the CLI needs), its own session, `nice`d.
-    fn cli_process(&self, program: &Path, args: &[String], env: Env, cwd: &Path) -> Command {
-        let mut command = self.driver.run_command(program, args, cwd);
+    fn cli_process(
+        &self,
+        program: &Path,
+        args: &[String],
+        env: Env,
+        cwd: &Path,
+        home: &CliHome,
+    ) -> Command {
+        let mut command = self.driver.run_command(program, args, cwd, home);
         command
             .env("LORE_AGENT_TOKEN", self.spec.token.expose())
+            .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (name, value) in self.git_env() {
-            command.env(name, value);
+        let config = self.cli_git_config();
+        command.env("GIT_CONFIG_COUNT", config.len().to_string());
+        for (index, (key, value)) in config.into_iter().enumerate() {
+            command
+                .env(format!("GIT_CONFIG_KEY_{index}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{index}"), value);
         }
         for (name, value) in env {
             command.env(name, value);
@@ -437,42 +548,77 @@ impl Run {
         command
     }
 
-    /// What git needs for the run: the token as a header for lore's own
-    /// address only, an identity, and no prompts.
-    fn git_env(&self) -> Vec<(String, String)> {
-        let lore = lore_origin(&self.spec.clone_url);
-        vec![
-            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
-            ("GIT_CONFIG_COUNT".into(), "3".into()),
-            (
-                "GIT_CONFIG_KEY_0".into(),
-                format!("http.{lore}/.extraHeader"),
-            ),
-            (
-                "GIT_CONFIG_VALUE_0".into(),
-                format!("Authorization: Bearer {}", self.spec.token.expose()),
-            ),
-            ("GIT_CONFIG_KEY_1".into(), "user.name".into()),
-            ("GIT_CONFIG_VALUE_1".into(), self.agent.clone()),
-            ("GIT_CONFIG_KEY_2".into(), "user.email".into()),
-            (
-                "GIT_CONFIG_VALUE_2".into(),
-                format!("{}@users.noreply.lore.invalid", self.agent),
-            ),
-        ]
+    /// The token as a header for lore's own address only. Always the
+    /// first entry of a `GIT_CONFIG_*` list.
+    fn token_header(&self) -> (String, String) {
+        (
+            format!("http.{}/.extraHeader", lore_origin(&self.spec.clone_url)),
+            format!("Authorization: Bearer {}", self.spec.token.expose()),
+        )
     }
 
-    /// Runs git with the run's environment; answers success and output.
-    async fn git(&self, args: &[String], cwd: &Path, wait: Duration) -> Result<(bool, String)> {
-        let mut command = self.driver.run_command(&self.git, args, cwd);
-        for (name, value) in self.git_env() {
-            command.env(name, value);
+    /// What the CLI's git gets: the token for lore, an identity, and the
+    /// GitHub address rewritten to lore's git proxy.
+    fn cli_git_config(&self) -> Vec<(String, String)> {
+        let mut config = vec![
+            self.token_header(),
+            ("user.name".into(), self.agent.clone()),
+            (
+                "user.email".into(),
+                format!("{}@users.noreply.lore.invalid", self.agent),
+            ),
+        ];
+        if let Some((_, lore)) = github_address(&self.spec.clone_url) {
+            config.push((
+                format!("url.{lore}.insteadOf"),
+                "https://github.com/".into(),
+            ));
+        }
+        config
+    }
+
+    /// Runner git: hermetic. No global or system configuration, a home of
+    /// the runner's, hooks and file transports off, no credential helper,
+    /// the run's environment never: only the token header for lore. It
+    /// runs as the runner, never in a checkout the CLI has touched.
+    fn git_command(&self, args: &[String], cwd: &Path) -> Command {
+        let mut command = Command::new(&self.git);
+        command.args(args).env_clear();
+        if let Ok(path) = std::env::var("PATH") {
+            command.env("PATH", path);
+        }
+        let config = [
+            self.token_header(),
+            ("core.hooksPath".into(), "/dev/null".into()),
+            ("protocol.file.allow".into(), "never".into()),
+            ("protocol.ext.allow".into(), "never".into()),
+            ("core.fsmonitor".into(), "false".into()),
+            ("credential.helper".into(), String::new()),
+        ];
+        command
+            .env("HOME", &self.driver.settings.home)
+            .env("LANG", "C.UTF-8")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", config.len().to_string());
+        for (index, (key, value)) in config.into_iter().enumerate() {
+            command
+                .env(format!("GIT_CONFIG_KEY_{index}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{index}"), value);
         }
         command
+            .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
+
+    /// Runs runner git; answers success and output.
+    async fn git(&self, args: &[String], cwd: &Path, wait: Duration) -> Result<(bool, String)> {
+        let mut command = self.git_command(args, cwd);
         let output = tokio::time::timeout(wait, command.output())
             .await
             .context("git took too long")?
@@ -483,7 +629,8 @@ impl Run {
     }
 
     /// The CLI's program, arguments and extra environment, with its MCP
-    /// configuration written to `conf` (outside the checkout).
+    /// configuration written to `conf` (outside the checkout, the
+    /// runner's: readable by the CLI, not changeable).
     fn cli_command(&self, repo: &Path, conf: &Path) -> Result<CliCommand> {
         let kind = self.driver.kind();
         let program = self.driver.settings.program.clone();
@@ -509,6 +656,12 @@ impl Run {
                 resume,
             },
         )?;
+        if self.driver.user().is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            for entry in std::fs::read_dir(conf)?.flatten() {
+                std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o644))?;
+            }
+        }
         // `ionice -c 3` when the image has it: the CLI's disk use waits for
         // everything else.
         match find_on_path("ionice") {
@@ -757,6 +910,38 @@ fn lore_origin(clone_url: &str) -> String {
     format!("{scheme}://{host}")
 }
 
+/// For a clone through lore's GitHub routes (`<lore>/git/github/o/r.git`,
+/// `…/git/github-org/…`): the repository's GitHub address, and the lore
+/// prefix the CLI's git rewrites `https://github.com/` to.
+pub fn github_address(clone_url: &str) -> Option<(String, String)> {
+    let (scheme, rest) = clone_url.split_once("://")?;
+    let (host, path) = rest.split_once('/')?;
+    let mut parts = path.split('/');
+    if parts.next()? != "git" {
+        return None;
+    }
+    let route = parts.next()?;
+    if !matches!(route, "github" | "github-org") {
+        return None;
+    }
+    let (owner, repo) = (parts.next()?, parts.next()?);
+    let plain = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('.')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    if parts.next().is_some() || !plain(owner) || !plain(repo) {
+        return None;
+    }
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    Some((
+        format!("https://github.com/{owner}/{repo}.git"),
+        format!("{scheme}://{host}/git/{route}/"),
+    ))
+}
+
 fn find_on_path(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
@@ -970,37 +1155,6 @@ fn create_private_dir(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
-}
-
-/// Deletes a work directory, making read-only parts (git's packs, a
-/// tool's caches) writable first if the plain delete fails.
-fn remove_dir(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => {
-            make_writable(path);
-            std::fs::remove_dir_all(path)
-        }
-    }
-}
-
-fn make_writable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.file_type().is_symlink() {
-        return;
-    }
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                make_writable(&entry.path());
-            }
-        }
-    }
 }
 
 /// What one line of a CLI's JSON stream says.
@@ -1476,6 +1630,281 @@ mod tests {
         assert!(!valid_session_id("--dangerous") && !valid_session_id("a b"));
         assert!(valid_session_id("ses_01JX.abc-1"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use crate::runner::{
+        drivers::{Fresh, Isolation, Settings},
+        protocol::Secret,
+    };
+
+    fn temp(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(sandbox::random_name(&format!(
+            "lore-runs-{label}-{}-",
+            std::process::id()
+        )));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// An MCP endpoint that answers every request with 200.
+    async fn fake_mcp() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 16 * 1024];
+                    let _ = socket.read(&mut buffer).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                });
+            }
+        });
+        url
+    }
+
+    struct Bench {
+        runs: Runs,
+        rx: mpsc::Receiver<FromRunner>,
+        dir: PathBuf,
+        occupancy: Arc<Occupancy>,
+        mcp: String,
+    }
+
+    async fn bench(label: &str, cli: &str) -> Bench {
+        let dir = temp(label);
+        let program = dir.join("claude");
+        executable(&program, cli);
+        let git = dir.join("git");
+        executable(
+            &git,
+            r#"#!/bin/sh
+echo "argv: $*" >> "$HOME/git.log"
+env | sort > "$HOME/git-env-$1"
+case "$1" in
+  clone) mkdir -p "$5" && echo hi > "$5/README" ;;
+  symbolic-ref) echo origin/main ;;
+  rev-parse) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+  ls-remote) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb	refs/heads/main
+' ;;
+esac
+"#,
+        );
+        let runner_home = dir.join("runner-home");
+        std::fs::create_dir_all(&runner_home).unwrap();
+        let driver = Arc::new(Driver::with_isolation(
+            Settings {
+                kind: Kind::Claude,
+                provider: "anthropic".into(),
+                home: runner_home,
+                program,
+            },
+            Isolation::Fresh(Fresh {
+                state: dir.join("state"),
+                homes: dir.join("work/.homes"),
+                user: None,
+            }),
+        ));
+        driver.prepare().unwrap();
+        // A stored credential: the CLI gets it, runner git never does.
+        std::fs::write(
+            dir.join("state/secrets.env"),
+            "CLAUDE_CODE_OAUTH_TOKEN=stored-oauth-token-value\n", // lore:allow-secret (fake test value)
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel(1024);
+        let occupancy = Arc::new(Occupancy::default());
+        let runs = Runs::new(
+            driver,
+            tx,
+            dir.join("work"),
+            git,
+            "claude-builtin".into(),
+            occupancy.clone(),
+        );
+        Bench {
+            runs,
+            rx,
+            dir,
+            occupancy,
+            mcp: fake_mcp().await,
+        }
+    }
+
+    fn spec(run_id: &str, clone_url: &str, mcp: &str) -> RunSpec {
+        RunSpec {
+            run_id: run_id.into(),
+            kind: if clone_url.is_empty() {
+                RunKind::Chat
+            } else {
+                RunKind::Task
+            },
+            clone_url: clone_url.into(),
+            mcp_url: format!("{mcp}/mcp"),
+            token: Secret::new("lore_run_secret_token_0123456789"),
+            model: String::new(),
+            prompt: "do it".into(),
+            resume: None,
+            workdir: None,
+            wall_clock_secs: 60,
+            output_cap_bytes: 1 << 20,
+        }
+    }
+
+    async fn exit_of(rx: &mut mpsc::Receiver<FromRunner>, run_id: &str) -> FromRunner {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                .await
+                .expect("no run_exit in time")
+                .expect("the channel closed");
+            if matches!(&message, FromRunner::RunExit { run_id: id, .. } if id == run_id) {
+                return message;
+            }
+        }
+    }
+
+    const QUIET_CLI: &str = "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"result\":\"ok\"}'\n";
+
+    /// A container that is only busy answers `busy: …`, which lore can
+    /// take as "try again later": another run, or an open terminal.
+    #[tokio::test]
+    async fn a_busy_container_says_so() {
+        let mut bench = bench("busy", "#!/bin/sh\nsleep 5\n").await;
+        assert!(bench.occupancy.open_terminal());
+        bench.runs.handle(ToRunner::RunStart {
+            spec: spec("r1", "", &bench.mcp),
+        });
+        let FromRunner::RunExit { reason, .. } = exit_of(&mut bench.rx, "r1").await else {
+            unreachable!()
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("busy: a terminal is open in this container")
+        );
+        bench.occupancy.close_terminal();
+        bench.runs.handle(ToRunner::RunStart {
+            spec: spec("r2", "", &bench.mcp),
+        });
+        bench.runs.handle(ToRunner::RunStart {
+            spec: spec("r3", "", &bench.mcp),
+        });
+        let FromRunner::RunExit { reason, .. } = exit_of(&mut bench.rx, "r3").await else {
+            unreachable!()
+        };
+        assert!(reason.unwrap().starts_with(BUSY));
+        // A terminal does not open while the run goes.
+        assert!(!bench.occupancy.open_terminal());
+        bench.runs.handle(ToRunner::RunStop {
+            run_id: "r2".into(),
+        });
+        exit_of(&mut bench.rx, "r2").await;
+        let _ = std::fs::remove_dir_all(&bench.dir);
+    }
+
+    /// When lore hears that a run ended, the runner's slot is already
+    /// free: a follow-up started at once is not refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_slot_is_free_before_the_run_s_end_is_reported() {
+        let mut bench = bench("slot", QUIET_CLI).await;
+        for round in 0..15 {
+            let id = format!("s{round}");
+            bench.runs.handle(ToRunner::RunStart {
+                spec: spec(&id, "", &bench.mcp),
+            });
+            // Spin, so the end is looked at the moment it arrives.
+            let exit = loop {
+                match bench.rx.try_recv() {
+                    Ok(message @ FromRunner::RunExit { .. }) => break message,
+                    Ok(_) | Err(mpsc::error::TryRecvError::Empty) => std::hint::spin_loop(),
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            assert!(
+                !bench.occupancy.run_going() && bench.runs.active().is_empty(),
+                "round {round}: the slot was still taken when {exit:?} arrived"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&bench.dir);
+    }
+
+    /// Runner git is hermetic and never gets a stored credential; the
+    /// CLI's git names the repository by its GitHub address and reaches it
+    /// through lore; the push check asks the address the runner was given.
+    #[tokio::test]
+    async fn runner_git_is_hermetic_and_the_checkout_names_github() {
+        let out = temp("git-out");
+        let cli = format!(
+            "#!/bin/sh\nenv | sort > '{}/cli-env'\nprintf '[core]\\n\\thooksPath = /tmp/x\\n' > \"$HOME/.gitconfig\"\necho '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"result\":\"ok\"}}'\n",
+            out.display()
+        );
+        let mut bench = bench("git", &cli).await;
+        let clone_url = format!("{}/git/github/owner/repo.git", bench.mcp);
+        bench.runs.handle(ToRunner::RunStart {
+            spec: spec("g1", &clone_url, &bench.mcp),
+        });
+        let FromRunner::RunExit { pushed, reason, .. } = exit_of(&mut bench.rx, "g1").await else {
+            unreachable!()
+        };
+        assert!(pushed, "{reason:?}");
+        let home = bench.dir.join("runner-home");
+        let log = std::fs::read_to_string(home.join("git.log")).unwrap();
+        assert!(
+            log.contains("remote set-url origin https://github.com/owner/repo.git"),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("ls-remote -- {clone_url} refs/heads/main")),
+            "{log}"
+        );
+        for step in ["clone", "ls-remote"] {
+            let env = std::fs::read_to_string(home.join(format!("git-env-{step}"))).unwrap();
+            assert!(env.contains("GIT_CONFIG_GLOBAL=/dev/null"), "{env}");
+            assert!(env.contains("GIT_CONFIG_NOSYSTEM=1"), "{env}");
+            assert!(env.contains("=core.hooksPath"), "{env}");
+            assert!(env.contains("=protocol.file.allow"), "{env}");
+            assert!(!env.contains("stored-oauth-token-value"), "{env}");
+            assert!(!env.contains("CLAUDE_CODE_OAUTH_TOKEN"), "{env}");
+        }
+        let cli_env = std::fs::read_to_string(out.join("cli-env")).unwrap();
+        assert!(cli_env.contains("CLAUDE_CODE_OAUTH_TOKEN=stored-oauth-token-value"));
+        assert!(
+            cli_env.contains(&format!("url.{}/git/github/.insteadOf", bench.mcp)),
+            "{cli_env}"
+        );
+        assert!(cli_env.contains("=https://github.com/"), "{cli_env}");
+        // The CLI ran in a fresh home, now gone, under the work area.
+        assert!(cli_env.contains(&format!("HOME={}", bench.dir.join("work/.homes").display())));
+        assert_eq!(
+            std::fs::read_dir(bench.dir.join("work/.homes"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!bench.dir.join("work/g1").exists());
+        assert_eq!(
+            github_address("http://lore:8081/git/github-org/o/r.git"),
+            Some((
+                "https://github.com/o/r.git".into(),
+                "http://lore:8081/git/github-org/".into()
+            ))
+        );
+        assert_eq!(github_address("http://lore:8081/git/gitlab/o/r.git"), None);
+        assert_eq!(github_address("http://lore:8081/git/github/../r.git"), None);
+        let _ = std::fs::remove_dir_all(&bench.dir);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

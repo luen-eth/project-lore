@@ -55,6 +55,21 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(90);
 /// Shortest runner secret accepted.
 const MIN_SECRET_LEN: usize = 24;
 
+/// Run events waiting for the task runner; a runner that floods past this
+/// loses its link.
+const RUN_EVENTS_QUEUE: usize = 4096;
+
+/// What one runner link may send: frames and bytes per second, with a
+/// burst. A runner over either loses its link.
+const FRAMES_PER_SECOND: f64 = 500.0;
+const FRAMES_BURST: f64 = 5000.0;
+const BYTES_PER_SECOND: f64 = 8.0 * 1024.0 * 1024.0;
+const BYTES_BURST: f64 = 64.0 * 1024.0 * 1024.0;
+
+/// How long a live link has to answer before a second runner of the same
+/// agent may take its place.
+const LIVE_PROBE: Duration = Duration::from_secs(3);
+
 /// Terminals one built-in agent may have open at once (its runner keeps
 /// the same limit).
 pub const MAX_TERMINALS: usize = crate::runner::terminal::MAX_TERMINALS;
@@ -63,9 +78,12 @@ pub const MAX_TERMINALS: usize = crate::runner::terminal::MAX_TERMINALS;
 /// falls this far behind loses its terminal.
 const TERMINAL_BACKLOG: usize = 1024;
 
-/// A runner secret and the built-in agent it belongs to.
+/// A runner secret, the built-in agent it belongs to, and what that agent
+/// is: its CLI and provider are fixed here, never taken from the runner.
 pub struct RunnerToken {
     pub agent: String,
+    pub kind: Kind,
+    pub provider: String,
     secret: String,
 }
 
@@ -81,18 +99,42 @@ impl std::fmt::Debug for RunnerToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunnerToken")
             .field("agent", &self.agent)
+            .field("kind", &self.kind)
+            .field("provider", &self.provider)
             .field("secret", &"[redacted]")
             .finish()
     }
 }
 
-/// Reads `LORE_RUNNER_TOKENS`: `agent:secret` pairs, comma separated, for
+/// The CLI and provider an agent's name implies: `claude…` is Claude
+/// Code with Anthropic, `codex…` Codex with OpenAI, `deepseek…` opencode
+/// with DeepSeek.
+pub fn kind_of_name(name: &str) -> Option<(Kind, String)> {
+    if name.starts_with("claude") {
+        Some((Kind::Claude, "anthropic".into()))
+    } else if name.starts_with("codex") {
+        Some((Kind::Codex, "openai".into()))
+    } else if name.starts_with("deepseek") {
+        Some((Kind::Opencode, "deepseek".into()))
+    } else {
+        None
+    }
+}
+
+/// Reads `LORE_RUNNER_TOKENS`: `agent:secret` entries, comma separated, for
 /// example `claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>`.
+/// An entry may name the agent's CLI (and provider) between the two:
+/// `agent:kind:secret` or `agent:kind/provider:secret`, which an agent
+/// whose name does not start with `claude`, `codex` or `deepseek` must.
+/// A runner whose hello claims another CLI or provider is refused.
 pub fn parse_runner_tokens(value: &str) -> Result<Vec<RunnerToken>> {
     let mut tokens: Vec<RunnerToken> = Vec::new();
     for pair in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let Some((agent, secret)) = pair.split_once(':') else {
-            bail!("LORE_RUNNER_TOKENS entries must look like agent:secret");
+        let parts: Vec<&str> = pair.splitn(3, ':').collect();
+        let (agent, named, secret) = match parts.as_slice() {
+            [agent, secret] => (*agent, None, *secret),
+            [agent, kind, secret] => (*agent, Some(*kind), *secret),
+            _ => bail!("LORE_RUNNER_TOKENS entries must look like agent:secret"),
         };
         let agent = agent.trim().to_lowercase();
         let plain = !agent.is_empty()
@@ -106,6 +148,38 @@ pub fn parse_runner_tokens(value: &str) -> Result<Vec<RunnerToken>> {
         if tokens.iter().any(|t| t.agent == agent) {
             bail!("LORE_RUNNER_TOKENS lists the agent \"{agent}\" twice");
         }
+        let (kind, provider) = match named {
+            Some(named) => {
+                let (kind, provider) = match named.trim().split_once('/') {
+                    Some((kind, provider)) => (kind, Some(provider)),
+                    None => (named.trim(), None),
+                };
+                let Some(kind) = Kind::parse(kind) else {
+                    bail!(
+                        "LORE_RUNNER_TOKENS: \"{agent}\" names the CLI \"{kind}\"; use claude, codex \
+                         or opencode"
+                    );
+                };
+                let provider = provider
+                    .map(|p| p.trim().to_lowercase())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| crate::runner::default_provider(kind).to_string());
+                if !provider
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                {
+                    bail!("LORE_RUNNER_TOKENS: the provider of \"{agent}\" must be a plain id");
+                }
+                (kind, provider)
+            }
+            None => kind_of_name(&agent).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "LORE_RUNNER_TOKENS: say which CLI \"{agent}\" runs, as \
+                     {agent}:claude:<secret>, {agent}:codex:<secret> or \
+                     {agent}:opencode/<provider>:<secret>"
+                )
+            })?,
+        };
         let secret = secret.trim().to_string();
         if secret.len() < MIN_SECRET_LEN {
             bail!(
@@ -113,9 +187,106 @@ pub fn parse_runner_tokens(value: &str) -> Result<Vec<RunnerToken>> {
                  (openssl rand -hex 32)"
             );
         }
-        tokens.push(RunnerToken { agent, secret });
+        tokens.push(RunnerToken {
+            agent,
+            kind,
+            provider,
+            secret,
+        });
     }
     Ok(tokens)
+}
+
+/// `LORE_RUNNER_BIND`: one address, or several, comma separated (one per
+/// agent network, so the runner listener is on those networks only).
+pub fn parse_runner_binds(value: &str) -> Result<Vec<SocketAddr>> {
+    let binds = value
+        .split(',')
+        .map(str::trim)
+        .filter(|bind| !bind.is_empty())
+        .map(|bind| {
+            bind.parse::<SocketAddr>().map_err(|_| {
+                anyhow::anyhow!(
+                    "LORE_RUNNER_BIND must be addresses like 172.30.1.2:8081, comma separated"
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if binds.is_empty() {
+        bail!("LORE_RUNNER_BIND is empty");
+    }
+    Ok(binds)
+}
+
+/// The sign-in hosts each CLI's interactive sign-in may send the owner
+/// to, from the CLIs' documentation.
+pub fn sign_in_hosts(kind: Kind) -> &'static [&'static str] {
+    match kind {
+        Kind::Claude => &[
+            "claude.ai",
+            "claude.com",
+            "console.anthropic.com",
+            "platform.claude.com",
+        ],
+        Kind::Codex => &["auth.openai.com", "chatgpt.com"],
+        Kind::Opencode => &[],
+    }
+}
+
+/// A sign-in link a runner reported, checked: it parses, is `https`, has
+/// no user name or password and no unusual port, and its host is one the
+/// agent's CLI signs in at. Answers the link and its host, for the page
+/// to show apart.
+pub fn checked_sign_in_url(kind: Kind, url: &str) -> Option<(String, String)> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+    {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    sign_in_hosts(kind)
+        .contains(&host.as_str())
+        .then(|| (parsed.to_string(), host))
+}
+
+/// A second runner that tried to connect for an agent whose link was live.
+#[derive(Debug, Clone, Serialize)]
+pub struct Intrusion {
+    pub at: String,
+    pub address: String,
+    pub count: u64,
+}
+
+/// A token bucket for one link's frames or bytes.
+struct Bucket {
+    level: f64,
+    rate: f64,
+    burst: f64,
+    at: tokio::time::Instant,
+}
+
+impl Bucket {
+    fn new(rate: f64, burst: f64) -> Self {
+        Self {
+            level: burst,
+            rate,
+            burst,
+            at: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Takes `amount`; false when the bucket is empty.
+    fn take(&mut self, amount: f64) -> bool {
+        let now = tokio::time::Instant::now();
+        self.level =
+            (self.level + now.duration_since(self.at).as_secs_f64() * self.rate).min(self.burst);
+        self.at = now;
+        self.level -= amount;
+        self.level >= 0.0
+    }
 }
 
 /// The kind a built-in agent's name suggests before its runner first
@@ -172,6 +343,8 @@ pub struct LoginState {
     /// `starting`, `waiting`, `done` or `failed`.
     pub state: String,
     pub url: Option<String>,
+    /// The sign-in link's host, which the page shows apart from the link.
+    pub url_host: Option<String>,
     pub code: Option<String>,
     pub needs_code: bool,
     pub message: String,
@@ -216,6 +389,7 @@ struct Inner {
     models: HashMap<String, ModelList>,
     resources: HashMap<String, Resources>,
     terminals: HashMap<String, Terminal>,
+    intrusions: HashMap<String, Intrusion>,
 }
 
 /// What the hub hands the task runner: what a runner said about a run,
@@ -238,13 +412,21 @@ pub struct Hub {
     /// Wrong runner secrets, by address: ten in fifteen minutes lock it out.
     failures: RateLimiter,
     /// Run events for the task runner, which takes the receiver once.
-    run_tx: mpsc::UnboundedSender<HubEvent>,
-    run_rx: Mutex<Option<mpsc::UnboundedReceiver<HubEvent>>>,
+    /// Bounded: a runner that floods it loses its link.
+    run_tx: mpsc::Sender<HubEvent>,
+    run_rx: Mutex<Option<mpsc::Receiver<HubEvent>>>,
+}
+
+/// Whether a link goes on after a message.
+#[derive(Debug, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Drop(&'static str),
 }
 
 impl Hub {
     pub fn new(db: Db, tokens: Vec<RunnerToken>) -> Self {
-        let (run_tx, run_rx) = mpsc::unbounded_channel();
+        let (run_tx, run_rx) = mpsc::channel(RUN_EVENTS_QUEUE);
         Self {
             db,
             tokens,
@@ -257,7 +439,7 @@ impl Hub {
     }
 
     /// The run events, for the one task runner that listens.
-    pub fn take_events(&self) -> Option<mpsc::UnboundedReceiver<HubEvent>> {
+    pub fn take_events(&self) -> Option<mpsc::Receiver<HubEvent>> {
         self.run_rx.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
@@ -312,6 +494,15 @@ impl Hub {
 
     pub fn resources(&self, name: &str) -> Option<Resources> {
         self.inner().resources.get(name).cloned()
+    }
+
+    /// The last time a second runner tried to connect for this agent.
+    pub fn intrusion(&self, name: &str) -> Option<Intrusion> {
+        self.inner().intrusions.get(name).cloned()
+    }
+
+    fn token(&self, agent: &str) -> Option<&RunnerToken> {
+        self.tokens.iter().find(|token| token.agent == agent)
     }
 
     /// Whether `presented` is the runner secret of `agent`. Every stored
@@ -503,6 +694,7 @@ impl Hub {
                 method: method.to_string(),
                 state: "starting".into(),
                 url: None,
+                url_host: None,
                 code: None,
                 needs_code: false,
                 message: String::new(),
@@ -520,9 +712,23 @@ impl Hub {
         }
     }
 
+    /// Hands a run event to the task runner; a full queue drops the link.
+    fn run_event(&self, agent: &str, message: &FromRunner) -> Flow {
+        match self.run_tx.try_send(HubEvent::Run {
+            agent: agent.to_string(),
+            message: message.clone(),
+        }) {
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Flow::Drop("its run events come faster than lore can store them")
+            }
+            _ => Flow::Continue,
+        }
+    }
+
     /// What a runner said: answers go to whoever asked; reports update the
     /// stored state.
-    fn on_message(&self, agent: &str, message: FromRunner) {
+    fn on_message(&self, agent: &str, message: FromRunner) -> Flow {
+        let mut flow = Flow::Continue;
         match &message {
             FromRunner::Status {
                 signed_in,
@@ -550,14 +756,29 @@ impl Hub {
                 needs_code,
                 message: said,
             } => {
+                // Only a link to where the agent's CLI signs in is shown.
+                let kind = self.token(agent).map(|token| token.kind);
+                let checked = url
+                    .as_deref()
+                    .zip(kind)
+                    .and_then(|(url, kind)| checked_sign_in_url(kind, url));
+                if url.is_some() && checked.is_none() {
+                    tracing::warn!(%agent, "a sign-in link to an unexpected place was refused");
+                }
                 if let Some(login) = self.inner().logins.get_mut(agent)
                     && login.id == *id
                 {
                     login.state = "waiting".into();
-                    login.url = url.clone();
+                    login.message = said.clone();
+                    if url.is_some() && checked.is_none() {
+                        login.message = format!(
+                            "The runner reported a sign-in link that is not at a host this CLI \
+                             signs in at, so it is not shown.\n{said}"
+                        );
+                    }
+                    (login.url, login.url_host) = checked.unzip();
                     login.code = code.clone();
                     login.needs_code = *needs_code;
-                    login.message = said.clone();
                 }
             }
             FromRunner::LoginDone {
@@ -570,6 +791,7 @@ impl Hub {
                 {
                     login.state = if *ok { "done" } else { "failed" }.into();
                     login.url = None;
+                    login.url_host = None;
                     login.code = None;
                     login.needs_code = false;
                     login.message = said.clone();
@@ -593,19 +815,13 @@ impl Hub {
             FromRunner::Unsupported { command, .. } => {
                 tracing::warn!(%agent, %command, "the runner does not support a command");
                 if command == "run_start" {
-                    let _ = self.run_tx.send(HubEvent::Run {
-                        agent: agent.to_string(),
-                        message: message.clone(),
-                    });
+                    flow = self.run_event(agent, &message);
                 }
             }
             FromRunner::RunStarted { .. }
             | FromRunner::RunOutput { .. }
             | FromRunner::RunExit { .. } => {
-                let _ = self.run_tx.send(HubEvent::Run {
-                    agent: agent.to_string(),
-                    message: message.clone(),
-                });
+                flow = self.run_event(agent, &message);
             }
             FromRunner::TerminalOutput { term_id, data } => {
                 self.on_terminal_output(agent, term_id, data);
@@ -629,6 +845,57 @@ impl Hub {
                 let _ = answer.send(message);
             }
         }
+        flow
+    }
+
+    /// Whether the agent's current link is alive: it answers a ping within
+    /// [`LIVE_PROBE`].
+    async fn link_is_live(&self, agent: &str) -> bool {
+        if self.link(agent).is_none() {
+            return false;
+        }
+        matches!(
+            self.request(agent, |id| ToRunner::Ping { id }, LIVE_PROBE)
+                .await,
+            Ok(FromRunner::Pong { .. })
+        )
+    }
+
+    /// Notes a second runner that tried to connect while the agent's link
+    /// was live: shown with the agent and in the activity feed.
+    fn note_intrusion(&self, agent: &str, address: &str) {
+        let at = crate::runner::drivers::iso_from_unix(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        );
+        let count = {
+            let mut inner = self.inner();
+            let entry = inner
+                .intrusions
+                .entry(agent.to_string())
+                .or_insert(Intrusion {
+                    at: at.clone(),
+                    address: address.to_string(),
+                    count: 0,
+                });
+            entry.at = at;
+            entry.address = address.to_string();
+            entry.count += 1;
+            entry.count
+        };
+        tracing::warn!(%agent, %address, count, "a second runner tried to connect while the agent's runner is connected; refused");
+        let summary = format!(
+            "a second runner tried to connect as {agent} from {address} while its runner was \
+             connected; it was refused (its runner secret may have leaked)"
+        );
+        if let Err(error) =
+            self.db
+                .record_activity("lore", "builtin", "", None, None, &[], &summary)
+        {
+            tracing::warn!(%error, "recording a second runner failed");
+        }
     }
 
     /// The internal router: only `/runner/ws`.
@@ -639,7 +906,7 @@ impl Hub {
     }
 
     /// One runner's link, from the hello to the close.
-    async fn serve(self: Arc<Self>, agent: String, mut socket: WebSocket) {
+    async fn serve(self: Arc<Self>, agent: String, address: String, mut socket: WebSocket) {
         let hello = tokio::time::timeout(Duration::from_secs(15), async {
             while let Some(Ok(frame)) = socket.recv().await {
                 if let Message::Text(text) = frame {
@@ -680,7 +947,25 @@ impl Hub {
                         .await;
                     return;
                 }
-                (kind, provider, runner_version, cli_version)
+                // What the agent is was fixed in LORE_RUNNER_TOKENS.
+                let Some(token) = self.token(&agent) else {
+                    return;
+                };
+                if kind != token.kind || provider.trim().to_lowercase() != token.provider {
+                    let reason = format!(
+                        "{agent} runs {} with {}; this runner says {} with {}",
+                        token.kind.id(),
+                        token.provider,
+                        kind.id(),
+                        provider
+                    );
+                    tracing::warn!(%agent, %reason, "a runner was refused");
+                    let _ = socket
+                        .send(Message::text(protocol::encode(&refuse(reason))))
+                        .await;
+                    return;
+                }
+                (kind, token.provider.clone(), runner_version, cli_version)
             }
             _ => {
                 tracing::warn!(%agent, "a runner connected without a hello");
@@ -693,11 +978,22 @@ impl Hub {
             .take(40)
             .collect();
         let shorten = |text: &str| text.chars().take(120).collect::<String>();
+        // One live link per agent: a runner that dials again after its
+        // link died replaces it; a second runner while the first answers
+        // is refused and noted.
+        if self.link_is_live(&agent).await {
+            self.note_intrusion(&agent, &address);
+            let _ = socket
+                .send(Message::text(protocol::encode(&refuse(
+                    "another runner is connected for this agent".into(),
+                ))))
+                .await;
+            return;
+        }
         let (tx, mut rx) = mpsc::channel::<ToRunner>(64);
         let generation = self.next_id();
         {
             let mut inner = self.inner();
-            // A runner that dials again replaces its old link.
             inner.links.insert(
                 agent.clone(),
                 Link {
@@ -748,6 +1044,7 @@ impl Hub {
                 {
                     login.state = "failed".into();
                     login.url = None;
+                    login.url_host = None;
                     login.code = None;
                     login.message = "the agent's container disconnected".into();
                 }
@@ -755,9 +1052,12 @@ impl Hub {
             current
         };
         if current {
-            let _ = self.run_tx.send(HubEvent::Disconnected {
-                agent: agent.clone(),
-            });
+            let _ = self
+                .run_tx
+                .send(HubEvent::Disconnected {
+                    agent: agent.clone(),
+                })
+                .await;
             if let Err(error) = self.db.builtin_disconnected(&agent) {
                 tracing::warn!(%agent, %error, "recording a runner's disconnection failed");
             }
@@ -770,14 +1070,32 @@ impl Hub {
         let mut ping = tokio::time::interval(PING_EVERY);
         ping.tick().await;
         let mut last_heard = tokio::time::Instant::now();
+        let mut frames = Bucket::new(FRAMES_PER_SECOND, FRAMES_BURST);
+        let mut bytes = Bucket::new(BYTES_PER_SECOND, BYTES_BURST);
         loop {
             tokio::select! {
                 frame = socket.recv() => {
                     let Some(Ok(frame)) = frame else { return };
                     last_heard = tokio::time::Instant::now();
+                    let size = match &frame {
+                        Message::Text(text) => text.len(),
+                        Message::Binary(data) => data.len(),
+                        _ => 0,
+                    };
+                    if !frames.take(1.0) || !bytes.take(size as f64) {
+                        tracing::warn!(%agent, "a runner sent more than its link allows; closing it");
+                        let _ = socket.send(Message::Close(None)).await;
+                        return;
+                    }
                     match frame {
                         Message::Text(text) => match protocol::decode::<FromRunner>(text.as_str()) {
-                            Ok(message) => self.on_message(agent, message),
+                            Ok(message) => {
+                                if let Flow::Drop(why) = self.on_message(agent, message) {
+                                    tracing::warn!(%agent, why, "closing a runner's link");
+                                    let _ = socket.send(Message::Close(None)).await;
+                                    return;
+                                }
+                            }
                             Err(error) => {
                                 tracing::warn!(%agent, %error, "a runner message could not be read");
                             }
@@ -861,7 +1179,7 @@ async fn runner_ws(
     upgrade
         .max_message_size(protocol::MAX_FRAME_BYTES)
         .max_frame_size(protocol::MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| hub.serve(agent, socket))
+        .on_upgrade(move |socket| hub.serve(agent, ip, socket))
 }
 
 #[cfg(test)]
@@ -1634,6 +1952,7 @@ esac
         let missing = http
             .post(format!("{base}/admin/api/builtin/gemini-builtin/refresh"))
             .header(header::COOKIE, &admin)
+            .json(&serde_json::json!({}))
             .send()
             .await
             .unwrap();
@@ -2044,5 +2363,352 @@ esac
             assert!(parse_runner_tokens(&bad).is_err(), "{bad}");
         }
         assert_eq!(kind_and_avatar("deepseek-builtin"), ("opencode", "wave"));
+    }
+
+    /// What an agent is comes from LORE_RUNNER_TOKENS: from its name, or
+    /// named in the entry, which a name that says nothing must do.
+    #[test]
+    fn an_agent_s_cli_and_provider_are_fixed_by_lore() {
+        let tokens = parse_runner_tokens(&format!(
+            "claude-builtin:{CLAUDE_SECRET},helper:opencode/qwen:{CODEX_SECRET},second:codex:{CODEX_SECRET}0"
+        ))
+        .unwrap();
+        assert_eq!(
+            (tokens[0].kind, tokens[0].provider.as_str()),
+            (Kind::Claude, "anthropic")
+        );
+        assert_eq!(
+            (tokens[1].kind, tokens[1].provider.as_str()),
+            (Kind::Opencode, "qwen")
+        );
+        assert_eq!(
+            (tokens[2].kind, tokens[2].provider.as_str()),
+            (Kind::Codex, "openai")
+        );
+        assert_eq!(tokens[1].secret(), CODEX_SECRET);
+        assert!(parse_runner_tokens(&format!("helper:{CLAUDE_SECRET}")).is_err());
+        assert!(parse_runner_tokens(&format!("helper:gemini:{CLAUDE_SECRET}")).is_err());
+        assert_eq!(
+            parse_runner_binds("172.31.250.2:8081, 172.31.250.18:8081")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(parse_runner_binds("lore:8081").is_err());
+        assert!(parse_runner_binds(" ").is_err());
+    }
+
+    /// A runner whose hello claims another CLI than the agent's is refused.
+    #[tokio::test]
+    async fn a_runner_claiming_another_cli_is_refused() {
+        let pair = listen().await;
+        let lying = config(&pair, "claude-builtin", Kind::Codex, CLAUDE_SECRET);
+        let driver = Arc::new(Driver::new(lying.settings.clone()));
+        let ended = runner::session(&lying, driver).await.unwrap();
+        assert!(
+            matches!(&ended, End::Refused(reason) if reason.contains("runs claude")),
+            "{ended:?}"
+        );
+        assert!(pair.hub.link("claude-builtin").is_none());
+    }
+
+    /// While an agent's runner is connected and answers, a second runner
+    /// with the same secret is refused (not swapped in) and noted for the
+    /// page and the activity feed.
+    #[tokio::test]
+    async fn a_second_runner_never_replaces_a_live_one() {
+        let pair = listen().await;
+        start(config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET));
+        connected(&pair.hub, "claude-builtin").await;
+        let thief = config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET);
+        let driver = Arc::new(Driver::new(thief.settings.clone()));
+        let ended = runner::session(&thief, driver).await.unwrap();
+        assert!(
+            matches!(&ended, End::Refused(reason) if reason.contains("another runner")),
+            "{ended:?}"
+        );
+        // The first one still answers.
+        assert!(matches!(
+            pair.hub
+                .request("claude-builtin", |id| ToRunner::Ping { id }, WAIT)
+                .await,
+            Ok(FromRunner::Pong { .. })
+        ));
+        let seen = pair.hub.intrusion("claude-builtin").unwrap();
+        assert_eq!((seen.count, seen.address.as_str()), (1, "127.0.0.1"));
+        let feed = format!("{:?}", pair.db.activity(20).unwrap());
+        assert!(feed.contains("a second runner tried to connect"), "{feed}");
+    }
+
+    /// Only a link to a host the agent's CLI signs in at is shown, and
+    /// only over https, without user info.
+    #[test]
+    fn sign_in_links_are_checked_against_the_cli_s_hosts() {
+        let ok = checked_sign_in_url(
+            Kind::Claude,
+            "https://claude.ai/oauth/authorize?code=true&client_id=x",
+        )
+        .unwrap();
+        assert_eq!(ok.1, "claude.ai");
+        assert_eq!(
+            checked_sign_in_url(Kind::Codex, "https://auth.openai.com/codex/device")
+                .unwrap()
+                .1,
+            "auth.openai.com"
+        );
+        for bad in [
+            "https://evil.example/oauth",
+            "http://claude.ai/oauth",
+            "https://user:pw@claude.ai/oauth",
+            "https://claude.ai.evil.example/",
+            "https://claude.ai:8443/",
+            "javascript:alert(1)",
+            "https://auth.openai.com/",
+        ] {
+            assert!(checked_sign_in_url(Kind::Claude, bad).is_none(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_link_to_elsewhere_is_not_shown() {
+        let pair = listen().await;
+        pair.hub.login_started("claude-builtin", 7, "interactive");
+        let flow = pair.hub.on_message(
+            "claude-builtin",
+            FromRunner::LoginPrompt {
+                id: 7,
+                url: Some("https://phish.example/login".into()),
+                code: None,
+                needs_code: true,
+                message: "open it".into(),
+            },
+        );
+        assert_eq!(flow, Flow::Continue);
+        let login = pair.hub.login_state("claude-builtin").unwrap();
+        assert_eq!((login.url, login.url_host), (None, None));
+        assert!(login.message.contains("not shown"), "{}", login.message);
+        pair.hub.on_message(
+            "claude-builtin",
+            FromRunner::LoginPrompt {
+                id: 7,
+                url: Some("https://claude.ai/oauth/authorize?x=1".into()),
+                code: None,
+                needs_code: true,
+                message: String::new(),
+            },
+        );
+        let login = pair.hub.login_state("claude-builtin").unwrap();
+        assert_eq!(login.url_host.as_deref(), Some("claude.ai"));
+    }
+
+    /// Run events wait in a bounded queue: a runner that floods it is
+    /// dropped instead of growing lore's memory; a link over its frame rate
+    /// is too.
+    #[tokio::test]
+    async fn a_flooding_runner_loses_its_link() {
+        let pair = listen().await;
+        let line = |seq| FromRunner::RunOutput {
+            run_id: "r1".into(),
+            seq,
+            stream: "text".into(),
+            line: "x".into(),
+        };
+        for seq in 0..RUN_EVENTS_QUEUE as u64 {
+            assert_eq!(
+                pair.hub.on_message("claude-builtin", line(seq)),
+                Flow::Continue
+            );
+        }
+        assert!(matches!(
+            pair.hub.on_message("claude-builtin", line(u64::MAX)),
+            Flow::Drop(_)
+        ));
+        let mut bucket = Bucket::new(10.0, 20.0);
+        assert!((0..20).all(|_| bucket.take(1.0)));
+        assert!(!bucket.take(1.0));
+    }
+
+    /// State-changing built-in routes take JSON only (a cross-site form
+    /// cannot send it); a viewer sees neither what the CLI said about the
+    /// sign-in nor any run's output.
+    #[tokio::test]
+    async fn forms_are_refused_and_viewers_see_less() {
+        let pair = listen().await;
+        let events = crate::events::Events::new();
+        pair.db
+            .builtin_status(
+                "claude-builtin",
+                &BuiltinStatus {
+                    detail: "Logged in as owner@example.com".into(),
+                    ..BuiltinStatus::default()
+                },
+            )
+            .unwrap();
+        let admin = crate::admin::Admin::new(
+            pair.db.clone(),
+            "admin-password-long".into(),
+            Some("viewer-password-long".into()),
+            None,
+            false,
+            Vec::new(),
+            None,
+            0.8,
+            events.clone(),
+            crate::embed::Embedder::disabled(),
+            12,
+            None,
+            crate::ops::Guard::default(),
+        )
+        .with_builtin(pair.hub.clone());
+        let router = crate::admin::router(Arc::new(admin));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let http = reqwest::Client::new();
+        let owner = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let viewer = sign_in(&http, &base, "viewer", "viewer-password-long").await;
+        for path in ["logout", "refresh", "login/cancel", "stop"] {
+            let form = http
+                .post(format!("{base}/admin/api/builtin/claude-builtin/{path}"))
+                .header(header::COOKIE, &owner)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body("x=1")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(form.status(), 415, "{path}");
+        }
+        let plain = http
+            .put(format!("{base}/admin/api/builtin/claude-builtin"))
+            .header(header::COOKIE, &owner)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(r#"{"enabled":true}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(plain.status(), 415);
+        assert!(
+            !pair
+                .db
+                .builtin_agent("claude-builtin")
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        // With JSON the same route works, and the new switch is kept.
+        let saved = http
+            .put(format!("{base}/admin/api/builtin/claude-builtin"))
+            .header(header::COOKIE, &owner)
+            .json(&serde_json::json!({ "read_other_services": true, "model": "-x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), 400, "a model starting with - is refused");
+        let saved: serde_json::Value = http
+            .put(format!("{base}/admin/api/builtin/claude-builtin"))
+            .header(header::COOKIE, &owner)
+            .json(&serde_json::json!({ "read_other_services": true }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(saved["agent"]["read_other_services"], true);
+        assert!(
+            pair.db
+                .builtin_agent("claude-builtin")
+                .unwrap()
+                .unwrap()
+                .read_other_services
+        );
+        let list = |cookie: String| {
+            let http = http.clone();
+            let base = base.clone();
+            async move {
+                http.get(format!("{base}/admin/api/builtin"))
+                    .header(header::COOKIE, cookie)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let seen = list(viewer.clone()).await;
+        assert!(seen["agents"][0]["status_detail"].is_null(), "{seen}");
+        assert!(!seen.to_string().contains("owner@example.com"));
+        let seen = list(owner.clone()).await;
+        assert!(seen.to_string().contains("owner@example.com"));
+        let output = http
+            .get(format!("{base}/admin/api/builtin/runs/r1/events"))
+            .header(header::COOKIE, &viewer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(output.status(), 403);
+
+        // The live stream: a viewer hears that a run started and ended,
+        // never a line of its output or the summary of its end.
+        let stream = |cookie: String| {
+            let http = http.clone();
+            let base = base.clone();
+            async move {
+                http.get(format!("{base}/admin/api/events"))
+                    .header(header::COOKIE, cookie)
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+        let mut seen_by_viewer = stream(viewer).await;
+        let mut seen_by_owner = stream(owner).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        events.publish_run(serde_json::json!({
+            "type": "output", "run_id": "r1", "agent": "claude-builtin",
+            "seq": 1, "stream": "text", "line": "secret-looking output line",
+        }));
+        events.publish_run(serde_json::json!({
+            "type": "ended", "run_id": "r1", "agent": "claude-builtin",
+            "status": "failed", "summary": "the last words of the run",
+        }));
+        async fn read(response: &mut reqwest::Response) -> String {
+            let mut text = String::new();
+            while !text.contains("\"ended\"") {
+                let chunk = tokio::time::timeout(WAIT, response.chunk())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                text.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            text
+        }
+        let viewer_text = read(&mut seen_by_viewer).await;
+        assert!(
+            !viewer_text.contains("secret-looking output line"),
+            "{viewer_text}"
+        );
+        assert!(
+            !viewer_text.contains("the last words of the run"),
+            "{viewer_text}"
+        );
+        let owner_text = read(&mut seen_by_owner).await;
+        assert!(
+            owner_text.contains("secret-looking output line"),
+            "{owner_text}"
+        );
+        assert!(
+            owner_text.contains("the last words of the run"),
+            "{owner_text}"
+        );
     }
 }

@@ -864,10 +864,23 @@ impl Lore {
             };
             // A run token: the one check of what its task allows, before
             // the credential is touched. Logged like every other refusal.
-            if let Some(scope) = &scope
-                && let Err(reason) =
-                    scope.check_repository_tool(&provider, method != "GET", &owner, &name)
-            {
+            let refused = scope.as_ref().and_then(|scope| {
+                let mut checked =
+                    scope.check_repository_tool(&provider, method != "GET", &owner, &name);
+                // A commit: no CI definition, and only the default branch
+                // or a new one.
+                if checked.is_ok()
+                    && let Plan::Commit(commit) = &plan
+                {
+                    checked = scope
+                        .check_commit_paths(commit.changes.iter().map(|(path, _)| path.as_str()))
+                        .and_then(|()| {
+                            scope.check_commit_branch(&commit.branch, commit.create_from.is_some())
+                        });
+                }
+                checked.err()
+            });
+            if let Some(reason) = refused {
                 this.log_op_call(
                     &label,
                     &actor,
@@ -2975,6 +2988,7 @@ mod tests {
             provider: "github".into(),
             owner: "me".into(),
             repo: "shop".into(),
+            branch: "main".into(),
             ..RunScope::default()
         };
         let as_run = |scope: &RunScope| {
@@ -3034,6 +3048,38 @@ mod tests {
             refused.contains("is a conversation and may only read"),
             "{refused}"
         );
+        assert!(log.lock().unwrap().is_empty());
+        // C3 and C5: no CI definition, and no other existing branch.
+        for (changes, branch, word) in [
+            (
+                json!([{"path": ".github/workflows/ci.yml", "content": "on: push\n"}]),
+                "main",
+                "CI definitions",
+            ),
+            (
+                json!([{"path": "Jenkinsfile", "content": "x\n"}]),
+                "main",
+                "CI definitions",
+            ),
+            (
+                json!([{"path": "a.txt", "content": "a\n"}]),
+                "release",
+                "existing branch",
+            ),
+        ] {
+            let refused = lore
+                .repo_commit(
+                    args::<RepoCommitArgs>(
+                        &session,
+                        json!({"repo": "me/shop", "account": "personal", "branch": branch,
+                               "message": "Change", "changes": changes}),
+                    ),
+                    as_run(&scope),
+                )
+                .await
+                .unwrap_err();
+            assert!(refused.contains(word), "{refused}");
+        }
         assert!(log.lock().unwrap().is_empty());
         // Its own repository through its own account: allowed.
         let answer = lore

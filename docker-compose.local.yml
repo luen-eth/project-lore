@@ -1,0 +1,11 @@
+# For a plain docker host (not Dokploy): publishes lore on 127.0.0.1 only,
+# for a reverse proxy on the same host to forward to. Never publish it on a
+# public address: lore would then be reachable in plain HTTP past your
+# proxy, and with LORE_TRUST_PROXY=on a client could pick its own
+# X-Forwarded-For.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+services:
+  lore:
+    ports:
+      - "127.0.0.1:${LORE_PORT:-8080}:8080"

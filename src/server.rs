@@ -751,6 +751,11 @@ impl Lore {
             Implicit::Reused(session) => (session, false),
             Implicit::Opened(session) => (session, true),
         };
+        if opened {
+            self.db
+                .set_session_token_agent(&session.id, agent)
+                .map_err(internal)?;
+        }
         let id = session.id.clone();
         let answer = (|| {
             let session = self.require_session(&id, agent, shared)?;
@@ -1284,6 +1289,11 @@ impl Lore {
             // chat of this agent whose client cannot call `hello`. They end
             // with `bye` or after inactivity.
             let session = this.db.open_session(&new).map_err(internal)?;
+            // The identity lore verified, beside the session's name: the
+            // task runner trusts a recorded repository only by it.
+            this.db
+                .set_session_token_agent(&session.id, &actor)
+                .map_err(internal)?;
             this.open_briefing(&session, &actor, true)
         })
         .await
@@ -1398,29 +1408,98 @@ impl Lore {
         let agent = agent_of(&parts);
         let shared = agent == SHARED_AGENT;
         let session_id = args.session_id.trim().to_string();
+        // A built-in agent (a run token, or a token of a built-in name)
+        // never names targets or a built-in assignee, and its tasks are
+        // never taken by the task runner.
+        let builtin = parts.extensions.get::<RunScope>().is_some()
+            || self
+                .assist
+                .as_ref()
+                .is_some_and(|runner| runner.is_builtin(&agent));
+        let assist = self.assist.clone();
         let this = self.clone();
         blocking(move || {
             let session = this.require_session(&session_id, &agent, shared)?;
             let actor = session_agent(&agent, &session);
+            let assignee = args
+                .assignee
+                .as_deref()
+                .map(|a| a.trim().to_lowercase())
+                .unwrap_or_default();
+            let mut targets = db::normalize_task_targets(&db::TaskTargets {
+                repo: args.repo.unwrap_or_default(),
+                dokploy_project_id: args.dokploy_project_id.unwrap_or_default(),
+                cloudflare_zone: args.cloudflare_zone.unwrap_or_default(),
+            })
+            .map_err(|error| error.to_string())?;
+            let assignee_builtin = assist
+                .as_ref()
+                .is_some_and(|runner| runner.is_builtin(&assignee));
+            let mut notes: Vec<String> = Vec::new();
+            if builtin {
+                if targets != db::TaskTargets::default() || assignee_builtin {
+                    return Err(
+                        "a built-in agent may not name a task's repository, Dokploy project, \
+                         Cloudflare zone or a built-in assignee: tasks it adds are for people \
+                         and other agents to look at, never run automatically"
+                            .into(),
+                    );
+                }
+            } else {
+                // A Dokploy project or Cloudflare zone is kept only when the
+                // author could change it itself.
+                let level = |service: &str| {
+                    ops::effective_level(&this.db, &agent, actor, service).map_err(internal)
+                };
+                if !targets.dokploy_project_id.is_empty() && level(ops::DOKPLOY.id)? != "full" {
+                    notes.push(format!(
+                        "The Dokploy project {} was not kept: you do not have full access to \
+                         Dokploy, and a task may name only what its author could change.",
+                        targets.dokploy_project_id
+                    ));
+                    targets.dokploy_project_id.clear();
+                }
+                if !targets.cloudflare_zone.is_empty() && level(ops::CLOUDFLARE.id)? != "full" {
+                    notes.push(format!(
+                        "The Cloudflare zone {} was not kept: you do not have full access to \
+                         Cloudflare, and a task may name only what its author could change.",
+                        targets.cloudflare_zone
+                    ));
+                    targets.cloudflare_zone.clear();
+                }
+                if assist.is_some()
+                    && !targets.repo.is_empty()
+                    && level(ops::GITHUB.id)? != "full"
+                    && level(ops::GITHUB_ORG.id)? != "full"
+                {
+                    notes.push(
+                        "Built-in agents will not take this task: you do not have full access \
+                         to either GitHub account, and a built-in agent does only what the \
+                         task's author could do."
+                            .into(),
+                    );
+                }
+            }
             let new = NewTask {
                 project: normalize_project(&args.project)?,
                 title: short_line("title", &args.title, TASK_TITLE_MAX_CHARS)?,
                 body: capped("body", args.body.as_deref(), BODY_MAX_CHARS)?,
-                assignee: args
-                    .assignee
-                    .as_deref()
-                    .map(|a| a.trim().to_lowercase())
-                    .unwrap_or_default(),
+                assignee,
                 created_by: actor.to_string(),
                 session_id: Some(session.id.clone()),
-                targets: db::normalize_task_targets(&db::TaskTargets {
-                    repo: args.repo.unwrap_or_default(),
-                    dokploy_project_id: args.dokploy_project_id.unwrap_or_default(),
-                    cloudflare_zone: args.cloudflare_zone.unwrap_or_default(),
-                })
-                .map_err(|error| error.to_string())?,
+                targets,
             };
             let task = this.db.add_task(&new).map_err(internal)?;
+            // The identity lore verified: the token's agent (a built-in
+            // agent's is marked, so its tasks are never run).
+            let author = if builtin {
+                format!("run:{agent}")
+            } else {
+                agent.clone()
+            };
+            this.db
+                .set_task_author(task.id, &author)
+                .map_err(internal)?;
             this.note(
                 actor,
                 "task_add",
@@ -1430,10 +1509,15 @@ impl Lore {
                 &[],
                 &format!("task #{}: {}", task.id, task.title),
             );
-            Ok(format!(
+            let mut answer = format!(
                 "Task #{} added to `{}`: {}",
                 task.id, task.project, task.title
-            ))
+            );
+            for note in notes {
+                answer.push('\n');
+                answer.push_str(&note);
+            }
+            Ok(answer)
         })
         .await
     }
@@ -1449,10 +1533,24 @@ impl Lore {
         let agent = agent_of(&parts);
         let shared = agent == SHARED_AGENT;
         let session_id = args.session_id.trim().to_string();
+        let run = parts.extensions.get::<RunScope>().is_some();
+        let assist = self.assist.clone();
         let this = self.clone();
         blocking(move || {
             let session = this.require_session(&session_id, &agent, shared)?;
             let actor = session_agent(&agent, &session);
+            // A built-in agent's name acts on the board only through that
+            // agent's own run: a session merely named after it does not.
+            if !run
+                && assist
+                    .as_ref()
+                    .is_some_and(|runner| runner.is_builtin(actor) && actor != agent)
+            {
+                return Err(format!(
+                    "a session named {actor} is not that built-in agent: only its own runs act \
+                     on the board under its name"
+                ));
+            }
             let action = args.action.trim().to_lowercase();
             if !TASK_ACTIONS.contains(&action.as_str()) {
                 return Err(format!(
@@ -1499,6 +1597,12 @@ impl Lore {
                 "cancel" => "cancelled".to_string(),
                 _ => "reopened".to_string(),
             };
+            // The task's author (the verified token agent, never a run)
+            // re-queues it for the task runner by touching it.
+            if !run && this.db.task_author(task.id).map_err(internal)? == agent && !agent.is_empty()
+            {
+                this.db.requeue_task(task.id, false).map_err(internal)?;
+            }
             this.note(
                 actor,
                 "task_update",
@@ -2659,7 +2763,20 @@ impl Lore {
                 };
                 // A run token: the one check of what its task allows.
                 let decision = match &scope {
-                    Some(scope) => scope.check_call(&provider, &method, &path),
+                    Some(scope) => match scope.check_call(&provider, &method, &path) {
+                        // A GitHub write is looked at with its body too:
+                        // refs and trees.
+                        Decision::Allow
+                            if provider.service() == ops::GITHUB.id && method != "GET" =>
+                        {
+                            match scope.check_github_request(&method, &path, request.body.as_ref())
+                            {
+                                Ok(()) => Decision::Allow,
+                                Err(reason) => Decision::Deny(reason),
+                            }
+                        }
+                        other => other,
+                    },
                     None => Decision::Allow,
                 };
                 if let Decision::Deny(reason) = &decision {
@@ -3164,6 +3281,30 @@ impl ServerHandler for Lore {
             ))
             .with_instructions(INSTRUCTIONS)
     }
+
+    /// Every tool call. A built-in agent's run token passes the one
+    /// allowlist of lore's own tools first (`RunScope::check_tool`); every
+    /// other caller goes straight to the tool, as always.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let scope = context
+            .extensions
+            .get::<Parts>()
+            .and_then(|parts| parts.extensions.get::<RunScope>());
+        if let Some(scope) = scope
+            && let Err(reason) = scope.check_tool(&request.name, request.arguments.as_ref())
+        {
+            return Ok(
+                rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(reason)])
+                    .into(),
+            );
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        Self::tool_router().call(tcc).await
+    }
 }
 
 /// Runs database work on the blocking pool, where every SQLite call of
@@ -3622,7 +3763,9 @@ fn optional_ref(value: &str) -> String {
     let value = value.trim();
     match value.to_lowercase().as_str() {
         "" | "none" | "n/a" | "null" | "-" => String::new(),
-        _ => value.to_string(),
+        // A built-in agent's checkout names lore's git proxy when git
+        // expands its remote: recorded as the GitHub address it stands for.
+        _ => crate::db::lore_proxy_repo(value).unwrap_or_else(|| value.to_string()),
     }
 }
 
@@ -4693,6 +4836,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(refused.contains("its own Dokploy deployment"), "{refused}");
+        // C1: a global procedure is refused even with the project's id.
+        let refused = lore
+            .dokploy(
+                call(
+                    "POST",
+                    "/settings.updateServer",
+                    Some(json!({"projectId": "proj-1234"})),
+                ),
+                as_run(&scope),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("Dokploy procedure"), "{refused}");
+        // C2, C3 and C5 through the REST API: an endpoint off the list, a
+        // CI file, a forced ref update, all refused before anything is sent.
+        let before = sent.lock().unwrap().len();
+        for (method, path, body, word) in [
+            (
+                "POST",
+                "/repos/me/shop/hooks",
+                json!({"config": {}}),
+                "hooks",
+            ),
+            (
+                "PUT",
+                "/repos/me/shop/contents/.github/workflows/x.yml",
+                json!({"message": "m", "content": "eA=="}),
+                "CI definitions",
+            ),
+            (
+                "PATCH",
+                "/repos/me/shop/git/refs/heads/main",
+                json!({"sha": "abc", "force": true}),
+                "force",
+            ),
+        ] {
+            let refused = lore
+                .github(call(method, path, Some(body)), as_run(&scope))
+                .await
+                .unwrap_err();
+            assert!(refused.contains(word), "{path}: {refused}");
+        }
+        assert_eq!(sent.lock().unwrap().len(), before);
         // Without a run token the same agent name is not limited by a
         // scope (a built-in agent has no other token; this is the plain
         // level check).
@@ -4702,6 +4888,107 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// E1: a run token never names a task's targets; everyone else's task
+    /// records its verified author; E15: a shared-token session named
+    /// after another agent is not that agent; the author's touch re-queues.
+    #[tokio::test]
+    async fn task_authors_are_verified_and_runs_add_no_targets() {
+        let lore = test_lore("task-authors");
+        let scope = RunScope {
+            version: crate::runscope::SCOPE_VERSION,
+            agent: "claude-builtin".into(),
+            task_id: Some(1),
+            ..Default::default()
+        };
+        let as_run = || {
+            let Extension(mut parts) = as_agent(Some("claude-builtin"));
+            parts.extensions.insert(scope.clone());
+            Extension(parts)
+        };
+        let (run_session, _) = hello_as(&lore, "claude-builtin").await;
+        let refused = lore
+            .task_add(
+                args(
+                    json!({"session_id": run_session, "project": "shop", "title": "t",
+                            "repo": "github.com/evil/repo"}),
+                ),
+                as_run(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("may not name a task's repository"),
+            "{refused}"
+        );
+        lore.task_add(
+            args(json!({"session_id": run_session, "project": "shop", "title": "plain"})),
+            as_run(),
+        )
+        .await
+        .unwrap();
+        let (session, _) = hello_as(&lore, "codex").await;
+        lore.task_add(
+            args(
+                json!({"session_id": session, "project": "shop", "title": "mine",
+                        "repo": "github.com/me/shop"}),
+            ),
+            as_agent(Some("codex")),
+        )
+        .await
+        .unwrap();
+        let tasks = lore.db.tasks(None, &[], 10).unwrap();
+        let id_of = |title: &str| tasks.iter().find(|t| t.title == title).unwrap().id;
+        assert_eq!(
+            lore.db.task_author(id_of("plain")).unwrap(),
+            "run:claude-builtin"
+        );
+        assert_eq!(lore.db.task_author(id_of("mine")).unwrap(), "codex");
+        // A Dokploy project its author may not change is not kept.
+        lore.db.set_ops_level("codex", "dokploy", "read").unwrap();
+        let said = lore
+            .task_add(
+                args(
+                    json!({"session_id": session, "project": "shop", "title": "deploy",
+                            "dokploy_project_id": "proj-1"}),
+                ),
+                as_agent(Some("codex")),
+            )
+            .await
+            .unwrap();
+        assert!(said.contains("was not kept"), "{said}");
+        let deploy = lore
+            .db
+            .tasks(None, &[], 10)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.title == "deploy")
+            .unwrap();
+        assert!(deploy.dokploy_project_id.is_empty());
+        // The author's touch re-queues; the runner's mark then waits again.
+        let mine = id_of("mine");
+        lore.db.mark_task_auto(mine, false).unwrap();
+        db_waiting(&lore.db, mine, true);
+        lore.task_update(
+            args(json!({"session_id": session, "id": mine, "action": "claim"})),
+            as_agent(Some("codex")),
+        )
+        .await
+        .unwrap();
+        lore.task_update(
+            args(json!({"session_id": session, "id": mine, "action": "release"})),
+            as_agent(Some("codex")),
+        )
+        .await
+        .unwrap();
+        db_waiting(&lore.db, mine, false);
+    }
+
+    fn db_waiting(db: &Db, id: i64, waiting: bool) {
+        let all = db.auto_tasks(0, 50).unwrap();
+        let task = all.iter().find(|item| item.task.id == id).unwrap();
+        assert_eq!(task.waiting, waiting, "{task:?}");
     }
 
     /// A Dokploy mock: `GET /api/project.one` lists one project's tree;
@@ -5298,6 +5585,9 @@ mod tests {
         );
         assert_eq!(run.conversation, conversation);
         assert!(run.task_id.is_none());
+        // E9: the run is closed, and its token gone, before the answer is
+        // handed over.
+        assert_eq!(db.run_token_hash(&run.id).unwrap(), None);
         let scope: RunScope = serde_json::from_str(&run.scope).unwrap();
         assert!(scope.read_only);
         // The question reached the CLI fenced as untrusted text, no

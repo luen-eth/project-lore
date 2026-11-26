@@ -330,7 +330,10 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// runner's task columns (`repo`, `dokploy_project_id`, `cloudflare_zone`,
 /// `auto_attempts`, `auto_last_at`) and run columns. 6: help for other
 /// agents (`delegations`; `agent_runs.requested_by`, `conversation`).
-pub const SCHEMA_VERSION: i64 = 6;
+/// 7: run hardening (`tasks.author`, `touches`, `auto_seen`;
+/// `sessions.token_agent`; `builtin_agents.read_other_services`;
+/// `agent_runs.output_bytes`).
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Columns every database lore ever created has in `entries`: a full
 /// backup without them is not a lore database.
@@ -394,6 +397,21 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // `ask`), and the conversation a chat run belongs to.
     ("agent_runs", "requested_by", "TEXT NOT NULL DEFAULT ''"),
     ("agent_runs", "conversation", "TEXT NOT NULL DEFAULT ''"),
+    // Run hardening (schema 7): the verified identity that added a task,
+    // the touches that re-queue it (by a signed-in user or its author) and
+    // the touch count the runner last saw; the token agent of a session;
+    // the owner's per-agent "may read other services during runs"; the
+    // bytes of a run's stored output.
+    ("tasks", "author", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "touches", "INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "auto_seen", "INTEGER"),
+    ("sessions", "token_agent", "TEXT NOT NULL DEFAULT ''"),
+    (
+        "builtin_agents",
+        "read_other_services",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    ("agent_runs", "output_bytes", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -843,11 +861,38 @@ pub fn normalize_task_targets(targets: &TaskTargets) -> Result<TaskTargets> {
     })
 }
 
+/// The GitHub address of a repository named by lore's own git proxy
+/// (`http(s)://<lore host>/git/github/<o>/<r>(.git)`, or `github-org`):
+/// what a built-in agent's checkout reports when git expands its remote.
+/// `https://github.com/<o>/<r>`, or `None` for anything else.
+pub fn lore_proxy_repo(address: &str) -> Option<String> {
+    let address = address.trim();
+    let rest = address
+        .strip_prefix("https://")
+        .or_else(|| address.strip_prefix("http://"))?;
+    let (_host, path) = rest.split_once('/')?;
+    let mut parts = path.trim_end_matches('/').split('/');
+    if parts.next()? != "git" || !matches!(parts.next()?, "github" | "github-org") {
+        return None;
+    }
+    let (owner, repo) = (parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    let github = format!("https://github.com/{owner}/{repo}");
+    // Only what the plain GitHub form accepts.
+    parse_github_repo(&github).map(|_| github)
+}
+
 /// `(owner, repo)` of a GitHub repository address: `github.com/o/r`,
 /// `https://github.com/o/r(.git)`, `git@github.com:o/r(.git)` or
 /// `ssh://git@github.com/o/r(.git)`. Anything else, another host
 /// included, is `None`.
 pub fn parse_github_repo(address: &str) -> Option<(String, String)> {
+    if let Some(github) = lore_proxy_repo(address) {
+        return parse_github_repo(&github);
+    }
     let address = address.trim();
     let rest = address
         .strip_prefix("https://")
@@ -1226,6 +1271,13 @@ pub struct Backup {
     /// Every version of every file kept for a project.
     #[serde(default)]
     pub files: Vec<BackupFile>,
+    /// The task runner's fields of the tasks (author, re-queue touches,
+    /// automatic attempts), by task id.
+    #[serde(default)]
+    pub task_runner: Vec<builtin::TaskRunnerState>,
+    /// Tasks handed to a built-in agent with `delegate`.
+    #[serde(default)]
+    pub delegations: Vec<builtin::Delegation>,
 }
 
 /// The backup version this build writes.
@@ -1954,6 +2006,8 @@ impl Db {
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
+        let task_runner = self.task_runner_states()?;
+        let delegations = self.delegations()?;
         Ok(Backup {
             format: BACKUP_FORMAT.to_string(),
             version: BACKUP_VERSION,
@@ -1971,6 +2025,8 @@ impl Db {
             messages,
             message_reads,
             files,
+            task_runner,
+            delegations,
         })
     }
 
@@ -2005,6 +2061,7 @@ impl Db {
         if replaces_board {
             tx.execute_batch(
                 "DELETE FROM message_reads; DELETE FROM messages; DELETE FROM tasks;
+                 DELETE FROM delegations;
                  DELETE FROM sqlite_sequence WHERE name IN ('tasks', 'messages');",
             )?;
         }
@@ -2179,6 +2236,36 @@ impl Db {
                     task.repo,
                     task.dokploy_project_id,
                     task.cloudflare_zone
+                ],
+            )?;
+        }
+        // The task runner's fields and the delegations ride along by task
+        // id; rows for tasks the backup does not hold are dropped.
+        for state in &backup.task_runner {
+            tx.execute(
+                "UPDATE tasks SET author = ?2, touches = ?3, auto_seen = ?4, auto_attempts = ?5,
+                     auto_last_at = ?6
+                 WHERE id = ?1",
+                params![
+                    state.task_id,
+                    state.author,
+                    state.touches,
+                    state.auto_seen,
+                    state.auto_attempts,
+                    state.auto_last_at
+                ],
+            )?;
+        }
+        for delegation in &backup.delegations {
+            tx.execute(
+                "INSERT OR REPLACE INTO delegations (task_id, agent, requested_by, via, created_at)
+                 SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ?1)",
+                params![
+                    delegation.task_id,
+                    delegation.agent,
+                    delegation.requested_by,
+                    delegation.via,
+                    delegation.created_at
                 ],
             )?;
         }
@@ -3849,6 +3936,29 @@ impl Db {
             scan: meta_value(&conn, "leakscan.enabled")? != "0",
             allow_public: meta_value(&conn, "leakscan.allow_public")? == "1",
         })
+    }
+
+    /// The owner's switch that lets built-in agents' runs add, change or
+    /// remove CI definitions (`.github/workflows/`, `.gitlab-ci.yml`, …):
+    /// `meta` key `runs.ci_changes`, only "1" allows (off by default).
+    pub fn runs_may_change_ci(&self) -> Result<bool> {
+        let conn = self.lock();
+        Ok(meta_value(&conn, "runs.ci_changes")? == "1")
+    }
+
+    pub fn set_runs_may_change_ci(&self, allow: bool) -> Result<()> {
+        let conn = self.lock();
+        set_meta(&conn, "runs.ci_changes", if allow { "1" } else { "0" })
+    }
+
+    /// Records the token agent a session was opened with: the identity lore
+    /// verified, which the session's free-text name may not be.
+    pub fn set_session_token_agent(&self, id: &str, token_agent: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE sessions SET token_agent = ?2 WHERE id = ?1 AND token_agent = ''",
+            params![id, token_agent.trim().to_lowercase()],
+        )?;
+        Ok(())
     }
 
     /// Sets either leak scan switch; `None` leaves it as it is.
@@ -5532,6 +5642,34 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lore_s_git_proxy_addresses_stand_for_their_github_repository() {
+        for address in [
+            "http://lore:8081/git/github/me/shop.git",
+            "https://lore.example/git/github-org/me/shop",
+            "http://172.31.250.2:8081/git/github/me/shop/",
+        ] {
+            assert_eq!(
+                lore_proxy_repo(address).as_deref(),
+                Some("https://github.com/me/shop"),
+                "{address}"
+            );
+            assert_eq!(
+                parse_github_repo(address),
+                Some(("me".into(), "shop".into())),
+                "{address}"
+            );
+        }
+        for other in [
+            "http://lore:8081/git/gitlab/me/shop.git",
+            "http://lore:8081/git/github/../shop.git",
+            "http://lore:8081/git/github/me/shop/extra",
+            "https://evil.example/me/shop",
+        ] {
+            assert_eq!(lore_proxy_repo(other), None, "{other}");
+        }
+    }
+
     use super::*;
 
     fn temp_db_named(name: &str) -> Db {

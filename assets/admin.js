@@ -2845,9 +2845,12 @@ function renderIntegrations() {
   if (data) $("integrations-enabled").checked = data.enabled;
   $("integrations-leakscan-switch").hidden = !admin || !data;
   $("integrations-public-switch").hidden = !admin || !data;
+  /* Shown only when this lore knows the switch (built-in agents). */
+  $("integrations-ci-switch").hidden = !admin || !data || !("runs_may_change_ci" in data);
   if (data) {
     $("integrations-leakscan").checked = data.leak_scan !== false;
     $("integrations-public").checked = data.allow_public_repos === true;
+    $("integrations-ci").checked = data.runs_may_change_ci === true;
   }
 
   let configured = 0;
@@ -3183,8 +3186,9 @@ $("integrations-enabled").addEventListener("change", async (event) => {
   }
 });
 
-/* The leak scan's two switches: scanning writes to public repositories,
-   and letting agents create public repositories or make one public. */
+/* The leak scan's switches: scanning writes to public repositories,
+   letting agents create public repositories or make one public, and
+   letting built-in agents' runs change CI definitions. */
 async function saveLeakScan(field, checkbox, onText, offText) {
   const value = checkbox.checked;
   try {
@@ -3221,6 +3225,15 @@ $("integrations-public").addEventListener("change", (event) =>
     event.target,
     "Agents may create public repositories or make one public.",
     "Agents may not create public repositories or make one public."
+  )
+);
+
+$("integrations-ci").addEventListener("change", (event) =>
+  saveLeakScan(
+    "runs_may_change_ci",
+    event.target,
+    "Built-in agents' runs may now add, change or remove CI definitions, which run with the repository's secrets.",
+    "Built-in agents' runs may not change CI definitions."
   )
 );
 

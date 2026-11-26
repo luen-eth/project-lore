@@ -80,10 +80,11 @@ pub(super) const ROUTES: &[(&str, &str, Access)] = &[
     // The task runner: anyone signed in may watch, only `agents` stops.
     ("GET", "/admin/api/builtin/runs", Access::SignedIn),
     ("GET", "/admin/api/builtin/active", Access::SignedIn),
+    // A run's output can hold what redaction missed: `agents` only.
     (
         "GET",
         "/admin/api/builtin/runs/{id}/events",
-        Access::SignedIn,
+        Access::Needs(Perm::Agents),
     ),
     (
         "POST",
@@ -182,6 +183,32 @@ pub(super) fn routes() -> Router<Arc<Admin>> {
         .route("/admin/vendor/xterm-6.0.0/{file}", get(xterm_file))
         .route("/admin/vendor/addon-fit-0.11.0/{file}", get(fit_file))
         .route("/admin/api/builtin/{name}/terminal", get(terminal))
+        .route_layer(middleware::from_fn(json_only))
+}
+
+/// Every state-changing built-in route takes JSON only: a form another
+/// site submits (even a sibling subdomain, which `SameSite` lets through)
+/// cannot send `Content-Type: application/json` without the browser
+/// asking first, and lore never says yes.
+async fn json_only(request: Request, next: Next) -> Response {
+    let changes = !matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    let json = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+    if changes && !json {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({ "error": "send JSON (Content-Type: application/json)" })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// `GET /admin/terminal`: the terminal overlay's document, with its own
@@ -555,7 +582,10 @@ fn agent_view(
         "signed_in": stored.signed_in,
         "login_method": stored.login_method,
         "login_ends": stored.login_ends,
-        "status_detail": stored.status_detail,
+        // What the CLI said may name the account (an e-mail address).
+        "status_detail": if manage { Some(&stored.status_detail) } else { None },
+        "read_other_services": stored.read_other_services,
+        "second_runner": if manage { hub.intrusion(name) } else { None },
         "status_at": stored.status_at,
         "updated_at": stored.updated_at,
         "updated_by": stored.updated_by,
@@ -615,11 +645,15 @@ struct SettingsForm {
     daily_cap: Option<i64>,
     #[serde(default)]
     active_hours: Option<String>,
+    #[serde(default)]
+    read_other_services: Option<bool>,
 }
 
-/// A model name: an alias or an id, no spaces. Empty is the CLI's default.
+/// A model name: an alias or an id, no spaces, not starting with `-` (it
+/// is a CLI argument). Empty is the CLI's default.
 fn valid_model(model: &str) -> bool {
-    model.chars().count() <= MODEL_MAX_CHARS
+    !model.starts_with('-')
+        && model.chars().count() <= MODEL_MAX_CHARS
         && model.chars().all(|c| {
             c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '@' | '[' | ']')
         })
@@ -689,9 +723,16 @@ async fn update(
     };
     let state = admin.clone();
     let (who, agent) = (me.username.clone(), name.clone());
+    let read_other_services = form.read_other_services;
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let before = state.db.builtin_agent(&agent)?;
-        let after = state.db.update_builtin_settings(&agent, &settings, &who)?;
+        let mut after = state.db.update_builtin_settings(&agent, &settings, &who)?;
+        if let Some(on) = read_other_services
+            && on != after.read_other_services
+        {
+            state.db.set_builtin_read_other_services(&agent, on, &who)?;
+            after.read_other_services = on;
+        }
         if before.as_ref() != Some(&after) {
             let mut changes = Vec::new();
             if let Some(before) = &before {
@@ -718,6 +759,16 @@ async fn update(
                 }
                 if before.daily_cap != after.daily_cap {
                     changes.push(format!("daily cap {}", after.daily_cap));
+                }
+                if before.read_other_services != after.read_other_services {
+                    changes.push(
+                        if after.read_other_services {
+                            "may read other services during runs"
+                        } else {
+                            "reads only its task's services during runs"
+                        }
+                        .to_string(),
+                    );
                 }
                 if before.active_hours != after.active_hours {
                     let hours = if after.active_hours.is_empty() {
@@ -1147,7 +1198,7 @@ mod tests {
         ] {
             assert!(valid_model(ok), "{ok}");
         }
-        for bad in ["two words", "x;rm", &"m".repeat(101)] {
+        for bad in ["two words", "x;rm", &"m".repeat(101), "-x", "--model=evil"] {
             assert!(!valid_model(bad), "{bad}");
         }
     }

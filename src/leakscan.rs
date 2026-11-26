@@ -204,6 +204,57 @@ fn compiled() -> &'static Compiled {
     })
 }
 
+/// `text` with every credential the format rules recognise replaced by
+/// `[redacted]`, line by line. For text lore shows and keeps but did not
+/// write itself (a built-in agent's run output): unlike the scan, the
+/// `ALLOW_MARKER` is not honoured, since whoever wrote the text could have
+/// added it.
+pub fn redact_formats(text: &str) -> String {
+    let rules = compiled();
+    let data = text.as_bytes();
+    if !rules.any.is_match(data) {
+        return text.to_string();
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut start = 0;
+    while start <= data.len() {
+        let end = data[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(data.len(), |offset| start + offset);
+        let line = &data[start..end];
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        if rules.any.is_match(line) {
+            for (_, regex, check) in &rules.rules {
+                for caps in regex.captures_iter(line) {
+                    if check(line, &caps)
+                        && let Some(found) = caps.get(0)
+                    {
+                        spans.push((found.start(), found.end()));
+                    }
+                }
+            }
+        }
+        spans.sort_unstable();
+        let mut at = 0;
+        for (from, to) in spans {
+            if to <= at {
+                continue;
+            }
+            let from = from.max(at);
+            out.extend_from_slice(&line[at..from]);
+            out.extend_from_slice(b"[redacted]");
+            at = to;
+        }
+        out.extend_from_slice(&line[at..]);
+        if end < data.len() {
+            out.push(b'\n');
+        }
+        start = end + 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The scanner for one call or one push: the format rules plus every
 /// secret lore knows, in every form the guard redacts. `Debug` never
 /// prints them.

@@ -26,6 +26,15 @@ pub const SHARED_AGENT: &str = "shared";
 #[derive(Clone, Debug)]
 pub struct Agent(pub String);
 
+/// Marks a request that arrived through the internal runner listener
+/// (`LORE_RUNNER_BIND`), the only place a built-in agent's run token is
+/// accepted. `main` adds it, as a request extension, to the routes it
+/// serves there; on the public listener a run token is refused like an
+/// unknown one, so a token that leaks out of a run is useless from the
+/// internet.
+#[derive(Clone, Copy, Debug)]
+pub struct InternalListener;
+
 /// A bearer token and the agent it was issued to.
 pub struct Token {
     pub agent: String,
@@ -189,7 +198,7 @@ pub enum Authenticated {
     OAuth(String),
     /// A built-in agent's run-scoped token: valid while its run lasts, for
     /// what its scope allows (see `runscope`).
-    Run(RunScope),
+    Run(Box<RunScope>),
 }
 
 impl Authenticated {
@@ -234,11 +243,23 @@ impl McpAuth {
         }
     }
 
-    /// Checks a presented bearer token: an env token first (constant
-    /// time, as always), then an unexpired, unrevoked OAuth access token.
-    /// Either way the agent must not be disabled. Shared by `/mcp` and
-    /// the git proxy.
+    /// Checks a presented bearer token as the public listener does: an
+    /// env token first (constant time, as always), then an unexpired,
+    /// unrevoked OAuth access token. Either way the agent must not be
+    /// disabled. A run token is refused here (see `authenticate_on`).
+    #[cfg(test)]
     pub async fn authenticate(&self, presented: &str) -> Result<Authenticated, Refused> {
+        self.authenticate_on(presented, false).await
+    }
+
+    /// `authenticate`, for a request that came in through the internal
+    /// runner listener (`internal`) or not: only there is a built-in
+    /// agent's run token accepted. Shared by `/mcp` and the git proxy.
+    pub async fn authenticate_on(
+        &self,
+        presented: &str,
+        internal: bool,
+    ) -> Result<Authenticated, Refused> {
         if presented.is_empty() {
             return Err(Refused::Invalid);
         }
@@ -260,6 +281,9 @@ impl McpAuth {
             };
         }
         if crate::runscope::looks_like_token(presented) {
+            if !internal {
+                return Err(Refused::Invalid);
+            }
             return self.authenticate_run(presented).await;
         }
         if !crate::oauth::looks_like_token(presented) {
@@ -293,6 +317,11 @@ impl McpAuth {
                 return Ok(None);
             };
             let mut scope: RunScope = serde_json::from_str(&scope)?;
+            // A scope an older build stored carries the old, wider rights:
+            // its token is no longer accepted.
+            if scope.version < crate::runscope::SCOPE_VERSION {
+                return Ok(None);
+            }
             // The row is the authority on whose run it is.
             scope.run_id = run_id;
             scope.agent = agent;
@@ -303,7 +332,7 @@ impl McpAuth {
         })
         .await;
         match found {
-            Ok(Ok(Some((scope, false)))) => Ok(Authenticated::Run(scope)),
+            Ok(Ok(Some((scope, false)))) => Ok(Authenticated::Run(Box::new(scope))),
             Ok(Ok(Some((scope, true)))) => Err(Refused::Disabled {
                 agent: scope.agent,
                 env: false,
@@ -367,7 +396,8 @@ pub async fn require_token(
         .unwrap_or("")
         .to_string();
 
-    let (agent, scope) = match auth.authenticate(&presented).await {
+    let internal = request.extensions().get::<InternalListener>().is_some();
+    let (agent, scope) = match auth.authenticate_on(&presented, internal).await {
         Ok(found) => (found.agent().to_string(), found.scope().cloned()),
         Err(Refused::Disabled { agent, env: true }) => {
             tracing::warn!(%agent, "a disabled agent was refused");
@@ -526,5 +556,60 @@ mod tests {
         let peer = Some("10.0.0.1:5000".parse().unwrap());
         assert_eq!(client_ip(&headers, peer, true), "1.2.3.4");
         assert_eq!(client_ip(&headers, peer, false), "10.0.0.1");
+    }
+
+    /// C8 and E5: a run token is accepted only through the internal
+    /// listener, and only when its stored scope has the current format.
+    #[tokio::test]
+    async fn run_tokens_need_the_internal_listener_and_a_current_scope() {
+        let dir = std::env::temp_dir().join(format!("lore-auth-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        db.register_builtin_agents(&[("claude-builtin".into(), "claude".into(), "ember")])
+            .unwrap();
+        let auth = McpAuth::new(
+            load_tokens("", &format!("claude:{}", "x".repeat(32))).unwrap(),
+            db.clone(),
+            false,
+        );
+        let mint = |id: &str, scope: &str| {
+            let token = crate::runscope::new_token().unwrap();
+            db.insert_run(&crate::db::NewRun {
+                id: id.into(),
+                agent: "claude-builtin".into(),
+                kind: "task".into(),
+                token_hash: crate::oauth::token_hash(&token),
+                token_expires_at: crate::db::unix_now() + 600,
+                scope: scope.into(),
+                ..Default::default()
+            })
+            .unwrap();
+            token
+        };
+        let current = mint(
+            "run-new",
+            &format!(
+                r#"{{"version":{},"provider":"github","owner":"me","repo":"shop","readable":["github"]}}"#,
+                crate::runscope::SCOPE_VERSION
+            ),
+        );
+        // A scope an older build stored: no version, no read limits.
+        let old = mint(
+            "run-old",
+            r#"{"provider":"github","owner":"me","repo":"shop"}"#,
+        );
+        assert!(matches!(
+            auth.authenticate_on(&current, true).await,
+            Ok(Authenticated::Run(scope)) if scope.run_id == "run-new"
+        ));
+        assert_eq!(
+            auth.authenticate_on(&current, false).await,
+            Err(Refused::Invalid)
+        );
+        assert_eq!(auth.authenticate(&current).await, Err(Refused::Invalid));
+        assert_eq!(
+            auth.authenticate_on(&old, true).await,
+            Err(Refused::Invalid)
+        );
     }
 }

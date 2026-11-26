@@ -22,6 +22,12 @@
 .builtin-login.done { border-color: rgba(95, 224, 160, 0.35); background: rgba(95, 224, 160, 0.06); }
 .builtin-login p { margin: 0; }
 .builtin-login a { color: var(--accent); overflow-wrap: anywhere; }
+.builtin-login .builtin-host { color: var(--text); font-family: var(--mono); }
+.builtin-warning {
+  margin: 0; padding: 6px 9px; font-size: 12px; color: var(--danger);
+  border: 1px solid rgba(255, 122, 144, 0.35); border-radius: 8px; background: rgba(255, 122, 144, 0.06);
+}
+.runner-denied { margin: 4px 0 0; }
 .builtin-login .ok { color: var(--ok); }
 .builtin-login .bad { color: var(--danger); }
 .builtin-code {

@@ -63,6 +63,10 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("runner") {
         return runner::main_from_env().await;
     }
+    // `lore proxy`: the built-in agents' allowlisted way out.
+    if std::env::args().nth(1).as_deref() == Some("proxy") {
+        return runner::proxy::main_from_env().await;
+    }
 
     let tokens = auth::load_tokens(&env_or("LORE_TOKEN", ""), &env_or("LORE_TOKENS", ""))?;
     let runner_tokens = builtin::parse_runner_tokens(&env_or("LORE_RUNNER_TOKENS", ""))?;
@@ -249,32 +253,28 @@ async fn main() -> Result<()> {
         (Some(admin), Some(hub), None) => Some(admin.with_builtin(hub.clone())),
         (admin, _, _) => admin,
     };
+    // The internal listener: the runners' link, and `/mcp` and `/git` for
+    // the built-in agents' runs (the only place their run tokens work).
+    let mut runner_listener = None;
     if let Some(hub) = &hub {
-        let runner_bind: SocketAddr = env_or("LORE_RUNNER_BIND", "0.0.0.0:8081")
-            .parse()
-            .context("LORE_RUNNER_BIND must be an address like 0.0.0.0:8081")?;
-        if runner_bind.port() == bind.port() {
-            bail!("LORE_RUNNER_BIND must use another port than LORE_BIND");
-        }
-        let listener = tokio::net::TcpListener::bind(runner_bind)
-            .await
-            .with_context(|| format!("binding {runner_bind}"))?;
-        tracing::info!(
-            %runner_bind,
-            agents = %hub.agents().join(", "),
-            "listening for built-in agent runners (internal network only; never publish this port)"
-        );
-        let router = hub.clone().router();
-        tokio::spawn(async move {
-            if let Err(error) = axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            {
-                tracing::error!(%error, "the runner listener stopped");
+        // One address, or one per agent network (comma separated).
+        let mut listeners = Vec::new();
+        for runner_bind in builtin::parse_runner_binds(&env_or("LORE_RUNNER_BIND", "0.0.0.0:8081"))?
+        {
+            if runner_bind.port() == bind.port() {
+                bail!("LORE_RUNNER_BIND must use another port than LORE_BIND");
             }
-        });
+            let listener = tokio::net::TcpListener::bind(runner_bind)
+                .await
+                .with_context(|| format!("binding {runner_bind}"))?;
+            tracing::info!(
+                %runner_bind,
+                agents = %hub.agents().join(", "),
+                "listening for built-in agent runners (internal network only; never publish this port)"
+            );
+            listeners.push(listener);
+        }
+        runner_listener = Some((listeners, hub.clone().router()));
     }
     for warning in startup_warnings(
         &db,
@@ -288,7 +288,10 @@ async fn main() -> Result<()> {
     )? {
         tracing::warn!("{warning}");
     }
-    let app = app(auth, lore, vault, events, admin);
+    let (app, agents) = app_and_agents(auth, lore, vault, events, admin);
+    if let Some((listeners, router)) = runner_listener {
+        serve_internal(listeners, router, agents);
+    }
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -375,13 +378,29 @@ fn startup_warnings(
 /// The HTTP routes: `/mcp` behind the bearer check, `/health`, the git
 /// proxy, and — when the admin view is on — the admin view and the OAuth
 /// authorization server, which needs it to sign users in.
+#[cfg(test)]
 fn app(
-    mut auth: McpAuth,
+    auth: McpAuth,
     lore: Lore,
     vault: Option<VaultKey>,
     events: Events,
     admin: Option<Admin>,
 ) -> Router {
+    app_and_agents(auth, lore, vault, events, admin).0
+}
+
+/// `app`, and the routes the internal runner listener serves to the
+/// built-in agents' runs: `/mcp` (without the Host pinning, as the agents
+/// reach lore by its internal name) and the git proxy, sharing the same
+/// authentication and limits. `main` marks them with
+/// `auth::InternalListener`.
+fn app_and_agents(
+    mut auth: McpAuth,
+    lore: Lore,
+    vault: Option<VaultKey>,
+    events: Events,
+    admin: Option<Admin>,
+) -> (Router, Router) {
     let oauth = admin.as_ref().map(|_| {
         Arc::new(OAuth::new(
             auth.db.clone(),
@@ -409,6 +428,16 @@ fn app(
     };
     // The git proxy's leak scan looks for lore's own secrets too.
     let guard = lore.guard();
+    let internal_config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .disable_allowed_hosts();
+    let internal_lore = lore.clone();
+    let internal_mcp = StreamableHttpService::new(
+        move || Ok(internal_lore.clone()),
+        Arc::new(LocalSessionManager::default()),
+        internal_config,
+    );
     let mcp = StreamableHttpService::new(
         move || Ok(lore.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -416,6 +445,17 @@ fn app(
     );
 
     let auth = Arc::new(auth);
+    // Plain `git` speaks to /git: lore authenticates the agent with its
+    // own lore token and adds the stored credential upstream, where the
+    // agent's machine never sees it.
+    let git = gitproxy::router(Arc::new(GitProxy::new(auth.clone(), vault, events, guard)));
+    let agents = Router::new()
+        .nest_service("/mcp", internal_mcp)
+        .layer(middleware::from_fn_with_state(
+            auth.clone(),
+            auth::require_token,
+        ))
+        .merge(git.clone());
     let mut app = Router::new()
         .nest_service("/mcp", mcp)
         .layer(middleware::from_fn_with_state(
@@ -423,18 +463,33 @@ fn app(
             auth::require_token,
         ))
         .route("/health", get(|| async { "ok" }))
-        // Plain `git` speaks to /git: lore authenticates the agent with
-        // its own lore token and adds the stored credential upstream,
-        // where the agent's machine never sees it.
-        .merge(gitproxy::router(Arc::new(GitProxy::new(
-            auth, vault, events, guard,
-        ))));
+        .merge(git);
     if let (Some(admin), Some(oauth)) = (admin, oauth) {
         app = app
             .merge(admin::router(Arc::new(admin.with_oauth(oauth.clone()))))
             .merge(oauth::router(oauth));
     }
-    app
+    (app, agents)
+}
+
+/// Serves the internal router on every internal listener (one per agent
+/// network): the runners' link, and `/mcp` and `/git` for the runs, marked
+/// `auth::InternalListener` so run tokens work there and nowhere else.
+fn serve_internal(listeners: Vec<tokio::net::TcpListener>, runners: Router, agents: Router) {
+    let router = runners.merge(agents.layer(axum::Extension(auth::InternalListener)));
+    for listener in listeners {
+        let router = router.clone();
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!(%error, "the runner listener stopped");
+            }
+        });
+    }
 }
 
 /// `lore healthcheck`: exits 0 when the local server answers `/health`.
@@ -1360,5 +1415,139 @@ mod tests {
             .unwrap();
         assert_eq!(tools_list(&server, ENV_TOKEN).await.status(), 200);
         assert_eq!(tools_list(&server, &access).await.status(), 200);
+    }
+
+    /// E5 and E2: a run token works only on the internal listener (on the
+    /// public one it is an unknown token), and there only for the tools on
+    /// its allowlist.
+    #[tokio::test]
+    async fn run_tokens_work_only_inside_and_only_for_their_tools() {
+        let dir = std::env::temp_dir().join(format!("lore-app-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        db.register_builtin_agents(&[("claude-builtin".into(), "claude".into(), "ember")])
+            .unwrap();
+        let token = crate::runscope::new_token().unwrap();
+        let scope = crate::runscope::RunScope {
+            version: crate::runscope::SCOPE_VERSION,
+            task_id: Some(7),
+            provider: "github".into(),
+            owner: "me".into(),
+            repo: "shop".into(),
+            branch: "main".into(),
+            readable: Some(vec!["github".into()]),
+            ..Default::default()
+        };
+        db.insert_run(&crate::db::NewRun {
+            id: "run-app".into(),
+            agent: "claude-builtin".into(),
+            kind: "task".into(),
+            token_hash: crate::oauth::token_hash(&token),
+            token_expires_at: crate::db::unix_now() + 600,
+            scope: serde_json::to_string(&scope).unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+        let tokens = auth::load_tokens("", &format!("claude:{ENV_TOKEN}")).unwrap();
+        let events = Events::new();
+        let lore = Lore::new(
+            db.clone(),
+            Embedder::disabled(),
+            0.8,
+            events.clone(),
+            12,
+            None,
+            ops::Guard::default(),
+        );
+        let (public, agents) = app_and_agents(
+            McpAuth::new(tokens, db.clone(), false),
+            lore,
+            None,
+            events,
+            None,
+        );
+        let mut bases = Vec::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        bases.push(format!("http://{}", listener.local_addr().unwrap()));
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                public.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        // Two internal listeners (LORE_RUNNER_BIND with two addresses):
+        // each serves the marked router.
+        let mut internal = Vec::new();
+        for _ in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            bases.push(format!("http://{}", listener.local_addr().unwrap()));
+            internal.push(listener);
+        }
+        serve_internal(internal, Router::new(), agents);
+        let http = reqwest::Client::new();
+        let call = |base: &str, tool: &str, arguments: Value| {
+            http.post(format!("{base}/mcp"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2025-06-18")
+                .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": { "name": tool, "arguments": arguments } }))
+                .send()
+        };
+        // The public listener: an unknown token.
+        let response = call(&bases[0], "recall", json!({"query": "x"}))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // The env token still works there.
+        let response = http
+            .post(format!("{}/mcp", bases[0]))
+            .header(header::AUTHORIZATION, format!("Bearer {ENV_TOKEN}"))
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-06-18")
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Inside: the allowlist decides.
+        let text = |value: Value| {
+            value["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        };
+        for (tool, arguments) in [
+            ("amend", json!({"session_id": "s", "id": 1})),
+            (
+                "task_add",
+                json!({"session_id": "s", "project": "p", "title": "t"}),
+            ),
+            ("send", json!({"session_id": "s", "to": "all", "body": "b"})),
+            (
+                "task_update",
+                json!({"session_id": "s", "id": 8, "action": "done"}),
+            ),
+        ] {
+            let response = call(&bases[1], tool, arguments).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{tool}");
+            let value: Value = response.json().await.unwrap();
+            assert_eq!(value["result"]["isError"], true, "{tool}: {value}");
+            let said = text(value);
+            assert!(
+                said.contains("may not call")
+                    || said.contains("only on task")
+                    || said.contains("task #7 only"),
+                "{tool}: {said}"
+            );
+        }
+        for base in &bases[1..] {
+            let response = call(base, "recall", json!({"query": "x"})).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{base}");
+            let value: Value = response.json().await.unwrap();
+            assert!(!text(value.clone()).contains("may not call"), "{value}");
+        }
     }
 }

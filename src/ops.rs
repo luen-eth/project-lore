@@ -572,7 +572,7 @@ pub fn denied_path(provider: &Provider, path: &str) -> Option<String> {
 
 /// The path as a server reads it, for the denylist: percent escapes
 /// decoded (except `%2F`, which stays inside its segment), lowercased.
-fn decode_for_match(path: &str) -> String {
+pub(crate) fn decode_for_match(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -736,6 +736,11 @@ pub async fn call_with_limit(
         ),
         Some(text) => {
             let text = guard.redact(text, secret.expose());
+            let text = if req.provider.id == DOKPLOY.id {
+                redact_stack_env(&text)
+            } else {
+                text
+            };
             let truncated = too_big || text.chars().count() > max_chars;
             let text: String = if truncated {
                 text.chars().take(max_chars).collect()
@@ -787,6 +792,25 @@ fn secret_forms(secret: &str) -> Vec<String> {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret),
     ];
     forms.into_iter().filter(|form| !form.is_empty()).collect()
+}
+
+/// The environment variables of this stack that hold secrets lore itself
+/// does not keep (each built-in agent's runner secret and the agents'
+/// own keys): in a Dokploy answer (an application's or compose service's
+/// `env`, plain or JSON-escaped) their values are replaced by name. Only
+/// these names: other applications' environments stay readable.
+fn redact_stack_env(text: &str) -> String {
+    static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(LORE_AGENT_[A-Z0-9_]+|LORE_RUNNER_TOKEN[A-Z0-9_]*|CODEX_API_KEY|DEEPSEEK_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=(\\?"[^"\\]*\\?"|'[^']*'|[^\s"'\\]+)"#,
+        )
+        .expect("a fixed pattern")
+    });
+    NAMES
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            format!("{}={REDACTED}", &captures[1])
+        })
+        .into_owned()
 }
 
 /// Every occurrence of any of `forms` in `text` replaced with `[redacted]`.
@@ -1888,6 +1912,38 @@ mod tests {
         }
         assert_eq!(normalize_path("/a/./b").unwrap(), "/a/b");
         assert_eq!(normalize_path("/zones").unwrap(), "/zones");
+    }
+
+    #[test]
+    fn this_stack_s_agent_secrets_are_redacted_from_dokploy_answers_by_name() {
+        // A compose service's env as Dokploy answers it: one JSON string.
+        let answer = serde_json::json!({
+            "composeId": "c1",
+            "env": "LORE_ADMIN_PASSWORD=kept-by-own-secrets\nLORE_RUNNER_TOKEN_CLAUDE=0123456789abcdef0123\nLORE_RUNNER_TOKENS=claude-builtin:0123456789abcdef0123\nLORE_AGENT_CODEX_API_KEY=\"sk-proj-not-a-real-key-0000\"\nDEEPSEEK_API_KEY=ds-not-a-real-key-0000\nOTHER_APP_SETTING=visible-value\nCLAUDE_CODE_OAUTH_TOKEN='quoted-value-0000'", // lore:allow-secret (fake test values)
+        })
+        .to_string();
+        let out = redact_stack_env(&answer);
+        for hidden in [
+            "0123456789abcdef0123",
+            "sk-proj-not-a-real-key-0000",
+            "ds-not-a-real-key-0000",
+            "quoted-value-0000",
+        ] {
+            assert!(!out.contains(hidden), "{hidden}: {out}");
+        }
+        assert!(out.contains("OTHER_APP_SETTING=visible-value"), "{out}");
+        assert!(out.contains("LORE_RUNNER_TOKEN_CLAUDE=[redacted]"), "{out}");
+        assert!(out.contains("composeId"), "{out}");
+        // The parsed answer is still JSON.
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out).is_ok(),
+            "{out}"
+        );
+        // Plain text too (a log line).
+        assert_eq!(
+            redact_stack_env("CODEX_API_KEY=abc LORE_AGENT_X=y Z=1"),
+            "CODEX_API_KEY=[redacted] LORE_AGENT_X=[redacted] Z=1"
+        );
     }
 
     #[test]

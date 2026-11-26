@@ -57,6 +57,8 @@ pub struct Commands {
     pub hash_len: usize,
     /// True when every command deletes its ref (no pack follows).
     pub deletes_only: bool,
+    /// Every command as `(old, new, ref)`, the ids in lowercase hex.
+    pub updates: Vec<(String, String, String)>,
     /// Where the pack starts.
     pack_at: usize,
 }
@@ -254,6 +256,11 @@ pub fn read_commands(body: &[u8]) -> Result<Commands, String> {
             commands.deletes_only = false;
         }
         commands.refs.push(name.to_string());
+        commands.updates.push((
+            old.to_ascii_lowercase(),
+            new.to_ascii_lowercase(),
+            name.to_string(),
+        ));
     }
     if commands.has("push-options") {
         loop {
@@ -273,6 +280,95 @@ pub fn read_commands(body: &[u8]) -> Result<Commands, String> {
     }
     commands.pack_at = at;
     Ok(commands)
+}
+
+/// One tree entry as `push_view` hands it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub mode: String,
+    pub name: String,
+    /// The object id, lowercase hex.
+    pub id: String,
+}
+
+/// What a push carries, for the checks of a built-in agent's push: its
+/// commands, and the commits (tree and parents) and trees its pack holds,
+/// by lowercase hex id.
+#[derive(Debug, Default)]
+pub struct PushView {
+    pub commands: Commands,
+    pub commits: HashMap<String, (String, Vec<String>)>,
+    pub trees: HashMap<String, Vec<TreeEntry>>,
+    /// False when part of the pack could not be read in full (a delta
+    /// against an object the pack does not carry, or an object past the
+    /// limits): an object it holds may then be missing here.
+    pub complete: bool,
+}
+
+fn hex(id: &[u8]) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Reads one `git-receive-pack` request body for its commands, commits
+/// and trees (see `PushView`). `encoding` is its `Content-Encoding`.
+pub fn push_view(body: &[u8], encoding: Option<&str>, limits: &Limits) -> Result<PushView, String> {
+    let decoded: Vec<u8>;
+    let body = match encoding.map(|value| value.trim().to_ascii_lowercase()) {
+        None => body,
+        Some(value) if value.is_empty() || value == "identity" => body,
+        Some(value) if value == "gzip" || value == "x-gzip" => {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(body)
+                .take(limits.max_request as u64 + 1)
+                .read_to_end(&mut out)
+                .map_err(|_| "the gzip request body is damaged".to_string())?;
+            if out.len() > limits.max_request {
+                return Err("the push is too large to check".into());
+            }
+            decoded = out;
+            &decoded
+        }
+        Some(_) => return Err("the request uses an unknown content encoding".into()),
+    };
+    let commands = read_commands(body)?;
+    let pack = &body[commands.pack_at..];
+    let mut view = PushView {
+        complete: true,
+        ..PushView::default()
+    };
+    if !pack.is_empty() {
+        let scanner = Scanner::default();
+        let mut reader = Pack::new(pack, commands.hash_len, &scanner, limits);
+        match reader.read() {
+            Ok(()) => {}
+            Err(Fail::Malformed(reason)) => return Err(reason),
+            Err(_) => view.complete = false,
+        }
+        if reader.too_large || reader.unresolved > 0 {
+            view.complete = false;
+        }
+        for (id, (tree, parents)) in &reader.commits {
+            view.commits.insert(
+                hex(id),
+                (hex(tree), parents.iter().map(|p| hex(p)).collect()),
+            );
+        }
+        for (id, entries) in &reader.trees {
+            view.trees.insert(
+                hex(id),
+                entries
+                    .iter()
+                    .map(|entry| TreeEntry {
+                        mode: entry.mode.clone(),
+                        name: entry.name.clone(),
+                        id: hex(&entry.id),
+                    })
+                    .collect(),
+            );
+        }
+    }
+    view.commands = commands;
+    Ok(view)
 }
 
 /// One pkt-line holding `payload`.
@@ -378,6 +474,9 @@ struct BlobHits {
     hits: Vec<crate::leakscan::Hit>,
 }
 
+/// A commit's tree and parents.
+type CommitLinks = (Vec<u8>, Vec<Vec<u8>>);
+
 struct Pack<'a> {
     data: &'a [u8],
     hash_len: usize,
@@ -392,6 +491,10 @@ struct Pack<'a> {
     blob_ids: HashSet<Vec<u8>>,
     trees: HashMap<Vec<u8>, Vec<Entry>>,
     roots: Vec<Vec<u8>>,
+    /// Commit id → its tree and parents.
+    commits: HashMap<Vec<u8>, CommitLinks>,
+    /// Deltas whose base the pack does not carry (a thin pack).
+    unresolved: usize,
     blobs: Vec<BlobHits>,
     found: Vec<Finding>,
 }
@@ -411,6 +514,8 @@ impl<'a> Pack<'a> {
             blob_ids: HashSet::new(),
             trees: HashMap::new(),
             roots: Vec::new(),
+            commits: HashMap::new(),
+            unresolved: 0,
             blobs: Vec::new(),
             found: Vec::new(),
         }
@@ -485,6 +590,7 @@ impl<'a> Pack<'a> {
                 break;
             }
         }
+        self.unresolved = deferred.len();
         for offset in deferred {
             let (_, size, start, _) = self.header(offset)?;
             let (delta, _, complete) = self.inflate(start, size)?;
@@ -638,7 +744,17 @@ impl<'a> Pack<'a> {
                         .and_then(|rest| rest.split(|byte| *byte == b'\n').next())
                         .and_then(decode_hex)
                 {
-                    self.roots.push(root);
+                    self.roots.push(root.clone());
+                    if let Some(id) = &id {
+                        let parents = resolved
+                            .data
+                            .split(|byte| *byte == b'\n')
+                            .take_while(|line| !line.is_empty())
+                            .filter_map(|line| line.strip_prefix(b"parent "))
+                            .filter_map(decode_hex)
+                            .collect();
+                        self.commits.insert(id.clone(), (root, parents));
+                    }
                 }
             }
             _ => return Err(malformed("the packfile holds an unknown object type")),

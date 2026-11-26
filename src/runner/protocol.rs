@@ -289,6 +289,10 @@ pub struct Resources {
     /// Free space where runs clone their repositories.
     #[serde(default)]
     pub work_free_bytes: Option<u64>,
+    /// What the runner's persistent directory (the stored sign-in and the
+    /// conversations' transcripts) holds.
+    #[serde(default)]
+    pub state_bytes: Option<u64>,
 }
 
 /// Runner to lore.

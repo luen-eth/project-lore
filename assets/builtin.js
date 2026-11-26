@@ -44,6 +44,9 @@
     device: "Sign in with ChatGPT (device code)",
     interactive: "Sign in with claude.ai",
   };
+  /* The agent's persistent volume holds only its sign-in and a week of
+     conversation transcripts (50 MiB each at most): above this, say so. */
+  const STATE_WARN_BYTES = 512 * 1024 * 1024;
   const CREDENTIAL_HELP = {
     setup_token: "Run claude setup-token on your own computer and paste the token it prints (valid for a year).",
     auth_json: "Paste the contents of an auth.json from a computer where you signed Codex in (~/.codex/auth.json).",
@@ -159,7 +162,16 @@
     head.append(agent.connected ? pill("connected", "open") : pill("not connected", "closed"));
     head.append(agent.signed_in ? pill("signed in", "open") : pill("not signed in", "implicit"));
     if (agent.enabled) head.append(pill("enabled", "oauth"));
+    if (agent.second_runner) head.append(pill("second runner refused", "closed"));
     item.append(head);
+    if (agent.second_runner) {
+      const seen = agent.second_runner;
+      item.append(el("p", "builtin-warning",
+        `A second runner tried to connect as ${agent.name} from ${seen.address} ${ago(seen.at)}`
+        + (seen.count > 1 ? ` (${seen.count} times)` : "")
+        + " while its own runner was connected, and was refused. Its runner secret may have leaked:"
+        + " generate a new one and restart its container."));
+    }
 
     const lines = [];
     if (agent.connected) {
@@ -181,9 +193,15 @@
       if (resources.load !== null && resources.load !== undefined) parts.push(`load ${resources.load.toFixed(2)}`);
       if (resources.mem_used_bytes) parts.push(`memory ${bytes(resources.mem_used_bytes)}` + (resources.mem_limit_bytes ? ` of ${bytes(resources.mem_limit_bytes)}` : ""));
       if (resources.work_free_bytes) parts.push(`${bytes(resources.work_free_bytes)} free for work`);
+      if (resources.state_bytes !== null && resources.state_bytes !== undefined) parts.push(`volume ${bytes(resources.state_bytes)}`);
       if (parts.length) lines.push(parts.join(" · "));
     }
     for (const line of lines) item.append(el("div", "board-meta", line));
+    if (resources && resources.state_bytes > STATE_WARN_BYTES) {
+      item.append(el("p", "builtin-warning",
+        `Its volume holds ${bytes(resources.state_bytes)}: more than the stored sign-in and a week of`
+        + " conversation transcripts should need. Look at the container's /var/lib/lore-runner."));
+    }
     if (agent.status_detail) item.append(el("pre", "builtin-detail", agent.status_detail));
 
     const box = el("dl", "agent-stats");
@@ -215,16 +233,22 @@
     const box = el("div", "builtin-login " + login.state);
     if (login.state === "starting") box.append(el("p", "", "Starting the sign-in…"));
     if (login.state === "waiting") {
-      if (login.url) {
+      if (login.url && login.url_host) {
+        /* The host on its own line, so a link to an unexpected place
+           stands out before anyone opens it (lore only passes links to the
+           CLI's own sign-in hosts). */
         const step = el("p", "");
-        step.append(document.createTextNode("1. Open "));
-        const link = el("a", "", login.url);
+        step.append(document.createTextNode("1. Sign in with your own account at "));
+        step.append(el("strong", "builtin-host", login.url_host));
+        step.append(document.createTextNode(":"));
+        box.append(step);
+        const link = el("a", "builtin-link", login.url);
         link.href = login.url;
         link.target = "_blank";
         link.rel = "noopener noreferrer";
-        step.append(link);
-        step.append(document.createTextNode(" and sign in with your own account."));
-        box.append(step);
+        const linkLine = el("p", "");
+        linkLine.append(link);
+        box.append(linkLine);
       }
       if (login.code) {
         box.append(el("p", "", "2. Enter this one-time code there:"));
@@ -456,7 +480,15 @@
     const row = el("div", "builtin-row");
     row.append(capField, hoursField);
     const checks = el("div", "builtin-row");
-    checks.append(check("enabled", "Works on idle board tasks"), check("available", "Available to help other agents"));
+    const enabledBox = check("enabled", "Works on idle board tasks");
+    const availableBox = check("available", "Available to help other agents");
+    checks.append(enabledBox, availableBox);
+    /* Shown once the server knows the switch. */
+    const readsBox = "read_other_services" in agent
+      ? check("read_other_services", "May read other services during runs")
+      : null;
+    const readsNote = readsBox && el("p", "muted small-text builtin-help-note",
+      "Off: a run reads only the services its task names. On: it may also read what the task's author may read (mail, other repositories, Dokploy, Cloudflare), and could copy it into its commit.");
 
     const actions = el("div", "board-actions");
     const save = el("button", "ghost small", "Save settings");
@@ -464,16 +496,19 @@
     actions.append(save);
     const helpNote = el("p", "muted small-text builtin-help-note",
       "Available to help: while it is idle, your other agents may hand it a task (delegate) or ask it a question (ask, read-only) through lore. Off: it only works on board tasks.");
-    form.append(modelField, checks, helpNote, row, actions);
+    form.append(modelField, checks, helpNote);
+    if (readsBox) form.append(readsBox, readsNote);
+    form.append(row, actions);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const payload = {
         model: model.value.trim(),
-        enabled: form.querySelectorAll("input[type=checkbox]")[0].checked,
-        available: form.querySelectorAll("input[type=checkbox]")[1].checked,
+        enabled: enabledBox.querySelector("input").checked,
+        available: availableBox.querySelector("input").checked,
         daily_cap: Number.parseInt(cap.value, 10) || 0,
         active_hours: hours.value.trim(),
       };
+      if (readsBox) payload.read_other_services = readsBox.querySelector("input").checked;
       save.disabled = true;
       const result = await call(url(agent.name), {
         method: "PUT",
@@ -600,11 +635,14 @@
     seen: new Map(),
     /* Run ids whose output the page shows. */
     open: new Set(),
+    /* The server refused run output to this user. */
+    denied: false,
   };
   const OUTPUT_KEEP = 400;
   const STATUS_LABEL = {
     starting: "starting", running: "running", pushed: "pushed", done: "done", failed: "failed",
     stopped: "stopped", timeout: "timed out", interrupted: "interrupted", answered: "answered",
+    busy: "container busy, retried later",
   };
 
   async function loadRunner() {
@@ -618,15 +656,23 @@
     if (!result.ok || !result.body.configured) { box.hidden = true; return; }
     runner.data = result.body;
     box.hidden = false;
-    for (const run of runner.data.active) {
-      runner.open.add(run.id);
-      if (!runner.lines.has(run.id)) await loadOutput(run.id);
+    /* Run output is for the agents permission only: without it the page
+       shows each run's line, not its output. */
+    if (runner.data.manage) {
+      for (const run of runner.data.active) {
+        runner.open.add(run.id);
+        if (!runner.lines.has(run.id)) await loadOutput(run.id);
+      }
     }
     renderRunner();
   }
 
   async function loadOutput(id) {
     const result = await call(`/admin/api/builtin/runs/${encodeURIComponent(id)}/events?after=0`).catch(() => null);
+    if (result && (result.status === 403 || result.status === 401)) {
+      runner.denied = true;
+      return;
+    }
     if (!result || !result.ok) return;
     const lines = result.body.events.map((event) => ({ seq: event.seq, stream: event.stream, line: event.body }));
     runner.lines.set(id, lines.slice(-OUTPUT_KEEP));
@@ -634,6 +680,9 @@
   }
 
   function outputBox(id) {
+    if (runner.denied || (runner.data && !runner.data.manage)) {
+      return el("p", "muted small-text runner-denied", "The output of runs is shown only with the agents permission.");
+    }
     const pre = el("pre", "runner-output");
     pre.dataset.run = id;
     pre.setAttribute("aria-label", "Output of run " + id);
@@ -717,12 +766,14 @@
       const line = `${run.agent} · ${runWhat(run)} · ${STATUS_LABEL[run.status] || run.status}`
         + ` · ${minutes(run.started_at, run.ended_at)}` + (run.commit ? ` · ${run.commit.slice(0, 10)}` : "");
       item.append(el("span", "runner-line", line), el("span", "runner-why", `${day(run.created_at)} · ${run.summary}`));
-      const show = button(runner.open.has(run.id) ? "Hide output" : "Show output", "", async () => {
-        if (runner.open.has(run.id)) runner.open.delete(run.id);
-        else { runner.open.add(run.id); await loadOutput(run.id); }
-        renderRunner();
-      });
-      item.append(show);
+      if (data.manage && !runner.denied) {
+        const show = button(runner.open.has(run.id) ? "Hide output" : "Show output", "", async () => {
+          if (runner.open.has(run.id)) runner.open.delete(run.id);
+          else { runner.open.add(run.id); await loadOutput(run.id); }
+          renderRunner();
+        });
+        item.append(show);
+      }
       if (runner.open.has(run.id)) item.append(outputBox(run.id));
       history.append(item);
     }
@@ -746,6 +797,7 @@
   window.addEventListener("lore-run", (event) => {
     const run = event.detail || {};
     if (run.type === "output") {
+      if (runner.denied || (runner.data && !runner.data.manage)) return;
       const last = runner.seen.get(run.run_id) || 0;
       if (run.seq <= last) return;
       runner.seen.set(run.run_id, run.seq);

@@ -384,7 +384,11 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
     // An OAuth access token works as well, as on `/mcp`; a disabled
     // agent is refused either way.
     let presented = presented_token(&parts.headers);
-    let (agent, scope) = match state.auth.authenticate(&presented).await {
+    let internal = parts
+        .extensions
+        .get::<crate::auth::InternalListener>()
+        .is_some();
+    let (agent, scope) = match state.auth.authenticate_on(&presented, internal).await {
         Ok(found) => (found.agent().to_string(), found.scope().cloned()),
         Err(Refused::Disabled { agent, env: true }) => {
             return plain(
@@ -558,8 +562,9 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
     // repository streams through untouched.
     let mut spooled: Option<SpoolStream> = None;
     let mut body = Some(body);
+    let (owner, repo) = git.repo.split_once('/').unwrap_or((git.repo.as_str(), ""));
+    let mut scan = None;
     if let Some(guard) = leak {
-        let (owner, repo) = git.repo.split_once('/').unwrap_or((git.repo.as_str(), ""));
         let public = leakscan::visibility()
             .is_public(
                 &state.http,
@@ -571,13 +576,30 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
             )
             .await;
         if public {
+            scan = Some(guard);
+        }
+    }
+    // A built-in agent's push is always read whole and checked: which refs
+    // it moves and how, and what it changes in the CI definitions.
+    let run = scope
+        .as_ref()
+        .filter(|_| git.endpoint == Endpoint::ReceivePack)
+        .map(|scope| RunPush {
+            scope,
+            secret: &secret,
+            provider: git.provider,
+            owner: owner.strip_suffix(".git").unwrap_or(owner).to_string(),
+            repo: repo.strip_suffix(".git").unwrap_or(repo).to_string(),
+        });
+    if scan.is_some() || run.is_some() {
+        {
             let encoding = parts
                 .headers
                 .get(header::CONTENT_ENCODING)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
             let taken = body.take().expect("the body is read once");
-            match check_push(&state, taken, encoding, guard).await {
+            match check_push(&state, taken, encoding, scan, run).await {
                 Ok(stream) => spooled = Some(stream),
                 Err(refused) => {
                     conclude(
@@ -746,12 +768,333 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
             }
         }
     }
+    // A built-in agent's push asks git for a full pack (`no-thin`), so
+    // lore can read every tree it changes.
+    if scope.is_some() && git.endpoint == Endpoint::InfoRefs && is_push(git.endpoint, query) {
+        let mut advertisement = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = tokio_stream::StreamExt::next(&mut stream).await {
+            let Ok(chunk) = chunk else {
+                return plain(
+                    StatusCode::BAD_GATEWAY,
+                    "the ref advertisement could not be read",
+                );
+            };
+            advertisement.extend_from_slice(&chunk);
+            if advertisement.len() > MAX_ADVERTISEMENT {
+                return plain(
+                    StatusCode::BAD_GATEWAY,
+                    "the ref advertisement is too large",
+                );
+            }
+        }
+        let advertisement = with_no_thin(&advertisement).unwrap_or(advertisement);
+        if let Some(headers) = out.headers_mut() {
+            headers.remove(header::CONTENT_LENGTH);
+        }
+        return out
+            .body(Body::from(advertisement))
+            .expect("a valid status and header values build a response");
+    }
     // A failure mid-stream is passed on without the upstream URL.
     let stream = tokio_stream::StreamExt::map(response.bytes_stream(), |chunk| {
         chunk.map_err(reqwest::Error::without_url)
     });
     out.body(Body::from_stream(stream))
         .expect("a valid status and header values build a response")
+}
+
+/// The largest ref advertisement lore rewrites for a built-in agent's push.
+const MAX_ADVERTISEMENT: usize = 16 * 1024 * 1024;
+
+/// A `git-receive-pack` ref advertisement with the `no-thin` capability
+/// added to the first ref line (so git sends a full pack), or `None` when
+/// it does not have the expected shape (it is then passed on as it is).
+fn with_no_thin(body: &[u8]) -> Option<Vec<u8>> {
+    let mut at = 0;
+    let mut out = Vec::with_capacity(body.len() + 8);
+    let mut done = false;
+    while at + 4 <= body.len() {
+        let len = usize::from_str_radix(std::str::from_utf8(&body[at..at + 4]).ok()?, 16).ok()?;
+        if len == 0 {
+            out.extend_from_slice(b"0000");
+            at += 4;
+            continue;
+        }
+        if len < 4 || at + len > body.len() {
+            return None;
+        }
+        let payload = &body[at + 4..at + len];
+        at += len;
+        if !done && let Some(nul) = payload.iter().position(|byte| *byte == 0) {
+            let (line, caps) = payload.split_at(nul);
+            let caps = caps[1..].strip_suffix(b"\n").unwrap_or(&caps[1..]);
+            let has = caps
+                .split(|byte| *byte == b' ')
+                .any(|cap| cap == b"no-thin");
+            let mut new = line.to_vec();
+            new.push(0);
+            new.extend_from_slice(caps);
+            if !has {
+                new.extend_from_slice(b" no-thin");
+            }
+            new.push(b'\n');
+            out.extend_from_slice(format!("{:04x}", new.len() + 4).as_bytes());
+            out.extend_from_slice(&new);
+            done = true;
+            continue;
+        }
+        out.extend_from_slice(&body[at - len..at]);
+    }
+    (done && at == body.len()).then_some(out)
+}
+
+/// What the checks of a built-in agent's push need.
+struct RunPush<'a> {
+    scope: &'a crate::runscope::RunScope,
+    /// lore's credential for the repository, to ask GitHub what the pack
+    /// does not carry.
+    secret: &'a crate::vault::Secret,
+    provider: ops::Provider,
+    owner: String,
+    repo: String,
+}
+
+/// The CI definitions at a commit: for each CI file or directory, the id
+/// of its entry (or none), by name.
+type CiState = Vec<(&'static str, Option<String>)>;
+
+impl RunPush<'_> {
+    /// One GET on GitHub's API with lore's credential: the JSON, or why
+    /// not.
+    async fn get(&self, state: &GitProxy, path: String) -> Result<serde_json::Value, String> {
+        let request = ops::OpsRequest {
+            provider: self.provider,
+            method: "GET".into(),
+            path,
+            query: None,
+            body: None,
+        };
+        let answer = ops::call(
+            &ops::client(),
+            &state.github_api_base,
+            self.secret,
+            &state.guard,
+            &request,
+        )
+        .await
+        .map_err(|error| error.message().to_string())?;
+        if answer.status != 200 || answer.truncated {
+            return Err(format!("GitHub answered HTTP {}", answer.status));
+        }
+        serde_json::from_str(&answer.body).map_err(|_| "GitHub's answer is not JSON".to_string())
+    }
+
+    /// A commit's tree: from the pack, else from GitHub.
+    async fn tree_of(
+        &self,
+        state: &GitProxy,
+        view: &packscan::PushView,
+        commit: &str,
+    ) -> Result<String, String> {
+        if let Some((tree, _)) = view.commits.get(commit) {
+            return Ok(tree.clone());
+        }
+        let value = self
+            .get(
+                state,
+                format!("/repos/{}/{}/git/commits/{commit}", self.owner, self.repo),
+            )
+            .await?;
+        value["tree"]["sha"]
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| "GitHub did not name the commit's tree".into())
+    }
+
+    /// A tree's entries as `(name, id)`: from the pack, else from GitHub.
+    async fn entries(
+        &self,
+        state: &GitProxy,
+        view: &packscan::PushView,
+        tree: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        if let Some(entries) = view.trees.get(tree) {
+            return Ok(entries
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.id.clone()))
+                .collect());
+        }
+        let value = self
+            .get(
+                state,
+                format!("/repos/{}/{}/git/trees/{tree}", self.owner, self.repo),
+            )
+            .await?;
+        let items = value["tree"]
+            .as_array()
+            .ok_or_else(|| "GitHub did not list the tree".to_string())?;
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                Some((
+                    item["path"].as_str()?.to_string(),
+                    item["sha"].as_str()?.to_ascii_lowercase(),
+                ))
+            })
+            .collect())
+    }
+
+    /// The CI definitions at a commit.
+    async fn ci_state(
+        &self,
+        state: &GitProxy,
+        view: &packscan::PushView,
+        commit: &str,
+    ) -> Result<CiState, String> {
+        let root = self.tree_of(state, view, commit).await?;
+        let root = self.entries(state, view, &root).await?;
+        let find = |entries: &[(String, String)], name: &str| {
+            entries
+                .iter()
+                .find(|(entry, _)| entry == name)
+                .map(|(_, id)| id.clone())
+        };
+        let mut out: CiState = Vec::new();
+        for file in crate::runscope::CI_FILES {
+            out.push((file, find(&root, file)));
+        }
+        let github = find(&root, ".github");
+        let github = match github {
+            Some(tree) => Some(self.entries(state, view, &tree).await?),
+            None => None,
+        };
+        for dir in crate::runscope::CI_DIRECTORIES {
+            let id = match dir.strip_prefix(".github/") {
+                Some(name) => github.as_deref().and_then(|entries| find(entries, name)),
+                None => find(&root, dir),
+            };
+            out.push((dir, id));
+        }
+        Ok(out)
+    }
+
+    /// Whether `old` is an ancestor of `new`: through the commits the pack
+    /// carries, then, from where the pack ends, by asking GitHub
+    /// (`compare`). Anything lore cannot prove is no.
+    async fn fast_forward(
+        &self,
+        state: &GitProxy,
+        view: &packscan::PushView,
+        old: &str,
+        new: &str,
+    ) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = vec![new.to_string()];
+        let mut edge: Vec<String> = Vec::new();
+        while let Some(commit) = queue.pop() {
+            if commit == old {
+                return true;
+            }
+            if !seen.insert(commit.clone()) || seen.len() > 100_000 {
+                continue;
+            }
+            match view.commits.get(&commit) {
+                Some((_, parents)) => queue.extend(parents.iter().cloned()),
+                None => edge.push(commit),
+            }
+        }
+        for commit in edge.iter().take(8) {
+            let compared = self
+                .get(
+                    state,
+                    format!(
+                        "/repos/{}/{}/compare/{old}...{commit}",
+                        self.owner, self.repo
+                    ),
+                )
+                .await;
+            if let Ok(value) = compared
+                && matches!(value["status"].as_str(), Some("ahead" | "identical"))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The checks of a built-in agent's push, on what it carries: every
+    /// ref (see `RunScope::check_ref_update`), fast-forward only for an
+    /// existing branch, and no change to a CI definition against the ref's
+    /// old commit (the default branch's head for a new branch) unless the
+    /// owner allows it. The refusal, when there is one.
+    async fn check(&self, state: &GitProxy, view: &packscan::PushView) -> Result<(), String> {
+        for (old, new, name) in &view.commands.updates {
+            let existing = self.scope.check_ref_update(old, new, name)?;
+            if existing && !self.fast_forward(state, view, old, new).await {
+                return Err(format!(
+                    "this run may only move {name} forward: lore could not prove that {} \
+                     descends from {} (a built-in agent never rewrites a branch's history)",
+                    &new[..new.len().min(12)],
+                    &old[..old.len().min(12)]
+                ));
+            }
+            if self.scope.ci_allowed {
+                continue;
+            }
+            let base = if existing {
+                old.clone()
+            } else {
+                let value = self
+                    .get(
+                        state,
+                        format!(
+                            "/repos/{}/{}/commits/{}",
+                            self.owner, self.repo, self.scope.branch
+                        ),
+                    )
+                    .await
+                    .map_err(|why| {
+                        format!(
+                            "lore could not read the default branch to check the push's CI \
+                             definitions ({why}), so it refuses the push"
+                        )
+                    })?;
+                value["sha"].as_str().map(str::to_ascii_lowercase).ok_or(
+                    "lore could not read the default branch's head, so it refuses the push",
+                )?
+            };
+            let unreadable = |why: String| {
+                format!(
+                    "lore could not read the CI definitions of {name} ({why}), so it refuses the \
+                     push{}",
+                    if view.complete {
+                        ""
+                    } else {
+                        "; push a full pack (lore asks for one with `no-thin`)"
+                    }
+                )
+            };
+            let before = self
+                .ci_state(state, view, &base)
+                .await
+                .map_err(unreadable)?;
+            let after = self.ci_state(state, view, new).await.map_err(unreadable)?;
+            let changed: Vec<&str> = before
+                .iter()
+                .zip(&after)
+                .filter(|(a, b)| a.1 != b.1)
+                .map(|(a, _)| a.0)
+                .collect();
+            if !changed.is_empty() {
+                return Err(crate::runscope::ci_refusal(&format!(
+                    "{} in {name}",
+                    changed.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// True when `url` has the scheme, host and port of `base` and a path at
@@ -872,7 +1215,8 @@ async fn check_push(
     state: &GitProxy,
     body: Body,
     encoding: Option<String>,
-    guard: ops::Guard,
+    guard: Option<ops::Guard>,
+    run: Option<RunPush<'_>>,
 ) -> Result<SpoolStream, PushRefused> {
     let permit = match tokio::time::timeout(SCAN_WAIT, scan_slots().acquire_owned()).await {
         Ok(Ok(permit)) => permit,
@@ -946,29 +1290,84 @@ async fn check_push(
         max_request: cap,
         ..packscan::LIMITS
     };
-    let checked = tokio::task::spawn_blocking(move || -> std::io::Result<packscan::Checked> {
+    let wants_view = run.is_some();
+    type Read = (
+        packscan::Checked,
+        Option<Result<packscan::PushView, String>>,
+    );
+    let checked = tokio::task::spawn_blocking(move || -> std::io::Result<Read> {
         let bytes = std::fs::read(&path)?;
         if over {
-            return Ok(packscan::Checked {
-                commands: packscan::read_commands(&bytes).ok(),
-                verdict: Verdict::TooLarge,
-            });
+            return Ok((
+                packscan::Checked {
+                    commands: packscan::read_commands(&bytes).ok(),
+                    verdict: Verdict::TooLarge,
+                },
+                None,
+            ));
         }
-        let scanner = leakscan::Scanner::new(&guard);
-        Ok(packscan::check_request(
-            &bytes,
-            encoding.as_deref(),
-            &scanner,
-            &limits,
-        ))
+        let view = wants_view.then(|| packscan::push_view(&bytes, encoding.as_deref(), &limits));
+        let checked = match &guard {
+            Some(guard) => {
+                let scanner = leakscan::Scanner::new(guard);
+                packscan::check_request(&bytes, encoding.as_deref(), &scanner, &limits)
+            }
+            None => packscan::Checked {
+                commands: packscan::read_commands(&bytes).ok(),
+                verdict: Verdict::Clean,
+            },
+        };
+        Ok((checked, view))
     })
     .await;
     drop(permit);
-    let checked = match checked {
+    let (checked, view) = match checked {
         Ok(Ok(checked)) => checked,
         Ok(Err(error)) => return Err(internal(&error)),
         Err(error) => return Err(internal(&error)),
     };
+    // A built-in agent's push: its refs and its CI definitions, refused in
+    // the protocol when the command list could be read.
+    if let Some(run) = &run {
+        let refusal = match &view {
+            _ if over => Some(format!(
+                "lore refused this push: it is larger than lore checks for a built-in agent's run \
+                 ({} MiB)",
+                cap / (1024 * 1024)
+            )),
+            Some(Ok(view)) => run.check(state, view).await.err(),
+            Some(Err(why)) => Some(format!("the push could not be read ({why})")),
+            None => Some("the push could not be read".to_string()),
+        };
+        if let Some(reason) = refusal {
+            let lines = vec![format!("lore refused this push: {reason}")];
+            let short = format!("lore: {}", reason.chars().take(200).collect::<String>());
+            let report = checked
+                .commands
+                .as_ref()
+                .and_then(|commands| packscan::refusal_report(commands, &lines, &short));
+            let response = match report {
+                Some(body) => (
+                    StatusCode::OK,
+                    [
+                        (
+                            header::CONTENT_TYPE,
+                            "application/x-git-receive-pack-result",
+                        ),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    body,
+                )
+                    .into_response(),
+                None => plain(StatusCode::FORBIDDEN, &lines.join("\n")),
+            };
+            return Err(PushRefused {
+                response: Box::new(response),
+                outcome: "denied",
+                detail: format!("run push: {}", reason.chars().take(300).collect::<String>()),
+            });
+        }
+    }
 
     let limit = if cap >= 1024 * 1024 {
         format!("{} MiB", cap / (1024 * 1024))
@@ -1342,7 +1741,8 @@ mod tests {
             github_api_base: api,
             max_scanned_push: max_scanned_push.min(packscan::LIMITS.max_request),
         });
-        let base = serve(router(state)).await;
+        // Served as the internal listener serves it, where run tokens work.
+        let base = serve(router(state).layer(axum::Extension(crate::auth::InternalListener))).await;
         (base, db, asked)
     }
 
@@ -1577,13 +1977,14 @@ mod tests {
             .unwrap();
         let token = crate::runscope::new_token().unwrap();
         let scope = crate::runscope::RunScope {
+            version: crate::runscope::SCOPE_VERSION,
             run_id: run_id.into(),
             agent: "claude-builtin".into(),
             provider: "github".into(),
             owner: "me".into(),
             repo: "shop".into(),
-            dokploy_project_id: None,
-            cloudflare_zone: None,
+            branch: "main".into(),
+            readable: Some(vec!["github".into()]),
             ..Default::default()
         };
         db.insert_run(&crate::db::NewRun {
@@ -2902,5 +3303,297 @@ mod tests {
         let response = send("public-x", big.clone()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(posts(&log).last().unwrap().body, big);
+    }
+
+    #[test]
+    fn the_receive_pack_advertisement_asks_for_a_full_pack() {
+        let first = format!(
+            "{} refs/heads/main\0report-status side-band-64k\n",
+            "a".repeat(40)
+        );
+        let second = format!("{} refs/heads/dev\n", "b".repeat(40));
+        let pkt = |text: &str| format!("{:04x}{text}", text.len() + 4);
+        let body = format!(
+            "{}0000{}{}0000",
+            pkt("# service=git-receive-pack\n"),
+            pkt(&first),
+            pkt(&second)
+        );
+        let rewritten = String::from_utf8(with_no_thin(body.as_bytes()).unwrap()).unwrap();
+        let expected = format!(
+            "{}0000{}{}0000",
+            pkt("# service=git-receive-pack\n"),
+            pkt(&format!(
+                "{} refs/heads/main\0report-status side-band-64k no-thin\n",
+                "a".repeat(40)
+            )),
+            pkt(&second)
+        );
+        assert_eq!(rewritten, expected);
+        // Already there: unchanged; not an advertisement: left alone.
+        assert_eq!(
+            with_no_thin(rewritten.as_bytes()).unwrap(),
+            rewritten.as_bytes()
+        );
+        assert!(with_no_thin(b"garbage").is_none());
+    }
+
+    /// C5 and C3 on a built-in agent's push: no deletion, no tag, the
+    /// default branch only fast-forward (proved from the pack, then by
+    /// asking GitHub), new branches, and no CI change against the old head
+    /// (or the default branch's head for a new branch).
+    #[tokio::test]
+    async fn a_run_push_moves_branches_forward_and_leaves_ci_alone() {
+        let id = |c: char| c.to_string().repeat(40);
+        let (a, b, c, d, e, f, x) = (
+            id('a'),
+            id('b'),
+            id('c'),
+            id('d'),
+            id('e'),
+            id('f'),
+            id('9'),
+        );
+        let zero = "0".repeat(40);
+        // What GitHub has: A on main, its tree, its `.github` tree.
+        let api = Router::new()
+            .route(
+                "/repos/me/shop/commits/main",
+                axum::routing::get({
+                    let a = a.clone();
+                    move || async move { format!(r#"{{"sha":"{a}"}}"#) }
+                }),
+            )
+            .route(
+                "/repos/me/shop/git/commits/{sha}",
+                axum::routing::get({
+                    let a = a.clone();
+                    move |axum::extract::Path(sha): axum::extract::Path<String>| {
+                        let a = a.clone();
+                        async move {
+                            if sha == a {
+                                (StatusCode::OK, r#"{"tree":{"sha":"1111111111111111111111111111111111111111"}}"#.to_string())
+                            } else {
+                                (StatusCode::NOT_FOUND, "{}".to_string())
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/me/shop/git/trees/{sha}",
+                axum::routing::get(|axum::extract::Path(sha): axum::extract::Path<String>| async move {
+                    match sha.as_str() {
+                        "1111111111111111111111111111111111111111" => (
+                            StatusCode::OK,
+                            r#"{"tree":[{"path":".github","sha":"2222222222222222222222222222222222222222","type":"tree"},
+                                        {"path":"src","sha":"3333333333333333333333333333333333333333","type":"tree"}]}"#,
+                        ),
+                        "2222222222222222222222222222222222222222" => (
+                            StatusCode::OK,
+                            r#"{"tree":[{"path":"workflows","sha":"4444444444444444444444444444444444444444","type":"tree"}]}"#,
+                        ),
+                        _ => (StatusCode::NOT_FOUND, "{}"),
+                    }
+                }),
+            )
+            .route(
+                "/repos/me/shop/compare/{spec}",
+                axum::routing::get({
+                    let ok = format!("{a}...{f}");
+                    move |axum::extract::Path(spec): axum::extract::Path<String>| {
+                        let ok = ok.clone();
+                        async move {
+                            if spec == ok {
+                                r#"{"status":"ahead"}"#
+                            } else {
+                                r#"{"status":"diverged"}"#
+                            }
+                        }
+                    }
+                }),
+            );
+        let api = serve(api).await;
+        let db = Db::open(&std::env::temp_dir().join(format!(
+            "lore-gitproxy-runpush-{}/lore.db",
+            std::process::id()
+        )))
+        .unwrap();
+        let state = GitProxy {
+            auth: Arc::new(McpAuth::new(
+                load_tokens("", &format!("claude:{TOKEN}")).unwrap(),
+                db,
+                false,
+            )),
+            vault: None,
+            github_web_base: String::new(),
+            http: client(),
+            events: Events::new(),
+            guard: ops::Guard::default(),
+            github_api_base: api,
+            max_scanned_push: 1024,
+        };
+        let entry = |name: &str, id: &str| packscan::TreeEntry {
+            mode: "40000".into(),
+            name: name.into(),
+            id: id.into(),
+        };
+        let same_ci = "5555555555555555555555555555555555555555".to_string();
+        let new_ci = "6666666666666666666666666666666666666666".to_string();
+        let new_github = "7777777777777777777777777777777777777777".to_string();
+        let mut view = packscan::PushView {
+            complete: true,
+            ..packscan::PushView::default()
+        };
+        // B, E: the CI as it was. D: a changed workflow. C: from elsewhere.
+        view.commits
+            .insert(b.clone(), (same_ci.clone(), vec![a.clone()]));
+        view.commits
+            .insert(e.clone(), (same_ci.clone(), vec![f.clone()]));
+        view.commits
+            .insert(d.clone(), (new_ci.clone(), vec![a.clone()]));
+        view.commits
+            .insert(c.clone(), (same_ci.clone(), vec![x.clone()]));
+        view.trees.insert(
+            same_ci.clone(),
+            vec![
+                entry(".github", "2222222222222222222222222222222222222222"),
+                entry("src", "8888888888888888888888888888888888888888"),
+            ],
+        );
+        view.trees
+            .insert(new_ci.clone(), vec![entry(".github", &new_github)]);
+        view.trees.insert(
+            new_github.clone(),
+            vec![entry(
+                "workflows",
+                "9999999999999999999999999999999999999999",
+            )],
+        );
+        let scope = crate::runscope::RunScope {
+            version: crate::runscope::SCOPE_VERSION,
+            provider: "github".into(),
+            owner: "me".into(),
+            repo: "shop".into(),
+            branch: "main".into(),
+            ..Default::default()
+        };
+        let secret = crate::vault::Secret::new("ghp_test-credential"); // lore:allow-secret
+        async fn run_check(
+            state: &GitProxy,
+            base: &packscan::PushView,
+            secret: &crate::vault::Secret,
+            scope: &crate::runscope::RunScope,
+            updates: Vec<(&str, &str, &str)>,
+        ) -> Result<(), String> {
+            let mut view = packscan::PushView {
+                commits: base.commits.clone(),
+                trees: base.trees.clone(),
+                complete: true,
+                ..packscan::PushView::default()
+            };
+            view.commands.updates = updates
+                .into_iter()
+                .map(|(o, n, r)| (o.to_string(), n.to_string(), r.to_string()))
+                .collect();
+            let run = RunPush {
+                scope,
+                secret,
+                provider: ops::GITHUB,
+                owner: "me".into(),
+                repo: "shop".into(),
+            };
+            run.check(state, &view).await
+        }
+        let check = |scope, updates| run_check(&state, &view, &secret, scope, updates);
+        // Allowed: forward on main (from the pack, and through GitHub's
+        // compare where the pack ends), and a new branch.
+        assert_eq!(
+            check(&scope, vec![(&a, &b, "refs/heads/main")]).await,
+            Ok(())
+        );
+        assert_eq!(
+            check(&scope, vec![(&a, &e, "refs/heads/main")]).await,
+            Ok(())
+        );
+        assert_eq!(
+            check(&scope, vec![(&zero, &b, "refs/heads/feature")]).await,
+            Ok(())
+        );
+        for (updates, word) in [
+            (
+                vec![(a.as_str(), zero.as_str(), "refs/heads/main")],
+                "delete",
+            ),
+            (
+                vec![(a.as_str(), zero.as_str(), "refs/heads/feature")],
+                "delete",
+            ),
+            (
+                vec![(zero.as_str(), b.as_str(), "refs/tags/v1")],
+                "only branches",
+            ),
+            (
+                vec![(a.as_str(), b.as_str(), "refs/heads/release")],
+                "only the default branch",
+            ),
+            (
+                vec![(a.as_str(), c.as_str(), "refs/heads/main")],
+                "only move refs/heads/main forward",
+            ),
+            (
+                vec![(a.as_str(), d.as_str(), "refs/heads/main")],
+                "CI definitions",
+            ),
+            (
+                vec![(zero.as_str(), d.as_str(), "refs/heads/sneaky")],
+                "CI definitions",
+            ),
+        ] {
+            let why = check(&scope, updates.clone()).await.unwrap_err();
+            assert!(why.contains(word), "{updates:?}: {why}");
+        }
+        // The owner's switch lets CI changes through, never history rewrites.
+        let allowed = crate::runscope::RunScope {
+            ci_allowed: true,
+            ..scope.clone()
+        };
+        assert_eq!(
+            check(&allowed, vec![(&a, &d, "refs/heads/main")]).await,
+            Ok(())
+        );
+        assert!(
+            check(&allowed, vec![(&a, &c, "refs/heads/main")])
+                .await
+                .is_err()
+        );
+    }
+
+    /// C5 end to end: a run token's push that deletes a branch is refused
+    /// in the protocol, and nothing goes upstream.
+    #[tokio::test]
+    async fn a_run_token_never_deletes_a_branch() {
+        let (base, db, log) = working_proxy().await;
+        let token = run_token(&db, "run-git-delete");
+        let line = format!(
+            "{} {} refs/heads/main\0report-status\n",
+            "a".repeat(40),
+            "0".repeat(40)
+        );
+        let body = format!("{:04x}{line}0000", line.len() + 4);
+        let sent = log.lock().unwrap().len();
+        let response = reqwest::Client::new()
+            .post(format!("{base}/git/github/me/shop.git/git-receive-pack"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("ng refs/heads/main"), "{text}");
+        assert!(text.contains("delete"), "{text}");
+        assert_eq!(log.lock().unwrap().len(), sent, "nothing went upstream");
+        assert_eq!(db.ops_log(1).unwrap()[0].outcome, "denied");
     }
 }

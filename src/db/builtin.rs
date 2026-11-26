@@ -109,11 +109,16 @@ pub struct BuiltinAgent {
     pub status_at: Option<String>,
     pub updated_at: String,
     pub updated_by: String,
+    /// The owner's per-agent switch "may read other services during runs"
+    /// (schema 7, off by default): a board run then also reads the services
+    /// its task's author may read, beyond the task's own targets.
+    pub read_other_services: bool,
 }
 
 const BUILTIN_COLUMNS: &str = "name, kind, provider, model, enabled, available, daily_cap, \
      active_hours, connected, connected_at, last_seen_at, runner_version, cli_version, \
-     signed_in, login_method, login_ends, status_detail, status_at, updated_at, updated_by";
+     signed_in, login_method, login_ends, status_detail, status_at, updated_at, updated_by, \
+     read_other_services";
 
 impl BuiltinAgent {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -138,6 +143,7 @@ impl BuiltinAgent {
             status_at: row.get(17)?,
             updated_at: row.get(18)?,
             updated_by: row.get(19)?,
+            read_other_services: row.get(20)?,
         })
     }
 }
@@ -219,6 +225,16 @@ impl Db {
         settings: &BuiltinSettings,
         by: &str,
     ) -> Result<BuiltinAgent> {
+        // A model is handed to the CLI as an argument: one that starts with
+        // `-` would be read as an option.
+        if let Some(model) = &settings.model
+            && !valid_model(model)
+        {
+            anyhow::bail!(
+                "the model must be a plain name (letters, digits, `-`, `_`, `.`, `:`, `/`, `@`, \
+                 `[`, `]`), not starting with `-`"
+            );
+        }
         {
             let conn = self.lock();
             conn.execute(
@@ -244,6 +260,21 @@ impl Db {
         }
         self.builtin_agent(name)?
             .context("there is no built-in agent by that name")
+    }
+
+    /// The owner's switch "may read other services during runs" for one
+    /// built-in agent.
+    pub fn set_builtin_read_other_services(&self, name: &str, on: bool, by: &str) -> Result<()> {
+        let changed = self.lock().execute(
+            "UPDATE builtin_agents SET read_other_services = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), updated_by = ?3
+             WHERE name = ?1",
+            params![name, on, by],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("there is no built-in agent by that name");
+        }
+        Ok(())
     }
 
     /// Notes that a runner connected, as what.
@@ -298,11 +329,31 @@ impl Db {
     }
 }
 
+/// Whether a model name may be handed to a CLI: non-empty is checked by
+/// the caller; empty means the CLI's default. Never an option (`-x`).
+pub fn valid_model(model: &str) -> bool {
+    let model = model.trim();
+    model.is_empty()
+        || (model.len() <= 200
+            && !model.starts_with('-')
+            && model.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '-' | '_' | '.' | ':' | '/' | '@' | '[' | ']')
+            }))
+}
+
 /// Lines of output kept per run; later ones are counted, not stored.
 pub const RUN_EVENTS_KEPT: i64 = 2000;
 
+/// Bytes of output kept per run; past them lines are counted, not stored.
+pub const RUN_EVENT_BYTES_KEPT: i64 = 1024 * 1024;
+
 /// Runs whose output is kept; older runs keep their row, not their lines.
 const RUNS_WITH_EVENTS: i64 = 200;
+
+/// Bytes of stored output across every run; the oldest runs' lines go
+/// first when there is more.
+pub const RUN_EVENT_BYTES_TOTAL: i64 = 64 * 1024 * 1024;
 
 /// The columns of a run row, in the order `Run::from_row` reads them.
 const RUN_COLUMNS: &str = "id, agent, task_id, kind, project, repo, provider, status, \
@@ -394,7 +445,7 @@ pub struct NewRun {
 }
 
 /// A task another agent delegated to a built-in agent.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Delegation {
     pub task_id: i64,
     pub agent: String,
@@ -442,10 +493,35 @@ pub struct AutoTask {
     pub task: super::Task,
     /// Not touched for the idle threshold.
     pub idle: bool,
-    /// Taken or skipped by the runner since it was last touched.
+    /// Taken or skipped by the runner since it was last re-queued (a touch
+    /// by a signed-in user or by the task's author).
     pub waiting: bool,
     pub auto_attempts: i64,
+    /// The verified identity that added the task (schema 7): a token's
+    /// agent, `user:<id>` / `user:admin` for the admin page, `run:<agent>`
+    /// for a built-in agent's run; empty when unknown (older tasks).
+    pub author: String,
 }
+
+/// The task runner's own fields of a task, for the JSON backup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskRunnerState {
+    pub task_id: i64,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub touches: i64,
+    #[serde(default)]
+    pub auto_seen: Option<i64>,
+    #[serde(default)]
+    pub auto_attempts: i64,
+    #[serde(default)]
+    pub auto_last_at: Option<String>,
+}
+
+/// The SQL that says a task waits: the runner took or skipped it since its
+/// last re-queueing touch.
+const WAITING_SQL: &str = "(auto_seen IS NOT NULL AND auto_seen >= touches)";
 
 impl Db {
     /// Sets a task's target fields (repository, Dokploy project,
@@ -475,6 +551,69 @@ impl Db {
         super::get_task(&conn, id)
     }
 
+    /// Records who added a task: the identity lore verified (see
+    /// `AutoTask::author`).
+    pub fn set_task_author(&self, id: i64, author: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE tasks SET author = ?2 WHERE id = ?1",
+            params![id, author.trim()],
+        )?;
+        Ok(())
+    }
+
+    /// Who added a task, as lore verified it; empty when unknown.
+    pub fn task_author(&self, id: i64) -> Result<String> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT author FROM tasks WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// A touch that re-queues a task for the runner: by a signed-in user
+    /// (`reset`: the automatic attempts start over) or by the task's
+    /// author (the attempts keep counting toward their maximum).
+    pub fn requeue_task(&self, id: i64, reset: bool) -> Result<()> {
+        self.lock().execute(
+            "UPDATE tasks SET touches = touches + 1,
+                 auto_attempts = CASE WHEN ?2 THEN 0 ELSE auto_attempts END
+             WHERE id = ?1",
+            params![id, reset],
+        )?;
+        Ok(())
+    }
+
+    /// The repositories lore recorded for a project, newest first, each
+    /// with the token agent of the session that wrote it (schema 7; empty
+    /// for records written before lore kept it). Empty values and "none"
+    /// are not repositories.
+    pub fn project_repo_records(
+        &self,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT repo, token_agent FROM (
+                 SELECT e.repo AS repo, COALESCE(s.token_agent, '') AS token_agent,
+                        e.created_at AS at
+                   FROM entries e LEFT JOIN sessions s ON s.id = e.session_id
+                  WHERE e.project = ?1 AND e.repo != '' AND lower(e.repo) != 'none'
+                 UNION ALL
+                 SELECT repo, token_agent, started_at AS at FROM sessions
+                  WHERE project = ?1 AND repo != '' AND lower(repo) != 'none'
+             ) ORDER BY at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project, limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The repository lore recorded most recently for a project: the
     /// newest `repo` of an entry or a session, whatever its host. Empty
     /// values and "none" are not repositories.
@@ -497,13 +636,42 @@ impl Db {
 
     /// Every open, unclaimed task, oldest first, with whether it is idle
     /// (not updated for `idle_minutes`) and whether the runner already
-    /// took or skipped it since it was last touched.
+    /// took or skipped it since it was last re-queued.
     pub fn auto_tasks(&self, idle_minutes: i64, limit: usize) -> Result<Vec<AutoTask>> {
+        self.auto_tasks_where(idle_minutes, limit, "")
+    }
+
+    /// The tasks the scheduler may take now, oldest first: open,
+    /// unclaimed, idle, not waiting, under `max_attempts` automatic
+    /// attempts, and not delegated (a delegated task waits for its own
+    /// agent). Filtered here, before the limit, so skipped tasks never
+    /// crowd out eligible ones.
+    pub fn eligible_auto_tasks(
+        &self,
+        idle_minutes: i64,
+        max_attempts: i64,
+        limit: usize,
+    ) -> Result<Vec<AutoTask>> {
+        let filter = format!(
+            "AND updated_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)
+             AND NOT {WAITING_SQL} AND auto_attempts < {}
+             AND id NOT IN (SELECT task_id FROM delegations)",
+            max_attempts.max(0)
+        );
+        self.auto_tasks_where(idle_minutes, limit, &filter)
+    }
+
+    fn auto_tasks_where(
+        &self,
+        idle_minutes: i64,
+        limit: usize,
+        filter: &str,
+    ) -> Result<Vec<AutoTask>> {
         let conn = self.lock();
         let sql = format!(
             "SELECT {}, updated_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1),
-                    auto_last_at IS NOT NULL AND auto_last_at >= updated_at, auto_attempts
-             FROM tasks WHERE status = 'open' AND claimed_by = ''
+                    {WAITING_SQL}, auto_attempts, author
+             FROM tasks WHERE status = 'open' AND claimed_by = '' {filter}
              ORDER BY created_at, id LIMIT ?2",
             super::TASK_COLUMNS
         );
@@ -515,31 +683,83 @@ impl Db {
                 idle: row.get(18)?,
                 waiting: row.get(19)?,
                 auto_attempts: row.get(20)?,
+                author: row.get(21)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Notes on a task why the runner skipped it, without touching it: it
-    /// waits until someone does.
+    /// waits until it is re-queued.
     pub fn note_task_skip(&self, id: i64, note: &str) -> Result<()> {
         let note: String = note.chars().take(super::NOTE_MAX_CHARS).collect();
         self.lock().execute(
-            "UPDATE tasks SET note = ?2, auto_last_at = updated_at WHERE id = ?1",
+            "UPDATE tasks SET note = ?2, auto_seen = touches,
+                 auto_last_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1",
             params![id, note],
         )?;
         Ok(())
     }
 
     /// Records that the runner took a task (counted) or left it (not
-    /// counted): either way it waits until it is touched again.
+    /// counted): either way it waits until it is re-queued.
     pub fn mark_task_auto(&self, id: i64, attempt: bool) -> Result<()> {
         self.lock().execute(
-            "UPDATE tasks SET auto_attempts = auto_attempts + ?2, auto_last_at = updated_at
+            "UPDATE tasks SET auto_attempts = auto_attempts + ?2, auto_seen = touches,
+                 auto_last_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?1",
             params![id, i64::from(attempt)],
         )?;
         Ok(())
+    }
+
+    /// A task the runner took but whose agent's container was only busy
+    /// (`busy: …`): it goes back exactly as it was before it was taken
+    /// (open, unclaimed, its old `updated_at`, the attempt not counted, not
+    /// waiting), so the scheduler tries it again on a later tick. Only a
+    /// claim by `agent` is undone.
+    pub fn give_back_task(&self, id: i64, agent: &str, updated_at: &str) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE tasks SET status = 'open', claimed_by = '', updated_at = ?3,
+                 auto_attempts = MAX(auto_attempts - 1, 0), auto_seen = NULL
+             WHERE id = ?1 AND status = 'claimed' AND claimed_by = ?2",
+            params![id, agent, updated_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The task runner's fields of every task, for the JSON backup.
+    pub fn task_runner_states(&self) -> Result<Vec<TaskRunnerState>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, author, touches, auto_seen, auto_attempts, auto_last_at FROM tasks
+             WHERE author != '' OR touches != 0 OR auto_seen IS NOT NULL OR auto_attempts != 0
+                   OR auto_last_at IS NOT NULL
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TaskRunnerState {
+                task_id: row.get(0)?,
+                author: row.get(1)?,
+                touches: row.get(2)?,
+                auto_seen: row.get(3)?,
+                auto_attempts: row.get(4)?,
+                auto_last_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every delegation, for the JSON backup.
+    pub fn delegations(&self) -> Result<Vec<Delegation>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT task_id, agent, requested_by, via, created_at FROM delegations
+             ORDER BY task_id",
+        )?;
+        let rows = stmt.query_map([], delegation_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// A new run. Its token is stored only as `token_hash`.
@@ -672,26 +892,31 @@ impl Db {
     }
 
     /// Stores one line of a run's (already redacted) output. Past
-    /// `RUN_EVENTS_KEPT` lines only the count grows.
+    /// `RUN_EVENTS_KEPT` lines or `RUN_EVENT_BYTES_KEPT` bytes only the
+    /// count grows.
     pub fn add_run_event(&self, run_id: &str, seq: i64, stream: &str, body: &str) -> Result<()> {
         let conn = self.lock();
-        let lines: i64 = conn
+        let (lines, bytes): (i64, i64) = conn
             .query_row(
-                "SELECT output_lines FROM agent_runs WHERE id = ?1",
+                "SELECT output_lines, output_bytes FROM agent_runs WHERE id = ?1",
                 params![run_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
-            .unwrap_or(0);
-        if lines < RUN_EVENTS_KEPT {
+            .unwrap_or((0, 0));
+        let size = body.len() as i64;
+        let keep = lines < RUN_EVENTS_KEPT && bytes + size <= RUN_EVENT_BYTES_KEPT;
+        if keep {
             conn.execute(
                 "INSERT INTO agent_run_events (run_id, seq, stream, body) VALUES (?1, ?2, ?3, ?4)",
                 params![run_id, seq, stream, body],
             )?;
         }
         conn.execute(
-            "UPDATE agent_runs SET output_lines = output_lines + 1 WHERE id = ?1",
-            params![run_id],
+            "UPDATE agent_runs SET output_lines = output_lines + 1,
+                 output_bytes = output_bytes + ?2
+             WHERE id = ?1",
+            params![run_id, if keep { size } else { 0 }],
         )?;
         Ok(())
     }
@@ -756,7 +981,7 @@ impl Db {
             "SELECT {}, d.task_id, d.agent, d.requested_by, d.via, d.created_at
              FROM delegations d JOIN tasks t ON t.id = d.task_id
              WHERE t.status = 'open' AND t.claimed_by = ''
-               AND (t.auto_last_at IS NULL OR t.auto_last_at < t.updated_at)
+               AND NOT (t.auto_seen IS NOT NULL AND t.auto_seen >= t.touches)
              ORDER BY d.created_at, t.id",
             columns.join(", ")
         );
@@ -797,14 +1022,45 @@ impl Db {
             .optional()?)
     }
 
-    /// Drops the output of all but the newest runs.
+    /// Drops the output of all but the newest runs, then the oldest runs'
+    /// output while all of it is more than `RUN_EVENT_BYTES_TOTAL` bytes.
     pub fn prune_run_events(&self) -> Result<()> {
-        self.lock().execute(
+        self.prune_run_events_to(RUN_EVENT_BYTES_TOTAL)
+    }
+
+    fn prune_run_events_to(&self, total: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
             "DELETE FROM agent_run_events WHERE run_id NOT IN (
                  SELECT id FROM agent_runs ORDER BY created_at DESC, rowid DESC LIMIT ?1)",
             params![RUNS_WITH_EVENTS],
         )?;
-        Ok(())
+        loop {
+            let stored: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(length(CAST(body AS BLOB))), 0) FROM agent_run_events",
+                [],
+                |row| row.get(0),
+            )?;
+            if stored <= total {
+                return Ok(());
+            }
+            let oldest: Option<String> = conn
+                .query_row(
+                    "SELECT r.id FROM agent_runs r
+                      WHERE EXISTS (SELECT 1 FROM agent_run_events e WHERE e.run_id = r.id)
+                      ORDER BY r.created_at, r.rowid LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(oldest) = oldest else {
+                return Ok(());
+            };
+            conn.execute(
+                "DELETE FROM agent_run_events WHERE run_id = ?1",
+                params![oldest],
+            )?;
+        }
     }
 }
 
@@ -1091,5 +1347,273 @@ mod tests {
         assert!(db.builtin_agent("codex").unwrap().is_none());
         // An OAuth agent cannot be re-authorized under a built-in name.
         assert!(db.oauth_agents().unwrap().is_empty());
+    }
+
+    /// E10: the eligible tasks are filtered before the limit, so waiting,
+    /// over-tried and delegated tasks never crowd out the next one.
+    #[test]
+    fn eligible_tasks_are_filtered_before_the_limit() {
+        let (db, _) = temp_db("eligible");
+        let add = |title: &str| {
+            db.add_task(&super::super::NewTask {
+                project: "shop".into(),
+                title: title.into(),
+                created_by: "codex".into(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        for index in 0..5 {
+            let task = add(&format!("waiting {index}"));
+            db.mark_task_auto(task.id, false).unwrap();
+        }
+        let tried = add("tried twice");
+        db.mark_task_auto(tried.id, true).unwrap();
+        db.requeue_task(tried.id, false).unwrap();
+        db.mark_task_auto(tried.id, true).unwrap();
+        db.requeue_task(tried.id, false).unwrap();
+        let delegated = add("delegated");
+        db.add_delegation(delegated.id, "claude-builtin", "codex", "")
+            .unwrap();
+        let next = add("next");
+        db.execute_for_test("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z'");
+        let eligible = db.eligible_auto_tasks(120, 2, 3).unwrap();
+        assert_eq!(eligible.len(), 1, "{eligible:?}");
+        assert_eq!(eligible[0].task.id, next.id);
+        // The queue view still lists them all.
+        assert_eq!(db.auto_tasks(120, 50).unwrap().len(), 8);
+    }
+
+    /// E12 and E15: a re-queueing touch is counted, so one in the same
+    /// second as the runner's mark is not lost; the author's touches keep
+    /// the attempts, a signed-in user's start them over.
+    #[test]
+    fn touches_re_queue_and_attempts_have_a_maximum() {
+        let (db, _) = temp_db("touches");
+        let task = db
+            .add_task(&super::super::NewTask {
+                project: "shop".into(),
+                title: "t".into(),
+                created_by: "codex".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        db.execute_for_test("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z'");
+        let eligible = |db: &Db| db.eligible_auto_tasks(120, 2, 10).unwrap().len();
+        assert_eq!(eligible(&db), 1);
+        db.mark_task_auto(task.id, true).unwrap();
+        assert_eq!(eligible(&db), 0);
+        // Any other change (a claim and release by someone else) does not
+        // re-queue it.
+        db.update_task(task.id, "claim", "someone", None, None)
+            .unwrap();
+        db.update_task(task.id, "release", "someone", None, None)
+            .unwrap();
+        db.execute_for_test("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z'");
+        assert_eq!(eligible(&db), 0);
+        // The author's touch, in the same second as the mark: re-queued.
+        db.requeue_task(task.id, false).unwrap();
+        assert_eq!(eligible(&db), 1);
+        db.mark_task_auto(task.id, true).unwrap();
+        db.requeue_task(task.id, false).unwrap();
+        // Two attempts: the maximum, whatever the author does.
+        assert_eq!(eligible(&db), 0);
+        // A signed-in user's touch starts the count over.
+        db.requeue_task(task.id, true).unwrap();
+        assert_eq!(eligible(&db), 1);
+    }
+
+    /// E14: the JSON backup carries the task runner's fields and the
+    /// delegations; a replacing restore leaves no delegation behind.
+    #[test]
+    fn the_backup_carries_the_task_runner_fields_and_delegations() {
+        let (db, _) = temp_db("backup");
+        let task = db
+            .add_task(&super::super::NewTask {
+                project: "shop".into(),
+                title: "t".into(),
+                created_by: "codex".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        db.set_task_author(task.id, "codex").unwrap();
+        db.mark_task_auto(task.id, true).unwrap();
+        db.add_delegation(task.id, "claude-builtin", "codex", "")
+            .unwrap();
+        let backup = db.export().unwrap();
+        assert_eq!(backup.delegations.len(), 1);
+        assert_eq!(backup.task_runner[0].author, "codex");
+        // Another store with a delegation on the same id.
+        let (other, _) = temp_db("backup-other");
+        let stale = other
+            .add_task(&super::super::NewTask {
+                project: "x".into(),
+                title: "stale".into(),
+                created_by: "a".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        other
+            .add_delegation(stale.id, "codex-builtin", "a", "")
+            .unwrap();
+        let mut without = db.export().unwrap();
+        without.delegations.clear();
+        other.restore(&without).unwrap();
+        assert!(other.delegations().unwrap().is_empty());
+        other.restore(&backup).unwrap();
+        assert_eq!(other.delegations().unwrap(), db.delegations().unwrap());
+        assert_eq!(other.task_author(task.id).unwrap(), "codex");
+        assert_eq!(
+            other.task_runner_states().unwrap(),
+            db.task_runner_states().unwrap()
+        );
+    }
+
+    /// F13: a run's stored output is capped in bytes, and so is all of it.
+    #[test]
+    fn stored_run_output_is_capped_in_bytes() {
+        let (db, _) = temp_db("bytes");
+        db.register_builtin_agents(&[("claude-builtin".into(), "claude".into(), "ember")])
+            .unwrap();
+        for id in ["run-a", "run-b"] {
+            db.insert_run(&NewRun {
+                id: id.into(),
+                agent: "claude-builtin".into(),
+                kind: "task".into(),
+                token_hash: format!("h-{id}"),
+                token_expires_at: super::super::unix_now() + 60,
+                scope: "{}".into(),
+                ..NewRun::default()
+            })
+            .unwrap();
+        }
+        let line = "x".repeat(100_000);
+        for seq in 0..20 {
+            db.add_run_event("run-a", seq, "text", &line).unwrap();
+        }
+        let kept = db.run_events("run-a", -1, 100).unwrap();
+        assert_eq!(kept.len() as i64, RUN_EVENT_BYTES_KEPT / 100_000);
+        assert_eq!(db.run("run-a").unwrap().unwrap().output_lines, 20);
+        db.add_run_event("run-b", 0, "text", "later").unwrap();
+        // The oldest run's lines go first past the total.
+        db.prune_run_events_to(10).unwrap();
+        assert!(db.run_events("run-a", -1, 100).unwrap().is_empty());
+        assert_eq!(db.run_events("run-b", -1, 100).unwrap().len(), 1);
+    }
+
+    /// F14: a model that would be read as an option is refused.
+    #[test]
+    fn a_model_never_starts_with_a_dash() {
+        let (db, _) = temp_db("model");
+        db.register_builtin_agents(&[("claude-builtin".into(), "claude".into(), "ember")])
+            .unwrap();
+        for model in ["--dangerously-skip-permissions", "-m", "a b"] {
+            assert!(
+                db.update_builtin_settings(
+                    "claude-builtin",
+                    &BuiltinSettings {
+                        model: Some(model.into()),
+                        ..BuiltinSettings::default()
+                    },
+                    "admin",
+                )
+                .is_err(),
+                "{model}"
+            );
+        }
+        assert!(valid_model("deepseek/deepseek-v4-pro") && valid_model("opus") && valid_model(""));
+        // The per-agent read switch.
+        assert!(
+            !db.builtin_agent("claude-builtin")
+                .unwrap()
+                .unwrap()
+                .read_other_services
+        );
+        db.set_builtin_read_other_services("claude-builtin", true, "admin")
+            .unwrap();
+        assert!(
+            db.builtin_agent("claude-builtin")
+                .unwrap()
+                .unwrap()
+                .read_other_services
+        );
+    }
+
+    /// The trusted repository records: each with the token agent of the
+    /// session that wrote it, empty for records from before.
+    #[test]
+    fn repository_records_carry_their_token_agent() {
+        let (db, _) = temp_db("records");
+        db.execute_for_test(
+            "INSERT INTO sessions (id, agent, project, repo, title, started_at, last_seen_at, token_agent)
+               VALUES ('s1', 'claude', 'shop', 'github.com/me/shop', 't', '2024-01-01T00:00:00Z', 'x', 'claude');
+             INSERT INTO entries (project, kind, title, body, agent, repo, session_id, created_at)
+               VALUES ('shop', 'note', 'n', 'b', 'claude', 'github.com/me/other', 's1', '2025-01-01T00:00:00Z'),
+                      ('shop', 'note', 'n', 'b', 'x', 'github.com/evil/repo', NULL, '2026-01-01T00:00:00Z');",
+        );
+        let records = db.project_repo_records("shop", 10).unwrap();
+        assert_eq!(
+            records,
+            vec![
+                ("github.com/evil/repo".to_string(), String::new()),
+                ("github.com/me/other".to_string(), "claude".to_string()),
+                ("github.com/me/shop".to_string(), "claude".to_string()),
+            ]
+        );
+    }
+
+    /// A database file `main`'s build wrote (pass its path in
+    /// `LORE_MAIN_DB`; the test copies it) opens with this build, gains
+    /// the new tables and columns, and keeps every row. Skipped without it.
+    #[test]
+    fn a_database_main_wrote_opens_with_every_row() {
+        let Ok(source) = std::env::var("LORE_MAIN_DB") else {
+            return;
+        };
+        let (_, path) = temp_db("from-main");
+        std::fs::copy(&source, &path).unwrap();
+        let before: HashMap<String, i64> = {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let names: Vec<String> = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'
+                       AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'entries_fts%'",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            names
+                .into_iter()
+                .map(|name| {
+                    let count = conn
+                        .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    (name, count)
+                })
+                .collect()
+        };
+        let db = Db::open(&path).unwrap();
+        let after: HashMap<String, i64> = db.table_counts().unwrap().into_iter().collect();
+        for (table, count) in &before {
+            if let Some(now) = after.get(table) {
+                assert_eq!(now, count, "{table}");
+            }
+        }
+        assert!(before.values().sum::<i64>() > 0, "the fixture holds rows");
+        assert_eq!(
+            super::super::schema_version(&db.lock()).unwrap(),
+            super::super::SCHEMA_VERSION
+        );
+        for task in db.tasks(None, &[], 100).unwrap() {
+            assert!(db.task_author(task.id).unwrap().is_empty());
+        }
+        assert!(!db.runs_may_change_ci().unwrap());
+        let backup = db.export().unwrap();
+        assert_eq!(backup.tasks.len() as i64, before["tasks"]);
+        assert_eq!(backup.entries.len() as i64, before["entries"]);
     }
 }

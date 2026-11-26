@@ -5,6 +5,13 @@
 //! Every CLI runs with a cleared environment: `PATH`, `HOME`, the locale,
 //! the CLI's own state directory, and the credentials the owner stored for
 //! it. The runner's own link secret never reaches a CLI.
+//!
+//! In the image every CLI command runs in a fresh home ([`Isolation::Fresh`])
+//! as the agent user: the stored sign-in stays in the runner's own
+//! directory, a copy goes into the fresh home with a configuration the
+//! runner writes, and nothing the CLI writes there outlives the command,
+//! except a refreshed credential the runner checks and takes back
+//! ([`Driver::harvest`]) and, for a conversation, its transcripts.
 
 use std::{
     path::{Path, PathBuf},
@@ -20,7 +27,10 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 
-use super::protocol::{CredentialKind, FromRunner, Kind, LoginMethod, Secret, TerminalMode};
+use super::{
+    protocol::{CredentialKind, FromRunner, Kind, LoginMethod, Secret, TerminalMode},
+    sandbox::{self, AgentUser},
+};
 
 /// The models Claude Code accepts as aliases; it has no command that lists
 /// them.
@@ -57,10 +67,38 @@ pub struct Settings {
     pub kind: Kind,
     /// The model provider; for opencode, the one it is pointed at.
     pub provider: String,
-    /// The agent user's home: a named volume.
+    /// With [`Isolation::Shared`], the one home every CLI command runs in
+    /// (a named volume). With [`Isolation::Fresh`], the runner's own home:
+    /// runner git runs with it, no CLI ever does.
     pub home: PathBuf,
     /// The CLI executable.
     pub program: PathBuf,
+}
+
+/// Where a CLI command runs and what it can reach.
+#[derive(Debug, Clone)]
+pub enum Isolation {
+    /// Every CLI command shares `Settings::home`, which also holds the
+    /// runner's files (`.lore-runner`). What a runner started by hand, and
+    /// the task runner's tests, use. The image never does.
+    Shared,
+    /// Every CLI command (a run, a terminal, a status check, a sign-in)
+    /// gets a fresh home that is deleted when it ends; the stored sign-in
+    /// lives in `state`, where the CLI cannot write or even look.
+    Fresh(Fresh),
+}
+
+#[derive(Debug, Clone)]
+pub struct Fresh {
+    /// The runner's own directory: stored credentials, the sign-in record
+    /// and the conversations' transcripts. Mode 0700, the runner's.
+    pub state: PathBuf,
+    /// Where fresh homes are made (mode 0711: the agent user reaches its
+    /// own home by name and cannot list the others).
+    pub homes: PathBuf,
+    /// The user every CLI process runs as; `None` runs it as the runner's
+    /// own user (a runner started by hand, the tests).
+    pub user: Option<AgentUser>,
 }
 
 /// The output of one quick command, with every known secret removed.
@@ -70,23 +108,114 @@ pub struct Output {
     pub text: String,
 }
 
+/// The home a CLI command runs in. A fresh one is deleted when dropped;
+/// the shared one stays.
+pub struct CliHome {
+    path: PathBuf,
+    fresh: bool,
+}
+
+impl CliHome {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn is_fresh(&self) -> bool {
+        self.fresh
+    }
+
+    fn claude_dir(&self) -> PathBuf {
+        self.path.join(".claude")
+    }
+
+    fn codex_home(&self) -> PathBuf {
+        self.path.join(".codex")
+    }
+
+    fn opencode_config(&self) -> PathBuf {
+        self.path.join(".config/opencode/opencode.json")
+    }
+
+    /// The temporary directory of a fresh home (so nothing is left in
+    /// the shared `/tmp` for a later run to find).
+    fn tmp(&self) -> PathBuf {
+        self.path.join("tmp")
+    }
+
+    /// Where the CLI keeps the transcripts of its sessions, relative to
+    /// its home: what a conversation carries from one turn to the next.
+    fn transcripts(kind: Kind) -> &'static [&'static str] {
+        match kind {
+            Kind::Claude => &[".claude/projects"],
+            Kind::Codex => &[".codex/sessions"],
+            Kind::Opencode => &[".local/share/opencode/storage"],
+        }
+    }
+}
+
+impl Drop for CliHome {
+    fn drop(&mut self) {
+        if self.fresh
+            && let Err(error) = sandbox::remove_tree(&self.path)
+        {
+            tracing::warn!(path = %self.path.display(), %error, "a CLI home could not be deleted");
+        }
+    }
+}
+
 /// An interactive sign-in in progress.
 struct Login {
     id: u64,
     child: Child,
     stdin: Option<ChildStdin>,
+    home: CliHome,
 }
 
 /// One CLI and its state.
 pub struct Driver {
     pub settings: Settings,
+    isolation: Isolation,
     login: Mutex<Option<Login>>,
 }
 
+/// Largest stored credential file (`auth.json`, `.credentials.json`)
+/// taken back from a CLI home.
+const MAX_CREDENTIAL_FILE: u64 = 64 * 1024;
+
+/// Most of one conversation's transcripts carried to its next turn.
+const MAX_TRANSCRIPT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// What a transcript is: session logs (`.jsonl`) and session records
+/// (`.json`). Nothing else under the transcript directories is carried: no
+/// Markdown memory or instructions, no scripts, no settings.
+const TRANSCRIPT_FILES: &[&str] = &["jsonl", "json"];
+
+/// A conversation's transcripts are forgotten after this many days.
+const TRANSCRIPT_DAYS: u64 = 7;
+
+/// Variables passed from the container's environment to every CLI
+/// command: the egress proxy the stack provides. Not secrets.
+const PROXY_VARS: &[&str] = &[
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+];
+
 impl Driver {
+    /// A driver whose CLI commands all share `settings.home` (the tests;
+    /// the runner binary always uses `with_isolation`).
+    #[cfg(test)]
     pub fn new(settings: Settings) -> Self {
+        Self::with_isolation(settings, Isolation::Shared)
+    }
+
+    pub fn with_isolation(settings: Settings, isolation: Isolation) -> Self {
         Self {
             settings,
+            isolation,
             login: Mutex::new(None),
         }
     }
@@ -95,10 +224,25 @@ impl Driver {
         self.settings.kind
     }
 
-    /// The runner's own files in the volume: the stored credentials
-    /// (`secrets.env`) and what is known about the sign-in.
+    /// The user CLI processes run as, when it is not the runner's own.
+    pub fn user(&self) -> Option<AgentUser> {
+        match &self.isolation {
+            Isolation::Fresh(fresh) => fresh.user,
+            Isolation::Shared => None,
+        }
+    }
+
+    pub fn is_fresh(&self) -> bool {
+        matches!(self.isolation, Isolation::Fresh(_))
+    }
+
+    /// The runner's own files: the stored credentials (`secrets.env`) and
+    /// what is known about the sign-in.
     fn state_dir(&self) -> PathBuf {
-        self.settings.home.join(".lore-runner")
+        match &self.isolation {
+            Isolation::Shared => self.settings.home.join(".lore-runner"),
+            Isolation::Fresh(fresh) => fresh.state.clone(),
+        }
     }
 
     fn secrets_file(&self) -> PathBuf {
@@ -109,20 +253,33 @@ impl Driver {
         self.state_dir().join("sign-in.json")
     }
 
-    fn claude_dir(&self) -> PathBuf {
-        self.settings.home.join(".claude")
+    /// The stored Codex `auth.json`.
+    fn codex_auth(&self) -> PathBuf {
+        match &self.isolation {
+            Isolation::Shared => self.settings.home.join(".codex/auth.json"),
+            Isolation::Fresh(fresh) => fresh.state.join("codex-auth.json"),
+        }
     }
 
-    fn codex_home(&self) -> PathBuf {
-        self.settings.home.join(".codex")
+    /// The stored credentials of an interactive Claude sign-in.
+    fn claude_credentials(&self) -> PathBuf {
+        match &self.isolation {
+            Isolation::Shared => self.settings.home.join(".claude/.credentials.json"),
+            Isolation::Fresh(fresh) => fresh.state.join("claude-credentials.json"),
+        }
     }
 
-    fn opencode_config(&self) -> PathBuf {
-        self.settings
-            .home
-            .join(".config")
-            .join("opencode")
-            .join("opencode.json")
+    /// Where conversations keep their transcripts between turns.
+    fn conversations(&self) -> Option<PathBuf> {
+        match &self.isolation {
+            Isolation::Shared => None,
+            Isolation::Fresh(fresh) => Some(fresh.state.join("conversations")),
+        }
+    }
+
+    /// Bytes the runner's own directory holds (the persistent volume).
+    pub fn state_bytes(&self) -> u64 {
+        sandbox::tree_size(&self.state_dir())
     }
 
     /// The variable an opencode provider reads its API key from:
@@ -153,33 +310,85 @@ impl Driver {
         }
     }
 
+    /// The only names `secrets.env` may hold for this CLI. Anything else
+    /// in the file (written by an older runner, or by a CLI that could
+    /// write there) is ignored, and nothing else is ever written.
+    fn stored_names(&self) -> Vec<String> {
+        match self.kind() {
+            Kind::Claude => vec!["CLAUDE_CODE_OAUTH_TOKEN".into()],
+            Kind::Codex => Vec::new(),
+            Kind::Opencode => vec![self.provider_key_var()],
+        }
+    }
+
     /// Creates the state directories and the CLI settings the runner
-    /// relies on, without touching anything the owner set.
+    /// relies on, without touching anything the owner set. With fresh
+    /// homes, the homes a previous runner left are deleted.
     pub fn prepare(&self) -> Result<()> {
+        if let Isolation::Fresh(fresh) = &self.isolation {
+            sandbox::make_dir(&fresh.state, 0o700)?;
+            sandbox::make_dir(&fresh.homes, 0o711)?;
+            if let Ok(entries) = std::fs::read_dir(&fresh.homes) {
+                for entry in entries.flatten() {
+                    let _ = sandbox::remove_tree(&entry.path());
+                }
+            }
+            if let Some(conversations) = self.conversations() {
+                sandbox::make_dir(&conversations, 0o700)?;
+                prune_older(&conversations, TRANSCRIPT_DAYS);
+            }
+            return Ok(());
+        }
         create_private_dir(&self.state_dir())?;
+        let home = CliHome {
+            path: self.settings.home.clone(),
+            fresh: false,
+        };
+        self.write_cli_config(&home, false)
+    }
+
+    /// The CLI settings the runner relies on. In a fresh home every file
+    /// is written from scratch: whatever a CLI wrote there before is gone.
+    fn write_cli_config(&self, home: &CliHome, fresh: bool) -> Result<()> {
         match self.kind() {
             Kind::Claude => {
-                let dir = self.claude_dir();
+                let dir = home.claude_dir();
                 create_private_dir(&dir)?;
-                // Sessions are kept a year instead of the default month.
                 let path = dir.join("settings.json");
-                let mut settings: serde_json::Value = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|text| serde_json::from_str(&text).ok())
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let mut settings: serde_json::Value = if fresh {
+                    serde_json::json!({})
+                } else {
+                    std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|text| serde_json::from_str(&text).ok())
+                        .unwrap_or_else(|| serde_json::json!({}))
+                };
                 if let Some(object) = settings.as_object_mut()
                     && !object.contains_key("cleanupPeriodDays")
                 {
+                    // Sessions are kept a year instead of the default month.
                     object.insert("cleanupPeriodDays".into(), 365.into());
                     write_private(&path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
                 }
+                if fresh {
+                    // The interactive interface skips its first-start
+                    // questions.
+                    write_private(
+                        &dir.join(".claude.json"),
+                        br#"{"hasCompletedOnboarding": true}"#,
+                    )?;
+                }
             }
             Kind::Codex => {
-                let home = self.codex_home();
-                create_private_dir(&home)?;
-                // Credentials in `auth.json`, which the volume keeps.
-                let path = home.join("config.toml");
-                let current = std::fs::read_to_string(&path).unwrap_or_default();
+                let codex = home.codex_home();
+                create_private_dir(&codex)?;
+                // Credentials in `auth.json`, a file.
+                let path = codex.join("config.toml");
+                let current = if fresh {
+                    String::new()
+                } else {
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                };
                 if !current
                     .lines()
                     .any(|line| line.trim_start().starts_with("cli_auth_credentials_store"))
@@ -189,14 +398,15 @@ impl Driver {
                 }
             }
             Kind::Opencode => {
-                let path = self.opencode_config();
+                let path = home.opencode_config();
                 if let Some(parent) = path.parent() {
                     create_private_dir(parent)?;
                 }
-                if !path.exists() {
+                if fresh || !path.exists() {
                     let config = serde_json::json!({
                         "$schema": "https://opencode.ai/config.json",
-                        "update": "disable",
+                        "autoupdate": false,
+                        "share": "disabled",
                     });
                     write_private(&path, serde_json::to_string_pretty(&config)?.as_bytes())?;
                 }
@@ -205,20 +415,120 @@ impl Driver {
         Ok(())
     }
 
-    /// The credentials stored in the volume, as `NAME=value` pairs.
+    /// A home for one CLI command: the shared one, or a fresh one with a
+    /// known-good configuration and copies of the stored credentials,
+    /// owned by the agent user.
+    pub fn home(&self) -> Result<CliHome> {
+        let Isolation::Fresh(fresh) = &self.isolation else {
+            return Ok(CliHome {
+                path: self.settings.home.clone(),
+                fresh: false,
+            });
+        };
+        sandbox::make_dir(&fresh.homes, 0o711)?;
+        let home = CliHome {
+            path: fresh.homes.join(sandbox::random_name("h-")),
+            fresh: true,
+        };
+        sandbox::make_dir(home.path(), 0o700)?;
+        sandbox::make_dir(&home.tmp(), 0o700)?;
+        self.write_cli_config(&home, true)?;
+        match self.kind() {
+            Kind::Codex => {
+                if let Some(bytes) = sandbox::read_regular(&self.codex_auth(), MAX_CREDENTIAL_FILE)
+                {
+                    write_private(&home.codex_home().join("auth.json"), &bytes)?;
+                }
+            }
+            Kind::Claude => {
+                if let Some(bytes) =
+                    sandbox::read_regular(&self.claude_credentials(), MAX_CREDENTIAL_FILE)
+                {
+                    write_private(&home.claude_dir().join(".credentials.json"), &bytes)?;
+                }
+            }
+            Kind::Opencode => {}
+        }
+        sandbox::hand_over(home.path(), fresh.user)
+            .with_context(|| format!("handing {} to the agent user", home.path().display()))?;
+        Ok(home)
+    }
+
+    /// Takes a credential the CLI refreshed (or a sign-in made) in a fresh
+    /// home back into the store: only the one file each CLI keeps it in,
+    /// only a regular file (never through a link), only JSON of the
+    /// expected shape and size. Unless `may_switch` (the owner signed in,
+    /// in a terminal or from the page), a Codex sign-in of another ChatGPT
+    /// account than the stored one is refused, so a run cannot swap in an
+    /// account of its own. Answers whether something was stored. Call it
+    /// only when no process of the agent user is left.
+    pub fn harvest(&self, home: &CliHome, may_switch: bool) -> Result<bool> {
+        if !home.is_fresh() {
+            return Ok(false);
+        }
+        let (found, stored) = match self.kind() {
+            Kind::Codex => (home.codex_home().join("auth.json"), self.codex_auth()),
+            Kind::Claude => (
+                home.claude_dir().join(".credentials.json"),
+                self.claude_credentials(),
+            ),
+            Kind::Opencode => return Ok(false),
+        };
+        let _ = sandbox::reclaim(home.path());
+        let Some(bytes) = sandbox::read_regular(&found, MAX_CREDENTIAL_FILE) else {
+            return Ok(false);
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            tracing::warn!("a refreshed credential that is not JSON was ignored");
+            return Ok(false);
+        };
+        let shaped = match self.kind() {
+            Kind::Codex => value["tokens"].is_object() || value["OPENAI_API_KEY"].is_string(),
+            _ => value["claudeAiOauth"].is_object(),
+        };
+        if !shaped {
+            tracing::warn!("a refreshed credential of an unexpected shape was ignored");
+            return Ok(false);
+        }
+        let before = sandbox::read_regular(&stored, MAX_CREDENTIAL_FILE);
+        if before.as_deref() == Some(&bytes[..]) {
+            return Ok(false);
+        }
+        if !may_switch && self.kind() == Kind::Codex {
+            let account = |value: &serde_json::Value| {
+                value["tokens"]["account_id"].as_str().map(str::to_string)
+            };
+            let old = before
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+            if let Some(old) = old
+                && account(&old) != account(&value)
+            {
+                tracing::warn!("a run tried to store another account's sign-in; refused");
+                return Ok(false);
+            }
+        }
+        write_private(&stored, &bytes)?;
+        Ok(true)
+    }
+
+    /// The credentials stored in the volume, as `NAME=value` pairs: only
+    /// the names this CLI uses.
     fn stored_vars(&self) -> Vec<(String, String)> {
         let Ok(text) = std::fs::read_to_string(self.secrets_file()) else {
             return Vec::new();
         };
+        let allowed = self.stored_names();
         text.lines()
             .filter_map(|line| line.split_once('='))
             .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
-            .filter(|(name, value)| !name.is_empty() && !value.is_empty())
+            .filter(|(name, value)| !value.is_empty() && allowed.contains(name))
             .collect()
     }
 
     /// Every secret the CLI's output could echo: stored credentials,
-    /// passed-through variables and the tokens inside Codex's `auth.json`.
+    /// passed-through variables and the tokens inside the CLIs' own
+    /// credential files.
     pub fn secrets(&self) -> Vec<String> {
         let mut secrets: Vec<String> = self
             .stored_vars()
@@ -232,11 +542,12 @@ impl Driver {
                 secrets.push(value.trim().to_string());
             }
         }
-        if self.kind() == Kind::Codex
-            && let Ok(text) = std::fs::read_to_string(self.codex_home().join("auth.json"))
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
-        {
-            collect_long_strings(&value, &mut secrets);
+        for file in [self.codex_auth(), self.claude_credentials()] {
+            if let Some(bytes) = sandbox::read_regular(&file, MAX_CREDENTIAL_FILE)
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            {
+                collect_long_strings(&value, &mut secrets);
+            }
         }
         secrets
     }
@@ -244,11 +555,6 @@ impl Driver {
     /// Removes every known secret from CLI output.
     pub fn redact(&self, text: &str) -> String {
         redact_with(text, &self.secrets())
-    }
-
-    /// A command for the CLI with the cleared environment.
-    fn command(&self, args: &[&str]) -> Command {
-        self.command_for(&self.settings.program, args)
     }
 
     /// What a terminal runs (part 6d): the CLI's own interactive interface
@@ -260,6 +566,7 @@ impl Driver {
         mode: TerminalMode,
         model: Option<&str>,
         shell: &Path,
+        home: &CliHome,
     ) -> Command {
         // A model is a plain name (lore checks it); one that looks like an
         // option is left out rather than passed on.
@@ -283,8 +590,8 @@ impl Driver {
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut command = match mode {
-            TerminalMode::Cli => self.command(&args),
-            TerminalMode::Shell => self.command_for(shell, &[]),
+            TerminalMode::Cli => self.command_for(&self.settings.program, &args, home),
+            TerminalMode::Shell => self.command_for(shell, &[], home),
         };
         command
             .env("TERM", "xterm-256color")
@@ -296,44 +603,65 @@ impl Driver {
     /// A command for a run (part 6b): the CLI's cleared environment and
     /// stored credentials, in the run's checkout. Lore's link secret never
     /// reaches it; the run token is added by the caller.
-    pub fn run_command(&self, program: &Path, args: &[String], cwd: &Path) -> Command {
+    pub fn run_command(
+        &self,
+        program: &Path,
+        args: &[String],
+        cwd: &Path,
+        home: &CliHome,
+    ) -> Command {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let mut command = self.command_for(program, &args);
+        let mut command = self.command_for(program, &args, home);
         command.current_dir(cwd);
         command
     }
 
-    fn command_for(&self, program: &Path, args: &[&str]) -> Command {
+    /// A CLI command: a cleared environment pointing at `home`, the
+    /// stored credentials, and (with an agent user) that user.
+    fn command_for(&self, program: &Path, args: &[&str], home: &CliHome) -> Command {
         let mut command = Command::new(program);
         command.args(args).env_clear();
         if let Ok(path) = std::env::var("PATH") {
             command.env("PATH", path);
         }
+        let path = home.path();
         command
-            .env("HOME", &self.settings.home)
+            .env("HOME", path)
             .env("LANG", "C.UTF-8")
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
-            .current_dir(&self.settings.home);
-        if let Ok(user) = std::env::var("USER") {
+            .current_dir(path);
+        if home.is_fresh() {
+            command
+                .env("TMPDIR", home.tmp())
+                .env("USER", "agent")
+                .env("LOGNAME", "agent");
+        } else if let Ok(user) = std::env::var("USER") {
             command.env("USER", user);
         }
         match self.kind() {
             Kind::Claude => {
                 command
-                    .env("CLAUDE_CONFIG_DIR", self.claude_dir())
+                    .env("CLAUDE_CONFIG_DIR", home.claude_dir())
                     .env("DISABLE_AUTOUPDATER", "1");
             }
             Kind::Codex => {
-                command.env("CODEX_HOME", self.codex_home());
+                command.env("CODEX_HOME", home.codex_home());
             }
             Kind::Opencode => {
                 command
-                    .env("XDG_CONFIG_HOME", self.settings.home.join(".config"))
-                    .env("XDG_DATA_HOME", self.settings.home.join(".local/share"))
-                    .env("XDG_STATE_HOME", self.settings.home.join(".local/state"))
-                    .env("XDG_CACHE_HOME", self.settings.home.join(".cache"))
+                    .env("XDG_CONFIG_HOME", path.join(".config"))
+                    .env("XDG_DATA_HOME", path.join(".local/share"))
+                    .env("XDG_STATE_HOME", path.join(".local/state"))
+                    .env("XDG_CACHE_HOME", path.join(".cache"))
                     .env("OPENCODE_DISABLE_AUTOUPDATE", "1");
+            }
+        }
+        for name in PROXY_VARS {
+            if let Ok(value) = std::env::var(name)
+                && !value.trim().is_empty()
+            {
+                command.env(name, value.trim());
             }
         }
         for name in self.passthrough_vars() {
@@ -346,13 +674,22 @@ impl Driver {
         for (name, value) in self.stored_vars() {
             command.env(name, value);
         }
+        if let Some(user) = self.user() {
+            command.uid(user.uid).gid(user.gid);
+        }
         command.kill_on_drop(true);
         command
     }
 
-    /// Runs a quick command to the end, with `stdin` written to it.
+    /// Runs a quick command to the end in a home of its own, with `stdin`
+    /// written to it.
     pub async fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<Output> {
-        let mut command = self.command(args);
+        let home = self.home()?;
+        self.run_in(&home, args, stdin).await
+    }
+
+    async fn run_in(&self, home: &CliHome, args: &[&str], stdin: Option<&str>) -> Result<Output> {
+        let mut command = self.command_for(&self.settings.program, args, home);
         command
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -587,21 +924,25 @@ impl Driver {
                 if !parsed.is_object() {
                     bail!("auth.json must be a JSON object");
                 }
-                self.prepare()?;
-                write_private(&self.codex_home().join("auth.json"), value.as_bytes())?;
+                create_private_dir(&self.state_dir())?;
+                write_private(&self.codex_auth(), value.as_bytes())?;
                 Ok("auth.json is stored in the agent's volume".into())
             }
             CredentialKind::ApiKey => {
                 single_line("API key")?;
                 match self.kind() {
                     Kind::Codex => {
-                        let output = self.run(&["login", "--with-api-key"], Some(value)).await?;
+                        let home = self.home()?;
+                        let output = self
+                            .run_in(&home, &["login", "--with-api-key"], Some(value))
+                            .await?;
                         if !output.success {
                             bail!(
                                 "codex refused the key: {}",
                                 shorten(&output.text, DETAIL_CHARS)
                             );
                         }
+                        self.harvest(&home, true)?;
                         Ok("codex is signed in with the API key".into())
                     }
                     _ => {
@@ -616,8 +957,12 @@ impl Driver {
         }
     }
 
-    /// Sets one variable in `secrets.env`, keeping the others.
+    /// Sets one variable in `secrets.env`, keeping the others. Only the
+    /// names this CLI uses are accepted.
     fn store_var(&self, name: &str, value: &str) -> Result<()> {
+        if !self.stored_names().iter().any(|allowed| allowed == name) {
+            bail!("{name} is not a credential this agent stores");
+        }
         create_private_dir(&self.state_dir())?;
         let mut lines: Vec<String> = self
             .stored_vars()
@@ -630,19 +975,58 @@ impl Driver {
     }
 
     /// Removes the stored sign-in: the runner's files and the CLI's own.
+    /// Says so only when it is gone; says what is left otherwise.
     pub async fn logout(&self) -> Result<String> {
         self.cancel_login().await;
-        let _ = std::fs::remove_file(self.secrets_file());
-        let _ = std::fs::remove_file(self.sign_in_file());
-        match self.kind() {
-            Kind::Claude => {
-                let _ = self.run(&["auth", "logout"], None).await;
+        let mut files = vec![
+            self.secrets_file(),
+            self.sign_in_file(),
+            self.codex_auth(),
+            self.claude_credentials(),
+        ];
+        if !self.is_fresh() {
+            // The shared home keeps what the CLIs wrote themselves.
+            let home = &self.settings.home;
+            match self.kind() {
+                Kind::Claude => {
+                    let _ = self.run(&["auth", "logout"], None).await;
+                }
+                Kind::Codex => {
+                    let _ = self.run(&["logout"], None).await;
+                }
+                Kind::Opencode => {
+                    files.push(home.join(".local/share/opencode/auth.json"));
+                }
             }
-            Kind::Codex => {
-                let _ = self.run(&["logout"], None).await;
-                let _ = std::fs::remove_file(self.codex_home().join("auth.json"));
+        }
+        let mut left = Vec::new();
+        for file in files {
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(file = %file.display(), %error, "a stored sign-in could not be removed");
+                    left.push(file);
+                }
             }
-            Kind::Opencode => {}
+        }
+        if !left.is_empty() {
+            bail!(
+                "signing out failed: {} could not be removed",
+                sandbox::shown(&left)
+            );
+        }
+        let from_env: Vec<String> = self
+            .passthrough_vars()
+            .into_iter()
+            .filter(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+            .collect();
+        if !from_env.is_empty() {
+            return Ok(format!(
+                "the stored sign-in is removed, but {} is set in the container's environment, \
+                 so the agent is still signed in; remove it there",
+                from_env.join(", ")
+            ));
         }
         Ok("signed out".into())
     }
@@ -669,7 +1053,8 @@ impl Driver {
             LoginMethod::Device => &["login", "--device-auth"],
             LoginMethod::Interactive => &["auth", "login", "--claudeai"],
         };
-        let mut command = self.command(args);
+        let home = self.home()?;
+        let mut command = self.command_for(&self.settings.program, args, &home);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -703,7 +1088,12 @@ impl Driver {
             });
         }
         drop(lines_tx);
-        *self.login.lock().await = Some(Login { id, child, stdin });
+        *self.login.lock().await = Some(Login {
+            id,
+            child,
+            stdin,
+            home,
+        });
 
         let driver = self.clone();
         tokio::spawn(async move {
@@ -757,7 +1147,7 @@ impl Driver {
                 }
             }
             // The CLI closed its output or the time ran out: collect it.
-            let status = {
+            let (status, home) = {
                 let mut guard = driver.login.lock().await;
                 match guard.as_mut() {
                     Some(login) if login.id == id => {
@@ -771,14 +1161,19 @@ impl Driver {
                                     None
                                 }
                             };
-                        *guard = None;
-                        status
+                        let login = guard.take().expect("the sign-in is there");
+                        (status, login.home)
                     }
                     // Cancelled, or replaced by a newer sign-in.
                     _ => return,
                 }
             };
-            let ok = status.is_some_and(|status| status.success());
+            let mut ok = status.is_some_and(|status| status.success());
+            if ok && let Err(error) = driver.harvest(&home, true) {
+                tracing::warn!(%error, "storing a new sign-in failed");
+                ok = false;
+            }
+            drop(home);
             if !prompted {
                 let _ = out
                     .send(FromRunner::LoginPrompt {
@@ -830,6 +1225,96 @@ impl Driver {
             None => false,
         }
     }
+
+    /// Puts a conversation's transcripts from its earlier turns into a
+    /// fresh home, so the CLI can resume its session.
+    pub fn restore_transcripts(&self, conversation: &str, home: &CliHome) -> Result<()> {
+        let Some(store) = self.conversation_store(conversation) else {
+            return Ok(());
+        };
+        if !home.is_fresh() || !store.is_dir() {
+            return Ok(());
+        }
+        // The home was just handed over and nothing ran in it yet: take it
+        // back to write into it (the runner has no DAC_OVERRIDE), then give
+        // it again.
+        sandbox::reclaim(home.path())?;
+        for relative in CliHome::transcripts(self.kind()) {
+            let from = store.join(relative);
+            if from.is_dir() {
+                sandbox::copy_plain_tree(
+                    &from,
+                    &home.path().join(relative),
+                    MAX_TRANSCRIPT_BYTES,
+                    TRANSCRIPT_FILES,
+                )?;
+            }
+        }
+        sandbox::hand_over(home.path(), self.user())?;
+        Ok(())
+    }
+
+    /// Keeps a conversation's transcripts for its next turn: plain files
+    /// under the CLI's transcript directory only, nothing else of the home
+    /// (no settings, no hooks, no plugins), at most
+    /// [`MAX_TRANSCRIPT_BYTES`]. Call it only when no process of the agent
+    /// user is left.
+    pub fn keep_transcripts(&self, conversation: &str, home: &CliHome) -> Result<()> {
+        let Some(store) = self.conversation_store(conversation) else {
+            return Ok(());
+        };
+        if !home.is_fresh() {
+            return Ok(());
+        }
+        let _ = sandbox::reclaim(home.path());
+        let fresh = store.with_extension("new");
+        let _ = sandbox::remove_tree(&fresh);
+        sandbox::make_dir(&fresh, 0o700)?;
+        let mut budget = MAX_TRANSCRIPT_BYTES;
+        for relative in CliHome::transcripts(self.kind()) {
+            let from = home.path().join(relative);
+            if std::fs::symlink_metadata(&from).is_ok_and(|meta| meta.is_dir()) {
+                let used = sandbox::copy_plain_tree(
+                    &from,
+                    &fresh.join(relative),
+                    budget,
+                    TRANSCRIPT_FILES,
+                )?;
+                budget = budget.saturating_sub(used);
+            }
+        }
+        let _ = sandbox::remove_tree(&store);
+        std::fs::rename(&fresh, &store)?;
+        Ok(())
+    }
+
+    fn conversation_store(&self, conversation: &str) -> Option<PathBuf> {
+        let plain = !conversation.is_empty()
+            && conversation.len() <= 64
+            && conversation
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+        plain.then(|| self.conversations().map(|dir| dir.join(conversation)))?
+    }
+}
+
+/// Deletes the entries of `dir` not changed for `days`.
+fn prune_older(dir: &Path, days: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let limit = Duration::from_secs(days * 86_400);
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > limit);
+        if old {
+            let _ = sandbox::remove_tree(&entry.path());
+        }
+    }
 }
 
 /// Creates a directory readable by its owner only.
@@ -844,38 +1329,37 @@ fn create_private_dir(path: &Path) -> Result<()> {
 }
 
 /// Writes a file readable by its owner only, through a temporary file so a
-/// half-written credential never replaces a good one.
+/// half-written credential never replaces a good one. The temporary file
+/// has a random name and is created new (`O_EXCL`, `O_NOFOLLOW`), so a
+/// link planted next to the target cannot redirect the write.
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let parent = path.parent().context("a file needs a directory")?;
     std::fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(
-        ".{}.tmp",
+    let temp = parent.join(sandbox::random_name(&format!(
+        ".{}.",
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
-    ));
-    {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
+    )));
+    let written = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
             .open(&temp)
             .with_context(|| format!("writing {}", temp.display()))?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    written
 }
 
 /// Every string of at least 16 characters inside a JSON value.
@@ -1127,5 +1611,263 @@ mod tests {
         // Too short to redact safely.
         assert_eq!(redact_with("abc", &["abc".into()]), "abc");
         assert_eq!(iso_from_unix(0), "1970-01-01T00:00:00Z");
+    }
+
+    fn temp(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(sandbox::random_name(&format!(
+            "lore-drivers-{label}-{}-",
+            std::process::id()
+        )));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn script(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-cli");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn fresh(dir: &Path, kind: Kind, body: &str) -> Driver {
+        let driver = Driver::with_isolation(
+            Settings {
+                kind,
+                provider: crate::runner::default_provider(kind).into(),
+                home: dir.join("runner-home"),
+                program: script(dir, body),
+            },
+            Isolation::Fresh(Fresh {
+                state: dir.join("state"),
+                homes: dir.join("homes"),
+                user: None,
+            }),
+        );
+        driver.prepare().unwrap();
+        driver
+    }
+
+    /// A planted link at the old, predictable temporary name no longer
+    /// redirects a credential write.
+    #[test]
+    fn a_credential_write_never_follows_a_planted_link() {
+        let dir = temp("link");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(".secrets.env.tmp")).unwrap();
+        write_private(&dir.join("secrets.env"), b"A=b\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("secrets.env")).unwrap(),
+            "A=b\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the names a CLI uses are read from `secrets.env` and written to
+    /// it: a line a CLI added (`LD_PRELOAD`, `GIT_TRACE_CURL`) reaches
+    /// nothing.
+    #[tokio::test]
+    async fn only_known_credential_names_are_stored_and_passed_on() {
+        let dir = temp("names");
+        let driver = fresh(
+            &dir,
+            Kind::Claude,
+            "#!/bin/sh\necho \"oauth=${CLAUDE_CODE_OAUTH_TOKEN:-none} preload=${LD_PRELOAD:-none} trace=${GIT_TRACE_CURL:-none}\"\n",
+        );
+        std::fs::write(
+            dir.join("state/secrets.env"),
+            "LD_PRELOAD=/tmp/evil.so\nGIT_TRACE_CURL=1\nCLAUDE_CODE_OAUTH_TOKEN=good-token-value\n", // lore:allow-secret (fake test value)
+        )
+        .unwrap();
+        let output = driver.run(&["x"], None).await.unwrap();
+        assert!(output.text.contains("preload=none"), "{}", output.text);
+        assert!(output.text.contains("trace=none"), "{}", output.text);
+        assert!(output.text.contains("oauth=[redacted]"), "{}", output.text);
+        assert!(driver.store_var("NODE_OPTIONS", "--require x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each command gets a fresh home: what a CLI wrote in its home (git
+    /// settings with a hook, a CLI hook) is gone for the next one, which
+    /// still gets the stored credential and the runner's configuration.
+    #[tokio::test]
+    async fn nothing_a_cli_writes_in_its_home_reaches_the_next_command() {
+        let dir = temp("fresh");
+        let driver = fresh(
+            &dir,
+            Kind::Codex,
+            r#"#!/bin/sh
+case "$1" in
+  plant)
+    printf '[core]\n\thooksPath = /tmp/evil\n' > "$HOME/.gitconfig"
+    echo '{"hooks":{"PreToolUse":[]}}' > "$HOME/.codex/hooks.json"
+    echo 'evil = true' >> "$CODEX_HOME/config.toml"
+    echo planted ;;
+  look)
+    [ -e "$HOME/.gitconfig" ] && echo "gitconfig survived"
+    [ -e "$HOME/.codex/hooks.json" ] && echo "hooks survived"
+    grep -q evil "$CODEX_HOME/config.toml" && echo "config survived"
+    [ -f "$CODEX_HOME/auth.json" ] && echo "auth present"
+    echo "tmp=$TMPDIR" ;;
+esac
+"#,
+        );
+        write_private(
+            &dir.join("state/codex-auth.json"),
+            br#"{"tokens":{"access_token":"a-stored-access-token-0001","account_id":"acct-1"}}"#, // lore:allow-secret (fake test value)
+        )
+        .unwrap();
+        assert!(
+            driver
+                .run(&["plant"], None)
+                .await
+                .unwrap()
+                .text
+                .contains("planted")
+        );
+        let look = driver.run(&["look"], None).await.unwrap().text;
+        assert!(!look.contains("survived"), "{look}");
+        assert!(look.contains("auth present"), "{look}");
+        assert!(
+            look.contains(&dir.join("homes").display().to_string()),
+            "{look}"
+        );
+        // Every fresh home was deleted.
+        assert_eq!(std::fs::read_dir(dir.join("homes")).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refreshed credential is taken back only as the file the CLI keeps
+    /// it in, of the right shape, never through a link, and (for a run) of
+    /// the same account.
+    #[test]
+    fn a_refreshed_credential_is_checked_before_it_is_kept() {
+        let dir = temp("harvest");
+        let driver = fresh(&dir, Kind::Codex, "#!/bin/sh\n");
+        let stored = dir.join("state/codex-auth.json");
+        write_private(
+            &stored,
+            br#"{"tokens":{"access_token":"old-access-token-000001","account_id":"acct-1"}}"#, // lore:allow-secret (fake test value)
+        )
+        .unwrap();
+        let auth = |home: &CliHome| home.codex_home().join("auth.json");
+        // A refresh of the same account is kept.
+        let home = driver.home().unwrap();
+        let refreshed =
+            br#"{"tokens":{"access_token":"new-access-token-000002","account_id":"acct-1"}}"#; // lore:allow-secret (fake test value)
+        std::fs::write(auth(&home), refreshed).unwrap();
+        assert!(driver.harvest(&home, false).unwrap());
+        assert_eq!(std::fs::read(&stored).unwrap(), refreshed);
+        drop(home);
+        // Another account, from a run: refused.
+        let home = driver.home().unwrap();
+        std::fs::write(
+            auth(&home),
+            br#"{"tokens":{"access_token":"thief-token-000000003","account_id":"acct-thief"}}"#, // lore:allow-secret (fake test value)
+        )
+        .unwrap();
+        assert!(!driver.harvest(&home, false).unwrap());
+        assert_eq!(std::fs::read(&stored).unwrap(), refreshed);
+        // Not JSON of the expected shape, or a link: refused.
+        std::fs::write(auth(&home), br#"{"something":"else"}"#).unwrap();
+        assert!(!driver.harvest(&home, true).unwrap());
+        std::fs::remove_file(auth(&home)).unwrap();
+        let elsewhere = dir.join("elsewhere.json");
+        std::fs::write(
+            &elsewhere,
+            br#"{"tokens":{"access_token":"via-a-link-0000000004","account_id":"acct-1"}}"#, // lore:allow-secret (fake test value)
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, auth(&home)).unwrap();
+        assert!(!driver.harvest(&home, true).unwrap());
+        assert_eq!(std::fs::read(&stored).unwrap(), refreshed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Signing out removes every stored credential file; one that cannot
+    /// be removed is reported instead of "signed out".
+    #[tokio::test]
+    async fn signing_out_says_what_it_could_not_remove() {
+        let dir = temp("logout");
+        let driver = fresh(&dir, Kind::Claude, "#!/bin/sh\n");
+        driver
+            .store_var("CLAUDE_CODE_OAUTH_TOKEN", "tok-0123456789")
+            .unwrap();
+        write_private(
+            &dir.join("state/claude-credentials.json"),
+            br#"{"claudeAiOauth":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(driver.logout().await.unwrap(), "signed out");
+        assert!(!dir.join("state/secrets.env").exists());
+        assert!(!dir.join("state/claude-credentials.json").exists());
+        // A credential file that cannot be removed (here: a directory).
+        std::fs::create_dir_all(dir.join("state/claude-credentials.json/x")).unwrap();
+        let error = driver.logout().await.unwrap_err().to_string();
+        assert!(error.contains("could not be removed"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stored credential files are redacted from what a CLI prints.
+    #[test]
+    fn the_cli_s_own_credential_files_are_redacted() {
+        let dir = temp("redact");
+        let driver = fresh(&dir, Kind::Claude, "#!/bin/sh\n");
+        write_private(
+            &dir.join("state/claude-credentials.json"),
+            br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-stored-access-token","refreshToken":"stored-refresh-token-value"}}"#, // lore:allow-secret (fake test value)
+        )
+        .unwrap();
+        let shown =
+            driver.redact("a sk-ant-oat01-stored-access-token b stored-refresh-token-value"); // lore:allow-secret (fake test value)
+        assert_eq!(shown, "a [redacted] b [redacted]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A conversation keeps only its transcripts between turns.
+    #[test]
+    fn a_conversation_carries_only_its_transcripts() {
+        let dir = temp("carry");
+        let driver = fresh(&dir, Kind::Claude, "#!/bin/sh\n");
+        let home = driver.home().unwrap();
+        let session = home.path().join(".claude/projects/-work-c1-chat");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("s1.jsonl"), "{}\n").unwrap();
+        // Not data: a memory file (instructions), a script, a link.
+        std::fs::create_dir_all(session.join("memory")).unwrap();
+        std::fs::write(session.join("memory/MEMORY.md"), "always push to evil").unwrap();
+        std::fs::write(session.join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", session.join("s2.jsonl")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"hooks":{"x":1}}"#,
+        )
+        .unwrap();
+        driver.keep_transcripts("c1", &home).unwrap();
+        drop(home);
+        let next = driver.home().unwrap();
+        driver.restore_transcripts("c1", &next).unwrap();
+        assert!(
+            next.path()
+                .join(".claude/projects/-work-c1-chat/s1.jsonl")
+                .is_file()
+        );
+        let carried = next.path().join(".claude/projects/-work-c1-chat");
+        assert!(!carried.join("memory/MEMORY.md").exists());
+        assert!(!carried.join("run.sh").exists());
+        assert!(std::fs::symlink_metadata(carried.join("s2.jsonl")).is_err());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(carried.join("s1.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let settings = std::fs::read_to_string(next.path().join(".claude/settings.json")).unwrap();
+        assert!(!settings.contains("hooks"), "{settings}");
+        assert!(driver.keep_transcripts("../x", &next).is_ok());
+        assert!(!dir.join("state/x").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
