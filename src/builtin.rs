@@ -1181,6 +1181,13 @@ impl Hub {
         }
     }
 
+    /// Keeps why a runner was refused where the admin page shows it.
+    fn note_refusal(&self, agent: &str, reason: &str) {
+        if let Err(error) = self.db.builtin_refused(agent, reason) {
+            tracing::warn!(%agent, %error, "recording a runner's refusal failed");
+        }
+    }
+
     /// The internal router: only `/runner/ws`.
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
@@ -1217,6 +1224,7 @@ impl Hub {
                          build both from the same version"
                     );
                     tracing::warn!(%agent, %reason, "a runner was refused");
+                    self.note_refusal(&agent, &reason);
                     let _ = socket
                         .send(Message::text(protocol::encode(&refuse(reason))))
                         .await;
@@ -1241,8 +1249,13 @@ impl Hub {
                         token.provider,
                         kind.id(),
                         provider
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                            .take(40)
+                            .collect::<String>()
                     );
                     tracing::warn!(%agent, %reason, "a runner was refused");
+                    self.note_refusal(&agent, &reason);
                     let _ = socket
                         .send(Message::text(protocol::encode(&refuse(reason))))
                         .await;
@@ -2001,6 +2014,14 @@ esac
         let reply: ToRunner = protocol::decode(reply.to_text().unwrap()).unwrap();
         assert!(matches!(reply, ToRunner::Refused { .. }), "{reply:?}");
         assert!(pair.hub.link("claude-builtin").is_none());
+        // The reason is where the admin page shows it, not only in the log.
+        let detail = pair
+            .db
+            .builtin_agent("claude-builtin")
+            .unwrap()
+            .unwrap()
+            .status_detail;
+        assert!(detail.contains("runner protocol"), "{detail}");
         // Not connected: a clear error, at once.
         assert!(matches!(
             pair.hub

@@ -230,6 +230,9 @@ pub struct Driver {
 /// taken back from a CLI home.
 const MAX_CREDENTIAL_FILE: u64 = 64 * 1024;
 
+/// How long a quick command killed by a sweep waits before it runs again.
+const RETRY_AFTER_KILL: Duration = Duration::from_secs(1);
+
 /// Most of one conversation's transcripts carried to its next turn.
 const MAX_TRANSCRIPT_BYTES: u64 = 50 * 1024 * 1024;
 
@@ -684,8 +687,8 @@ impl Driver {
     /// ([`Source::Owner`]: a sign-in from the page or in a terminal) any
     /// account is stored; from the runner's clean status check
     /// ([`Source::Clean`]) only a renewal of what is stored: a stored file
-    /// must exist, and for Codex its ChatGPT account must be the same.
-    /// Answers whether something was stored. Call it only when no process
+    /// must exist and its ChatGPT account must be the same (Codex; a Claude
+    /// credential is never taken back this way). Answers whether something was stored. Call it only when no process
     /// of the agent user is left.
     pub fn harvest(&self, home: &CliHome, source: Source) -> Result<bool> {
         if !home.is_fresh() {
@@ -720,6 +723,10 @@ impl Driver {
             return Ok(false);
         }
         if source == Source::Clean {
+            // A Claude credential names no account: see `renew_sign_in`.
+            if self.kind() == Kind::Claude {
+                return Ok(false);
+            }
             let Some(old) = before
                 .as_deref()
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
@@ -914,12 +921,36 @@ impl Driver {
 
     /// Runs a quick command to the end in a home of its own, with `stdin`
     /// written to it.
+    ///
+    /// Such a command (a status check, the version, the model list) does
+    /// not hold the container, so a sweep (a run's end, the last terminal
+    /// closing) may kill it: a command ended by `SIGKILL` runs once more,
+    /// a moment later, so the status does not flap.
     pub async fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<Output> {
+        {
+            let home = self.home()?;
+            let (output, killed) = self.run_once(&home, args, stdin).await?;
+            if !killed {
+                return Ok(output);
+            }
+        }
+        tokio::time::sleep(RETRY_AFTER_KILL).await;
         let home = self.home()?;
         self.run_in(&home, args, stdin).await
     }
 
     async fn run_in(&self, home: &CliHome, args: &[&str], stdin: Option<&str>) -> Result<Output> {
+        Ok(self.run_once(home, args, stdin).await?.0)
+    }
+
+    /// [`Driver::run_in`], and whether the command was ended by `SIGKILL`.
+    async fn run_once(
+        &self,
+        home: &CliHome,
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Result<(Output, bool)> {
+        use std::os::unix::process::ExitStatusExt;
         let mut command = self.command_for(&self.settings.program, args, home);
         command
             .stdin(if stdin.is_some() {
@@ -940,13 +971,17 @@ impl Driver {
         let output = tokio::time::timeout(QUICK_TIMEOUT, child.wait_with_output())
             .await
             .context("the command took too long")??;
+        let killed = output.status.signal() == Some(9);
         let mut bytes = output.stdout;
         bytes.extend_from_slice(&output.stderr);
         bytes.truncate(OUTPUT_CAP);
-        Ok(Output {
-            success: output.status.success(),
-            text: self.redact(&strip_ansi(&String::from_utf8_lossy(&bytes))),
-        })
+        Ok((
+            Output {
+                success: output.status.success(),
+                text: self.redact(&strip_ansi(&String::from_utf8_lossy(&bytes))),
+            },
+            killed,
+        ))
     }
 
     /// The CLI's version line, or `None` when it cannot be run.
@@ -986,11 +1021,17 @@ impl Driver {
     /// renews the stored one ([`Source::Clean`]). Runs never give a
     /// credential back; this is the only way a renewal reaches the store
     /// without the owner. Answers whether one was stored.
+    ///
+    /// Only Codex: its stored file names the ChatGPT account, so a renewal
+    /// can be told from another account's sign-in. Claude's file names no
+    /// account, and its refresh token changes on every renewal, so nothing
+    /// offline tells a renewal from a credential a hostile process planted:
+    /// a Claude interactive sign-in is never taken back without the owner
+    /// (it may need signing in again; a setup token does not).
     pub async fn renew_sign_in(&self) -> Result<bool> {
         let stored = match self.kind() {
-            Kind::Claude => self.claude_credentials(),
             Kind::Codex => self.codex_auth(),
-            Kind::Opencode => return Ok(false),
+            Kind::Claude | Kind::Opencode => return Ok(false),
         };
         if !self.is_fresh() || !stored.is_file() {
             return Ok(false);
@@ -999,14 +1040,22 @@ impl Driver {
             return Ok(false);
         };
         self.sweep().await;
+        if self.agent_alive() {
+            bail!("a process of the agent user is still alive; the renewal waits");
+        }
         let home = self.home()?;
-        let args: &[&str] = match self.kind() {
-            Kind::Claude => &["auth", "status", "--text"],
-            _ => &["login", "status"],
-        };
-        let _ = self.run_in(&home, args, None).await;
+        let _ = self.run_in(&home, &["login", "status"], None).await;
         self.sweep().await;
+        if self.agent_alive() {
+            bail!("a process of the agent user outlived the renewal; nothing was taken back");
+        }
         self.harvest(&home, Source::Clean)
+    }
+
+    /// Whether any thread of the agent user is alive.
+    fn agent_alive(&self) -> bool {
+        self.user()
+            .is_some_and(|user| !sandbox::processes_of(user.uid).is_empty())
     }
 
     async fn claude_status(&self) -> (bool, Option<String>, Option<String>, String) {
@@ -2162,6 +2211,59 @@ esac
         std::fs::write(auth(&home), refreshed).unwrap();
         assert!(!driver.harvest(&home, Source::Clean).unwrap());
         assert!(!stored.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A quick command (status, version, models) that a sweep killed runs
+    /// once more instead of reading as a failure.
+    #[tokio::test]
+    async fn a_quick_command_killed_by_a_sweep_runs_once_more() {
+        let dir = temp("retry");
+        let marker = dir.join("killed-once");
+        let driver = fresh(
+            &dir,
+            Kind::Codex,
+            &format!(
+                "#!/bin/sh\nif [ -e {m} ]; then echo second try; else touch {m}; kill -9 $$; fi\n",
+                m = marker.display()
+            ),
+        );
+        let output = driver.run(&["login", "status"], None).await.unwrap();
+        assert!(output.success, "{}", output.text);
+        assert!(output.text.contains("second try"), "{}", output.text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F1: a Claude credential names no account and its refresh token
+    /// changes on every renewal, so the runner's renewal never takes one
+    /// back (a survivor could have planted it); only the owner's sign-in
+    /// stores one. The renewal does not even start the CLI for Claude.
+    #[tokio::test]
+    async fn a_claude_credential_is_never_taken_back_by_the_renewal() {
+        let dir = temp("claude-renew");
+        let driver = fresh(
+            &dir,
+            Kind::Claude,
+            &format!("#!/bin/sh\ntouch {}\n", dir.join("cli-ran").display()),
+        );
+        let stored = dir.join("state/claude-credentials.json");
+        let original =
+            br#"{"claudeAiOauth":{"accessToken":"stored-access-000001","refreshToken":"stored-refresh-000001","expiresAt":1}}"#; // lore:allow-secret (fake test value)
+        write_private(&stored, original).unwrap();
+        let file = |home: &CliHome| home.claude_dir().join(".credentials.json");
+        let home = driver.home().unwrap();
+        let planted =
+            br#"{"claudeAiOauth":{"accessToken":"planted-access-00002","refreshToken":"planted-refresh-00002","expiresAt":9999999999999}}"#; // lore:allow-secret (fake test value)
+        std::fs::write(file(&home), planted).unwrap();
+        assert!(!driver.harvest(&home, Source::Clean).unwrap());
+        assert_eq!(std::fs::read(&stored).unwrap(), original);
+        assert!(!driver.renew_sign_in().await.unwrap());
+        assert!(!dir.join("cli-ran").exists());
+        assert_eq!(std::fs::read(&stored).unwrap(), original);
+        // The owner's own sign-in is stored.
+        assert!(driver.harvest(&home, Source::Owner).unwrap());
+        assert_eq!(std::fs::read(&stored).unwrap(), planted);
+        drop(home);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

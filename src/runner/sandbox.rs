@@ -114,11 +114,20 @@ pub fn can_switch_user() -> bool {
     rustix::process::geteuid().is_root()
 }
 
-/// The live processes of `uid` (real, effective or saved), from `/proc`,
-/// this process excepted. Zombies are dead and left out.
-pub fn processes_of(uid: u32) -> Vec<i32> {
-    let me = std::process::id() as i32;
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+/// The thread groups of `uid` that are still alive, this process
+/// excepted, each with the state letters (`R`, `S`, `D`, `T`, `t`, …) of
+/// its live threads. A group is alive while any of its threads
+/// (`/proc/<pid>/task/*`) belongs to `uid` (real, effective or saved) and
+/// is not itself dead (`Z`, `X`): a process whose main thread ended with a
+/// raw `exit` shows a zombie leader while its other threads run on, and is
+/// alive. A group whose threads are all dead (a zombie waiting for its
+/// parent) is left out.
+fn live_groups(uid: u32) -> Vec<(i32, Vec<char>)> {
+    live_groups_in(Path::new("/proc"), uid, std::process::id() as i32)
+}
+
+fn live_groups_in(proc: &Path, uid: u32, me: i32) -> Vec<(i32, Vec<char>)> {
+    let Ok(entries) = std::fs::read_dir(proc) else {
         return Vec::new();
     };
     entries
@@ -128,83 +137,93 @@ pub fn processes_of(uid: u32) -> Vec<i32> {
             if pid == me {
                 return None;
             }
-            let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
-            let mut zombie = false;
-            let mut matches = false;
-            for line in status.lines() {
-                if let Some(state) = line.strip_prefix("State:") {
-                    zombie = state.trim_start().starts_with('Z');
-                } else if let Some(ids) = line.strip_prefix("Uid:") {
-                    matches = ids
-                        .split_whitespace()
-                        .take(3)
-                        .any(|id| id.parse::<u32>() == Ok(uid));
+            let mut states = Vec::new();
+            match std::fs::read_dir(entry.path().join("task")) {
+                Ok(tasks) => {
+                    for task in tasks.flatten() {
+                        if let Ok(status) = std::fs::read_to_string(task.path().join("status"))
+                            && let Some(state) = live_state_of(&status, uid)
+                        {
+                            states.push(state);
+                        }
+                    }
+                }
+                // No task list (it went away, or an unusual /proc): the
+                // group's own status is all there is.
+                Err(_) => {
+                    let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+                    states.extend(live_state_of(&status, uid));
                 }
             }
-            (matches && !zombie).then_some(pid)
+            (!states.is_empty()).then_some((pid, states))
         })
         .collect()
 }
 
-/// The live processes of `uid` with their state letter (`R`, `S`, `D`,
-/// `T`, `t`, …), zombies left out, this process excepted.
-fn processes_with_state(uid: u32) -> Vec<(i32, char)> {
-    let me = std::process::id() as i32;
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
-            if pid == me {
-                return None;
-            }
-            let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
-            let mut state = '?';
-            let mut matches = false;
-            for line in status.lines() {
-                if let Some(rest) = line.strip_prefix("State:") {
-                    state = rest.trim_start().chars().next().unwrap_or('?');
-                } else if let Some(ids) = line.strip_prefix("Uid:") {
-                    matches = ids
-                        .split_whitespace()
-                        .take(3)
-                        .any(|id| id.parse::<u32>() == Ok(uid));
-                }
-            }
-            (matches && !matches!(state, 'Z' | 'X')).then_some((pid, state))
-        })
-        .collect()
+/// The state letter of one thread's `status` when it belongs to `uid` and
+/// is not dead.
+fn live_state_of(status: &str, uid: u32) -> Option<char> {
+    let mut state = '?';
+    let mut matches = false;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("State:") {
+            state = rest.trim_start().chars().next().unwrap_or('?');
+        } else if let Some(ids) = line.strip_prefix("Uid:") {
+            matches = ids
+                .split_whitespace()
+                .take(3)
+                .any(|id| id.parse::<u32>() == Ok(uid));
+        }
+    }
+    (matches && !matches!(state, 'Z' | 'X')).then_some(state)
+}
+
+/// The live processes (thread groups) of `uid`, from `/proc`, this
+/// process excepted (see [`live_groups`]: a zombie leader with a live
+/// thread counts).
+pub fn processes_of(uid: u32) -> Vec<i32> {
+    live_groups(uid).into_iter().map(|(pid, _)| pid).collect()
 }
 
 /// How long [`kill_all`] keeps at it before it gives up.
 const KILL_PATIENCE: Duration = Duration::from_secs(10);
 
+/// Most passes [`kill_all`] spends stopping processes before it kills
+/// every one of them, stopped or not (a process in uninterruptible sleep,
+/// such as a `vfork` parent waiting on a stopped child, never reads as
+/// stopped).
+const STOP_PASSES: u32 = 100;
+
 /// Ends every process of the agent user and waits until none is left,
 /// without starting any process or thread: the runner signals them
 /// itself (`CAP_KILL`), so a process that holds every pid the container
 /// may have cannot stop it. First every running one is stopped
-/// (`SIGSTOP`, which no process can catch, block or ignore; a stopped
-/// process cannot fork), pass after pass, until a pass finds them all
-/// stopped; then all of them are killed. Errors when some process is
-/// still alive after [`KILL_PATIENCE`].
+/// (`SIGSTOP` to the thread group, which no process can catch, block or
+/// ignore; a stopped process cannot fork), pass after pass, until a pass
+/// finds every thread of them stopped or [`STOP_PASSES`] are spent; then
+/// all of them are killed (`SIGKILL` to the thread group ends every
+/// thread, a zombie leader's live threads included), and the whole round
+/// starts again until none is left. Errors when some process is still
+/// alive after [`KILL_PATIENCE`].
 pub async fn kill_all(user: AgentUser) -> Result<()> {
     use rustix::process::{Pid, Signal, kill_process};
     let deadline = tokio::time::Instant::now() + KILL_PATIENCE;
+    let mut passes = 0u32;
     loop {
-        let found = processes_with_state(user.uid);
+        let found = live_groups(user.uid);
         if found.is_empty() {
             return Ok(());
         }
         let running: Vec<i32> = found
             .iter()
-            .filter(|(_, state)| !matches!(state, 'T' | 't'))
+            .filter(|(_, states)| states.iter().any(|state| !matches!(state, 'T' | 't')))
             .map(|(pid, _)| *pid)
             .collect();
-        let (targets, signal): (Vec<i32>, Signal) = if running.is_empty() {
+        let (targets, signal): (Vec<i32>, Signal) = if running.is_empty() || passes >= STOP_PASSES {
+            passes = 0;
             (found.iter().map(|(pid, _)| *pid).collect(), Signal::KILL)
         } else {
+            passes += 1;
             (running, Signal::STOP)
         };
         for pid in targets {
@@ -215,7 +234,7 @@ pub async fn kill_all(user: AgentUser) -> Result<()> {
         if tokio::time::Instant::now() >= deadline {
             bail!(
                 "{} process(es) of the agent user would not end",
-                processes_with_state(user.uid).len()
+                live_groups(user.uid).len()
             );
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -827,6 +846,187 @@ mod tests {
         assert!(!processes_of(user.uid).is_empty());
         kill_all(user).await.unwrap();
         assert!(processes_of(user.uid).is_empty());
+    }
+
+    /// A process whose main thread ended with a raw `SYS_exit` while
+    /// another thread runs on shows a zombie leader, and is alive: it is
+    /// found (by the janitor's check and by `kill_all`), and a group whose
+    /// threads are all dead is not.
+    #[test]
+    fn a_zombie_leader_with_a_live_thread_is_alive() {
+        if std::process::Command::new("python3")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: needs python3");
+            return;
+        }
+        let me = rustix::process::getuid().as_raw();
+        /// Ends the survivor even when an assertion fails.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Reap(
+            std::process::Command::new("python3")
+                .args(["-I", "-c", ZOMBIE_LEADER])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id() as i32;
+        wait_for_zombie_leader(pid);
+        assert!(processes_of(me).contains(&pid), "the survivor was missed");
+        let states = live_groups(me)
+            .into_iter()
+            .find(|(found, _)| *found == pid)
+            .map(|(_, states)| states)
+            .unwrap();
+        assert_eq!(states.len(), 1, "{states:?}");
+        drop(child);
+        assert!(!processes_of(me).contains(&pid));
+    }
+
+    /// The same from a fake `/proc`: per-thread states and owners decide.
+    #[test]
+    fn groups_are_judged_from_their_threads() {
+        let dir = temp("proc");
+        let thread = |pid: i32, tid: i32, state: &str, uid: u32| {
+            let task = dir.join(format!("{pid}/task/{tid}"));
+            std::fs::create_dir_all(&task).unwrap();
+            std::fs::write(
+                task.join("status"),
+                format!(
+                    "Name:\tx\nState:\t{state}\nTgid:\t{pid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+                ),
+            )
+            .unwrap();
+        };
+        thread(100, 100, "Z (zombie)", 4242);
+        thread(100, 101, "S (sleeping)", 4242);
+        thread(200, 200, "Z (zombie)", 4242);
+        thread(300, 300, "R (running)", 4343);
+        thread(400, 400, "T (stopped)", 4242);
+        thread(400, 401, "D (disk sleep)", 4242);
+        thread(500, 500, "S (sleeping)", 4242);
+        let mut found = live_groups_in(&dir, 4242, 500);
+        for (_, states) in &mut found {
+            states.sort();
+        }
+        found.sort();
+        // 100: a zombie leader with a live thread; 200: dead; 300: someone
+        // else's; 400: one thread stopped, one in D; 500: this process.
+        assert_eq!(found, vec![(100, vec!['S']), (400, vec!['D', 'T'])]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Python process whose main thread leaves with a raw `SYS_exit`
+    /// (x86-64: 60, arm64: 93) while a second thread sleeps on.
+    const ZOMBIE_LEADER: &str = "import ctypes, os, platform, threading, time\n\
+                                 threading.Thread(target=lambda: time.sleep(300)).start()\n\
+                                 time.sleep(0.2)\n\
+                                 nr = 93 if platform.machine() in ('aarch64', 'arm64') else 60\n\
+                                 ctypes.CDLL(None).syscall(nr, 0)\n";
+
+    /// Waits until `pid`'s leader reads as a zombie.
+    fn wait_for_zombie_leader(pid: i32) {
+        for _ in 0..200 {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+            if status
+                .lines()
+                .any(|line| line.starts_with("State:") && line.contains('Z'))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("the leader of {pid} never became a zombie");
+    }
+
+    /// Needs root (the uid switch): skipped otherwise. A process of the
+    /// agent user whose leader left with `SYS_exit` while a thread runs on
+    /// is stopped and killed, and every thread of it ends.
+    #[tokio::test]
+    async fn kill_all_ends_a_process_whose_leader_is_a_zombie() {
+        if !can_switch_user() {
+            eprintln!("skipped: needs root to start processes as another user");
+            return;
+        }
+        let user = AgentUser {
+            uid: 64_125,
+            gid: 64_125,
+        };
+        let mut command = tokio::process::Command::new("python3");
+        command
+            .args(["-I", "-c", ZOMBIE_LEADER])
+            .uid(user.uid)
+            .gid(user.gid)
+            .current_dir("/")
+            .stdin(std::process::Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+        wait_for_zombie_leader(pid);
+        assert_eq!(processes_of(user.uid), vec![pid]);
+        kill_all(user).await.unwrap();
+        assert!(processes_of(user.uid).is_empty());
+        // Every thread is gone: the group is a plain zombie for its parent.
+        let _ = child.wait().await;
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    /// Needs root and perl: skipped otherwise. A `vfork` parent waits, in
+    /// uninterruptible sleep, on a child that gets stopped: it never reads
+    /// as stopped, and `kill_all` must still end both well within its
+    /// patience.
+    #[tokio::test]
+    async fn kill_all_ends_a_vfork_parent_in_uninterruptible_sleep() {
+        let has_perl = std::process::Command::new("perl")
+            .arg("-v")
+            .output()
+            .is_ok();
+        if !can_switch_user() || !has_perl || std::env::consts::ARCH != "x86_64" {
+            eprintln!("skipped: needs root, perl and x86-64");
+            return;
+        }
+        let user = AgentUser {
+            uid: 64_126,
+            gid: 64_126,
+        };
+        let mut command = tokio::process::Command::new("perl");
+        command
+            .args([
+                "-e",
+                "require POSIX; my $p = syscall(58); if ($p == 0) { sleep 3600; POSIX::_exit(0); } \
+                 sleep 3600;",
+            ])
+            .uid(user.uid)
+            .gid(user.gid)
+            .current_dir("/")
+            .stdin(std::process::Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let mut groups = Vec::new();
+        for _ in 0..200 {
+            groups = live_groups(user.uid);
+            if groups.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            groups.iter().any(|(_, states)| states.contains(&'D')),
+            "no vfork parent in D: {groups:?}"
+        );
+        let started = std::time::Instant::now();
+        kill_all(user).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(processes_of(user.uid).is_empty());
+        let _ = child.wait().await;
     }
 
     /// Needs root and a container whose pids limit the bomb can fill

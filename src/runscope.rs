@@ -751,7 +751,7 @@ impl RunScope {
     }
 
     /// The branches a run may move, as its refusals name them.
-    fn movable(&self) -> String {
+    pub fn movable(&self) -> String {
         if self.created_branches.is_empty() {
             format!("the default branch `{}` or a new branch", self.branch)
         } else {

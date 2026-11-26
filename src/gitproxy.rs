@@ -567,7 +567,7 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
     // and checked before a byte of it goes upstream. A push to a private
     // repository streams through untouched.
     let mut spooled: Option<SpoolStream> = None;
-    let mut run_updates: RefUpdates = Vec::new();
+    let mut run_pushed: Option<RunPushed> = None;
     let mut body = Some(body);
     let (owner, repo) = git.repo.split_once('/').unwrap_or((git.repo.as_str(), ""));
     let mut scan = None;
@@ -607,9 +607,9 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
                 .map(str::to_string);
             let taken = body.take().expect("the body is read once");
             match check_push(&state, taken, encoding, scan, run).await {
-                Ok((stream, updates)) => {
+                Ok((stream, pushed)) => {
                     spooled = Some(stream);
-                    run_updates = updates;
+                    run_pushed = pushed;
                 }
                 Err(refused) => {
                     conclude(
@@ -754,26 +754,6 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
         .await;
         return plain(StatusCode::BAD_GATEWAY, reason);
     }
-    // A built-in agent's accepted push: every ref update it made is
-    // recorded for its run (lore credits a task only with a commit its own
-    // run pushed, and lets the run move again only branches it created).
-    if let Some(scope) = scope.as_ref().filter(|_| status.is_success())
-        && !run_updates.is_empty()
-    {
-        let db = state.auth.db.clone();
-        let run_id = scope.run_id.clone();
-        let updates = std::mem::take(&mut run_updates);
-        let recorded = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            for (old, new, name) in &updates {
-                db.record_run_ref(&run_id, name, old, new, "push")?;
-            }
-            Ok(())
-        })
-        .await;
-        if !matches!(recorded, Ok(Ok(()))) {
-            tracing::error!("recording a run's pushed refs failed");
-        }
-    }
     // The row is written once the headers are in: the duration is the
     // time to the response, and the body streams on without bookkeeping.
     conclude(
@@ -824,6 +804,24 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
         }
         return out
             .body(Body::from(advertisement))
+            .expect("a valid status and header values build a response");
+    }
+    // A built-in agent's push: the answer streams to git unchanged while
+    // lore reads upstream's report from it, and records for the run only
+    // the refs upstream reported `ok` (lore credits a task only with a
+    // commit its own run pushed, and lets the run move again only branches
+    // it created).
+    if let Some(scope) = scope.as_ref().filter(|_| status.is_success())
+        && let Some(pushed) = run_pushed.filter(|pushed| !pushed.updates.is_empty())
+    {
+        let body = recording_body(
+            response,
+            pushed,
+            state.auth.db.clone(),
+            scope.run_id.clone(),
+        );
+        return out
+            .body(body)
             .expect("a valid status and header values build a response");
     }
     // A failure mid-stream is passed on without the upstream URL.
@@ -879,9 +877,257 @@ fn with_no_thin(body: &[u8]) -> Option<Vec<u8>> {
     (done && at == body.len()).then_some(out)
 }
 
-/// The ref updates of a push (`old`, `new`, ref), as its command list
-/// names them.
-type RefUpdates = Vec<(String, String, String)>;
+/// One ref update of a built-in agent's push that lore records for the
+/// run once upstream reports it `ok`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunUpdate {
+    old: String,
+    new: String,
+    name: String,
+    /// Whether the new commit came in the run's own pack (else the run
+    /// only pointed the ref at a commit that was there already).
+    own: bool,
+}
+
+/// What a built-in agent's checked push may record: its real updates
+/// (`old` differs from `new`), and how upstream's answer is framed.
+#[derive(Debug)]
+struct RunPushed {
+    updates: Vec<RunUpdate>,
+    /// The client asked for a side band: the report comes in band 1.
+    side_band: bool,
+}
+
+impl RunPushed {
+    fn from_view(view: &packscan::PushView) -> Self {
+        Self {
+            updates: view
+                .commands
+                .updates
+                .iter()
+                .filter(|(old, new, _)| old != new)
+                .map(|(old, new, name)| RunUpdate {
+                    old: old.clone(),
+                    new: new.clone(),
+                    name: name.clone(),
+                    own: view.commits.contains_key(new),
+                })
+                .collect(),
+            side_band: view.commands.has("side-band-64k") || view.commands.has("side-band"),
+        }
+    }
+}
+
+/// How a run's pushed ref is recorded: `push` when its commit came in the
+/// run's own pack (only such a push, or a `repo_commit`, credits a task),
+/// `push-existing` when the run pointed the ref at a commit that was
+/// already there.
+fn push_via(update: &RunUpdate) -> &'static str {
+    if update.own { "push" } else { "push-existing" }
+}
+
+/// Most bytes of upstream's report lore keeps while reading it (one line
+/// per ref; far more than any push lore lets through has).
+const MAX_REPORT: usize = 1024 * 1024;
+
+/// Reads upstream's `report-status` from the bytes of a push's answer as
+/// they pass by: band 1 when the client asked for a side band (band 2 is
+/// progress and skipped, band 3 a fatal error), the whole answer
+/// otherwise. Keeps at most one partial packet and [`MAX_REPORT`] bytes of
+/// the report; past that, or on anything it cannot read, it gives up and
+/// [`ReportReader::finish`] answers `None`.
+#[derive(Debug, Default)]
+struct ReportReader {
+    side_band: bool,
+    outer: Vec<u8>,
+    report: Vec<u8>,
+    broken: bool,
+}
+
+/// The length of a pkt-line from its four hex digits.
+fn pkt_len(head: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(head).ok()?;
+    if text.len() != 4 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    usize::from_str_radix(text, 16).ok()
+}
+
+impl ReportReader {
+    fn new(side_band: bool) -> Self {
+        Self {
+            side_band,
+            ..Self::default()
+        }
+    }
+
+    fn keep(&mut self, bytes: &[u8]) {
+        if self.report.len() + bytes.len() > MAX_REPORT {
+            self.broken = true;
+            self.report = Vec::new();
+        } else {
+            self.report.extend_from_slice(bytes);
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        if self.broken {
+            return;
+        }
+        if !self.side_band {
+            self.keep(bytes);
+            return;
+        }
+        self.outer.extend_from_slice(bytes);
+        let mut at = 0;
+        while !self.broken && self.outer.len() - at >= 4 {
+            let Some(len) = pkt_len(&self.outer[at..at + 4]) else {
+                self.broken = true;
+                break;
+            };
+            if len == 0 {
+                at += 4;
+                continue;
+            }
+            if !(5..=65520).contains(&len) {
+                self.broken = true;
+                break;
+            }
+            if self.outer.len() - at < len {
+                break;
+            }
+            let band = self.outer[at + 4];
+            let payload = self.outer[at + 5..at + len].to_vec();
+            at += len;
+            match band {
+                1 => self.keep(&payload),
+                2 => {}
+                _ => self.broken = true,
+            }
+        }
+        self.outer.drain(..at.min(self.outer.len()));
+        if self.broken {
+            self.outer = Vec::new();
+        }
+    }
+
+    /// The refs upstream reported `ok`, when the report was read whole:
+    /// `unpack ok`, then `ok <ref>` / `ng <ref> <why>` lines (and the
+    /// `option` lines of report-status-v2), closed by a flush. `None`
+    /// when it could not be read or the pack was not unpacked.
+    fn finish(&self) -> Option<std::collections::HashSet<String>> {
+        if self.broken {
+            return None;
+        }
+        let body = &self.report;
+        let mut at = 0;
+        let mut ok = std::collections::HashSet::new();
+        let mut unpacked = false;
+        while at + 4 <= body.len() {
+            let len = pkt_len(&body[at..at + 4])?;
+            if len == 0 {
+                return unpacked.then_some(ok);
+            }
+            if len < 4 || at + len > body.len() {
+                return None;
+            }
+            let line = std::str::from_utf8(&body[at + 4..at + len]).ok()?;
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            at += len;
+            if !unpacked {
+                if line != "unpack ok" {
+                    return None;
+                }
+                unpacked = true;
+            } else if let Some(name) = line.strip_prefix("ok ") {
+                ok.insert(name.to_string());
+            } else if !(line.starts_with("ng ") || line.starts_with("option ")) {
+                return None;
+            }
+        }
+        None
+    }
+}
+
+/// The answer to a built-in agent's push: upstream's bytes pass to git
+/// unchanged, while a [`ReportReader`] reads the report from them; once
+/// upstream is done (and before git sees the end), the updates upstream
+/// reported `ok` are recorded for the run. Nothing is recorded when the
+/// report cannot be read.
+fn recording_body(response: reqwest::Response, pushed: RunPushed, db: Db, run_id: String) -> Body {
+    let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(8);
+    tokio::spawn(async move {
+        let mut reader = ReportReader::new(pushed.side_band);
+        let mut stream = response.bytes_stream();
+        let mut client_gone = false;
+        while let Some(chunk) = tokio_stream::StreamExt::next(&mut stream).await {
+            match chunk {
+                Ok(bytes) => {
+                    reader.feed(&bytes);
+                    if !client_gone && sender.send(Ok(bytes)).await.is_err() {
+                        // git went away: upstream is still read to the end,
+                        // so what it did is recorded.
+                        client_gone = true;
+                    }
+                }
+                Err(error) => {
+                    let error = std::io::Error::other(error.without_url());
+                    if !client_gone {
+                        let _ = sender.send(Err(error)).await;
+                    }
+                    break;
+                }
+            }
+        }
+        let Some(ok) = reader.finish() else {
+            tracing::warn!(
+                run = %run_id,
+                "upstream's report of a run's push could not be read; nothing was recorded for it"
+            );
+            return;
+        };
+        let updates: Vec<RunUpdate> = pushed
+            .updates
+            .into_iter()
+            .filter(|update| ok.contains(&update.name))
+            .collect();
+        if updates.is_empty() {
+            return;
+        }
+        let recorded = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            for update in &updates {
+                db.record_run_ref(
+                    &run_id,
+                    &update.name,
+                    &update.old,
+                    &update.new,
+                    push_via(update),
+                )?;
+            }
+            Ok(())
+        })
+        .await;
+        if !matches!(recorded, Ok(Ok(()))) {
+            tracing::error!("recording a run's pushed refs failed");
+        }
+        drop(sender);
+    });
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
+}
+
+/// A short ref name as a path segment of GitHub's API: everything but
+/// letters, digits, `.`, `_`, `-` and `/` percent-encoded.
+fn ref_path(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
 
 /// What the checks of a built-in agent's push need.
 struct RunPush<'a> {
@@ -918,6 +1164,42 @@ impl RunPush<'_> {
             return Err(format!("GitHub answered HTTP {}", answer.status));
         }
         serde_json::from_str(&answer.body).map_err(|_| "GitHub's answer is not JSON".to_string())
+    }
+
+    /// Whether `name` (a full ref) exists upstream, asked with lore's
+    /// credential (`GET /repos/{o}/{r}/git/ref/<ref>`): 200 yes, 404 (or
+    /// 409, an empty repository) no, anything else is not an answer.
+    async fn ref_exists(&self, state: &GitProxy, name: &str) -> Result<bool, String> {
+        if self.provider.service() != "github" {
+            return Err(format!("{} cannot be asked", self.provider.label));
+        }
+        let short = name.strip_prefix("refs/").unwrap_or(name);
+        let request = ops::OpsRequest {
+            provider: self.provider,
+            method: "GET".into(),
+            path: format!(
+                "/repos/{}/{}/git/ref/{}",
+                self.owner,
+                self.repo,
+                ref_path(short)
+            ),
+            query: None,
+            body: None,
+        };
+        let answer = ops::call(
+            &ops::client(),
+            &state.github_api_base,
+            self.secret,
+            &state.guard,
+            &request,
+        )
+        .await
+        .map_err(|error| error.message().to_string())?;
+        match answer.status {
+            200 => Ok(true),
+            404 | 409 => Ok(false),
+            status => Err(format!("GitHub answered HTTP {status}")),
+        }
     }
 
     /// A commit's tree: from the pack, else from GitHub.
@@ -1051,6 +1333,33 @@ impl RunPush<'_> {
         }
         for (old, new, name) in &view.commands.updates {
             let existing = self.scope.check_ref_update(old, new, name)?;
+            // A command that changes nothing moves nothing, and is never
+            // recorded for the run.
+            if old == new {
+                continue;
+            }
+            // A creation only creates: lore asks upstream itself whether
+            // the branch is there already, and refuses when it is (or
+            // when it cannot tell).
+            if !existing {
+                match self.ref_exists(state, name).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return Err(format!(
+                            "{name} already exists, so this push cannot create it: a built-in \
+                             agent creates only new branches, and moves an existing one only \
+                             when it is {}",
+                            self.scope.movable()
+                        ));
+                    }
+                    Err(why) => {
+                        return Err(format!(
+                            "lore could not check whether {name} already exists ({why}), so it \
+                             refuses to let this push create it"
+                        ));
+                    }
+                }
+            }
             if existing && !self.fast_forward(state, view, old, new).await {
                 return Err(format!(
                     "this run may only move {name} forward: lore could not prove that {} \
@@ -1232,7 +1541,7 @@ async fn check_push(
     encoding: Option<String>,
     guard: Option<ops::Guard>,
     run: Option<RunPush<'_>>,
-) -> Result<(SpoolStream, RefUpdates), PushRefused> {
+) -> Result<(SpoolStream, Option<RunPushed>), PushRefused> {
     let permit = match tokio::time::timeout(SCAN_WAIT, scan_slots().acquire_owned()).await {
         Ok(Ok(permit)) => permit,
         _ => {
@@ -1343,10 +1652,10 @@ async fn check_push(
     };
     // A built-in agent's push: its refs and its CI definitions, refused in
     // the protocol when the command list could be read.
-    let mut accepted: RefUpdates = Vec::new();
+    let mut accepted: Option<RunPushed> = None;
     if let Some(run) = &run {
         if let Some(Ok(view)) = &view {
-            accepted = view.commands.updates.clone();
+            accepted = Some(RunPushed::from_view(view));
         }
         let refusal = match &view {
             _ if over => Some(format!(
@@ -1696,6 +2005,38 @@ mod tests {
     async fn visibility_api() -> (String, Arc<Mutex<Vec<String>>>) {
         let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let router = Router::new()
+            // Which branches exist (a run's push may only create new ones):
+            // `main` and `release` do, a name starting with `broken` gets a
+            // 500, every other one is missing.
+            .route(
+                "/repos/{owner}/{repo}/git/ref/{*name}",
+                any(
+                    |State(asked): State<Arc<Mutex<Vec<String>>>>,
+                     axum::extract::Path((_, _, name)): axum::extract::Path<(
+                        String,
+                        String,
+                        String,
+                    )>| async move {
+                        asked.lock().unwrap().push(format!("ref {name}"));
+                        match name.trim_start_matches("heads/") {
+                            "main" | "release" => (
+                                StatusCode::OK,
+                                format!(
+                                    r#"{{"ref":"refs/{name}","object":{{"sha":"{}"}}}}"#,
+                                    "e".repeat(40)
+                                ),
+                            ),
+                            other if other.starts_with("broken") => {
+                                (StatusCode::INTERNAL_SERVER_ERROR, String::new())
+                            }
+                            _ => (
+                                StatusCode::NOT_FOUND,
+                                r#"{"message":"Not Found"}"#.to_string(),
+                            ),
+                        }
+                    },
+                ),
+            )
             .route(
                 "/repos/{owner}/{repo}",
                 any(
@@ -3619,41 +3960,109 @@ mod tests {
         assert_eq!(db.ops_log(1).unwrap()[0].outcome, "denied");
     }
 
-    /// G3 and G5: every ref update of a run's accepted push is recorded
-    /// for the run, and a branch the run created is one it may move later
+    /// A pkt-line.
+    fn pkt(text: &[u8]) -> Vec<u8> {
+        let mut out = format!("{:04x}", text.len() + 4).into_bytes();
+        out.extend_from_slice(text);
+        out
+    }
+
+    /// An upstream `report-status`: these lines, then a flush; in band 1
+    /// (after a progress line in band 2) when `side_band`.
+    fn report(lines: &[&str], side_band: bool) -> Vec<u8> {
+        let mut status = Vec::new();
+        for line in lines {
+            status.extend(pkt(format!("{line}\n").as_bytes()));
+        }
+        status.extend_from_slice(b"0000");
+        if !side_band {
+            return status;
+        }
+        let mut out = pkt(b"\x02Resolving deltas: 100% (1/1)\n");
+        for chunk in status.chunks(7) {
+            let mut band = vec![1u8];
+            band.extend_from_slice(chunk);
+            out.extend(pkt(&band));
+        }
+        out.extend_from_slice(b"0000");
+        out
+    }
+
+    /// The proxy in front of an upstream that answers every push with
+    /// `answer`.
+    async fn proxy_answering(answer: Vec<u8>) -> (String, Db, Log) {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mock = Mock {
+            log: log.clone(),
+            status: StatusCode::OK,
+            headers: vec![("content-type", "application/x-git-receive-pack-result")],
+            body: answer,
+        };
+        let upstream = serve(mock_upstream(&mock)).await;
+        let (base, db) = serve_proxy(&upstream, Some(key())).await;
+        (base, db, log)
+    }
+
+    /// A push of these command lines (no pack) with `token`; the status
+    /// and the bytes of the answer.
+    async fn push_lines(base: &str, token: &str, lines: &[String]) -> (StatusCode, Vec<u8>) {
+        let mut body = Vec::new();
+        for line in lines {
+            body.extend(pkt(line.as_bytes()));
+        }
+        body.extend_from_slice(b"0000");
+        let response = reqwest::Client::new()
+            .post(format!("{base}/git/github/me/shop.git/git-receive-pack"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, response.bytes().await.unwrap().to_vec())
+    }
+
+    /// Lets a run's pushes change CI, so a test needs no CI comparison
+    /// upstream.
+    fn allow_ci(db: &Db, run: &str) {
+        db.execute_for_test(&format!(
+            "UPDATE agent_runs SET scope = json_set(scope, '$.ci_allowed', json('true'))
+             WHERE id = '{run}'"
+        ));
+    }
+
+    /// G3 and G5: a run's push that upstream reports `ok` is recorded for
+    /// the run, and a branch the run created is one it may move later
     /// (its token's scope learns it); a refused push records nothing.
     #[tokio::test]
     async fn a_run_s_accepted_pushes_are_recorded_for_it() {
-        let (base, db, _log) = working_proxy().await;
+        let answer = report(&["unpack ok", "ok refs/heads/feature"], false);
+        let (base, db, _log) = proxy_answering(answer.clone()).await;
         let token = run_token(&db, "run-git-record");
-        // The owner's switch, so this push needs no CI comparison upstream.
-        db.execute_for_test(
-            "UPDATE agent_runs SET scope = json_set(scope, '$.ci_allowed', json('true'))
-             WHERE id = 'run-git-record'",
-        );
+        allow_ci(&db, "run-git-record");
         let (zero, new) = ("0".repeat(40), "c".repeat(40));
-        let push = |line: String| {
-            let body = format!("{:04x}{line}0000", line.len() + 4);
-            reqwest::Client::new()
-                .post(format!("{base}/git/github/me/shop.git/git-receive-pack"))
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .body(body)
-                .send()
-        };
-        let response = push(format!("{zero} {new} refs/heads/feature\0report-status\n"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let (status, bytes) = push_lines(
+            &base,
+            &token,
+            &[format!("{zero} {new} refs/heads/feature\0report-status\n")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // git gets upstream's answer byte for byte.
+        assert_eq!(bytes, answer);
         let refs = db.run_refs("run-git-record").unwrap();
         assert_eq!(refs.len(), 1, "{refs:?}");
+        // No pack came with it: the run pointed a new branch at a commit
+        // that was there, which creates the branch and credits nothing.
         assert_eq!(
             (
                 refs[0].name.as_str(),
                 refs[0].new.as_str(),
                 refs[0].via.as_str()
             ),
-            ("refs/heads/feature", new.as_str(), "push")
+            ("refs/heads/feature", new.as_str(), "push-existing")
         );
+        assert!(!refs[0].credits("refs/heads/feature", &new));
         assert_eq!(
             db.run_created_branches("run-git-record").unwrap(),
             vec!["feature"]
@@ -3662,18 +4071,268 @@ mod tests {
         let found = auth.authenticate_on(&token, true).await.unwrap();
         assert_eq!(found.scope().unwrap().created_branches, vec!["feature"]);
         // Another existing branch is still refused, and nothing recorded.
-        let text = push(format!(
-            "{} {} refs/heads/release\0report-status\n",
-            "a".repeat(40),
-            "b".repeat(40)
-        ))
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+        let (_, bytes) = push_lines(
+            &base,
+            &token,
+            &[format!(
+                "{} {} refs/heads/release\0report-status\n",
+                "a".repeat(40),
+                "b".repeat(40)
+            )],
+        )
+        .await;
+        let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("ng refs/heads/release"), "{text}");
         assert_eq!(db.run_refs("run-git-record").unwrap().len(), 1);
+    }
+
+    /// F2, the reviewer's probe: a no-op `H H refs/heads/main` (H someone
+    /// else's commit) is not the run's update, and a "creation" of a
+    /// branch that exists (`0 X refs/heads/release`, or `0 H main`) is
+    /// refused by lore itself, so the run never gains `release` to move.
+    #[tokio::test]
+    async fn no_ops_and_creations_of_existing_branches_are_not_the_run_s() {
+        let answer = report(
+            &["unpack ok", "ok refs/heads/main", "ok refs/heads/release"],
+            false,
+        );
+        let (base, db, log) = proxy_answering(answer).await;
+        let token = run_token(&db, "run-probe");
+        allow_ci(&db, "run-probe");
+        let someone_elses = "e".repeat(40);
+        let (status, _) = push_lines(
+            &base,
+            &token,
+            &[format!(
+                "{someone_elses} {someone_elses} refs/heads/main\0report-status\n"
+            )],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(db.run_refs("run-probe").unwrap().is_empty());
+        for line in [
+            format!(
+                "{} {} refs/heads/release\0report-status\n",
+                "0".repeat(40),
+                "d".repeat(40)
+            ),
+            format!(
+                "{} {someone_elses} refs/heads/main\0report-status\n",
+                "0".repeat(40)
+            ),
+        ] {
+            let sent = posts(&log).len();
+            let (status, bytes) = push_lines(&base, &token, std::slice::from_ref(&line)).await;
+            let text = String::from_utf8_lossy(&bytes);
+            assert_eq!(status, StatusCode::OK);
+            assert!(text.contains("already exists"), "{line}: {text}");
+            assert!(text.contains("ng refs/heads/"), "{text}");
+            assert_eq!(posts(&log).len(), sent, "nothing went upstream");
+        }
+        assert!(db.run_refs("run-probe").unwrap().is_empty());
+        assert!(db.run_created_branches("run-probe").unwrap().is_empty());
+        // When lore cannot tell whether the branch exists, it refuses.
+        let (_, bytes) = push_lines(
+            &base,
+            &token,
+            &[format!(
+                "{} {} refs/heads/broken-lookup\0report-status\n",
+                "0".repeat(40),
+                "d".repeat(40)
+            )],
+        )
+        .await;
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("could not check whether"), "{text}");
+        assert!(db.run_refs("run-probe").unwrap().is_empty());
+    }
+
+    /// F2: only the refs upstream reports `ok` are recorded; an `ng`, a
+    /// failed unpack or a report lore cannot read records nothing, and git
+    /// still gets upstream's bytes unchanged.
+    #[tokio::test]
+    async fn only_refs_upstream_reports_ok_are_recorded() {
+        let (zero, new) = ("0".repeat(40), "c".repeat(40));
+        let cases: Vec<(Vec<u8>, &str, Vec<&str>)> = vec![
+            (
+                report(
+                    &[
+                        "unpack ok",
+                        "ng refs/heads/one failed to update ref",
+                        "ok refs/heads/two",
+                    ],
+                    true,
+                ),
+                "report-status side-band-64k",
+                vec!["refs/heads/two"],
+            ),
+            (
+                report(
+                    &[
+                        "unpack ok",
+                        "ok refs/heads/one",
+                        "option refname refs/heads/one",
+                        "ok refs/heads/two",
+                    ],
+                    false,
+                ),
+                "report-status-v2",
+                vec!["refs/heads/one", "refs/heads/two"],
+            ),
+            (
+                report(
+                    &[
+                        "unpack index-pack failed",
+                        "ng refs/heads/one unpacker error",
+                    ],
+                    true,
+                ),
+                "report-status side-band-64k",
+                vec![],
+            ),
+            (
+                b"this is not a report at all".to_vec(),
+                "report-status",
+                vec![],
+            ),
+            // A report with no flush at its end was cut short.
+            (
+                pkt(b"unpack ok\n")
+                    .into_iter()
+                    .chain(pkt(b"ok refs/heads/one\n"))
+                    .collect(),
+                "report-status",
+                vec![],
+            ),
+            // Side band asked for, but the answer is not framed in one.
+            (
+                report(&["unpack ok", "ok refs/heads/one"], false),
+                "report-status side-band-64k",
+                vec![],
+            ),
+        ];
+        for (index, (answer, caps, wanted)) in cases.into_iter().enumerate() {
+            let (base, db, _log) = proxy_answering(answer.clone()).await;
+            let run = format!("run-report-{index}");
+            let token = run_token(&db, &run);
+            allow_ci(&db, &run);
+            let (status, bytes) = push_lines(
+                &base,
+                &token,
+                &[
+                    format!("{zero} {new} refs/heads/one\0{caps}\n"),
+                    format!("{zero} {new} refs/heads/two\n"),
+                ],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(bytes, answer, "case {index}");
+            let recorded: Vec<String> = db
+                .run_refs(&run)
+                .unwrap()
+                .into_iter()
+                .map(|update| update.name)
+                .collect();
+            assert_eq!(recorded, wanted, "case {index}");
+        }
+        // A token that is not a run's: its push streams through as before,
+        // whatever the answer, and nothing is recorded anywhere.
+        let answer = b"this is not a report at all".to_vec();
+        let (base, db, _log) = proxy_answering(answer.clone()).await;
+        let (status, bytes) = push_lines(
+            &base,
+            TOKEN,
+            &[format!("{zero} {new} refs/heads/one\0report-status\n")],
+        )
+        .await;
+        assert_eq!((status, bytes), (StatusCode::OK, answer));
+        let counts: std::collections::HashMap<String, i64> =
+            db.table_counts().unwrap().into_iter().collect();
+        assert_eq!(
+            counts.get("agent_run_refs").copied().unwrap_or(0),
+            0,
+            "{counts:?}"
+        );
+    }
+
+    /// F2: a real `git push` by a run, with its pack: upstream reports it
+    /// `ok`, it is recorded as the run's own (`push`) and credits the run
+    /// with its commit.
+    #[tokio::test]
+    async fn a_run_s_real_push_is_recorded_as_its_own_and_credited() {
+        if !git_available() {
+            eprintln!("git is not installed; skipped");
+            return;
+        }
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let capture = serve(receive_pack_upstream(&log)).await;
+        let dir = work_repo("run-real", &[("README.md", "hello\n".to_string())]);
+        // The capturing mock reports `main`, so git calls this push failed;
+        // only the request body it sent is wanted.
+        {
+            let dir = dir.clone();
+            let url = format!("{capture}/owner/capture.git");
+            tokio::task::spawn_blocking(move || {
+                git(&dir, &["push", &url, "HEAD:refs/heads/newwork"])
+            })
+            .await
+            .unwrap();
+        }
+        let body = posts(&log).pop().expect("git sent a pack").body;
+        let head = String::from_utf8(git(&dir, &["rev-parse", "HEAD"]).stdout).unwrap();
+        let head = head.trim().to_string();
+        let answer = report(&["unpack ok", "ok refs/heads/newwork"], true);
+        let (base, db, _log) = proxy_answering(answer.clone()).await;
+        let token = run_token(&db, "run-real");
+        allow_ci(&db, "run-real");
+        let response = reqwest::Client::new()
+            .post(format!("{base}/git/github/me/shop.git/git-receive-pack"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().to_vec(), answer);
+        let refs = db.run_refs("run-real").unwrap();
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(refs[0].via, "push");
+        assert_eq!(refs[0].new, head);
+        assert!(refs[0].credits("refs/heads/newwork", &head));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The report reader on its own: fed byte by byte, bounded, strict.
+    #[test]
+    fn the_report_reader_reads_band_one_and_gives_up_on_anything_else() {
+        let answer = report(
+            &["unpack ok", "ok refs/heads/a", "ng refs/heads/b no"],
+            true,
+        );
+        let mut reader = ReportReader::new(true);
+        for byte in &answer {
+            reader.feed(std::slice::from_ref(byte));
+        }
+        let ok = reader.finish().unwrap();
+        assert_eq!(ok.len(), 1);
+        assert!(ok.contains("refs/heads/a"));
+        // Band 3 is a fatal error.
+        let mut reader = ReportReader::new(true);
+        reader.feed(&pkt(b"\x03remote error\n"));
+        assert_eq!(reader.finish(), None);
+        // Past the bound it gives up and keeps nothing.
+        let mut reader = ReportReader::new(false);
+        let line = pkt(format!("ok refs/heads/{}\n", "x".repeat(200)).as_bytes());
+        reader.feed(&pkt(b"unpack ok\n"));
+        for _ in 0..(MAX_REPORT / line.len() + 2) {
+            reader.feed(&line);
+        }
+        assert!(reader.report.len() <= MAX_REPORT);
+        assert_eq!(reader.finish(), None);
+        // An unknown line makes the whole report unreadable.
+        let mut reader = ReportReader::new(false);
+        reader.feed(&report(&["unpack ok", "ok refs/heads/a", "weird"], false));
+        assert_eq!(reader.finish(), None);
     }
 
     /// G1 end to end, with the re-review's crafted push: a commit whose

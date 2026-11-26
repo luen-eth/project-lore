@@ -302,8 +302,10 @@ async fn main() -> Result<()> {
             tracing::warn!(
                 "LORE_TRUST_PROXY is on without LORE_TRUSTED_PROXIES: X-Forwarded-For is believed \
                  from any private or loopback peer outside the agent networks. Set \
-                 LORE_TRUSTED_PROXIES to your reverse proxy's network (for Dokploy, the subnet \
-                 of dokploy-network) so other containers cannot choose their address."
+                 LORE_TRUSTED_PROXIES to your reverse proxy's own address (for Dokploy, \
+                 Traefik's address on dokploy-network as a /32, not that network's subnet, \
+                 which every Dokploy application shares) so other containers cannot choose \
+                 their address."
             );
             auth::ProxyTrust::Private { never }
         } else {

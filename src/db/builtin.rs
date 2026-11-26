@@ -322,6 +322,24 @@ impl Db {
         Ok(())
     }
 
+    /// Notes why lore refused a runner (another protocol version, another
+    /// CLI than the agent was set up with), where the admin page shows the
+    /// sign-in detail.
+    pub fn builtin_refused(&self, name: &str, reason: &str) -> Result<()> {
+        let reason: String = reason
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(300)
+            .collect();
+        self.lock().execute(
+            "UPDATE builtin_agents SET status_detail = ?2,
+                 status_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE name = ?1",
+            params![name, format!("lore refused this agent's runner: {reason}")],
+        )?;
+        Ok(())
+    }
+
     /// Notes that a runner's link closed.
     pub fn builtin_disconnected(&self, name: &str) -> Result<()> {
         self.lock().execute(
@@ -1105,11 +1123,24 @@ impl RunRef {
     pub fn created(&self) -> bool {
         self.old.bytes().all(|byte| byte == b'0')
     }
+
+    /// Whether this update credits its run with `sha` on `name` (a full
+    /// ref): it moved the ref (old differs from new) to that commit, and
+    /// the commit is the run's own: it came in the run's own pack
+    /// (`push`) or `repo_commit` made it. A push that only pointed the ref
+    /// at a commit that was already there (`push-existing`) credits
+    /// nothing.
+    pub fn credits(&self, name: &str, sha: &str) -> bool {
+        self.name == name
+            && self.new == sha
+            && self.old != self.new
+            && matches!(self.via.as_str(), "push" | "repo_commit")
+    }
 }
 
 impl Db {
-    /// Records a ref update lore let run `run_id` make (`via` push or
-    /// repo_commit). `old` empty or zeros: the run created the branch.
+    /// Records a ref update lore let run `run_id` make (`via` push,
+    /// push-existing or repo_commit). `old` empty or zeros: the run created the branch.
     pub fn record_run_ref(
         &self,
         run_id: &str,
@@ -1277,6 +1308,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("lore.db");
         (Db::open(&path).unwrap(), path)
+    }
+
+    /// F2: only an update that moved the branch to a commit of the run's
+    /// own (its pack, or `repo_commit`) credits the run; a no-op, or a
+    /// push that only pointed the branch at a commit someone else made,
+    /// does not. Every recorded creation still counts as created.
+    #[test]
+    fn only_a_run_s_own_commit_credits_it() {
+        let (db, _) = temp_db("credits");
+        let (zero, base, mine, theirs) = (
+            "0".repeat(40),
+            "a".repeat(40),
+            "b".repeat(40),
+            "e".repeat(40),
+        );
+        let main = "refs/heads/main";
+        db.record_run_ref("r1", main, &base, &mine, "push").unwrap();
+        db.record_run_ref("r2", main, &base, &mine, "repo_commit")
+            .unwrap();
+        db.record_run_ref("r3", main, &base, &theirs, "push-existing")
+            .unwrap();
+        db.record_run_ref("r4", main, &theirs, &theirs, "push")
+            .unwrap();
+        db.record_run_ref("r5", "refs/heads/side", &zero, &theirs, "push-existing")
+            .unwrap();
+        let credited = |run: &str, sha: &str| {
+            db.run_refs(run)
+                .unwrap()
+                .iter()
+                .any(|update| update.credits(main, sha))
+        };
+        assert!(credited("r1", &mine));
+        assert!(credited("r2", &mine));
+        assert!(!credited("r3", &theirs));
+        assert!(!credited("r4", &theirs));
+        assert!(!credited("r1", &theirs));
+        assert_eq!(db.run_created_branches("r5").unwrap(), vec!["side"]);
     }
 
     #[test]

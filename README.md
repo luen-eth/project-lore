@@ -1081,14 +1081,20 @@ credential is taken back into the store only after something the owner did: a
 sign-in from the page, or a sign-in in the owner's terminal (*Terminal* below); and
 then only as the one file that CLI keeps it in, a regular file of at most 64 KiB
 holding JSON of the expected shape, never through a symbolic link, after every
-process of the agent user has ended. Besides that, every six hours, in a clean
-moment (no run, no terminal, no sign-in, no process of the agent user), the runner
-itself runs the CLI's status command (`claude auth status`, `codex login status`)
-with the stored credential in a fresh home and no task text, and keeps a renewed
-credential if that command wrote one, but only as a renewal of what is stored: a
-stored file must exist, and for Codex its ChatGPT account (`tokens.account_id`, read
-from the stored file) must be the same. A Codex token's signature cannot be checked
-offline without a new dependency, so nothing a run wrote is ever trusted instead.
+process of the agent user has ended. "Ended" means every thread: a process whose
+main thread left while another thread runs on (its leader then reads as a zombie)
+counts as alive, and is stopped and killed by its thread group. Besides that, for
+Codex only, every six hours, in a clean moment (no run, no terminal, no sign-in, and
+no thread of the agent user alive, checked again right before the command and right
+before anything is taken back), the runner itself runs `codex login status` with the
+stored credential in a fresh home and no task text, and keeps a renewed credential if
+that command wrote one, but only as a renewal of what is stored: a stored file must
+exist, and its ChatGPT account (`tokens.account_id`, read from the stored file) must
+be the same. A Codex token's signature cannot be checked offline without a new
+dependency, so nothing a run wrote is ever trusted instead. A Claude interactive
+sign-in is never taken back this way: Claude's `.credentials.json` names no account
+and its refresh token changes on every renewal, so nothing the runner can check
+offline tells a renewal from a credential a hostile process planted.
 See *Signing in* for what this means for how long an interactive sign-in lasts.
 
 For a conversation (`ask`), the CLI's session transcripts are kept so a follow-up
@@ -1283,9 +1289,12 @@ refresh token that the CLI renews from time to time. Since a run never gives a
 renewed credential back (*How a built-in agent is kept apart*), such a sign-in lasts
 until the first renewal happens inside a run; if the provider then invalidates the
 stored refresh token (both rotate them), later runs fail to authenticate and the
-page shows the agent as signed out: sign in again. The runner's own clean status
-check every six hours keeps a renewal when the CLI's status command makes one; that
-those commands renew at all was not verified here (it needs a real sign-in).
+page shows the agent as signed out: sign in again. For Codex, the runner's own clean
+status check every six hours keeps a renewal when `codex login status` makes one;
+that it renews at all was not verified here (it needs a real sign-in). For Claude
+there is no such renewal (see above): a claude.ai sign-in may need signing in again
+by the owner from time to time, so use a setup token for a Claude agent that runs on
+its own.
 
 **Claude Code** (`agent-claude`), either of:
 
@@ -1604,10 +1613,18 @@ on the admin page needs the integrations permission.
 **How often.** A task is taken at most `LORE_AUTO_TASK_MAX_ATTEMPTS` times (default
 2); after a run it waits until its author or a signed-in user touches it, and a
 user's touch starts the count over. lore reads the default branch's head itself
-before a run starts and records every ref update the git proxy and `repo_commit`
-make for the run; it marks the task done only when the default branch, read again
-with its own credential, points at a commit this run pushed. Anything else is *not
-confirmed* and the task is released with a note.
+before a run starts and records the ref updates the git proxy and `repo_commit`
+make for the run. From a push it records only commands that change something (old
+and new commit differ) and that GitHub itself reported `ok` in its answer to that
+push (lore reads the `report-status` as the answer streams back to git; a report it
+cannot read records nothing). A run may create only a branch that does not exist:
+lore asks GitHub with its own credential before it lets a push create one, and
+refuses the push when the branch is there or when it cannot tell. lore marks the
+task done only when the default branch, read again with its own credential, points
+at a commit this run made: one that came in the run's own pack, or one
+`repo_commit` made for it, and that moved the branch. Pointing the branch at a
+commit that was already there credits nothing. Anything else is *not confirmed* and
+the task is released with a note.
 
 **Notes.** A released task's note and the activity line say only how the run ended,
 in lore's words; the detail, with anything the run itself said, stays in the run's
@@ -1701,6 +1718,39 @@ most 50 MiB per conversation, and put back in the fresh home of the next turn.
   prompt injection: the container's limits, the run-scoped token and the scope
   checks in lore are what contain an agent.
 
+### Deploying this version
+
+The built-in agents come in three separate steps, each checked before the next.
+Step zero changes nothing about how lore runs:
+
+0. **Tag the running image for rollback**, on the server:
+   `docker tag <the image the running lore container uses> project-lore:pre-phase6`
+   (`docker inspect <container> --format '{{.Config.Image}}'` names it). **Take the
+   full and the JSON backups** (*Backup and restore*) and keep them off the server.
+   Then merge and deploy this version **as the existing single container, with no
+   `LORE_RUNNER_TOKENS`**: lore behaves as before (no runner listener, no agent), and
+   the database moves to schema 8, which only adds tables and columns, so the
+   previous image can still open it. Backups made after the upgrade restore only into
+   this version or a later one, which is why the backups above come first.
+1. **Check right after the deployment:**
+   - the log has the line *project-lore listening* and **no** line *listening for
+     built-in agent runners* (no runner listener without `LORE_RUNNER_TOKENS`);
+   - signing in to the admin page works, and so do its forms (the cross-site write
+     check refuses a request whose `Origin` differs from its `Host`: if saving
+     anything fails with a cross-site refusal, the reverse proxy changes the `Host`
+     header, which must be fixed before going on);
+   - a wrong password logs the client's own address in *admin login with a wrong user
+     name or password*, not the proxy's (see step 6 of the move below for
+     `LORE_TRUSTED_PROXIES`);
+   - Integrations → a provider's **Test** works (the vault key is right);
+   - an agent's `hello` works.
+
+   To roll back: deploy `project-lore:pre-phase6` on the same volume; it opens the
+   upgraded database and ignores what it does not know.
+2. **Later, separately:** the move to compose (*Moving a single-container install to
+   compose* below), lore alone.
+3. **Later again, separately:** the agents (step 9 of the move).
+
 ### Moving a single-container install to compose
 
 This is written for the production layout lore has today: a **Dokploy application**
@@ -1761,11 +1811,25 @@ when the name is wrong instead of starting lore on an empty database.
    tab: service `lore`, port `8080`, HTTPS with Let's Encrypt). Dokploy attaches
    Traefik to that service; no port is published on the server
    (`docker-compose.yml` has `expose` only, so lore is not reachable past Traefik
-   in plain HTTP). Set `LORE_TRUSTED_PROXIES` to the subnet of the network Traefik
-   reaches lore on, so that only Traefik's `X-Forwarded-For` is believed:
-   `docker network inspect dokploy-network --format '{{range .IPAM.Config}}{{.Subnet}}
-   {{end}}'` (Dokploy's overlay network, usually `10.0.1.0/24`; use what it prints).
-   Without it lore keeps believing any peer, as before.
+   in plain HTTP). Set `LORE_TRUSTED_PROXIES` to **Traefik's own address** as a
+   `/32`, so that only Traefik's `X-Forwarded-For` is believed. Not the subnet of
+   `dokploy-network`: every Dokploy application is on that network, and any of them
+   could then send lore a made-up `X-Forwarded-For`. Read the address with
+
+   ```sh
+   docker inspect dokploy-traefik --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'
+   ```
+
+   and use the one on the network lore shares with Traefik (`dokploy-network`), for
+   example `LORE_TRUSTED_PROXIES=10.0.1.7/32`. That address can change whenever
+   Traefik's container is recreated (a Dokploy update, a server restart that
+   recreates it): **check it again after each of those**. When it is wrong, lore
+   believes no `X-Forwarded-For` and sees every client as Traefik: all clients share
+   one failed-sign-in counter, so a few wrong passwords from anyone lock everyone out
+   of the admin page for a while, and failed token attempts of all agents count as
+   one client's too. You notice it in the log: the line *admin login with a wrong
+   user name or password* shows Traefik's address instead of the client's. Without
+   `LORE_TRUSTED_PROXIES` lore keeps believing any peer, as before.
 7. **Verify.** The admin page loads at the domain with your memories, the board and
    the stored credentials (open Integrations: a provider's **Test** works, which
    proves `LORE_VAULT_KEY` is right); an agent's `hello` works; signing in to the
@@ -1908,7 +1972,7 @@ documentation for adding a remote MCP server.
 | `LORE_SESSION_IDLE_HOURS` | `12` | Hours without activity after which an open session is closed. Whole number between 1 and 720. |
 | `LORE_ALLOWED_HOSTS` | any | Hostnames accepted in the `Host` header. |
 | `LORE_TRUST_PROXY` | `on` in Docker | Read the client address from `X-Forwarded-For`. Turn off if the port is exposed directly. |
-| `LORE_TRUSTED_PROXIES` | | With `LORE_TRUST_PROXY=on`: the peers whose `X-Forwarded-For` is believed, as address ranges, comma separated (`10.0.1.0/24`, `127.0.0.1`): your reverse proxy's network, for Dokploy the subnet of `dokploy-network`. Unset: any peer, as before; with built-in agents, any private or loopback peer (and a warning at start-up). Never the agent networks, and never on the runner listener. |
+| `LORE_TRUSTED_PROXIES` | | With `LORE_TRUST_PROXY=on`: the peers whose `X-Forwarded-For` is believed, as address ranges, comma separated (`10.0.1.7/32`, `127.0.0.1`): your reverse proxy's own address, for Dokploy Traefik's address on `dokploy-network` as a `/32` (not the network's subnet, which every Dokploy application shares; re-check it when Traefik's container is recreated, see *Moving a single-container install to compose*, step 6). Unset: any peer, as before; with built-in agents, any private or loopback peer (and a warning at start-up). Never the agent networks, and never on the runner listener. |
 | `LORE_DATA_DIR` | `/data` in Docker | Where the database and model cache live. |
 | `LORE_BIND` | `0.0.0.0:8080` | Listen address. |
 | `LORE_RUNNER_TOKENS` | | The built-in agents: `agent:secret` pairs (`claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>`), each secret 24 characters or longer. An entry may name the agent's CLI and provider, `agent:kind:secret` or `agent:opencode/<provider>:secret`, which a name not starting with `claude`, `codex` or `deepseek` must; a runner claiming anything else is refused. Unset: no built-in agent, no runner listener, nothing changes. A name may not also be in `LORE_TOKENS` or belong to another agent. |

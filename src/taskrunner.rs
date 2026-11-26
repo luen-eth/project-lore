@@ -1780,8 +1780,10 @@ impl TaskRunner {
     }
 
     /// Whether the run's default branch, read by lore itself, now points
-    /// at a commit this run pushed through the git proxy or made with
-    /// `repo_commit` (lore's own record, `agent_run_refs`), and moved since
+    /// at a commit this run pushed through the git proxy in its own pack
+    /// (upstream reported the update `ok`, and it moved the branch) or
+    /// made with `repo_commit` (lore's own record, `agent_run_refs`; see
+    /// `RunRef::credits`), and moved since
     /// the head lore read before the run started. The commit, when it
     /// does. Anything else is not confirmed, whatever the runner says.
     async fn confirmed_push(&self, active: &Active) -> Option<String> {
@@ -1795,7 +1797,7 @@ impl TaskRunner {
         let refs = blocking(move || db.run_refs(&id)).await.ok()?;
         let wanted = format!("refs/heads/{}", active.branch);
         refs.iter()
-            .any(|update| update.name == wanted && update.new == sha)
+            .any(|update| update.credits(&wanted, &sha))
             .then_some(sha)
     }
 
