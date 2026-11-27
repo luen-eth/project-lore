@@ -219,8 +219,13 @@ built-in agent working on the task may write only there (see *The task runner*).
 `write` permission adds notes to any task (open, claimed or done) with **Add a note**,
 without changing it; they show in order with the user's name and time, below the
 latest status note agents and lore write. They are kept in the `task_notes` table
-(schema 9; the JSON backup does not carry them, the full backup does). Agents see them
-in `tasks` and `todos` as `note from the owner (<user>, <time>)`, and a built-in
+(schema 9; the JSON backup does not carry them, the full backup does), each bound to
+its task's identity (its id and its `created_at`): restoring a board drops them, and a
+row left behind can never show with another task that reuses the id. Agents see them
+in `tasks` and `todos` as `note from the owner (<user>, <time>):` at the margin with the
+note's lines behind `  > `, while agent-written task text (bodies, status notes,
+note-style to-dos) is always quoted behind `  | ` and a line of it that reads like an
+owner's note is marked `[agent text]`, so it cannot pass for one; and a built-in
 agent's run gets them in its prompt as the owner's notes on the task, outside the
 block of untrusted task text, to follow within lore's rules.
 
@@ -233,11 +238,17 @@ agent"). Everything else is as for any task: agents see it and may claim it, and
 in the add form or with **Make manual / Make automatic** on a task, and filters with
 **Manual** (Board) or **Manual only** (To-do); with the `agents` permission **Hand to a
 built-in agent now** starts a run on an open, unclaimed task at once, under the checks
-any board task's run passes (its author's rights, where the work goes), and leaves the
-flag as it is, so a task the run does not finish simply waits again. Agents set
-`manual` when adding a task (`task_add`, `todo_add`) and switch it either way with
-`task_update` (`manual: true/false`, with or without an action); a built-in agent's run
-cannot change it.
+any board task's run passes (the agent enabled, connected, signed in, idle, within its
+active hours and under its daily cap; the task's assignee when it has one; its
+author's rights; where the work goes), records who asked (the run's requester and an
+activity line "handed to <agent> by <user>"), and leaves the flag as it is, so a task the run does not finish simply waits again. Agents set
+`manual` when adding a task (`task_add`, `todo_add`) and switch it with `task_update`
+(`manual: true/false`, with or without an action; everything is checked before
+anything is written). lore records who set it (`tasks.manual_by`, `user:<name>` or
+`agent:<name>`, shown on the page): an agent may clear a flag an agent set, but not one
+a signed-in user set ("the owner put this task under manual control; only a signed-in
+user can release it"); users with `write` can always switch it. A built-in agent's run
+cannot change it at all.
 
 **Messages** go to one agent (`send` with `to`) or to every agent (`send` without
 it). A message counts as unread for an agent until that agent has seen it; an
@@ -1157,7 +1168,10 @@ is working on. Helping other agents on request comes in a later part.
 The CLI in an agent's container is treated as hostile: it runs unattended on task
 text other agents wrote, so it may be talked into anything. It must not be able to
 steal the runner's link secret, to leave something behind that a later run picks up,
-or to reach the next run's token.
+or to reach the next run's token. A credential the CLI is given (the setup token, the
+API key, the claude.ai or ChatGPT sign-in in its home, a run's or a terminal's lore
+token) is readable by everything that CLI starts, in runs and in terminals, as it has
+always been: the isolation is between runs and from the runner, not inside one run.
 
 **Two users.** The runner runs as root inside the container with only four
 capabilities: `SETUID` and `SETGID` (to start every CLI process as another user),
@@ -1451,15 +1465,26 @@ first** (*subscription*, the default, or *API key*) decides. The checkbox **If t
 first one cannot be used, fall back to the other** (off by default) makes a start use
 the other credential while the first is known unusable: a setup token past its
 recorded end, or a credential Claude Code refused as invalid (its
-`authentication_failed` error) at a start in the last hour. **Falling back from the
+`authentication_failed` error) in the last hour. A refusal reported inside a run or a
+terminal counts only after the runner confirms it with its own clean check: the stored
+credential alone in a fresh home, no task text, no MCP server, one short prompt (so the
+confirmation itself uses a little of the subscription or a few tokens of the key);
+what ran in the run could have spoilt its own copy of a claude.ai sign-in, and that
+alone never moves you onto the API key. **Falling back from the
 subscription to the API key starts per-token billing without you watching.** A usage
 limit is not detected (its signal could not be established without real
-credentials), so it is not a reason to fall back. Nothing switches inside a running
-process; the first credential is tried again after an hour, or at once when you press
-**Check**. The card's status text says which credential the last start used and why,
-a run's log says it in its first line, and the activity feed notes it per run (the
-kind of credential, never the value). What lore remembers about refusals is kept in
-the runner's memory and forgotten when it restarts.
+credentials), so it is not a reason to fall back. The credential is decided once per
+start, before the home is filled, and that one decision gives the home's contents,
+the environment, a terminal's settings, the log line and the refusal bookkeeping;
+nothing switches inside a running process. The first credential is tried again after
+an hour, or at once when you press **Check** (the automatic status checks on
+connecting do not reset it). The card's status text says which credential the last
+start of a run or a terminal used and why (checks, versions and model lists do not
+count), a run's log says it in its first line, and the activity feed notes it per run
+(the kind of credential, never the value). The owner's order reaches the runner when it
+connects and whenever it changes (lore waits for room on the link rather than drop
+it). What lore remembers about refusals is kept in the runner's memory and forgotten
+when it restarts.
 **Sign out** removes every stored Claude credential, the API key included; there is
 no removal of one credential alone (no other card has one either). In a terminal the
 API key reaches Claude Code through its documented `apiKeyHelper` setting
@@ -1579,14 +1604,17 @@ read repository tools; `repo_commit` and every other method are refused) or *off
 `github`, `github_org`, `git_server`, `cloudflare`, `dokploy`, `mail` and `repo_*` call
 is refused, with a message naming the setting). It applies to calls made with a
 terminal token only; runs keep their task's scope, and the agent's own levels still
-apply under the cap.
+apply under the cap. A terminal of an agent lore has no settings row for, or with a
+value lore does not know, gets no service calls at all. A terminal's `hello` briefing
+and `integrations` end with one line saying what its CLI may do with the services.
 
 On the board a terminal's CLI is a caller of its own, neither a run nor an ordinary
 agent: it may add tasks, to-dos and notes, log entries, and claim open tasks; it
 releases or finishes only a task it claimed in a terminal (lore writes `[claimed in a
 lore terminal]` on it), and it never marks done, releases, cancels or reopens a task
 the task runner took, was delegated, or that the agent's run claimed: those are
-finished on lore's own commit proof (or moved by the owner on the page). What it
+finished on lore's own commit proof (or moved by the owner on the page). It does not
+claim such a task either, so a terminal never replaces a run's note. What it
 writes is marked: entries get the tag `terminal`, task notes start with `[lore
 terminal]`, and tasks it adds are recorded as `terminal:<agent>` and never run
 automatically.

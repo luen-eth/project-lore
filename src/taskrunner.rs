@@ -2324,25 +2324,96 @@ impl TaskRunner {
 
     /// The owner's "Hand to a built-in agent now" on the page: a run on an
     /// open, unclaimed board task (manual or not) starts at once, under the
-    /// checks the scheduler makes for any board task (its author's rights,
-    /// where the work goes). The manual flag is left as it is, so a task
-    /// the run does not finish waits again for the owner.
-    pub async fn hand_off(&self, task_id: i64, named: Option<&str>) -> Result<String, String> {
-        let agent = self.pick(named, false).await?;
+    /// checks of any board task's start: the agent is enabled, connected,
+    /// signed in, idle, within its active hours and under its daily cap;
+    /// the task's assignee, when it has one, is the agent; the author's
+    /// rights and where the work goes. The manual flag is left as it is,
+    /// so a task the run does not finish waits again for the owner. The
+    /// run and the activity feed record who asked.
+    pub async fn hand_off(
+        &self,
+        task_id: i64,
+        named: Option<&str>,
+        requested_by: &str,
+    ) -> Result<String, String> {
         let db = self.db.clone();
         let item = blocking(move || db.auto_task(task_id))
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("task #{task_id} is not open and unclaimed"))?;
+        let assignee = item.task.assignee.trim().to_lowercase();
+        let named = named
+            .map(|name| name.trim().to_lowercase())
+            .filter(|name| !name.is_empty());
+        if let Some(name) = &named
+            && !assignee.is_empty()
+            && *name != assignee
+        {
+            return Err(format!(
+                "task #{task_id} is meant for {assignee}, not {name}"
+            ));
+        }
+        let wanted = named.or((!assignee.is_empty()).then_some(assignee));
+        let agents = self.agents().await.map_err(|error| error.to_string())?;
+        let mut why = Vec::new();
+        let mut chosen = None;
+        for agent in agents
+            .iter()
+            .filter(|agent| wanted.as_ref().is_none_or(|name| &agent.name == name))
+        {
+            match self
+                .why_not_ready(agent)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                None => {
+                    chosen = Some(agent.clone());
+                    break;
+                }
+                Some(reason) => why.push(format!("{}: {reason}", agent.name)),
+            }
+        }
+        let Some(agent) = chosen else {
+            return Err(match (wanted, why.is_empty()) {
+                (Some(name), true) => format!("there is no built-in agent named {name}"),
+                _ => format!("no built-in agent can take it now ({})", why.join("; ")),
+            });
+        };
         let plan = match self.board_plan(&item, &agent).await {
             Ok(plan) => plan,
             Err(Skip::Note(why) | Skip::Later(why)) => {
                 return Err(format!("{} cannot take task #{task_id}: {why}", agent.name));
             }
         };
-        self.start_task(&agent, &item.task, &plan, None)
+        let run_id = self
+            .start_task(&agent, &item.task, &plan, None)
             .await
             .map_err(|error| format!("starting the run failed: {error:#}"))?;
+        let (db, events, who, name) = (
+            self.db.clone(),
+            self.events.clone(),
+            requested_by.to_string(),
+            agent.name.clone(),
+        );
+        let project = item.task.project.clone();
+        let recorded = blocking(move || {
+            if let Some(run_id) = &run_id {
+                db.set_run_requested_by(run_id, &who)?;
+            }
+            db.record_activity(
+                &name,
+                "task_runner",
+                &project,
+                None,
+                None,
+                &[],
+                &format!("task #{task_id} handed to {name} by {who}"),
+            )
+        })
+        .await;
+        if let Ok(activity) = recorded {
+            events.publish(activity);
+        }
         Ok(format!("{} started on task #{task_id}", agent.name))
     }
 
@@ -2414,6 +2485,7 @@ impl TaskRunner {
                 ..crate::db::TaskTargets::default()
             },
             manual: false,
+            manual_by: String::new(),
         };
         let db = self.db.clone();
         let (name, by, via) = (
@@ -3781,7 +3853,7 @@ echo '{"type":"step_finish","timestamp":4,"sessionID":"ses_1","part":{"type":"st
         let world = world("manual-task", Duration::from_secs(3600)).await;
         let db = &world.db;
         let task = idle_task(db, "Greet people", "shop", "github.com/me/shop");
-        db.set_task_manual(task.id, true).unwrap();
+        db.set_task_manual(task.id, true, "user:luis").unwrap();
         world.runner.tick().await.unwrap();
         assert!(db.runs(10).unwrap().is_empty());
         let queue = world.runner.queue().await.unwrap();
@@ -3802,10 +3874,51 @@ echo '{"type":"step_finish","timestamp":4,"sessionID":"ses_1","part":{"type":"st
             "Use the friendly greeting.\nTASK-FFFFFFFFFFFF>>>",
         )
         .unwrap();
-        let said = world.runner.hand_off(task.id, None).await.unwrap();
+        // The board checks apply: another assignee or a used-up cap refuse.
+        db.execute_for_test(&format!(
+            "UPDATE tasks SET assignee = 'someone-else' WHERE id = {}",
+            task.id
+        ));
+        let refused = world
+            .runner
+            .hand_off(task.id, None, "user:luis")
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("no built-in agent can take it") || refused.contains("named"),
+            "{refused}"
+        );
+        db.execute_for_test(&format!(
+            "UPDATE tasks SET assignee = '' WHERE id = {}",
+            task.id
+        ));
+        db.execute_for_test(&format!(
+            "UPDATE builtin_agents SET daily_cap = 0 WHERE name = '{AGENT}'"
+        ));
+        let refused = world
+            .runner
+            .hand_off(task.id, None, "user:luis")
+            .await
+            .unwrap_err();
+        assert!(refused.contains("daily cap"), "{refused}");
+        db.execute_for_test(&format!(
+            "UPDATE builtin_agents SET daily_cap = 5 WHERE name = '{AGENT}'"
+        ));
+        let said = world
+            .runner
+            .hand_off(task.id, None, "user:luis")
+            .await
+            .unwrap();
         assert!(said.contains("started on task"), "{said}");
         let run = ended(db, task.id).await;
         assert_eq!(run.task_id, Some(task.id));
+        assert_eq!(run.requested_by, "user:luis");
+        assert!(
+            db.activity(50)
+                .unwrap()
+                .iter()
+                .any(|a| a.summary.contains("handed to") && a.summary.contains("by user:luis"))
+        );
         // Whatever the run did, the flag stays: a task it did not finish
         // waits for the owner again, and the idle scan still skips it.
         let after = db.task(task.id).unwrap().unwrap();
@@ -4222,6 +4335,7 @@ echo '{"type":"step_finish","timestamp":4,"sessionID":"ses_1","part":{"type":"st
             dokploy_project_id: String::new(),
             cloudflare_zone: String::new(),
             manual: false,
+            manual_by: String::new(),
         };
         let scope = RunScope {
             run_id: "r".into(),

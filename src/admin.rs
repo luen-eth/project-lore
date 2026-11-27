@@ -2175,6 +2175,7 @@ async fn add_task(
             cloudflare_zone: form.cloudflare_zone,
         },
         manual: form.manual,
+        manual_by: format!("user:{}", me.username),
     };
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Task> {
@@ -2247,7 +2248,11 @@ async fn update_task(
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Task>> {
         if form.action.trim() == "manual" {
             let manual = form.manual.unwrap_or(true);
-            let Some(task) = state.db.set_task_manual(id, manual)? else {
+            let Some(task) =
+                state
+                    .db
+                    .set_task_manual(id, manual, &format!("user:{}", me.username))?
+            else {
                 return Ok(None);
             };
             let summary = format!(

@@ -222,7 +222,13 @@ pub enum ToRunner {
     /// The hello was refused; lore closes the link after this.
     Refused { reason: String },
     /// Report the sign-in state (answered with `Status`).
-    Status { id: u64 },
+    Status {
+        id: u64,
+        /// The owner pressed Check: forget what was refused lately and try
+        /// the first credential again.
+        #[serde(default)]
+        check: bool,
+    },
     /// List the models the CLI offers (answered with `Models`).
     ListModels { id: u64 },
     /// Start an interactive sign-in (answered with `LoginPrompt`, later
@@ -528,7 +534,7 @@ mod tests {
         let to: Vec<ToRunner> = vec![
             ToRunner::Welcome { protocol: 1 },
             ToRunner::Refused { reason: "x".into() },
-            ToRunner::Status { id: 1 },
+            ToRunner::Status { id: 1, check: true },
             ToRunner::ListModels { id: 2 },
             ToRunner::LoginStart {
                 id: 3,

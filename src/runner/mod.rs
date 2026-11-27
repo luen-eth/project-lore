@@ -478,7 +478,12 @@ fn handle(command: ToRunner, driver: &Arc<Driver>, out: &mpsc::Sender<FromRunner
                 return;
             }
             ToRunner::Ping { id } => FromRunner::Pong { id },
-            ToRunner::Status { id } => driver.status(Some(id)).await,
+            ToRunner::Status { id, check } => {
+                if check {
+                    driver.clear_claude_refusals();
+                }
+                driver.status(Some(id)).await
+            }
             ToRunner::ListModels { id } => {
                 let (models, source) = driver.models().await;
                 FromRunner::Models {
@@ -665,7 +670,14 @@ mod tests {
             Some(FromRunner::Unsupported { command, .. }) if command == "terminal"
         ));
         // A CLI that cannot be started is reported, not fatal.
-        handle(ToRunner::Status { id: 4 }, &driver, &tx);
+        handle(
+            ToRunner::Status {
+                id: 4,
+                check: false,
+            },
+            &driver,
+            &tx,
+        );
         assert!(matches!(
             rx.recv().await,
             Some(FromRunner::Status {

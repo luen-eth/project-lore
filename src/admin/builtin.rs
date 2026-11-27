@@ -791,7 +791,9 @@ async fn update(
     };
     let claude_fallback = form.claude_fallback;
     let prefs_hub = hub.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let prefs_agent = name.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let mut prefs_changed = false;
         let before = state.db.builtin_agent(&agent)?;
         let mut after = state.db.update_builtin_settings(&agent, &settings, &who)?;
         if let Some(on) = read_other_services
@@ -822,7 +824,7 @@ async fn update(
                 )?;
                 after.claude_priority = priority;
                 after.claude_fallback = fallback.then_some(true);
-                prefs_hub.send_claude_prefs(&agent);
+                prefs_changed = true;
             }
         }
         if before.as_ref() != Some(&after) {
@@ -910,11 +912,16 @@ async fn update(
                 );
             }
         }
-        Ok(())
+        Ok(prefs_changed)
     })
     .await;
     match result {
-        Ok(Ok(())) => one(&admin, hub, name).await,
+        Ok(Ok(prefs_changed)) => {
+            if prefs_changed {
+                prefs_hub.send_claude_prefs(&prefs_agent).await;
+            }
+            one(&admin, hub, name).await
+        }
         Ok(Err(error)) => bad_request(&error.to_string()),
         Err(error) => {
             tracing::error!(%error, "saving a built-in agent failed");
@@ -931,7 +938,11 @@ async fn refresh(State(admin): State<Arc<Admin>>, Path(name): Path<String>) -> R
         Err(status) => return status.into_response(),
     };
     let (status, models) = tokio::join!(
-        hub.request(&name, |id| ToRunner::Status { id }, STATUS_WAIT),
+        hub.request(
+            &name,
+            |id| ToRunner::Status { id, check: true },
+            STATUS_WAIT
+        ),
         hub.request(&name, |id| ToRunner::ListModels { id }, MODELS_WAIT),
     );
     if let Err(error) = status.and(models) {
@@ -1112,7 +1123,11 @@ async fn credential(
         Ok(FromRunner::Done { .. }) => {
             // The page shows the sign-in state the stored credential gives.
             let _ = hub
-                .request(&name, |id| ToRunner::Status { id }, STATUS_WAIT)
+                .request(
+                    &name,
+                    |id| ToRunner::Status { id, check: false },
+                    STATUS_WAIT,
+                )
                 .await;
             note_activity(
                 &admin,
@@ -1152,7 +1167,11 @@ async fn logout(
     {
         Ok(FromRunner::Done { .. }) => {
             let _ = hub
-                .request(&name, |id| ToRunner::Status { id }, STATUS_WAIT)
+                .request(
+                    &name,
+                    |id| ToRunner::Status { id, check: false },
+                    STATUS_WAIT,
+                )
                 .await;
             note_activity(
                 &admin,

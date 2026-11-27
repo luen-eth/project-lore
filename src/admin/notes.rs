@@ -242,6 +242,8 @@ pub(super) async fn todo_from_entry(
 ) -> Response {
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Task>> {
+        // One move at a time (see `MOVE_TO_BOARD`).
+        let _moving = crate::db::MOVE_TO_BOARD.blocking_lock();
         let Some(entry) = state.db.get(id)? else {
             return Ok(None);
         };
@@ -270,6 +272,7 @@ pub(super) async fn todo_from_entry(
             session_id: None,
             targets: crate::db::TaskTargets::default(),
             manual: false,
+            manual_by: String::new(),
         })?;
         state.db.set_task_author(task.id, &page_author(&me))?;
         state.db.amend(
@@ -361,6 +364,7 @@ pub(super) struct HandOffForm {
 /// checks a delegation passes. The manual flag stays as it is.
 pub(super) async fn hand_off(
     State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
     Path(id): Path<i64>,
     Json(form): Json<HandOffForm>,
 ) -> Response {
@@ -369,7 +373,11 @@ pub(super) async fn hand_off(
     };
     let agent = form.agent.trim().to_lowercase();
     match runner
-        .hand_off(id, (!agent.is_empty()).then_some(agent.as_str()))
+        .hand_off(
+            id,
+            (!agent.is_empty()).then_some(agent.as_str()),
+            &format!("user:{}", me.username),
+        )
         .await
     {
         Ok(said) => Json(json!({ "ok": true, "message": said })).into_response(),

@@ -694,14 +694,17 @@ impl Hub {
     }
 
     /// Sends the agent's runner its Claude credential choice again, after
-    /// the owner changed it.
-    pub fn send_claude_prefs(&self, agent: &str) {
+    /// the owner changed it: waits for room on the link rather than drop
+    /// it (a runner that is not connected gets it when it connects).
+    pub async fn send_claude_prefs(&self, agent: &str) {
         let Some(prefs) = self.claude_prefs(agent) else {
             return;
         };
         let link = self.inner().links.get(agent).map(|link| link.tx.clone());
-        if let Some(link) = link {
-            let _ = link.try_send(prefs);
+        if let Some(link) = link
+            && link.send(prefs).await.is_err()
+        {
+            tracing::warn!(%agent, "the runner's link closed before it heard the credential order");
         }
     }
 
@@ -1787,7 +1790,11 @@ esac
         );
         let status = pair
             .hub
-            .request("claude-builtin", |id| ToRunner::Status { id }, WAIT)
+            .request(
+                "claude-builtin",
+                |id| ToRunner::Status { id, check: false },
+                WAIT,
+            )
             .await
             .unwrap();
         let FromRunner::Status { signed_in, .. } = status else {
@@ -1826,7 +1833,11 @@ esac
         // The fake CLI echoes the token in its status; the runner removes it.
         let status = pair
             .hub
-            .request("claude-builtin", |id| ToRunner::Status { id }, WAIT)
+            .request(
+                "claude-builtin",
+                |id| ToRunner::Status { id, check: false },
+                WAIT,
+            )
             .await
             .unwrap();
         let FromRunner::Status {
@@ -2169,7 +2180,11 @@ esac
         // Not connected: a clear error, at once.
         assert!(matches!(
             pair.hub
-                .request("claude-builtin", |id| ToRunner::Status { id }, WAIT)
+                .request(
+                    "claude-builtin",
+                    |id| ToRunner::Status { id, check: false },
+                    WAIT
+                )
                 .await,
             Err(HubError::NotConnected)
         ));

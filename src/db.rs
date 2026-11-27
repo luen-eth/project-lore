@@ -20,6 +20,10 @@ pub use builtin::*;
 
 pub const KINDS: &[&str] = &["update", "decision", "bug", "note", "todo"];
 
+/// Held while a note-style to-do is checked and moved to the board (the
+/// tool and the page), so two moves at once cannot both add a task.
+pub static MOVE_TO_BOARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The line a note-style to-do gets when it is moved to the board.
 pub fn moved_to_board_line(task_id: i64) -> String {
     format!("Moved to the board as task #{task_id}.")
@@ -150,12 +154,16 @@ CREATE INDEX IF NOT EXISTS tasks_project_status ON tasks (project, status);
 
 -- Notes the owner (a signed-in user) leaves on a task (schema 9), in order;
 -- the task's own `note` stays the latest status note agents and lore write.
+-- `task_created` is the task's own created_at when the note was written: a
+-- note shows only with the task whose created_at still matches, so a row
+-- left behind can never attach to another task that reuses the id.
 CREATE TABLE IF NOT EXISTS task_notes (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id    INTEGER NOT NULL,
-    author     TEXT NOT NULL,
-    body       TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER NOT NULL,
+    author       TEXT NOT NULL,
+    body         TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    task_created TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS task_notes_task ON task_notes (task_id, id);
 
@@ -287,7 +295,7 @@ const RULE_BODY_MAX_CHARS: usize = 2000;
 const TASK_COLUMNS: &str = "id, project, title, body, status, assignee, created_by, \
                             claimed_by, done_by, done_commit, note, session_id, \
                             created_at, updated_at, done_at, repo, dokploy_project_id, \
-                            cloudflare_zone, manual";
+                            cloudflare_zone, manual, manual_by";
 
 /// The columns of a message row, in the order `Message::from_row` reads them.
 const MESSAGE_COLUMNS: &str = "id, kind, project, from_agent, to_agent, body, session_id, \
@@ -371,7 +379,8 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// agent the services of its terminals and the order and fallback of
 /// Claude's credentials (`builtin_agents.terminal_services`,
 /// `claude_priority`, `claude_fallback`), a task's manual flag
-/// (`tasks.manual`) and the owner's notes on tasks (`task_notes`); the
+/// (`tasks.manual`, `tasks.manual_by`) and the owner's notes on tasks
+/// (`task_notes`, each bound to its task's `created_at`); the
 /// columns nullable, NULL being the behaviour before them.
 pub const SCHEMA_VERSION: i64 = 9;
 
@@ -469,6 +478,10 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // Tasks (schema 9): manual, never assigned to a built-in agent by lore
     // itself (NULL or 0: automatic, as before).
     ("tasks", "manual", "INTEGER"),
+    // Who set it (schema 9): `user:<name>` or `agent:<name>`.
+    ("tasks", "manual_by", "TEXT"),
+    // The task's created_at a note was written for (schema 9).
+    ("task_notes", "task_created", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -836,6 +849,10 @@ pub struct Task {
     /// itself (the idle rule skips it); anything else is as for any task.
     #[serde(default)]
     pub manual: bool,
+    /// Who made it manual (schema 9): `user:<name>` or `agent:<name>`;
+    /// empty when it is not manual or nobody was recorded.
+    #[serde(default)]
+    pub manual_by: String,
 }
 
 impl Task {
@@ -860,6 +877,7 @@ impl Task {
             dokploy_project_id: row.get(16)?,
             cloudflare_zone: row.get(17)?,
             manual: row.get::<_, Option<bool>>(18)?.unwrap_or(false),
+            manual_by: row.get::<_, Option<String>>(19)?.unwrap_or_default(),
         })
     }
 }
@@ -904,6 +922,8 @@ pub struct NewTask {
     pub targets: TaskTargets,
     /// Manual: never assigned to a built-in agent by lore itself.
     pub manual: bool,
+    /// Who made it manual (`user:<name>` or `agent:<name>`).
+    pub manual_by: String,
 }
 
 /// The optional fields that say where a task's work goes: the repository,
@@ -2217,8 +2237,9 @@ impl Db {
         if replaces_board {
             tx.execute_batch(
                 "DELETE FROM message_reads; DELETE FROM messages; DELETE FROM tasks;
+                 DELETE FROM task_notes;
                  DELETE FROM delegations; DELETE FROM run_writes WHERE kind = 'message';
-                 DELETE FROM sqlite_sequence WHERE name IN ('tasks', 'messages');",
+                 DELETE FROM sqlite_sequence WHERE name IN ('tasks', 'messages', 'task_notes');",
             )?;
         }
         for entry in &backup.entries {
@@ -2370,9 +2391,9 @@ impl Db {
                 "INSERT INTO tasks (id, project, title, body, status, assignee, created_by,
                                       claimed_by, done_by, done_commit, note, session_id,
                                       created_at, updated_at, done_at, repo,
-                                      dokploy_project_id, cloudflare_zone, manual)
+                                      dokploy_project_id, cloudflare_zone, manual, manual_by)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16, ?17, ?18, ?19)",
+                         ?16, ?17, ?18, ?19, ?20)",
                 params![
                     task.id,
                     task.project,
@@ -2392,7 +2413,8 @@ impl Db {
                     task.repo,
                     task.dokploy_project_id,
                     task.cloudflare_zone,
-                    task.manual.then_some(true)
+                    task.manual.then_some(true),
+                    (task.manual && !task.manual_by.is_empty()).then_some(task.manual_by.as_str())
                 ],
             )?;
         }
@@ -2629,9 +2651,9 @@ impl Db {
                 "INSERT INTO tasks (project, title, body, status, assignee, created_by,
                                       claimed_by, done_by, done_commit, note, session_id,
                                       created_at, updated_at, done_at, repo,
-                                      dokploy_project_id, cloudflare_zone, manual)
+                                      dokploy_project_id, cloudflare_zone, manual, manual_by)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16, ?17, ?18)",
+                         ?16, ?17, ?18, ?19)",
                 params![
                     task.project,
                     task.title,
@@ -2650,7 +2672,8 @@ impl Db {
                     task.repo,
                     task.dokploy_project_id,
                     task.cloudflare_zone,
-                    task.manual.then_some(true)
+                    task.manual.then_some(true),
+                    (task.manual && !task.manual_by.is_empty()).then_some(task.manual_by.as_str())
                 ],
             )?;
         }
@@ -3086,12 +3109,12 @@ impl Db {
             anyhow::bail!("the note must be at most {BODY_MAX_CHARS} characters");
         }
         let conn = self.lock();
-        if get_task(&conn, task_id)?.is_none() {
+        let Some(task) = get_task(&conn, task_id)? else {
             return Ok(None);
-        }
+        };
         conn.execute(
-            "INSERT INTO task_notes (task_id, author, body) VALUES (?1, ?2, ?3)",
-            params![task_id, author, body],
+            "INSERT INTO task_notes (task_id, author, body, task_created) VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, author, body, task.created_at],
         )?;
         let id = conn.last_insert_rowid();
         Ok(Some(conn.query_row(
@@ -3108,9 +3131,12 @@ impl Db {
             return Ok(out);
         }
         let conn = self.lock();
+        // Only notes written for this very task (same id and created_at).
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, author, body, created_at FROM task_notes WHERE task_id = ?1
-             ORDER BY id",
+            "SELECT n.id, n.task_id, n.author, n.body, n.created_at
+             FROM task_notes n JOIN tasks t ON t.id = n.task_id
+             WHERE n.task_id = ?1 AND n.task_created = t.created_at
+             ORDER BY n.id",
         )?;
         for id in task_ids {
             let notes = stmt
@@ -3124,13 +3150,15 @@ impl Db {
     }
 
     /// Puts a task on manual (lore never assigns it to a built-in agent by
-    /// itself) or back to automatic.
-    pub fn set_task_manual(&self, id: i64, manual: bool) -> Result<Option<Task>> {
+    /// itself) or back to automatic, recording who did (`user:<name>` or
+    /// `agent:<name>`; cleared with the flag).
+    pub fn set_task_manual(&self, id: i64, manual: bool, by: &str) -> Result<Option<Task>> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE tasks SET manual = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            "UPDATE tasks SET manual = ?2, manual_by = ?3,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?1",
-            params![id, manual.then_some(true)],
+            params![id, manual.then_some(true), manual.then_some(by)],
         )?;
         get_task(&conn, id)
     }
@@ -3144,10 +3172,10 @@ impl Db {
         conn.execute(
             "INSERT INTO tasks (project, title, body, assignee, created_by, session_id,
                                  created_at, updated_at, repo, dokploy_project_id,
-                                 cloudflare_zone, manual)
+                                 cloudflare_zone, manual, manual_by)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6,
                      strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?7, ?8, ?9, ?10)",
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?7, ?8, ?9, ?10, ?11)",
             params![
                 project,
                 title,
@@ -3158,7 +3186,8 @@ impl Db {
                 targets.repo,
                 targets.dokploy_project_id,
                 targets.cloudflare_zone,
-                new.manual.then_some(true)
+                new.manual.then_some(true),
+                new.manual.then_some(new.manual_by.as_str())
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -5974,10 +6003,12 @@ fn similar_pairs(
                 })
             })
             .collect();
-        handles
+        // Every worker is joined before any failure is answered.
+        let joined: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
+        joined
             .into_iter()
-            .map(|handle| {
-                handle.join().map_err(|_| {
+            .map(|result| {
+                result.map_err(|_| {
                     tracing::error!("a worker computing the graph's links panicked");
                     anyhow::anyhow!("computing the graph's links failed")
                 })
@@ -6001,6 +6032,38 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// The owner's notes belong to one task: a board restore drops them,
+    /// and a row left behind (an older binary's restore) never attaches to
+    /// a new task that reuses the id.
+    #[test]
+    fn owner_notes_never_attach_to_another_task_with_the_same_id() {
+        let dir = std::env::temp_dir().join(format!("lore-db-notes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = super::Db::open(&dir.join("lore.db")).unwrap();
+        let backup = db.export().unwrap();
+        let new = |title: &str| super::NewTask {
+            project: "shop".into(),
+            title: title.into(),
+            created_by: "admin".into(),
+            ..Default::default()
+        };
+        let task = db.add_task(&new("old task")).unwrap();
+        db.add_task_note(task.id, "luis", "only for the old task")
+            .unwrap();
+        assert_eq!(db.task_notes(&[task.id]).unwrap()[&task.id].len(), 1);
+        db.restore(&backup).unwrap();
+        // The restore dropped the notes and restarted the ids.
+        db.execute_for_test(&format!(
+            "INSERT INTO task_notes (task_id, author, body, task_created)
+             VALUES ({}, 'luis', 'left behind', '1999-01-01T00:00:00Z')",
+            task.id
+        ));
+        let reused = db.add_task(&new("new task")).unwrap();
+        assert_eq!(reused.id, task.id, "the id is reused");
+        assert!(db.task_notes(&[reused.id]).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The parallel, once-per-pair similarity pass finds exactly what the
     /// plain pass over every ordered pair finds, in the same order.
     #[test]

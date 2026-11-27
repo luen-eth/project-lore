@@ -792,10 +792,10 @@ impl Db {
         let rows = stmt.query_map(params![offset, limit as i64], |row| {
             Ok(AutoTask {
                 task: super::Task::from_row(row)?,
-                idle: row.get(19)?,
-                waiting: row.get(20)?,
-                auto_attempts: row.get(21)?,
-                author: row.get(22)?,
+                idle: row.get(20)?,
+                waiting: row.get(21)?,
+                auto_attempts: row.get(22)?,
+                author: row.get(23)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1068,6 +1068,16 @@ impl Db {
         Ok(())
     }
 
+    /// Records who asked for a run that lore did not start by itself
+    /// (`user:<name>` for the owner's hand-off on the page).
+    pub fn set_run_requested_by(&self, run_id: &str, by: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE agent_runs SET requested_by = ?2 WHERE id = ?1",
+            params![run_id, by],
+        )?;
+        Ok(())
+    }
+
     /// Whether the task runner ever started a run for a task, or a
     /// delegation hands it to a built-in agent: such a task is finished
     /// only on lore's own commit proof, never from a terminal.
@@ -1114,11 +1124,11 @@ impl Db {
             Ok((
                 super::Task::from_row(row)?,
                 Delegation {
-                    task_id: row.get(19)?,
-                    agent: row.get(20)?,
-                    requested_by: row.get(21)?,
-                    via: row.get(22)?,
-                    created_at: row.get(23)?,
+                    task_id: row.get(20)?,
+                    agent: row.get(21)?,
+                    requested_by: row.get(22)?,
+                    via: row.get(23)?,
+                    created_at: row.get(24)?,
                 },
             ))
         })?;

@@ -2190,7 +2190,10 @@ function renderTasks(admin) {
    the owner's notes in order, and with `write` a note field, the manual
    switch and (with `agents`) "Hand to a built-in agent now". */
 function taskExtras(item, task, notes, reload, statusLine) {
-  if (task.manual) item.append(el("div", "board-meta task-manual", "manual: lore will not assign this to a built-in agent"));
+  if (task.manual) {
+    const by = task.manual_by ? ` (set by ${task.manual_by.replace(/^user:/, "").replace(/^agent:/, "agent ")})` : "";
+    item.append(el("div", "board-meta task-manual", "manual: lore will not assign this to a built-in agent" + by));
+  }
   if (notes && notes.length) {
     const list = el("ul", "task-owner-notes");
     for (const note of notes) {

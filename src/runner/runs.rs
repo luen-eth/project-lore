@@ -171,6 +171,7 @@ impl Runs {
         let (stop_tx, stop_rx) = watch::channel(None);
         self.active().insert(run_id.clone(), stop_tx);
         let run = Run {
+            claude: None,
             driver: self.driver.clone(),
             out: self.out.clone(),
             dir: self.work.join(&dir_name),
@@ -248,6 +249,8 @@ fn valid_run_id(id: &str) -> bool {
 /// One run in progress.
 struct Run {
     driver: Arc<Driver>,
+    /// The Claude credential this run's CLI was started with.
+    claude: Option<super::drivers::ClaudeAuth>,
     out: mpsc::Sender<FromRunner>,
     /// `/work/<run id>`: `repo` (the checkout) and `lore` (the CLI's
     /// configuration), deleted whatever happens.
@@ -528,8 +531,13 @@ impl Run {
 
     /// The CLI's home for this run; a conversation's earlier transcripts
     /// are put back in it.
-    fn cli_home(&self) -> Result<CliHome> {
+    fn cli_home(&mut self) -> Result<CliHome> {
         let home = self.driver.home()?;
+        // The run's Claude credential, decided with the home and used for
+        // its log line and the refusal bookkeeping.
+        self.claude =
+            (home.claude_auth() != super::drivers::ClaudeAuth::None).then(|| home.claude_auth());
+        self.driver.note_claude_start(&home);
         if self.spec.kind == RunKind::Chat
             && let Some(name) = &self.spec.workdir
         {
@@ -728,9 +736,7 @@ impl Run {
         base: Option<String>,
     ) -> Result<Ended> {
         // The credential Claude Code was started with (its kind only).
-        let credential = (self.driver.kind() == Kind::Claude)
-            .then(|| self.driver.claude_last())
-            .flatten();
+        let credential = self.claude;
         let mut child = command.spawn().context("starting the CLI")?;
         let session = child.id().and_then(|pid| Pid::from_raw(pid as i32));
         self.flush().await;
@@ -791,6 +797,7 @@ impl Run {
         }
         drop(lines_tx);
         let kind = self.driver.kind();
+        let mut suspected: Option<super::drivers::ClaudeAuth> = None;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(self.spec.wall_clock_secs);
         let mut session_sent = false;
         let mut reason: Option<String> = None;
@@ -825,8 +832,11 @@ impl Run {
                         if let Some(answer) = parsed.answer {
                             self.answer = Some(answer);
                         }
-                        if parsed.auth_failed && let Some(auth) = credential {
-                            self.driver.claude_refused(auth);
+                        // Only suspected here: whatever ran in the run could
+                        // have spoilt its own copy of the credential. The
+                        // runner confirms it below with a clean check.
+                        if parsed.auth_failed && credential.is_some() {
+                            suspected = credential;
                         }
                         for (stream, text) in parsed.lines {
                             self.say(&stream, &text).await;
@@ -899,6 +909,12 @@ impl Run {
         // Nothing the CLI started outlives the run.
         if let Some(session) = session {
             super::terminal::kill_session(session);
+        }
+        // A refusal inside a run counts only once the runner confirms it
+        // with its own clean check of the stored credential.
+        if let Some(auth) = suspected {
+            let driver = self.driver.clone();
+            tokio::spawn(async move { driver.confirm_claude_refusal(auth).await });
         }
         Ok(Ended { code, reason })
     }
