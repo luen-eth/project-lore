@@ -42,7 +42,7 @@ use tokio::{
 };
 
 use super::{
-    drivers::{CliHome, Driver, redact_with, shorten},
+    drivers::{CliHome, Driver, HomePurpose, redact_with, shorten},
     protocol::{FromRunner, Kind, RunKind, RunLine, RunSpec, ToRunner},
     sandbox::{self, Occupancy},
 };
@@ -150,8 +150,18 @@ impl Runs {
     fn start(&self, spec: RunSpec) {
         let run_id = spec.run_id.clone();
         let dir_name = spec.workdir.clone().unwrap_or_else(|| run_id.clone());
+        // opencode starts with a model whose provider has a key: the
+        // owner's choice, else the agent's default; with none, the run is
+        // refused with the reason instead of starting a CLI that cannot
+        // work.
+        let model = match self.driver.kind() {
+            Kind::Opencode => self.driver.opencode_model(Some(&spec.model)).map(Some),
+            _ => Ok(None),
+        };
         let refusal = if !valid_run_id(&run_id) || !valid_run_id(&dir_name) {
             Some("failed: the run id is not a plain name".to_string())
+        } else if let Err(why) = &model {
+            Some(format!("failed: {why}"))
         } else if !self.active().is_empty() {
             Some(format!(
                 "{BUSY}another run is still going in this container"
@@ -171,6 +181,7 @@ impl Runs {
         let (stop_tx, stop_rx) = watch::channel(None);
         self.active().insert(run_id.clone(), stop_tx);
         let run = Run {
+            model: model.ok().flatten(),
             driver: self.driver.clone(),
             out: self.out.clone(),
             dir: self.work.join(&dir_name),
@@ -248,6 +259,10 @@ fn valid_run_id(id: &str) -> bool {
 /// One run in progress.
 struct Run {
     driver: Arc<Driver>,
+    /// The model an opencode run starts with, decided when it was asked
+    /// for (see `Driver::opencode_model`); `None` for the other CLIs,
+    /// which take the spec's model as it is.
+    model: Option<String>,
     out: mpsc::Sender<FromRunner>,
     /// `/work/<run id>`: `repo` (the checkout) and `lore` (the CLI's
     /// configuration), deleted whatever happens.
@@ -529,7 +544,9 @@ impl Run {
     /// The CLI's home for this run; a conversation's earlier transcripts
     /// are put back in it.
     fn cli_home(&mut self) -> Result<CliHome> {
-        let home = self.driver.home()?;
+        let home = self
+            .driver
+            .home_for_model(HomePurpose::Plain, self.model.as_deref())?;
         if self.spec.kind == RunKind::Chat
             && let Some(name) = &self.spec.workdir
         {
@@ -678,8 +695,13 @@ impl Run {
     fn cli_command(&self, repo: &Path, conf: &Path) -> Result<CliCommand> {
         let kind = self.driver.kind();
         let program = self.driver.settings.program.clone();
-        let model = self.spec.model.trim();
-        let model = (!model.is_empty() && !model.starts_with('-')).then_some(model);
+        let model = match &self.model {
+            Some(model) => Some(model.as_str()),
+            None => {
+                let model = self.spec.model.trim();
+                (!model.is_empty() && !model.starts_with('-')).then_some(model)
+            }
+        };
         let resume = self
             .spec
             .resume
@@ -736,9 +758,16 @@ impl Run {
                 run_id: self.spec.run_id.clone(),
                 session_id: None,
                 base,
+                model: self.model.clone(),
             })
             .await;
-        self.say("lore", "the CLI started").await;
+        match &self.model {
+            Some(model) => {
+                self.say("lore", &format!("the CLI started with the model {model}"))
+                    .await
+            }
+            None => self.say("lore", "the CLI started").await,
+        }
         let (lines_tx, mut lines_rx) = mpsc::channel::<(bool, String)>(256);
         for (is_err, pipe) in [
             (
@@ -805,6 +834,7 @@ impl Run {
                                 run_id: self.spec.run_id.clone(),
                                 session_id: Some(self.redact(&session_id)),
                                 base: None,
+                                model: None,
                             }).await;
                         }
                         if let Some(answer) = parsed.answer {
@@ -2022,6 +2052,73 @@ esac
                 _ => {}
             }
         }
+    }
+
+    /// An opencode run (a task or `ask`) without a key for the model it
+    /// would use is refused with the reason before anything starts: no
+    /// clone, no CLI, never opencode's own default model.
+    #[tokio::test]
+    async fn an_opencode_run_without_a_key_is_refused_with_the_reason() {
+        let dir = temp("oc-no-key");
+        let program = dir.join("opencode");
+        executable(&program, "#!/bin/sh\ntouch \"$HOME/../../cli-ran\"\n");
+        let driver = Arc::new(Driver::with_isolation(
+            Settings {
+                kind: Kind::Opencode,
+                provider: "deepseek".into(),
+                home: dir.join("runner-home"),
+                program,
+            },
+            Isolation::Fresh(Fresh {
+                exec_tmp: None,
+                state: dir.join("state"),
+                homes: dir.join("work/.homes"),
+                user: None,
+            }),
+        ));
+        driver.prepare().unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let runs = Runs::new(
+            driver.clone(),
+            tx,
+            dir.join("work"),
+            PathBuf::from("/bin/false"),
+            "deepseek-builtin".into(),
+            Registry::default(),
+        );
+        let mcp = fake_mcp().await;
+        runs.handle(ToRunner::RunStart {
+            spec: spec("r1", "", &mcp),
+        });
+        let FromRunner::RunExit { reason, .. } = exit_of(&mut rx, "r1").await else {
+            panic!()
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some(format!("failed: {}", super::super::drivers::NO_KEY).as_str())
+        );
+        // A key for DeepSeek, a model chosen of Anthropic: refused by name.
+        driver
+            .set_credential(
+                super::super::protocol::CredentialKind::ApiKey,
+                &Secret::new("sk-deepseek-fake-0000000001"),
+            )
+            .await
+            .unwrap();
+        let mut asked = spec("r2", "", &mcp);
+        asked.model = "anthropic/claude-sonnet-5-5".into();
+        runs.handle(ToRunner::RunStart { spec: asked });
+        let FromRunner::RunExit { reason, .. } = exit_of(&mut rx, "r2").await else {
+            panic!()
+        };
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("needs an API key for Anthropic")),
+            "{reason:?}"
+        );
+        assert!(!dir.join("cli-ran").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// H1: whatever a run leaves in its home, the stored sign-in is never

@@ -545,6 +545,13 @@ pub struct ModelList {
     pub source: String,
 }
 
+/// An opencode agent's keys, as its runner last reported them.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OpencodeKeys {
+    pub keys: Vec<crate::runner::protocol::ProviderKey>,
+    pub default_model: Option<String>,
+}
+
 /// What a terminal's page hears from the runner.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TerminalEvent {
@@ -615,6 +622,9 @@ struct Inner {
     pending: HashMap<u64, (String, oneshot::Sender<FromRunner>)>,
     logins: HashMap<String, LoginState>,
     models: HashMap<String, ModelList>,
+    /// opencode agents: each provider's key as the runner last reported
+    /// it (never a key), and the model a start without a chosen one uses.
+    keys: HashMap<String, OpencodeKeys>,
     resources: HashMap<String, Resources>,
     terminals: HashMap<String, Terminal>,
     intrusions: HashMap<String, Intrusion>,
@@ -739,6 +749,10 @@ impl Hub {
 
     pub fn models(&self, name: &str) -> Option<ModelList> {
         self.inner().models.get(name).cloned()
+    }
+
+    pub fn keys(&self, name: &str) -> Option<OpencodeKeys> {
+        self.inner().keys.get(name).cloned()
     }
 
     pub fn resources(&self, name: &str) -> Option<Resources> {
@@ -1095,8 +1109,19 @@ impl Hub {
                 login_ends,
                 cli_version,
                 detail,
+                keys,
+                default_model,
                 ..
             } => {
+                if self.token(agent).map(|token| token.kind) == Some(Kind::Opencode) {
+                    self.inner().keys.insert(
+                        agent.to_string(),
+                        OpencodeKeys {
+                            keys: keys.iter().take(16).cloned().collect(),
+                            default_model: default_model.clone(),
+                        },
+                    );
+                }
                 let status = BuiltinStatus {
                     signed_in: *signed_in,
                     login_method: method.clone().unwrap_or_default(),
@@ -1166,7 +1191,7 @@ impl Hub {
                 self.inner().models.insert(
                     agent.to_string(),
                     ModelList {
-                        models: models.iter().take(200).cloned().collect(),
+                        models: models.iter().take(400).cloned().collect(),
                         source: source.clone(),
                     },
                 );
@@ -1755,11 +1780,7 @@ esac
         );
         let status = pair
             .hub
-            .request(
-                "claude-builtin",
-                |id| ToRunner::Status { id },
-                WAIT,
-            )
+            .request("claude-builtin", |id| ToRunner::Status { id }, WAIT)
             .await
             .unwrap();
         let FromRunner::Status { signed_in, .. } = status else {
@@ -1776,6 +1797,7 @@ esac
                     id,
                     credential: CredentialKind::SetupToken,
                     value: Secret::new(token),
+                    provider: None,
                 },
                 WAIT,
             )
@@ -1798,11 +1820,7 @@ esac
         // The fake CLI echoes the token in its status; the runner removes it.
         let status = pair
             .hub
-            .request(
-                "claude-builtin",
-                |id| ToRunner::Status { id },
-                WAIT,
-            )
+            .request("claude-builtin", |id| ToRunner::Status { id }, WAIT)
             .await
             .unwrap();
         let FromRunner::Status {
@@ -1987,6 +2005,7 @@ esac
                     id,
                     credential: CredentialKind::AuthJson,
                     value: Secret::new("not-json-but-secret-looking-value"),
+                    provider: None,
                 },
                 WAIT,
             )
@@ -2027,6 +2046,7 @@ esac
                     id,
                     credential: CredentialKind::ApiKey,
                     value: Secret::new("sk-deepseek-0123456789"),
+                    provider: None,
                 },
                 WAIT,
             )
@@ -2044,11 +2064,79 @@ esac
             .request("deepseek-builtin", |id| ToRunner::ListModels { id }, WAIT)
             .await
             .unwrap();
+        // Only the models of providers with a key, as full ids.
         assert!(
             matches!(&models, FromRunner::Models { models, .. }
-                if models == &vec!["deepseek-v4-pro".to_string(), "deepseek-flash".to_string()]),
+                if models == &vec!["deepseek/deepseek-v4-pro".to_string(), "deepseek/deepseek-flash".to_string()]),
             "{models:?}"
         );
+        // A second provider's key, named; the hub learns which providers
+        // have one (never a key), and the models follow.
+        let answer = pair
+            .hub
+            .request(
+                "deepseek-builtin",
+                |id| ToRunner::SetCredential {
+                    id,
+                    credential: CredentialKind::ApiKey,
+                    value: Secret::new("sk-ant-api03-fake-0123456789"),
+                    provider: Some("anthropic".into()),
+                },
+                WAIT,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(answer, FromRunner::Done { ok: true, .. }),
+            "{answer:?}"
+        );
+        let _ = pair
+            .hub
+            .request("deepseek-builtin", |id| ToRunner::Status { id }, WAIT)
+            .await
+            .unwrap();
+        let keys = pair.hub.keys("deepseek-builtin").unwrap();
+        let stored: Vec<&str> = keys
+            .keys
+            .iter()
+            .filter(|k| k.stored)
+            .map(|k| k.provider.as_str())
+            .collect();
+        assert_eq!(stored, vec!["deepseek", "anthropic"]);
+        assert_eq!(
+            keys.default_model.as_deref(),
+            Some("deepseek/deepseek-v4-pro")
+        );
+        assert!(!format!("{keys:?}").contains("sk-ant-api03"));
+        let models = pair
+            .hub
+            .request("deepseek-builtin", |id| ToRunner::ListModels { id }, WAIT)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&models, FromRunner::Models { models, .. }
+                if models.iter().any(|m| m == "anthropic/x") && models.len() == 3),
+            "{models:?}"
+        );
+        // Removing it removes only it.
+        let answer = pair
+            .hub
+            .request(
+                "deepseek-builtin",
+                |id| ToRunner::RemoveCredential {
+                    id,
+                    provider: "anthropic".into(),
+                },
+                WAIT,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(answer, FromRunner::Done { ok: true, .. }),
+            "{answer:?}"
+        );
+        let text = std::fs::read_to_string(home.join(".lore-runner/secrets.env")).unwrap();
+        assert_eq!(text.trim(), "DEEPSEEK_API_KEY=sk-deepseek-0123456789");
         // A setup token is not a DeepSeek credential.
         let answer = pair
             .hub
@@ -2058,6 +2146,7 @@ esac
                     id,
                     credential: CredentialKind::SetupToken,
                     value: Secret::new("whatever-token-value"),
+                    provider: None,
                 },
                 WAIT,
             )
@@ -2145,11 +2234,7 @@ esac
         // Not connected: a clear error, at once.
         assert!(matches!(
             pair.hub
-                .request(
-                    "claude-builtin",
-                    |id| ToRunner::Status { id },
-                    WAIT
-                )
+                .request("claude-builtin", |id| ToRunner::Status { id }, WAIT)
                 .await,
             Err(HubError::NotConnected)
         ));

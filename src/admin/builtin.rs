@@ -126,6 +126,16 @@ pub(super) const ROUTES: &[(&str, &str, Access)] = &[
         "/admin/api/builtin/{name}/logout",
         Access::Needs(Perm::Agents),
     ),
+    (
+        "POST",
+        "/admin/api/builtin/{name}/key/remove",
+        Access::Needs(Perm::Agents),
+    ),
+    (
+        "POST",
+        "/admin/api/builtin/{name}/key/check",
+        Access::Needs(Perm::Agents),
+    ),
 ];
 
 /// Longest model name accepted.
@@ -171,6 +181,14 @@ pub(super) fn routes() -> Router<Arc<Admin>> {
             post(credential).layer(DefaultBodyLimit::max(2 * MAX_CREDENTIAL_BYTES)),
         )
         .route("/admin/api/builtin/{name}/logout", post(logout))
+        .route(
+            "/admin/api/builtin/{name}/key/remove",
+            post(key_remove).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/builtin/{name}/key/check",
+            post(key_check).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
         .route("/admin/terminal", get(terminal_page))
         .route(
             "/admin/terminal.js",
@@ -633,6 +651,10 @@ fn agent_view(
         "updated_by": stored.updated_by,
         "models": models,
         "resources": hub.resources(name),
+        // opencode: per provider, whether a key is stored (never the key),
+        // and the model a start without a chosen one uses.
+        "keys": hub.keys(name).map(|keys| keys.keys).unwrap_or_default(),
+        "default_model": hub.keys(name).and_then(|keys| keys.default_model),
         "methods": methods,
         "credentials": credentials,
         "login": if manage { hub.login_state(name).map(|login| json!(login)) } else { None },
@@ -877,11 +899,7 @@ async fn refresh(State(admin): State<Arc<Admin>>, Path(name): Path<String>) -> R
         Err(status) => return status.into_response(),
     };
     let (status, models) = tokio::join!(
-        hub.request(
-            &name,
-            |id| ToRunner::Status { id },
-            STATUS_WAIT
-        ),
+        hub.request(&name, |id| ToRunner::Status { id }, STATUS_WAIT),
         hub.request(&name, |id| ToRunner::ListModels { id }, MODELS_WAIT),
     );
     if let Err(error) = status.and(models) {
@@ -1013,6 +1031,19 @@ async fn login_cancel(State(admin): State<Arc<Admin>>, Path(name): Path<String>)
 struct CredentialForm {
     credential: CredentialKind,
     value: Secret,
+    /// An opencode agent's API key: which provider it is for (missing:
+    /// the agent's own).
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+/// An opencode provider id as the page sends it: a plain name.
+fn valid_provider(provider: &str) -> bool {
+    !provider.is_empty()
+        && provider.len() <= 40
+        && provider
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
 /// `POST /admin/api/builtin/{name}/credential`: a pasted token,
@@ -1045,8 +1076,24 @@ async fn credential(
     if value.len() > MAX_CREDENTIAL_BYTES {
         return bad_request(&format!("the {} is too long", form.credential.label()));
     }
+    let provider = form
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    if provider
+        .as_deref()
+        .is_some_and(|p| kind != Kind::Opencode || !valid_provider(p))
+    {
+        return bad_request("a provider is named only for an opencode agent's API key");
+    }
     let pasted = value.to_string();
     let value = Secret::new(value);
+    let for_provider = provider
+        .as_deref()
+        .map(|p| format!(" for {p}"))
+        .unwrap_or_default();
     let answer = hub
         .request(
             &name,
@@ -1054,25 +1101,28 @@ async fn credential(
                 id,
                 credential: form.credential,
                 value,
+                provider,
             },
             STATUS_WAIT,
         )
         .await;
     match answer {
         Ok(FromRunner::Done { .. }) => {
-            // The page shows the sign-in state the stored credential gives.
+            // The page shows the sign-in state the stored credential gives,
+            // and an opencode agent's models of the providers it now has.
             let _ = hub
-                .request(
-                    &name,
-                    |id| ToRunner::Status { id },
-                    STATUS_WAIT,
-                )
+                .request(&name, |id| ToRunner::Status { id }, STATUS_WAIT)
                 .await;
+            if kind == Kind::Opencode {
+                let _ = hub
+                    .request(&name, |id| ToRunner::ListModels { id }, MODELS_WAIT)
+                    .await;
+            }
             note_activity(
                 &admin,
                 "builtin",
                 &format!(
-                    "{} stored a {} in the volume of {name}",
+                    "{} stored a {}{for_provider} in the volume of {name}",
                     me.username,
                     form.credential.label()
                 ),
@@ -1083,6 +1133,108 @@ async fn credential(
         Ok(FromRunner::Error { message, .. }) => {
             bad_request(&crate::runner::drivers::redact_with(&message, &[pasted]))
         }
+        Ok(_) => StatusCode::BAD_GATEWAY.into_response(),
+        Err(error) => unreachable_runner(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct ProviderForm {
+    provider: String,
+}
+
+/// The opencode agent `name` and the provider the form names, or why not.
+fn provider_target(
+    admin: &Admin,
+    name: &str,
+    form: &ProviderForm,
+) -> Result<(Arc<Hub>, String, String), Box<Response>> {
+    let (hub, name) = target(admin, name).map_err(|status| Box::new(status.into_response()))?;
+    let Some((kind, _)) = hub.link(&name) else {
+        return Err(Box::new(unreachable_runner(HubError::NotConnected)));
+    };
+    if kind != Kind::Opencode {
+        return Err(Box::new(bad_request(
+            "only an opencode agent keeps an API key per provider",
+        )));
+    }
+    let provider = form.provider.trim();
+    if !valid_provider(provider) {
+        return Err(Box::new(bad_request("name the provider, such as deepseek")));
+    }
+    Ok((hub, name, provider.to_string()))
+}
+
+/// `POST /admin/api/builtin/{name}/key/remove`: removes one provider's
+/// stored API key from an opencode agent's volume.
+async fn key_remove(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    Path(name): Path<String>,
+    Json(form): Json<ProviderForm>,
+) -> Response {
+    let (hub, name, provider) = match provider_target(&admin, &name, &form) {
+        Ok(found) => found,
+        Err(response) => return *response,
+    };
+    let asked = provider.clone();
+    match hub
+        .request(
+            &name,
+            |id| ToRunner::RemoveCredential {
+                id,
+                provider: asked,
+            },
+            STATUS_WAIT,
+        )
+        .await
+    {
+        Ok(FromRunner::Done { .. }) => {
+            let _ = hub
+                .request(&name, |id| ToRunner::Status { id }, STATUS_WAIT)
+                .await;
+            let _ = hub
+                .request(&name, |id| ToRunner::ListModels { id }, MODELS_WAIT)
+                .await;
+            note_activity(
+                &admin,
+                "builtin",
+                &format!(
+                    "{} removed the {provider} API key from the volume of {name}",
+                    me.username
+                ),
+            );
+            one(&admin, hub, name).await
+        }
+        Ok(FromRunner::Error { message, .. }) => bad_request(&message),
+        Ok(_) => StatusCode::BAD_GATEWAY.into_response(),
+        Err(error) => unreachable_runner(error),
+    }
+}
+
+/// `POST /admin/api/builtin/{name}/key/check`: asks the provider whether
+/// it takes the stored key (one short request on it).
+async fn key_check(
+    State(admin): State<Arc<Admin>>,
+    Path(name): Path<String>,
+    Json(form): Json<ProviderForm>,
+) -> Response {
+    let (hub, name, provider) = match provider_target(&admin, &name, &form) {
+        Ok(found) => found,
+        Err(response) => return *response,
+    };
+    match hub
+        .request(
+            &name,
+            |id| ToRunner::CheckProvider { id, provider },
+            STATUS_WAIT,
+        )
+        .await
+    {
+        Ok(FromRunner::Done { ok, message, .. }) => {
+            Json(json!({ "ok": ok, "message": message })).into_response()
+        }
+        Ok(FromRunner::Error { message, .. }) => bad_request(&message),
         Ok(_) => StatusCode::BAD_GATEWAY.into_response(),
         Err(error) => unreachable_runner(error),
     }
@@ -1106,11 +1258,7 @@ async fn logout(
     {
         Ok(FromRunner::Done { .. }) => {
             let _ = hub
-                .request(
-                    &name,
-                    |id| ToRunner::Status { id },
-                    STATUS_WAIT,
-                )
+                .request(&name, |id| ToRunner::Status { id }, STATUS_WAIT)
                 .await;
             note_activity(
                 &admin,

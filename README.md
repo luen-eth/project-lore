@@ -1450,11 +1450,20 @@ allowlist cannot be bent toward the host or the LAN; plain HTTP and IP literals 
 refused. One agent cannot hold the proxy for the others: at most 64 tunnels are open
 from one container (256 in all), and a tunnel closes after 15 minutes without a byte
 passing, or after 3 hours whatever passes. The default allowlist is what each CLI
-needs, from its documentation:
+needs:
 `api.anthropic.com`, `claude.ai`, `console.anthropic.com`, `platform.claude.com`
 (Claude Code and its sign-in), `api.openai.com`, `auth.openai.com`, `chatgpt.com`
-(Codex with an API key or the ChatGPT sign-in), `api.deepseek.com` and `models.dev`
-(opencode with DeepSeek, and its model catalogue). graphify needs no network at run
+(Codex with an API key or the ChatGPT sign-in), and for the opencode agents the API
+hosts of their four providers as opencode's built-in catalogue (2.3.2) names them:
+`api.deepseek.com` (DeepSeek), `opencode.ai` (OpenCode Go, at
+`https://opencode.ai/inference/go/…`), `api.anthropic.com` (Anthropic) and
+`api.openai.com` (OpenAI). No catalogue host is allowed: the runner sets
+`OPENCODE_DISABLE_MODELS_FETCH=1`, so opencode lists the catalogue built into the
+pinned CLI and never downloads one from `models.opencode.ai` (opencode 2.x no longer
+uses `models.dev`, which earlier versions of this list allowed). `opencode.ai` is
+also where opencode's own free provider (`opencode`) is served; the proxy cannot
+tell the two apart, which is why the runner turns that provider off in opencode's
+configuration (*Signing in*, opencode agents). graphify needs no network at run
 time. Set `LORE_PROXY_ALLOW` (comma separated; `.example.com` allows every name under
 it) to change it. The agents get `HTTPS_PROXY`/`HTTP_PROXY=http://egress:3128` and
 `NO_PROXY=lore`. Claude Code documents `HTTPS_PROXY`; Codex (a Rust HTTP client)
@@ -1576,10 +1585,70 @@ ignored.
   `.env` (passed to the container as `CODEX_API_KEY`): OpenAI recommends API keys for
   automation.
 
-**DeepSeek** (`agent-deepseek`): press **Paste API key**, paste a key from the
-DeepSeek platform and press **Store**. The runner keeps it as `DEEPSEEK_API_KEY` in
-the agent's volume and passes it only to `opencode`. DeepSeek offers API keys only;
-there is no subscription sign-in.
+**opencode agents** (`agent-deepseek`, `agent-opencode`): an opencode agent takes an
+API key per provider. Its card lists four providers, each with its own **Paste API
+key**, its state (*stored* and the day, *not stored*, or *set in the container's
+environment*; never the key), **Remove** for that key alone, and **Check**:
+
+| Provider | opencode id | Variable opencode reads | Host | Default model |
+|---|---|---|---|---|
+| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | `api.deepseek.com` | `deepseek/deepseek-v4-pro` |
+| OpenCode Go | `opencode-go` | `OPENCODE_API_KEY` | `opencode.ai` | `opencode-go/glm-5.3` |
+| Anthropic (Claude models through the API) | `anthropic` | `ANTHROPIC_API_KEY` | `api.anthropic.com` | `anthropic/claude-sonnet-5-5` |
+| OpenAI (GPT models through the API) | `openai` | `OPENAI_API_KEY` | `api.openai.com` | `openai/gpt-5.5` |
+
+All four take a plain API key; this was read from opencode 2.3.2 itself, in the
+agent image: its built-in provider catalogue names the variable and the API address
+of each, and `opencode auth login <provider> --method x` lists the sign-in methods
+it offers (`key` for `deepseek`, `opencode-go` and `anthropic`; `openai` also offers
+ChatGPT sign-ins, which lore does not use). **OpenCode Go** is opencode's own
+subscription: create an API key for it in the opencode console at `opencode.ai`.
+Its key is the same variable as opencode's other provider `opencode` (its "Zen"
+models, free ones among them); lore never enables that one. A model of an agent's
+own provider may be named without the provider (`deepseek-flash` on
+`deepseek-builtin` is `deepseek/deepseek-flash`); an agent defined as
+`helper:opencode/<provider>:<secret>` offers its own provider as a fifth, keyed by
+`<PROVIDER>_API_KEY`, with no default model (choose one on its card).
+
+The runner keeps each key in the agent's volume (`secrets.env`, root's, mode 0600;
+when each was stored in `keys.json` next to it, without the key), never in lore's
+database, logs, API answers or the activity feed (which says only which provider's
+key was stored or removed), and redacts it from everything the CLI prints. The keys
+are given to the `opencode` process only, in its environment, never written to a
+file the CLI can read and never given to runner git. As before, a **Shell** in the
+agent's terminal runs with the same stored credentials (*Terminal* below).
+
+**Only the providers with a key.** Every opencode command (runs, `ask`, checks, the
+model list and terminals) starts in a fresh home whose `opencode.json` the runner
+writes before handing the home over: `enabled_providers` lists exactly the
+providers that have a key on this agent (opencode turns every other one off,
+including its own free `opencode` provider; with no key the list is empty and
+nothing is enabled), and `model` names the model the start uses. So opencode can
+never again start on a model the proxy refuses (the *Hy4 flash Free* of the
+`opencode` provider, which opencode chose by itself when no model was set).
+
+**The model a start uses**: the model chosen on the card, when its provider has a
+key; with none chosen, the agent's own default (`deepseek-builtin`:
+`deepseek/deepseek-v4-pro`; `opencode-builtin`: `opencode-go/glm-5.3`) when its
+provider has a key, else the default of the first provider with a key (in the
+table's order). A chosen model whose provider has no key is refused by name
+("the model … needs an API key for Anthropic, which this agent does not have"), and
+with no key at all runs, questions and terminals are refused with "no API key
+stored" instead of starting a CLI that cannot work; a Shell still opens. The card's
+status line says *Model in use: … (chosen)* or *(default)*, and a run's log says
+which model it started with.
+
+**Check** on a provider sends one short request ("Reply with the single word OK")
+with that provider's default model, in a fresh home that enables only that provider,
+and shows what came back: the provider's answer, or its error (for a wrong key, its
+authentication error). It costs one tiny request on the key, and like storing a key
+it waits until no run or terminal is going. **Sign out** removes every key at once.
+
+**Billing.** API keys are billed per token by their providers (DeepSeek, Anthropic
+and OpenAI per request; OpenCode Go against its subscription's limits). The only
+spending limits lore applies are the daily cap of board tasks (*Board tasks a day*)
+and the per-hour limits on `ask` and `delegate`: set a spend limit on every key at
+its provider.
 
 **Check** asks the runner again for the sign-in state and the models; **Sign out**
 removes every stored credential file from the volume and says so only when they are
@@ -1711,10 +1780,14 @@ admin page's except `style-src 'self' 'unsafe-inline'` and `frame-ancestors 'sel
 
 - *Default model*: Claude takes the aliases `opus`, `sonnet`, `haiku`, `fable` and
   `default` (it has no list command) or a full model name; Codex offers what
-  `codex debug models` lists (`--bundled` when the catalog cannot be refreshed);
-  DeepSeek offers what `opencode models` lists for the provider `deepseek`, else
-  `deepseek-v4-pro` and `deepseek-flash`. Free text is always accepted. Empty means
-  the CLI's default.
+  `codex debug models` lists (`--bundled` when the catalog cannot be refreshed). An
+  opencode agent offers what `opencode models` lists for the providers that have a
+  key on it, grouped by provider (`provider/model`; the catalogue built into the
+  pinned opencode), else those providers' default models; with no key the list is
+  empty and says so. Free text is always accepted. Empty means the CLI's default,
+  and for an opencode agent the default described in *Signing in*. opencode's
+  interface takes its model from the configuration file, never from `--model`
+  (2.3.x refuses that flag outside `opencode run`).
 - *Works on idle board tasks* (enabled), *Available to help other agents*, *Board
   tasks a day* (0 to 100) and *Active hours* (`HH:MM-HH:MM`, UTC; empty for always)
   are what the task runner goes by.
@@ -1726,9 +1799,11 @@ built-in agent needs: run unattended (`opencode run --auto`), stream JSON events
 (`--format json`), use a remote HTTP MCP server with a bearer header
 (`"mcp": {"servers": {"lore": {"type": "remote", "url": …, "oauth": false,
 "headers": {"Authorization": "Bearer {env:LORE_AGENT_TOKEN}"}}}}`), and take the
-model per run (`--model deepseek/<model>`). The runner's kind is `opencode` with a
-configurable provider (`deepseek` for `agent-deepseek`), so another provider can be
-added later without a new kind. DeepSeek's API is at `https://api.deepseek.com`
+model per run (`opencode run --model deepseek/<model>`; the interface takes it from
+its configuration). The runner's kind is `opencode` with an own provider
+(`deepseek` for `agent-deepseek`, `opencode-go` for `agent-opencode`), and every
+opencode agent takes keys for the four providers above, so one CLI covers DeepSeek,
+OpenCode Go, and Claude and GPT models through their APIs. DeepSeek's API is at `https://api.deepseek.com`
 (OpenAI-compatible; `https://api.deepseek.com/anthropic` is Anthropic-compatible).
 
 ### The task runner
@@ -2310,7 +2385,19 @@ as), `LORE_RUNNER_WORK` (`/work`), `LORE_RUNNER_CLI` (the CLI's path) and
 - **The CLIs**: raise `CLAUDE_CODE_VERSION`, `CODEX_VERSION` or `OPENCODE_VERSION` in
   `Dockerfile.agent` after reading the changelog, build, and check
   `docker run --rm --network none --entrypoint <cli> project-lore-agent-<agent>:latest
-  --version`.
+  --version`. Flags change between versions, and a flag the CLI no longer accepts
+  stops it at once (opencode 2.3.x ends with "Unrecognized flag: --model" when its
+  interface is given `--model`). After a bump, run `--help` for every command the
+  runner uses in the new image and compare with what the runner passes (the test
+  `opencode_invocations_carry_only_flags_the_cli_accepts` pins opencode's argument
+  vectors): for opencode `opencode --help`, `opencode run --help`, `opencode models
+  --help`; for Claude Code `claude --help`, `claude auth status --help`; for Codex
+  `codex exec --help`, `codex login --help`, `codex debug models --help`. For opencode
+  also check that its catalogue still names the same variables, hosts and default
+  models (*Signing in*, opencode agents), that `enabled_providers`,
+  `OPENCODE_DISABLE_MODELS_FETCH` and `model` still mean what they mean in 2.3.2, and
+  update the egress allowlist and the defaults in `src/runner/drivers.rs`
+  (`OPENCODE_PROVIDERS`) to match.
 - **graphify**: raise `GRAPHIFY_VERSION`, then regenerate the constraints list in
   `Dockerfile.agent` from a fresh install: `docker run --rm
   node:22-trixie-slim@<digest> sh -c 'apt-get update && apt-get install -y python3 pipx

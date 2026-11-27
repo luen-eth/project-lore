@@ -3384,6 +3384,16 @@ esac
         let (home, work) = (dir.join("home"), dir.join("work"));
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&work).unwrap();
+        if kind == Kind::Opencode {
+            // opencode starts only with a key of the provider it uses.
+            let state = home.join(".lore-runner");
+            crate::runner::drivers::create_private_dir(&state).unwrap();
+            crate::runner::drivers::write_private(
+                &state.join("secrets.env"),
+                b"DEEPSEEK_API_KEY=sk-deepseek-taskrunner-test-key\n", // lore:allow-secret (fake test value)
+            )
+            .unwrap();
+        }
         let db = Db::open(&dir.join("lore.db")).unwrap();
         db.register_builtin_agents(&[(AGENT.into(), "claude".into(), "ember")])
             .unwrap();

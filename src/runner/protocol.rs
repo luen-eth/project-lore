@@ -240,7 +240,19 @@ pub enum ToRunner {
         id: u64,
         credential: CredentialKind,
         value: Secret,
+        /// For an opencode agent's API key: the provider it is for
+        /// (`deepseek`, `opencode-go`, `anthropic`, `openai`, …); missing
+        /// is the agent's own provider.
+        #[serde(default)]
+        provider: Option<String>,
     },
+    /// Remove one opencode provider's stored API key, and only that one
+    /// (answered with `Done`, then an unsolicited `Status`).
+    RemoveCredential { id: u64, provider: String },
+    /// Ask one opencode provider whether it takes the stored key: a short
+    /// request with the provider's default model (answered with `Done`,
+    /// whose message is what the provider said).
+    CheckProvider { id: u64, provider: String },
     /// Remove the stored sign-in (answered with `Done`).
     Logout { id: u64 },
     /// Liveness check (answered with `Pong`).
@@ -290,6 +302,24 @@ pub enum ToRunner {
     },
     /// Close a terminal: its whole session is killed.
     TerminalClose { term_id: String },
+}
+
+/// One provider's API key of an opencode agent, as the card shows it:
+/// never the key itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderKey {
+    /// opencode's provider id (`deepseek`, `opencode-go`, …).
+    pub provider: String,
+    /// What the card calls it (`DeepSeek`, `OpenCode Go`, …).
+    pub label: String,
+    /// A key is stored in the agent's volume.
+    pub stored: bool,
+    /// When it was stored (ISO 8601), when the runner knows.
+    #[serde(default)]
+    pub saved: Option<String>,
+    /// The container's environment sets one (which the card cannot remove).
+    #[serde(default)]
+    pub from_env: bool,
 }
 
 /// The resources an agent container uses, as the runner reads them.
@@ -361,6 +391,13 @@ pub enum FromRunner {
         /// removed.
         #[serde(default)]
         detail: String,
+        /// opencode: each provider's key, stored or not (never a key).
+        #[serde(default)]
+        keys: Vec<ProviderKey>,
+        /// opencode: the model a start without a chosen one uses; none
+        /// when no provider has a key.
+        #[serde(default)]
+        default_model: Option<String>,
     },
     /// What the owner must do to finish an interactive sign-in.
     LoginPrompt {
@@ -423,6 +460,10 @@ pub enum FromRunner {
         /// made, so lore can tell later whether the run moved it.
         #[serde(default)]
         base: Option<String>,
+        /// The model the CLI was started with, when the runner chose it
+        /// (opencode).
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Part 6b: one line of a run's output, parsed from the CLI's JSON
     /// stream (`text`, `tool`, `result`, `error` or `raw`).
@@ -536,6 +577,21 @@ mod tests {
                 id: 6,
                 credential: CredentialKind::SetupToken,
                 value: Secret::new("sk-ant-oat01-secret"),
+                provider: None,
+            },
+            ToRunner::SetCredential {
+                id: 6,
+                credential: CredentialKind::ApiKey,
+                value: Secret::new("sk-secret"),
+                provider: Some("opencode-go".into()),
+            },
+            ToRunner::RemoveCredential {
+                id: 6,
+                provider: "anthropic".into(),
+            },
+            ToRunner::CheckProvider {
+                id: 6,
+                provider: "openai".into(),
             },
             ToRunner::Logout { id: 7 },
             ToRunner::Ping { id: 8 },
@@ -594,6 +650,14 @@ mod tests {
                 login_ends: None,
                 cli_version: None,
                 detail: "Logged in".into(),
+                keys: vec![ProviderKey {
+                    provider: "deepseek".into(),
+                    label: "DeepSeek".into(),
+                    stored: true,
+                    saved: Some("2026-11-27T12:00:00Z".into()),
+                    from_env: false,
+                }],
+                default_model: Some("deepseek/deepseek-v4-pro".into()),
             },
             FromRunner::LoginPrompt {
                 id: 3,
@@ -634,6 +698,7 @@ mod tests {
                 run_id: "r1".into(),
                 session_id: None,
                 base: Some("abc".into()),
+                model: Some("opencode-go/glm-5.3".into()),
             },
             FromRunner::RunOutput {
                 run_id: "r1".into(),
@@ -710,6 +775,7 @@ mod tests {
             id: 1,
             credential: CredentialKind::AuthJson,
             value: Secret::new("{\"tokens\":\"very-secret\"}"),
+            provider: None,
         };
         let shown = format!("{message:?}");
         assert!(!shown.contains("very-secret"), "{shown}");

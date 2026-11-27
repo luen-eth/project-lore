@@ -49,6 +49,13 @@
     auth_json: "Paste the contents of an auth.json from a computer where you signed Codex in (~/.codex/auth.json).",
     api_key: "Paste the API key.",
   };
+  /* Where each opencode provider's key comes from, and what it costs. */
+  const PROVIDER_HELP = {
+    deepseek: "A key from the DeepSeek platform (platform.deepseek.com).",
+    "opencode-go": "An API key from your OpenCode Go subscription in the opencode console (opencode.ai).",
+    anthropic: "An Anthropic API key from the Anthropic console: Claude models billed per token, not a Claude subscription.",
+    openai: "An OpenAI API key from the OpenAI platform: GPT models billed per token, not a ChatGPT subscription.",
+  };
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -186,6 +193,9 @@
         ? `Its container was last connected ${ago(agent.last_seen_at)}.`
         : "Its container has not connected yet: start it with docker compose -f docker-compose.agents.yml up -d.");
     }
+    if (agent.kind === "opencode" && agent.connected) {
+      lines.push(modelLine(agent));
+    }
     if (agent.signed_in) {
       let line = `Signed in${agent.login_method ? " with " + agent.login_method : ""}`;
       if (agent.login_ends) line += ` · ends ${day(agent.login_ends)}`;
@@ -213,7 +223,7 @@
 
     const box = el("dl", "agent-stats");
     const stat = (label, value) => box.append(el("dt", "", label), el("dd", "", value));
-    stat("Model", agent.model || "the CLI's default");
+    stat("Model", agent.model || (agent.kind === "opencode" && agent.default_model ? `${agent.default_model} (default)` : "the CLI's default"));
     stat("Board tasks", agent.enabled ? `up to ${agent.daily_cap} a day` + (agent.active_hours ? `, ${agent.active_hours} UTC` : "") : "off");
     stat("Help for other agents", agent.available ? "available" : "off");
     item.append(box);
@@ -225,6 +235,65 @@
     if (ui.credential[agent.name]) item.append(credentialForm(agent, ui.credential[agent.name]));
     item.append(settingsForm(agent));
     return item;
+  }
+
+  /* The model an opencode agent starts with: the owner's choice, else the
+     runner's default; none without a key. */
+  function modelLine(agent) {
+    if (!agent.signed_in) return "Model in use: none, no API key stored";
+    if (agent.model) return `Model in use: ${agent.model} (chosen)`;
+    return agent.default_model ? `Model in use: ${agent.default_model} (default)` : "Model in use: choose one below";
+  }
+
+  /* An opencode agent's providers: each with its own key, stored or not
+     (the key is never shown), and its own Paste, Remove and Check. */
+  function providerBox(agent) {
+    const box = el("div", "builtin-providers");
+    const busy = ui.busy.has(agent.name);
+    for (const key of agent.keys || []) {
+      const row = el("div", "builtin-provider");
+      let state = "not stored";
+      if (key.stored) state = "stored" + (key.saved ? ` ${day(key.saved)}` : "");
+      else if (key.from_env) state = "set in the container's environment";
+      row.append(el("strong", "", key.label), el("span", "muted small-text", state));
+      const actions = el("span", "board-actions");
+      const add = (node) => { node.disabled = busy || !agent.connected; actions.append(node); };
+      const id = "api_key:" + key.provider;
+      add(button("Paste API key", "", () => {
+        ui.credential[agent.name] = ui.credential[agent.name] === id ? undefined : id;
+        render();
+      }));
+      if (key.stored) add(button("Remove", "danger", () => removeKey(agent, key)));
+      if (key.stored || key.from_env) add(button("Check", "", () => checkKey(agent, key)));
+      row.append(actions);
+      box.append(row);
+    }
+    return box;
+  }
+
+  function removeKey(agent, key) {
+    if (!window.confirm(`Remove the ${key.label} API key from ${agent.name}?\n\nOnly this key is removed from its container's volume.`)) return;
+    return withBusy(agent, async () => {
+      const result = await post(url(agent.name, "/key/remove"), { provider: key.provider }).catch(() => null);
+      if (!result || !result.ok) {
+        status((result && result.body.error) || "The key could not be removed.", "bad");
+        return;
+      }
+      replaceAgent(result.body.agent);
+      status(`The ${key.label} key is removed from ${agent.name}'s volume.`, "ok");
+    });
+  }
+
+  function checkKey(agent, key) {
+    return withBusy(agent, async () => {
+      status(`Asking ${key.label} whether it takes ${agent.name}'s key…`);
+      const result = await post(url(agent.name, "/key/check"), { provider: key.provider }).catch(() => null);
+      if (!result || !result.ok) {
+        status((result && result.body.error) || `${key.label} could not be asked.`, "bad");
+        return;
+      }
+      status(`${key.label}: ${result.body.message}`, result.body.ok ? "ok" : "bad");
+    });
   }
 
   function button(text, className, onClick) {
@@ -318,7 +387,10 @@
     for (const method of agent.methods || []) {
       add(button(METHOD_LABEL[method] || "Sign in", "", () => startLogin(agent, method)));
     }
-    for (const credential of agent.credentials || []) {
+    /* An opencode agent's keys are per provider (providerBox), once the
+       runner has said which it offers. */
+    const perProvider = agent.kind === "opencode" && (agent.keys || []).length > 0;
+    for (const credential of perProvider ? [] : agent.credentials || []) {
       add(button(`Paste ${credential.label}`, "", () => {
         ui.credential[agent.name] = ui.credential[agent.name] === credential.id ? undefined : credential.id;
         render();
@@ -326,7 +398,10 @@
     }
     add(button("Check", "", () => refreshAgent(agent)));
     if (agent.signed_in) add(button("Sign out", "danger", () => signOut(agent)));
-    return actions;
+    if (!perProvider) return actions;
+    const wrap = el("div", "");
+    wrap.append(providerBox(agent), actions);
+    return wrap;
   }
 
   async function withBusy(agent, work) {
@@ -383,7 +458,10 @@
 
   /* One pasted credential. The value goes to the server once and the field
      is emptied whatever happens. */
-  function credentialForm(agent, kind) {
+  function credentialForm(agent, chosen) {
+    /* `api_key:<provider>` for one of an opencode agent's providers. */
+    const [kind, provider] = chosen.split(":");
+    const key = provider && (agent.keys || []).find((k) => k.provider === provider);
     const credential = (agent.credentials || []).find((c) => c.id === kind);
     const form = el("form", "board-form builtin-credential");
     form.autocomplete = "off";
@@ -398,8 +476,10 @@
     }
     field.autocomplete = "off";
     field.spellcheck = false;
-    label.append(el("span", "", (credential ? credential.label : kind) + " for " + agent.name), field);
-    form.append(label, el("p", "muted small-text", CREDENTIAL_HELP[kind] + " It is stored only in the agent's own volume, never in lore."));
+    const what = key ? `${key.label} API key` : credential ? credential.label : kind;
+    label.append(el("span", "", what + " for " + agent.name), field);
+    const help = (provider && PROVIDER_HELP[provider]) || CREDENTIAL_HELP[kind];
+    form.append(label, el("p", "muted small-text", help + " It is stored only in the agent's own volume, never in lore."));
     const actions = el("div", "board-actions");
     actions.append(button("Cancel", "", () => { ui.credential[agent.name] = undefined; render(); }));
     const save = el("button", "ghost small", "Store");
@@ -412,7 +492,9 @@
       field.value = "";
       if (!value.trim()) return;
       save.disabled = true;
-      const result = await post(url(agent.name, "/credential"), { credential: kind, value }).catch(() => null);
+      const payload = { credential: kind, value };
+      if (provider) payload.provider = provider;
+      const result = await post(url(agent.name, "/credential"), payload).catch(() => null);
       save.disabled = false;
       if (!result || !result.ok) {
         status((result && result.body.error) || "The credential could not be stored.", "bad");
@@ -454,7 +536,40 @@
     model.addEventListener("input", remember("model", (node) => node.value));
     const modelField = el("label", "board-field");
     const source = agent.models && agent.models.source === "cli" ? "listed by the CLI" : "pick one or type a name";
-    modelField.append(el("span", "", `Default model (${source})`), model, options);
+    if (agent.kind === "opencode") {
+      /* opencode: only the models of providers with a key, grouped by
+         provider; empty starts with the agent's default. */
+      model.placeholder = agent.default_model ? `default: ${agent.default_model}` : "no API key stored";
+      const pick = el("select", "builtin-model-pick");
+      pick.setAttribute("aria-label", "Pick a model");
+      const first = el("option", "", agent.default_model ? `the default (${agent.default_model})` : "pick a model");
+      first.value = "";
+      pick.append(first);
+      const groups = new Map();
+      for (const id of (agent.models && agent.models.models) || []) {
+        const at = id.indexOf("/");
+        const providerId = at > 0 ? id.slice(0, at) : "";
+        if (!groups.has(providerId)) {
+          const keyed = (agent.keys || []).find((k) => k.provider === providerId);
+          const group = el("optgroup");
+          group.label = keyed ? keyed.label : providerId || "other";
+          groups.set(providerId, group);
+          pick.append(group);
+        }
+        const option = el("option", "", id);
+        option.value = id;
+        groups.get(providerId).append(option);
+      }
+      pick.value = [...pick.options].some((o) => o.value === model.value) ? model.value : "";
+      pick.addEventListener("change", () => {
+        model.value = pick.value;
+        ui.drafts[agent.name] = { ...(ui.drafts[agent.name] || {}), model: pick.value };
+      });
+      const title = groups.size ? "models of the providers with a key, or type one" : "no API key stored";
+      modelField.append(el("span", "", `Default model (${title})`), pick, model, options);
+    } else {
+      modelField.append(el("span", "", `Default model (${source})`), model, options);
+    }
 
     const check = (key, text) => {
       const label = el("label", "builtin-check");

@@ -252,9 +252,7 @@ impl Terminals {
                     driver.sweep().await;
                 }
                 driver
-                    .home_for(super::drivers::HomePurpose::Terminal {
-                        cli: mode == TerminalMode::Cli,
-                    })
+                    .terminal_home(mode, model.as_deref())
                     .and_then(|mut home| {
                         // Only the CLI's interactive interface needs the exec
                         // mount (opencode's renderer); a shell never gets it.

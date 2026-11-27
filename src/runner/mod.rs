@@ -519,8 +519,12 @@ fn handle(command: ToRunner, driver: &Arc<Driver>, out: &mpsc::Sender<FromRunner
                 id,
                 credential,
                 value,
+                provider,
             } => {
-                let answer = match driver.set_credential(credential, &value).await {
+                let answer = match driver
+                    .set_credential_for(credential, &value, provider.as_deref())
+                    .await
+                {
                     Ok(message) => FromRunner::Done {
                         id,
                         ok: true,
@@ -536,6 +540,30 @@ fn handle(command: ToRunner, driver: &Arc<Driver>, out: &mpsc::Sender<FromRunner
                 };
                 let _ = out.send(answer).await;
                 driver.status(None).await
+            }
+            ToRunner::RemoveCredential { id, provider } => {
+                let answer = match driver.remove_credential(&provider).await {
+                    Ok(message) => FromRunner::Done {
+                        id,
+                        ok: true,
+                        message,
+                    },
+                    Err(error) => FromRunner::Error {
+                        id: Some(id),
+                        message: error.to_string(),
+                    },
+                };
+                let _ = out.send(answer).await;
+                driver.status(None).await
+            }
+            ToRunner::CheckProvider { id, provider } => {
+                match driver.check_provider(&provider).await {
+                    Ok((ok, message)) => FromRunner::Done { id, ok, message },
+                    Err(error) => FromRunner::Error {
+                        id: Some(id),
+                        message: driver.redact(&error.to_string()),
+                    },
+                }
             }
             ToRunner::Logout { id } => {
                 let answer = match driver.logout().await {
@@ -661,11 +689,7 @@ mod tests {
             Some(FromRunner::Unsupported { command, .. }) if command == "terminal"
         ));
         // A CLI that cannot be started is reported, not fatal.
-        handle(
-            ToRunner::Status { id: 4 },
-            &driver,
-            &tx,
-        );
+        handle(ToRunner::Status { id: 4 }, &driver, &tx);
         assert!(matches!(
             rx.recv().await,
             Some(FromRunner::Status {

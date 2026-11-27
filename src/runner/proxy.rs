@@ -29,14 +29,19 @@ use tokio::{
     sync::Semaphore,
 };
 
-/// What each CLI needs, from their documentation: Claude Code
-/// (`api.anthropic.com`; sign-in at `claude.ai`, `console.anthropic.com`,
-/// `platform.claude.com`), Codex (`api.openai.com`; the ChatGPT sign-in
-/// and its backend at `auth.openai.com` and `chatgpt.com`), opencode with
-/// DeepSeek (`api.deepseek.com`, and `models.dev`, opencode's model
-/// catalogue).
+/// What each CLI needs: Claude Code (`api.anthropic.com`; sign-in at
+/// `claude.ai`, `console.anthropic.com`, `platform.claude.com`), Codex
+/// (`api.openai.com`; the ChatGPT sign-in and its backend at
+/// `auth.openai.com` and `chatgpt.com`), and opencode's four providers as
+/// its built-in catalogue (2.3.2) names their APIs: DeepSeek
+/// (`api.deepseek.com`), Anthropic (`api.anthropic.com`), OpenAI
+/// (`api.openai.com`) and OpenCode Go (`opencode.ai`, its
+/// `/inference/go/…` endpoints). No model catalogue host: the runner sets
+/// `OPENCODE_DISABLE_MODELS_FETCH`, so opencode lists the catalogue built
+/// into the pinned CLI and never asks `models.opencode.ai` (nor
+/// `models.dev`, which 2.x no longer uses).
 pub const DEFAULT_ALLOW: &str = "api.anthropic.com,claude.ai,console.anthropic.com,\
-platform.claude.com,api.openai.com,auth.openai.com,chatgpt.com,api.deepseek.com,models.dev";
+platform.claude.com,api.openai.com,auth.openai.com,chatgpt.com,api.deepseek.com,opencode.ai";
 
 /// Largest request head read.
 const HEAD_BYTES: usize = 8 * 1024;
