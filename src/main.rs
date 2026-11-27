@@ -19,6 +19,8 @@ mod server;
 mod shutdown;
 mod taskrunner;
 mod toolui;
+#[allow(dead_code, reason = "the sign-in routes use it in a later commit")]
+mod totp;
 mod users;
 mod vault;
 
