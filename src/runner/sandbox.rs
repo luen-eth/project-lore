@@ -122,42 +122,108 @@ pub fn can_switch_user() -> bool {
 /// raw `exit` shows a zombie leader while its other threads run on, and is
 /// alive. A group whose threads are all dead (a zombie waiting for its
 /// parent) is left out.
-fn live_groups(uid: u32) -> Vec<(i32, Vec<char>)> {
+fn live_groups(uid: u32) -> io::Result<Vec<(i32, Vec<char>)>> {
     live_groups_in(Path::new("/proc"), uid, std::process::id() as i32)
 }
 
-fn live_groups_in(proc: &Path, uid: u32, me: i32) -> Vec<(i32, Vec<char>)> {
-    let Ok(entries) = std::fs::read_dir(proc) else {
-        return Vec::new();
+/// Whether an error reading `/proc` only says that the process (or
+/// thread) went away between being listed and being read: `ENOENT`, or
+/// `ESRCH` for a status file opened just before its process was reaped.
+fn vanished(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
+/// [`live_groups`] over the `/proc` at `proc`. Fails closed: any error
+/// other than a process vanishing while it is looked at (an unreadable
+/// `/proc`, entry or status file) is an error, never "nothing left", so a
+/// sweep that cannot see is a sweep that failed.
+fn live_groups_in(proc: &Path, uid: u32, me: i32) -> io::Result<Vec<(i32, Vec<char>)>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(proc)? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let states = group_states(&entry.path(), uid)?;
+        if !states.is_empty() {
+            found.push((pid, states));
+        }
+    }
+    Ok(found)
+}
+
+/// The states of the live threads of `uid` in the thread group whose
+/// `/proc` directory is `dir`; empty when there is none or the group went
+/// away. Errors as [`live_groups_in`] does.
+fn group_states(dir: &Path, uid: u32) -> io::Result<Vec<char>> {
+    let mut states = Vec::new();
+    match std::fs::read_dir(dir.join("task")) {
+        Ok(tasks) => {
+            for task in tasks {
+                let task = match task {
+                    Ok(task) => task,
+                    Err(error) if vanished(&error) => continue,
+                    Err(error) => return Err(error),
+                };
+                match std::fs::read_to_string(task.path().join("status")) {
+                    Ok(status) => states.extend(live_state_of(&status, uid)),
+                    Err(error) if vanished(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        // No task list (it went away, or an unusual /proc): the group's
+        // own status is all there is.
+        Err(error) if vanished(&error) => match std::fs::read_to_string(dir.join("status")) {
+            Ok(status) => states.extend(live_state_of(&status, uid)),
+            Err(error) if vanished(&error) => {}
+            Err(error) => return Err(error),
+        },
+        Err(error) => return Err(error),
+    }
+    Ok(states)
+}
+
+/// Sends `signal` to the thread group `pid` only if, once a pidfd pins
+/// the process that holds that pid, `still_ours` (given the process's
+/// `/proc` directory) says it is still the one meant. The pidfd keeps
+/// naming that one process even if it dies and its pid is handed to
+/// another: when `still_ours` reads `/proc/<pid>` after the pidfd is held,
+/// either the pinned process is alive (and what was read is its own) or it
+/// is gone (and the signal reaches nobody). So a pid recycled between a
+/// scan and the signal never gets it, the runner included. Answers whether
+/// a signal was sent; a process that went away is not an error.
+pub fn signal_pinned(
+    proc: &Path,
+    pid: i32,
+    signal: rustix::process::Signal,
+    still_ours: impl FnOnce(&Path) -> io::Result<bool>,
+) -> io::Result<bool> {
+    use rustix::process::{Pid, PidfdFlags, pidfd_open, pidfd_send_signal};
+    let Some(raw) = Pid::from_raw(pid) else {
+        return Ok(false);
     };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
-            if pid == me {
-                return None;
-            }
-            let mut states = Vec::new();
-            match std::fs::read_dir(entry.path().join("task")) {
-                Ok(tasks) => {
-                    for task in tasks.flatten() {
-                        if let Ok(status) = std::fs::read_to_string(task.path().join("status"))
-                            && let Some(state) = live_state_of(&status, uid)
-                        {
-                            states.push(state);
-                        }
-                    }
-                }
-                // No task list (it went away, or an unusual /proc): the
-                // group's own status is all there is.
-                Err(_) => {
-                    let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
-                    states.extend(live_state_of(&status, uid));
-                }
-            }
-            (!states.is_empty()).then_some((pid, states))
-        })
-        .collect()
+    let pidfd = match pidfd_open(raw, PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(rustix::io::Errno::SRCH) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !still_ours(&proc.join(pid.to_string()))? {
+        return Ok(false);
+    }
+    match pidfd_send_signal(&pidfd, signal) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::SRCH) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The state letter of one thread's `status` when it belongs to `uid` and
@@ -181,8 +247,16 @@ fn live_state_of(status: &str, uid: u32) -> Option<char> {
 /// The live processes (thread groups) of `uid`, from `/proc`, this
 /// process excepted (see [`live_groups`]: a zombie leader with a live
 /// thread counts).
-pub fn processes_of(uid: u32) -> Vec<i32> {
-    live_groups(uid).into_iter().map(|(pid, _)| pid).collect()
+/// `None` when `/proc` cannot be read (see [`live_groups_in`]): callers
+/// treat that as "some process may be left".
+pub fn processes_of(uid: u32) -> Option<Vec<i32>> {
+    match live_groups(uid) {
+        Ok(groups) => Some(groups.into_iter().map(|(pid, _)| pid).collect()),
+        Err(error) => {
+            tracing::warn!(%error, "the agent user's processes could not be listed");
+            None
+        }
+    }
 }
 
 /// How long [`kill_all`] keeps at it before it gives up.
@@ -206,11 +280,12 @@ const STOP_PASSES: u32 = 100;
 /// starts again until none is left. Errors when some process is still
 /// alive after [`KILL_PATIENCE`].
 pub async fn kill_all(user: AgentUser) -> Result<()> {
-    use rustix::process::{Pid, Signal, kill_process};
+    use rustix::process::Signal;
     let deadline = tokio::time::Instant::now() + KILL_PATIENCE;
+    let proc = Path::new("/proc");
     let mut passes = 0u32;
     loop {
-        let found = live_groups(user.uid);
+        let found = live_groups(user.uid).context("looking for the agent user's processes")?;
         if found.is_empty() {
             return Ok(());
         }
@@ -227,14 +302,17 @@ pub async fn kill_all(user: AgentUser) -> Result<()> {
             (running, Signal::STOP)
         };
         for pid in targets {
-            if let Some(pid) = Pid::from_raw(pid) {
-                let _ = kill_process(pid, signal);
-            }
+            // Checked again through a pidfd: the pid may have been handed
+            // to another process since the scan.
+            signal_pinned(proc, pid, signal, |dir| {
+                Ok(!group_states(dir, user.uid)?.is_empty())
+            })
+            .with_context(|| format!("signalling process {pid} of the agent user"))?;
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(
                 "{} process(es) of the agent user would not end",
-                live_groups(user.uid).len()
+                live_groups(user.uid).map_or(0, |left| left.len())
             );
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -749,6 +827,17 @@ mod tests {
         dir
     }
 
+    /// The tests that start processes as another user are `#[ignore]`d
+    /// (they need root); run on purpose without it they fail loudly
+    /// instead of passing without having tested anything.
+    fn needs_root() {
+        assert!(
+            can_switch_user(),
+            "this test needs root to start processes as another user: \
+             see the README, Development"
+        );
+    }
+
     #[test]
     fn the_agent_user_is_never_root() {
         assert_eq!(AgentUser::from_values(None, None).unwrap(), None);
@@ -815,22 +904,24 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as i32;
-        assert!(processes_of(me).contains(&pid));
-        assert!(!processes_of(me).contains(&(std::process::id() as i32)));
-        assert!(!processes_of(me.wrapping_add(4242)).contains(&pid));
+        assert!(processes_of(me).unwrap().contains(&pid));
+        assert!(
+            !processes_of(me)
+                .unwrap()
+                .contains(&(std::process::id() as i32))
+        );
+        assert!(!processes_of(me.wrapping_add(4242)).unwrap().contains(&pid));
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(!processes_of(me).contains(&pid));
+        assert!(!processes_of(me).unwrap().contains(&pid));
     }
 
     /// Needs root (the uid switch): skipped otherwise. A process of the
     /// agent user that left its session and double-forked is still ended.
     #[tokio::test]
+    #[ignore = "needs root: see the README, Development"]
     async fn kill_all_ends_every_process_of_the_agent_user() {
-        if !can_switch_user() {
-            eprintln!("skipped: needs root to start processes as another user");
-            return;
-        }
+        needs_root();
         let user = AgentUser {
             uid: 64_123,
             gid: 64_123,
@@ -843,9 +934,9 @@ mod tests {
             .current_dir("/");
         command.status().await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!processes_of(user.uid).is_empty());
+        assert!(!processes_of(user.uid).unwrap().is_empty());
         kill_all(user).await.unwrap();
-        assert!(processes_of(user.uid).is_empty());
+        assert!(processes_of(user.uid).unwrap().is_empty());
     }
 
     /// A process whose main thread ended with a raw `SYS_exit` while
@@ -882,15 +973,19 @@ mod tests {
         );
         let pid = child.0.id() as i32;
         wait_for_zombie_leader(pid);
-        assert!(processes_of(me).contains(&pid), "the survivor was missed");
+        assert!(
+            processes_of(me).unwrap().contains(&pid),
+            "the survivor was missed"
+        );
         let states = live_groups(me)
+            .unwrap()
             .into_iter()
             .find(|(found, _)| *found == pid)
             .map(|(_, states)| states)
             .unwrap();
         assert_eq!(states.len(), 1, "{states:?}");
         drop(child);
-        assert!(!processes_of(me).contains(&pid));
+        assert!(!processes_of(me).unwrap().contains(&pid));
     }
 
     /// The same from a fake `/proc`: per-thread states and owners decide.
@@ -915,7 +1010,7 @@ mod tests {
         thread(400, 400, "T (stopped)", 4242);
         thread(400, 401, "D (disk sleep)", 4242);
         thread(500, 500, "S (sleeping)", 4242);
-        let mut found = live_groups_in(&dir, 4242, 500);
+        let mut found = live_groups_in(&dir, 4242, 500).unwrap();
         for (_, states) in &mut found {
             states.sort();
         }
@@ -924,6 +1019,79 @@ mod tests {
         // else's; 400: one thread stopped, one in D; 500: this process.
         assert_eq!(found, vec![(100, vec!['S']), (400, vec!['D', 'T'])]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `/proc` that cannot be read is never taken for "nothing left":
+    /// an unreadable directory, task list or status file fails the scan,
+    /// while a process that vanished between listing and reading does not.
+    #[test]
+    fn an_unreadable_proc_fails_the_scan() {
+        // Not a directory at all.
+        let dir = temp("proc-broken");
+        let file = dir.join("not-proc");
+        std::fs::write(&file, "").unwrap();
+        assert!(live_groups_in(&file, 4242, 1).is_err());
+        assert!(live_groups_in(&dir.join("missing"), 4242, 1).is_err());
+
+        // A status file that cannot be read (a directory in its place,
+        // which no permission bit or root can read as a file).
+        let status_dir = dir.join("a");
+        std::fs::create_dir_all(status_dir.join("100/task/100/status")).unwrap();
+        assert!(live_groups_in(&status_dir, 4242, 1).is_err());
+
+        // A task list that is not a directory.
+        let task_file = dir.join("b");
+        std::fs::create_dir_all(task_file.join("100")).unwrap();
+        std::fs::write(task_file.join("100/task"), "").unwrap();
+        assert!(live_groups_in(&task_file, 4242, 1).is_err());
+
+        // A group that vanished (no task list, no status) or a thread
+        // that vanished (a task directory without its status) is fine.
+        let gone = dir.join("c");
+        std::fs::create_dir_all(gone.join("100")).unwrap();
+        std::fs::create_dir_all(gone.join("200/task/201")).unwrap();
+        assert_eq!(live_groups_in(&gone, 4242, 1).unwrap(), Vec::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A signal through a pidfd reaches the process only when the check,
+    /// made while the pidfd is held, approves it; a pid nobody holds is
+    /// not an error.
+    #[test]
+    fn a_pinned_signal_needs_the_check_to_pass() {
+        use rustix::process::Signal;
+        let proc = Path::new("/proc");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let mut seen = None;
+        let sent = signal_pinned(proc, pid, Signal::KILL, |dir| {
+            seen = Some(dir.to_path_buf());
+            Ok(false)
+        })
+        .unwrap();
+        assert!(!sent);
+        assert_eq!(seen.unwrap(), proc.join(pid.to_string()));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "killed without approval"
+        );
+        let me = rustix::process::getuid().as_raw();
+        let sent = signal_pinned(proc, pid, Signal::KILL, |dir| {
+            Ok(!group_states(dir, me)?.is_empty())
+        })
+        .unwrap();
+        assert!(sent);
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+        // Reaped: the pid is free (or someone else's, checked again).
+        let sent = signal_pinned(proc, pid, Signal::KILL, |dir| {
+            Ok(!group_states(dir, me.wrapping_add(4242))?.is_empty())
+        })
+        .unwrap();
+        assert!(!sent);
     }
 
     /// A Python process whose main thread leaves with a raw `SYS_exit`
@@ -953,11 +1121,9 @@ mod tests {
     /// agent user whose leader left with `SYS_exit` while a thread runs on
     /// is stopped and killed, and every thread of it ends.
     #[tokio::test]
+    #[ignore = "needs root: see the README, Development"]
     async fn kill_all_ends_a_process_whose_leader_is_a_zombie() {
-        if !can_switch_user() {
-            eprintln!("skipped: needs root to start processes as another user");
-            return;
-        }
+        needs_root();
         let user = AgentUser {
             uid: 64_125,
             gid: 64_125,
@@ -972,9 +1138,9 @@ mod tests {
         let mut child = command.spawn().unwrap();
         let pid = child.id().unwrap() as i32;
         wait_for_zombie_leader(pid);
-        assert_eq!(processes_of(user.uid), vec![pid]);
+        assert_eq!(processes_of(user.uid).unwrap(), vec![pid]);
         kill_all(user).await.unwrap();
-        assert!(processes_of(user.uid).is_empty());
+        assert!(processes_of(user.uid).unwrap().is_empty());
         // Every thread is gone: the group is a plain zombie for its parent.
         let _ = child.wait().await;
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
@@ -985,13 +1151,15 @@ mod tests {
     /// as stopped, and `kill_all` must still end both well within its
     /// patience.
     #[tokio::test]
+    #[ignore = "needs root: see the README, Development"]
     async fn kill_all_ends_a_vfork_parent_in_uninterruptible_sleep() {
+        needs_root();
         let has_perl = std::process::Command::new("perl")
             .arg("-v")
             .output()
             .is_ok();
-        if !can_switch_user() || !has_perl || std::env::consts::ARCH != "x86_64" {
-            eprintln!("skipped: needs root, perl and x86-64");
+        if !has_perl || std::env::consts::ARCH != "x86_64" {
+            eprintln!("skipped: needs perl and x86-64");
             return;
         }
         let user = AgentUser {
@@ -1012,7 +1180,7 @@ mod tests {
         let mut child = command.spawn().unwrap();
         let mut groups = Vec::new();
         for _ in 0..200 {
-            groups = live_groups(user.uid);
+            groups = live_groups(user.uid).unwrap();
             if groups.len() == 2 {
                 break;
             }
@@ -1025,7 +1193,7 @@ mod tests {
         let started = std::time::Instant::now();
         kill_all(user).await.unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(processes_of(user.uid).is_empty());
+        assert!(processes_of(user.uid).unwrap().is_empty());
         let _ = child.wait().await;
     }
 
@@ -1035,6 +1203,7 @@ mod tests {
     /// re-forks into every freed pid holds the whole pids limit, so the
     /// runner cannot start anything; the sweep must still end it all.
     #[tokio::test]
+    #[ignore = "needs root, LORE_TEST_PID_BOMB=1 and a pids limit"]
     async fn kill_all_ends_a_fork_bomb_that_holds_every_pid() {
         let limit: Option<u64> = std::fs::read_to_string("/sys/fs/cgroup/pids.max")
             .ok()
@@ -1081,9 +1250,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(60), full)
             .await
             .expect("the bomb never filled the pids limit");
-        assert!(processes_of(user.uid).len() > 10);
+        assert!(processes_of(user.uid).unwrap().len() > 10);
         kill_all(user).await.unwrap();
-        assert!(processes_of(user.uid).is_empty());
+        assert!(processes_of(user.uid).unwrap().is_empty());
         let _ = child.wait().await;
         assert!(std::process::Command::new("true").status().is_ok());
     }

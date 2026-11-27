@@ -351,7 +351,7 @@ impl Driver {
             return 0;
         };
         if let Some(user) = fresh.user
-            && !sandbox::processes_of(user.uid).is_empty()
+            && sandbox::processes_of(user.uid).is_none_or(|left| !left.is_empty())
         {
             return 0;
         }
@@ -1054,8 +1054,10 @@ impl Driver {
 
     /// Whether any thread of the agent user is alive.
     fn agent_alive(&self) -> bool {
-        self.user()
-            .is_some_and(|user| !sandbox::processes_of(user.uid).is_empty())
+        self.user().is_some_and(|user| {
+            // An unreadable /proc counts as alive: fail closed.
+            sandbox::processes_of(user.uid).is_none_or(|left| !left.is_empty())
+        })
     }
 
     async fn claude_status(&self) -> (bool, Option<String>, Option<String>, String) {

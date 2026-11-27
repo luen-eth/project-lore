@@ -543,12 +543,30 @@ async fn write_all(master: &AsyncFd<OwnedFd>, mut bytes: &[u8]) -> io::Result<()
 }
 
 /// Kills a terminal's session: its process group, then every process
-/// still in the session (a shell's jobs run in groups of their own).
+/// still in the session (a shell's jobs run in groups of their own). The
+/// group is the session leader's, which is not reaped yet, so its id cannot
+/// name anyone else; each other member is signalled through a pidfd and
+/// only once it is seen, pinned, to still be in the session, so a pid
+/// recycled since the scan of `/proc` is never hit.
 pub(super) fn kill_session(session: Pid) {
     let _ = rustix::process::kill_process_group(session, Signal::KILL);
+    let sid = session.as_raw_nonzero().get();
+    let proc = std::path::Path::new("/proc");
     for pid in session_members(session) {
-        let _ = rustix::process::kill_process(pid, Signal::KILL);
+        let _ =
+            super::sandbox::signal_pinned(proc, pid.as_raw_nonzero().get(), Signal::KILL, |dir| {
+                Ok(session_of(dir) == Some(sid))
+            });
     }
+}
+
+/// The session id in the `stat` of the process whose `/proc` directory is
+/// `dir`.
+fn session_of(dir: &std::path::Path) -> Option<i32> {
+    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+    // `pid (comm) state ppid pgrp session …`; comm may hold spaces.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(3)?.parse().ok()
 }
 
 /// The processes whose session is `session`, from `/proc`.
@@ -560,11 +578,7 @@ fn session_members(session: Pid) -> Vec<Pid> {
         .flatten()
         .filter_map(|entry| {
             let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
-            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
-            // `pid (comm) state ppid pgrp session …`; comm may hold spaces.
-            let rest = &stat[stat.rfind(')')? + 1..];
-            let sid: i32 = rest.split_whitespace().nth(3)?.parse().ok()?;
-            (sid == session.as_raw_nonzero().get())
+            (session_of(&entry.path())? == session.as_raw_nonzero().get())
                 .then(|| Pid::from_raw(pid))
                 .flatten()
         })

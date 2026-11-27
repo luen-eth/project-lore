@@ -1123,8 +1123,15 @@ running process of that user (`SIGSTOP`, which cannot be caught, blocked or igno
 a stopped process cannot fork), pass after pass, until a pass finds all of them
 stopped, then kills them all, and waits until none is left. Then it removes what that
 user left in `/tmp`, `/dev/shm` and `/dev/mqueue` (POSIX message queues) and, with
-`ipcrm --all` run as that user, its System V shared memory, queues and semaphores. If
-the processes still cannot be ended, the runner exits with an error instead of
+`ipcrm --all` run as that user, its System V shared memory, queues and semaphores.
+Every signal goes through a pidfd: the runner pins the process, checks again through
+`/proc` that it still belongs to the agent user, and only then signals it, so a pid
+that was handed to another process since the scan (the runner itself, in the worst
+case) is never stopped or killed. A terminal's leftover processes are killed the same
+way. The scan of `/proc` fails closed: a process that vanished while it was being
+read is gone, but any other error reading `/proc` counts as "something may be left",
+never as "nothing is left". If
+the processes still cannot be ended (or cannot be seen), the runner exits with an error instead of
 reading or reclaiming anything of the agent user's: compose restarts the container
 (`restart: unless-stopped`), which ends every process in it, and lore marks the run
 interrupted when the link drops. This was proven in a container against a process
@@ -2234,6 +2241,24 @@ docker compose start lore
 LORE_TOKEN=$(openssl rand -hex 32) LORE_ADMIN_PASSWORD=local-admin-password cargo run
 cargo test
 ```
+
+The tests that start processes as another user (the `kill_all_*` tests
+of the runner's sandbox) need root and are marked `#[ignore]`: a plain
+`cargo test` lists them as ignored rather than passing them without
+having tested anything. Build as yourself and run only those as root, so
+that nothing in `target/` ends up owned by root:
+
+```bash
+cargo test --no-run          # prints the test binary, target/debug/deps/lore-<hash>
+doas target/debug/deps/lore-<hash> --ignored kill_all
+```
+
+Run with `--ignored` but without root, they fail with "needs root"
+instead of skipping. The fork-bomb test additionally wants
+`LORE_TEST_PID_BOMB=1` and a container with a small `--pids-limit` (the
+agent image), and says "skipped" on stderr otherwise. Do not run the
+whole suite as root: a few tests check what another user can not do, and
+root can.
 
 Rust 1.85 or newer. The source is small:
 
