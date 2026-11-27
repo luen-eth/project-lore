@@ -46,6 +46,8 @@ ring = "0.17.14"
 # Already built through tungstenite; named here for base32 (TOTP secrets,
 # recovery codes).
 data-encoding = "2.11"
+# CBOR for WebAuthn attestation objects and COSE keys.
+ciborium = "0.2.2"
 # QR codes for setting up an authenticator app, rendered as SVG only.
 qrcode = { version = "0.15", default-features = false, features = ["std", "svg"] }
 
