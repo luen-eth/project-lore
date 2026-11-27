@@ -1663,8 +1663,12 @@ are given to the `opencode` process only, in its environment, never written to a
 file the CLI can read and never given to runner git, and each start gets only the
 keys it needs: a board run and a question (`ask`) get only the key of the provider
 of the model they use, with only that provider enabled in their configuration; a
-provider's **Check** gets only that provider's key; the model list gets every key
-(`opencode models` lists the built-in catalogue and makes no request). The owner's
+provider's **Check** gets only that provider's key; the model list gets no key at
+all: `opencode models --standalone` runs with the providers that have a key enabled
+and a placeholder in each key variable (it lists the built-in catalogue, but with an
+OpenCode Go key variable set it also sends a request to `opencode.ai`, which then
+sees only the placeholder; `--standalone`, because without it opencode leaves a
+background service running with the environment it was started with). The owner's
 **terminal** (the CLI's interface) gets every stored key, so models of every keyed
 provider can be switched to there; a **Shell** runs with every stored credential
 too, as it always has (*Terminal* below).

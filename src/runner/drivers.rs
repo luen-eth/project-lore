@@ -100,6 +100,12 @@ pub struct ProviderInfo {
     pub default_model: Option<String>,
 }
 
+/// What opencode's model list gets in place of each key.
+pub const LIST_PLACEHOLDER: &str = "lore-model-list-has-no-key";
+
+/// The command line of opencode's model list.
+pub const OPENCODE_MODELS_ARGS: [&str; 2] = ["models", "--standalone"];
+
 /// What the card says when an opencode agent has no key at all.
 pub const NO_KEY: &str = "no API key stored: paste one on the agent's card (Sign-in) first";
 
@@ -195,6 +201,9 @@ pub struct CliHome {
     /// it gets (a run, `ask`, a provider check: the one of its model);
     /// `None`: every provider with a key (the model list, a terminal).
     providers: Option<Vec<String>>,
+    /// opencode's model list: the key variables of the providers with a
+    /// key are set to [`LIST_PLACEHOLDER`], never to a key.
+    placeholders: bool,
     /// opencode's directory on the exec-capable mount (`Fresh::exec_tmp`),
     /// deleted with the home.
     exec_tmp: Option<PathBuf>,
@@ -885,6 +894,7 @@ impl Driver {
             path: self.settings.home.clone(),
             fresh: false,
             providers: None,
+            placeholders: false,
             exec_tmp: None,
             side: None,
             live: None,
@@ -1066,6 +1076,7 @@ impl Driver {
                 path: self.settings.home.clone(),
                 fresh: false,
                 providers,
+                placeholders: false,
                 exec_tmp: None,
                 side: None,
                 live: None,
@@ -1095,6 +1106,7 @@ impl Driver {
             path,
             fresh: true,
             providers,
+            placeholders: false,
             exec_tmp: None,
             side,
             live: Some(self.live.clone()),
@@ -1473,6 +1485,19 @@ impl Driver {
                 command.env(name, value);
             }
         }
+        if home.placeholders {
+            // The model list: which providers have a key is all opencode
+            // needs to list their models; it never gets a key.
+            for name in self.passthrough_vars() {
+                if command
+                    .as_std()
+                    .get_envs()
+                    .any(|(set, value)| set == name.as_str() && value.is_some())
+                {
+                    command.env(&name, LIST_PLACEHOLDER);
+                }
+            }
+        }
         if let Some(user) = self.user() {
             command.uid(user.uid).gid(user.gid);
         }
@@ -1498,6 +1523,18 @@ impl Driver {
         tokio::time::sleep(RETRY_AFTER_KILL).await;
         let home = self.home()?;
         self.run_in(&home, args, stdin).await
+    }
+
+    /// `opencode models --standalone` (a private server that ends with it;
+    /// without it opencode leaves a background service running), with the
+    /// providers that have a key enabled and a placeholder in place of
+    /// each key: with an OpenCode Go key set, listing asks opencode.ai,
+    /// which then sees no key.
+    async fn list_models(&self) -> Result<Output> {
+        let model = self.opencode_model(None).ok();
+        let mut home = self.make_home(HomePurpose::Plain, model.as_deref(), None)?;
+        home.placeholders = true;
+        self.run_in(&home, &OPENCODE_MODELS_ARGS, None).await
     }
 
     async fn run_in(&self, home: &CliHome, args: &[&str], stdin: Option<&str>) -> Result<Output> {
@@ -1752,7 +1789,7 @@ impl Driver {
                 if keyed.is_empty() {
                     return (Vec::new(), "cli");
                 }
-                if let Ok(output) = self.run(&["models"], None).await
+                if let Ok(output) = self.list_models().await
                     && output.success
                 {
                     let models = opencode_models(&output.text, &keyed);
@@ -3600,19 +3637,37 @@ esac
             assert!(ok, "{said}");
             assert_eq!(said, format!("the provider answered: {var}"), "{provider}");
         }
-        // The model list and the owner's terminal: every key.
-        let home = driver.home().unwrap();
-        assert_eq!(keys_of(&home).len(), 4);
-        assert_eq!(
-            config(&home)["enabled_providers"].as_array().unwrap().len(),
-            4
-        );
-        drop(home);
+        // The owner's terminal: every key.
         let home = driver
             .terminal_home(TerminalMode::Cli, Some("openai/gpt-5.5"))
             .unwrap();
         assert_eq!(keys_of(&home).len(), 4);
         drop(home);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The model list runs `opencode models --standalone` with every
+    /// provider that has a key enabled, and a placeholder, never a key, in
+    /// each key variable.
+    #[tokio::test]
+    async fn the_model_list_never_gets_a_key() {
+        let dir = temp("oc-list");
+        let driver = opencode(
+            &dir,
+            "deepseek",
+            "#!/bin/sh\n[ \"$*\" = \"models --standalone\" ] || exit 3\necho \"deepseek/d-$DEEPSEEK_API_KEY\"\necho \"openai/o-$OPENAI_API_KEY\"\necho \"anthropic/a-$ANTHROPIC_API_KEY\"\n",
+        );
+        store_key(&driver, "deepseek", "sk-deepseek-fake-key-000001").await;
+        store_key(&driver, "openai", "sk-openai-fake-key-0000001").await;
+        let (models, source) = driver.models().await;
+        assert_eq!(source, "cli");
+        assert_eq!(
+            models,
+            vec![
+                format!("deepseek/d-{LIST_PLACEHOLDER}"),
+                format!("openai/o-{LIST_PLACEHOLDER}")
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3676,6 +3731,8 @@ esac
                 "the prompt"
             ]
         );
+        // `opencode models`, with a private server.
+        assert_eq!(OPENCODE_MODELS_ARGS, ["models", "--standalone"]);
         // `opencode run` for a provider check.
         assert_eq!(
             opencode_check_args("openai/gpt-5.5"),
