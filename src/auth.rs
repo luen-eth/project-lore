@@ -207,9 +207,12 @@ pub enum ProxyTrust {
     /// Every peer, as before `LORE_TRUSTED_PROXIES` existed: an instance
     /// without built-in agents and without the variable.
     Any,
-    /// The ranges `LORE_TRUSTED_PROXIES` names, never the agent networks.
+    /// The ranges `LORE_TRUSTED_PROXIES` names and the addresses the
+    /// names in `LORE_TRUSTED_PROXY_HOSTS` resolve to now, never the agent
+    /// networks.
     Listed {
         trusted: Vec<Cidr>,
+        hosts: Option<Arc<HostTrust>>,
         never: Vec<Cidr>,
     },
     /// With built-in agents and without the variable: private and loopback
@@ -242,6 +245,260 @@ pub fn parse_trusted_proxies(value: &str) -> Result<Vec<Cidr>> {
         .collect()
 }
 
+/// Reads `LORE_TRUSTED_PROXY_HOSTS`: host names, comma separated.
+pub fn parse_trusted_proxy_hosts(value: &str) -> Result<Vec<String>> {
+    let mut names: Vec<String> = Vec::new();
+    for name in value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let valid = name.len() <= 253
+            && name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            });
+        if !valid {
+            bail!(
+                "LORE_TRUSTED_PROXY_HOSTS must be host names such as dokploy-traefik, comma \
+                 separated (\"{name}\" is not one)"
+            );
+        }
+        let name = name.to_ascii_lowercase();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// How often the names of `LORE_TRUSTED_PROXY_HOSTS` are resolved again.
+pub const PROXY_HOSTS_REFRESH: Duration = Duration::from_secs(30);
+
+/// How long the last addresses of a name that no longer resolves stay
+/// trusted.
+pub const PROXY_HOSTS_STALE: Duration = Duration::from_secs(5 * 60);
+
+/// The reverse proxy trusted by name (`LORE_TRUSTED_PROXY_HOSTS`): the
+/// addresses its names resolve to, kept current by [`HostTrust::refresh`].
+/// A name that resolves to new addresses replaces its old ones at once
+/// (the old address stops being trusted, which is the point: Docker hands
+/// a restarted container a new one, and the old one to whoever comes
+/// next); a name that stops resolving keeps its last addresses for
+/// [`PROXY_HOSTS_STALE`], then loses them.
+#[derive(Debug)]
+pub struct HostTrust {
+    names: Vec<String>,
+    known: Mutex<HashMap<String, Known>>,
+    /// The union of every name's addresses, swapped whole.
+    current: std::sync::RwLock<Arc<Vec<IpAddr>>>,
+}
+
+#[derive(Debug, Clone)]
+struct Known {
+    addresses: Vec<IpAddr>,
+    resolved_at: Instant,
+    failing: bool,
+}
+
+fn shown_addresses(addresses: &[IpAddr]) -> String {
+    addresses
+        .iter()
+        .map(IpAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl HostTrust {
+    pub fn new(names: Vec<String>) -> Self {
+        Self {
+            names,
+            known: Mutex::new(HashMap::new()),
+            current: std::sync::RwLock::new(Arc::new(Vec::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Whether `ip` is one of the addresses the names resolve to now.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = unmapped(ip);
+        self.current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&ip)
+    }
+
+    /// The addresses trusted now, sorted.
+    #[cfg(test)]
+    pub fn addresses(&self) -> Vec<IpAddr> {
+        let mut addresses = self
+            .current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .to_vec();
+        addresses.sort();
+        addresses
+    }
+
+    /// Takes in one resolution of `name` made at `now`: its addresses, or
+    /// why it failed (an empty answer is a failure too).
+    pub fn apply(&self, name: &str, answer: std::io::Result<Vec<IpAddr>>, now: Instant) {
+        let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        let answer = answer.and_then(|addresses| {
+            let mut addresses: Vec<IpAddr> = addresses.into_iter().map(unmapped).collect();
+            addresses.sort();
+            addresses.dedup();
+            if addresses.is_empty() {
+                Err(std::io::Error::other("no address"))
+            } else {
+                Ok(addresses)
+            }
+        });
+        // A name that never resolved is kept with no address, so that its
+        // warning is given once, not every refresh.
+        let never_resolved = known
+            .get(name)
+            .is_some_and(|entry| entry.addresses.is_empty());
+        let entry = known
+            .get_mut(name)
+            .filter(|entry| !entry.addresses.is_empty());
+        match (answer, entry) {
+            (Ok(addresses), Some(entry)) => {
+                if entry.addresses != addresses {
+                    tracing::info!(
+                        host = name,
+                        old = %shown_addresses(&entry.addresses),
+                        new = %shown_addresses(&addresses),
+                        "a trusted proxy's address changed; only the new one is trusted now"
+                    );
+                } else if entry.failing {
+                    tracing::info!(host = name, addresses = %shown_addresses(&addresses), "a trusted proxy's name resolves again");
+                }
+                *entry = Known {
+                    addresses,
+                    resolved_at: now,
+                    failing: false,
+                };
+            }
+            (Ok(addresses), None) => {
+                tracing::info!(
+                    host = name,
+                    addresses = %shown_addresses(&addresses),
+                    "trusting X-Forwarded-For from this reverse proxy"
+                );
+                known.insert(
+                    name.to_string(),
+                    Known {
+                        addresses,
+                        resolved_at: now,
+                        failing: false,
+                    },
+                );
+            }
+            (Err(error), Some(entry)) => {
+                if now.duration_since(entry.resolved_at) >= PROXY_HOSTS_STALE {
+                    tracing::warn!(
+                        host = name,
+                        %error,
+                        dropped = %shown_addresses(&entry.addresses),
+                        "a trusted proxy's name has not resolved for {} minutes; its last \
+                         addresses are no longer trusted",
+                        PROXY_HOSTS_STALE.as_secs() / 60
+                    );
+                    known.remove(name);
+                } else if !entry.failing {
+                    tracing::warn!(
+                        host = name,
+                        %error,
+                        kept = %shown_addresses(&entry.addresses),
+                        "a trusted proxy's name did not resolve; its last addresses stay \
+                         trusted for now"
+                    );
+                    entry.failing = true;
+                }
+            }
+            (Err(_), None) if never_resolved => {}
+            (Err(error), None) => {
+                tracing::warn!(
+                    host = name,
+                    %error,
+                    "a name in LORE_TRUSTED_PROXY_HOSTS does not resolve (yet): nothing is \
+                     trusted for it until it does"
+                );
+                known.insert(
+                    name.to_string(),
+                    Known {
+                        addresses: Vec::new(),
+                        resolved_at: now,
+                        failing: true,
+                    },
+                );
+            }
+        }
+        let mut union: Vec<IpAddr> = known
+            .values()
+            .flat_map(|entry| entry.addresses.iter().copied())
+            .collect();
+        union.sort();
+        union.dedup();
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(union);
+    }
+
+    /// Resolves every name once with `resolve` and takes the answers in.
+    pub async fn refresh_with<F, Fut>(&self, resolve: F)
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<IpAddr>>>,
+    {
+        for name in &self.names {
+            let answer = resolve(name.clone()).await;
+            self.apply(name, answer, Instant::now());
+        }
+    }
+
+    /// Resolves every name once through the system resolver (in Docker,
+    /// the embedded DNS: a container's name on a shared network).
+    pub async fn refresh(&self) {
+        self.refresh_with(system_resolve).await;
+    }
+
+    /// Keeps the addresses current: resolves every name again every
+    /// [`PROXY_HOSTS_REFRESH`], for as long as lore runs.
+    pub fn spawn_refresh(self: &Arc<Self>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PROXY_HOSTS_REFRESH);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                this.refresh().await;
+            }
+        });
+    }
+}
+
+/// One name through the system resolver, bounded to a few seconds.
+async fn system_resolve(name: String) -> std::io::Result<Vec<IpAddr>> {
+    let lookup = tokio::net::lookup_host((name.as_str(), 0));
+    match tokio::time::timeout(Duration::from_secs(5), lookup).await {
+        Ok(found) => Ok(found?.map(|addr| addr.ip()).collect()),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the resolver did not answer",
+        )),
+    }
+}
+
 /// Whether an address is private or loopback (RFC 1918, unique local,
 /// loopback).
 fn private_or_loopback(ip: IpAddr) -> bool {
@@ -258,8 +515,14 @@ pub fn peer_may_forward(trust: &ProxyTrust, peer: Option<SocketAddr>) -> bool {
     };
     match trust {
         ProxyTrust::Any => true,
-        ProxyTrust::Listed { trusted, never } => {
-            !never.iter().any(|net| net.contains(ip)) && trusted.iter().any(|net| net.contains(ip))
+        ProxyTrust::Listed {
+            trusted,
+            hosts,
+            never,
+        } => {
+            !never.iter().any(|net| net.contains(ip))
+                && (trusted.iter().any(|net| net.contains(ip))
+                    || hosts.as_ref().is_some_and(|hosts| hosts.contains(ip)))
         }
         ProxyTrust::Private { never } => {
             !never.iter().any(|net| net.contains(ip)) && private_or_loopback(ip)
@@ -680,6 +943,7 @@ mod tests {
         let agents = vec![Cidr::parse("172.31.250.0/28").unwrap()];
         let listed = ProxyTrust::Listed {
             trusted: parse_trusted_proxies("10.0.1.0/24, 127.0.0.1").unwrap(),
+            hosts: None,
             never: agents.clone(),
         };
         assert!(peer_may_forward(&listed, peer("10.0.1.7")));
@@ -699,6 +963,115 @@ mod tests {
                 .unwrap()
                 .contains("fd12::1".parse().unwrap())
         );
+    }
+
+    /// `LORE_TRUSTED_PROXY_HOSTS`: the peer is trusted while it is what
+    /// the name resolves to now; a new address replaces the old one at
+    /// once; a name that stops resolving keeps its last addresses for a
+    /// while, then loses them; a name that never resolved trusts nothing;
+    /// the agent networks are never trusted, whatever a name says.
+    #[tokio::test]
+    async fn a_proxy_trusted_by_name_follows_its_address() {
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        let peer = |text: &str| Some(SocketAddr::new(text.parse().unwrap(), 4000));
+        let hosts = Arc::new(HostTrust::new(
+            parse_trusted_proxy_hosts(" dokploy-traefik, other-proxy ,dokploy-traefik").unwrap(),
+        ));
+        assert_eq!(hosts.names(), ["dokploy-traefik", "other-proxy"]);
+        let trust = ProxyTrust::Listed {
+            trusted: Vec::new(),
+            hosts: Some(hosts.clone()),
+            never: vec![Cidr::parse("172.31.250.0/28").unwrap()],
+        };
+        // An injected resolver: what each name resolves to.
+        let answers: Arc<Mutex<HashMap<String, std::io::Result<Vec<IpAddr>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let set = |name: &str, answer: std::io::Result<Vec<IpAddr>>| {
+            answers.lock().unwrap().insert(name.to_string(), answer);
+        };
+        let resolve = |name: String| {
+            let answers = answers.clone();
+            async move {
+                match answers.lock().unwrap().get(&name) {
+                    Some(Ok(found)) => Ok(found.clone()),
+                    Some(Err(error)) => Err(std::io::Error::new(error.kind(), error.to_string())),
+                    None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "unknown")),
+                }
+            }
+        };
+
+        // Nothing resolves at start-up: a warning, and nobody is trusted.
+        hosts.refresh_with(resolve).await;
+        assert!(hosts.addresses().is_empty());
+        assert!(!peer_may_forward(&trust, peer("10.0.1.5")));
+
+        // The proxy comes up.
+        set("dokploy-traefik", Ok(vec![ip("10.0.1.5")]));
+        hosts.refresh_with(resolve).await;
+        assert!(peer_may_forward(&trust, peer("10.0.1.5")));
+        assert!(peer_may_forward(&trust, peer("::ffff:10.0.1.5")));
+        assert!(!peer_may_forward(&trust, peer("10.0.1.6")));
+
+        // Docker restarts it with a new address: the old one is dropped.
+        set("dokploy-traefik", Ok(vec![ip("10.0.1.9")]));
+        hosts.refresh_with(resolve).await;
+        assert!(peer_may_forward(&trust, peer("10.0.1.9")));
+        assert!(!peer_may_forward(&trust, peer("10.0.1.5")));
+
+        // The name stops resolving: the last address is kept a while...
+        let start = Instant::now();
+        hosts.apply(
+            "dokploy-traefik",
+            Err(std::io::Error::other("no such host")),
+            start,
+        );
+        assert!(peer_may_forward(&trust, peer("10.0.1.9")));
+        // ... an empty answer is a failure too ...
+        hosts.apply(
+            "dokploy-traefik",
+            Ok(Vec::new()),
+            start + Duration::from_secs(60),
+        );
+        assert!(peer_may_forward(&trust, peer("10.0.1.9")));
+        // ... and dropped once the failures last too long (counted from
+        // the last success, which was before `start`).
+        hosts.apply(
+            "dokploy-traefik",
+            Err(std::io::Error::other("no such host")),
+            start + PROXY_HOSTS_STALE,
+        );
+        assert!(!peer_may_forward(&trust, peer("10.0.1.9")));
+        assert!(hosts.addresses().is_empty());
+
+        // Two names: the union; an agent-network address never counts.
+        let now = Instant::now();
+        hosts.apply("dokploy-traefik", Ok(vec![ip("10.0.1.9")]), now);
+        hosts.apply(
+            "other-proxy",
+            Ok(vec![ip("172.31.250.3"), ip("fd00::7")]),
+            now,
+        );
+        assert_eq!(
+            hosts.addresses(),
+            vec![ip("10.0.1.9"), ip("172.31.250.3"), ip("fd00::7")]
+        );
+        assert!(peer_may_forward(&trust, peer("fd00::7")));
+        assert!(!peer_may_forward(&trust, peer("172.31.250.3")));
+
+        // Together with ranges: either one trusts.
+        let both = ProxyTrust::Listed {
+            trusted: parse_trusted_proxies("127.0.0.1").unwrap(),
+            hosts: Some(hosts.clone()),
+            never: Vec::new(),
+        };
+        assert!(peer_may_forward(&both, peer("127.0.0.1")));
+        assert!(peer_may_forward(&both, peer("10.0.1.9")));
+        assert!(!peer_may_forward(&both, peer("10.0.1.5")));
+
+        assert!(parse_trusted_proxy_hosts("").unwrap().is_empty());
+        assert!(parse_trusted_proxy_hosts("10.0.1.0/24").is_err());
+        assert!(parse_trusted_proxy_hosts("http://traefik").is_err());
+        assert!(parse_trusted_proxy_hosts("-bad").is_err());
     }
 
     #[test]

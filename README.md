@@ -1214,7 +1214,8 @@ password nor lock the owner out. Only the runner listener answers there (`/runne
 and `/mcp` and `/git` for a run's token), where a request is always attributed to its
 direct peer address: proxy headers are removed, and `X-Forwarded-For` is never
 believed. On the public port, `X-Forwarded-For` is believed only from the peers
-`LORE_TRUSTED_PROXIES` names (*Configuration*), never from an agent network.
+`LORE_TRUSTED_PROXIES` and `LORE_TRUSTED_PROXY_HOSTS` name (*Configuration*), never
+from an agent network.
 
 The proxy (`egress`, the lore image running `lore proxy`) is the agents' only way to
 the internet. It accepts only `CONNECT host:443` (HTTPS tunnels; it never sees
@@ -1760,7 +1761,11 @@ Step zero changes nothing about how lore runs:
      header, which must be fixed before going on);
    - a wrong password logs the client's own address in *admin login with a wrong user
      name or password*, not the proxy's (see step 6 of the move below for
-     `LORE_TRUSTED_PROXIES`);
+     `LORE_TRUSTED_PROXY_HOSTS` and `LORE_TRUSTED_PROXIES`);
+   - with `LORE_TRUSTED_PROXY_HOSTS=dokploy-traefik`, the log has *trusting
+     X-Forwarded-For from this reverse proxy* with Traefik's current address (`docker
+     exec <lore container> getent hosts dokploy-traefik` shows the same one), and no
+     warning that the name does not resolve;
    - Integrations → a provider's **Test** works (the vault key is right);
    - an agent's `hello` works.
 
@@ -1830,25 +1835,48 @@ when the name is wrong instead of starting lore on an empty database.
    tab: service `lore`, port `8080`, HTTPS with Let's Encrypt). Dokploy attaches
    Traefik to that service; no port is published on the server
    (`docker-compose.yml` has `expose` only, so lore is not reachable past Traefik
-   in plain HTTP). Set `LORE_TRUSTED_PROXIES` to **Traefik's own address** as a
-   `/32`, so that only Traefik's `X-Forwarded-For` is believed. Not the subnet of
-   `dokploy-network`: every Dokploy application is on that network, and any of them
-   could then send lore a made-up `X-Forwarded-For`. Read the address with
+   in plain HTTP). Then tell lore which peer is Traefik, so that only Traefik's
+   `X-Forwarded-For` is believed. **On Dokploy, name it:**
+   `LORE_TRUSTED_PROXY_HOSTS=dokploy-traefik`. lore resolves that name at start-up
+   and again every 30 seconds (from lore's container it resolves through Docker's
+   embedded DNS to Traefik's address on `dokploy-network`; check with
+   `docker exec <lore container> getent hosts dokploy-traefik`), trusts the address
+   it resolves to now, and stops trusting the old one as soon as the name points
+   elsewhere. A fixed address is not recommended on Dokploy: Traefik's address on
+   `dokploy-network` changed twice within half an hour in production (once after a
+   Docker restart, once after a host reboot).
 
-   ```sh
-   docker inspect dokploy-traefik --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'
-   ```
+   Never the subnet of `dokploy-network`: every Dokploy application is on that
+   network, and any of them could then send lore a made-up `X-Forwarded-For`. A
+   fixed `/32` in `LORE_TRUSTED_PROXIES` still works (read the address with
+   `docker inspect dokploy-traefik --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'`
+   and use the one on `dokploy-network`, for example
+   `LORE_TRUSTED_PROXIES=10.0.1.7/32`), but it goes wrong in two ways when Traefik's
+   container gets a new address (a Docker restart, a host reboot, a Dokploy update):
 
-   and use the one on the network lore shares with Traefik (`dokploy-network`), for
-   example `LORE_TRUSTED_PROXIES=10.0.1.7/32`. That address can change whenever
-   Traefik's container is recreated (a Dokploy update, a server restart that
-   recreates it): **check it again after each of those**. When it is wrong, lore
-   believes no `X-Forwarded-For` and sees every client as Traefik: all clients share
-   one failed-sign-in counter, so a few wrong passwords from anyone lock everyone out
-   of the admin page for a while, and failed token attempts of all agents count as
-   one client's too. You notice it in the log: the line *admin login with a wrong
-   user name or password* shows Traefik's address instead of the client's. Without
-   `LORE_TRUSTED_PROXIES` lore keeps believing any peer, as before.
+   - **Fail closed:** lore believes no `X-Forwarded-For` and sees every client as
+     Traefik. All clients share one failed-sign-in counter, so a few wrong passwords
+     from anyone lock everyone out of the admin page for a while, and failed token
+     attempts of all agents count as one client's too. You notice it in the log: the
+     line *admin login with a wrong user name or password* shows Traefik's address
+     instead of the client's.
+   - **Fail open:** if another container on `dokploy-network` is later given
+     Traefik's old address, lore believes *that* container's `X-Forwarded-For`, and it
+     can make its requests look as if they came from any client (and spread its
+     failed attempts over made-up addresses to dodge the rate limits).
+
+   What the name protects against, and what not: while Traefik runs, no other
+   container on `dokploy-network` can take the name `dokploy-traefik` there, and an
+   address Traefik gave up is no longer trusted within 30 seconds. If the name stops
+   resolving (Traefik is down), lore keeps its last address for 5 minutes, then
+   trusts nothing for it until it resolves again; a name that does not resolve at
+   start-up is a warning, not an error. It does not protect against someone who can
+   create containers on the host: they can start one with that name while Traefik is
+   down, or simply be root on the server, and such a person owns the host already.
+   Every change is in the log at info level, with the old and the new addresses
+   (*a trusted proxy's address changed*). Without either setting lore keeps believing
+   any peer, as before (with built-in agents: any private or loopback peer outside
+   the agent networks, with a warning at start-up).
 7. **Verify.** The admin page loads at the domain with your memories, the board and
    the stored credentials (open Integrations: a provider's **Test** works, which
    proves `LORE_VAULT_KEY` is right); an agent's `hello` works; signing in to the
@@ -1991,7 +2019,8 @@ documentation for adding a remote MCP server.
 | `LORE_SESSION_IDLE_HOURS` | `12` | Hours without activity after which an open session is closed. Whole number between 1 and 720. |
 | `LORE_ALLOWED_HOSTS` | any | Hostnames accepted in the `Host` header. |
 | `LORE_TRUST_PROXY` | `on` in Docker | Read the client address from `X-Forwarded-For`. Turn off if the port is exposed directly. |
-| `LORE_TRUSTED_PROXIES` | | With `LORE_TRUST_PROXY=on`: the peers whose `X-Forwarded-For` is believed, as address ranges, comma separated (`10.0.1.7/32`, `127.0.0.1`): your reverse proxy's own address, for Dokploy Traefik's address on `dokploy-network` as a `/32` (not the network's subnet, which every Dokploy application shares; re-check it when Traefik's container is recreated, see *Moving a single-container install to compose*, step 6). Unset: any peer, as before; with built-in agents, any private or loopback peer (and a warning at start-up). Never the agent networks, and never on the runner listener. |
+| `LORE_TRUSTED_PROXIES` | | With `LORE_TRUST_PROXY=on`: the peers whose `X-Forwarded-For` is believed, as address ranges, comma separated (`10.0.1.7/32`, `127.0.0.1`): your reverse proxy's own address. On Dokploy prefer `LORE_TRUSTED_PROXY_HOSTS`: Traefik's address on `dokploy-network` changes when its container restarts, and a fixed `/32` then either locks every client into one rate-limit counter or, once another container gets the old address, believes that container (see *Moving a single-container install to compose*, step 6). Never the subnet of `dokploy-network`, which every Dokploy application shares. Without this and `LORE_TRUSTED_PROXY_HOSTS`: any peer, as before; with built-in agents, any private or loopback peer (and a warning at start-up). Never the agent networks, and never on the runner listener. |
+| `LORE_TRUSTED_PROXY_HOSTS` | | With `LORE_TRUST_PROXY=on`: host names of your reverse proxy, comma separated (on Dokploy `dokploy-traefik`). Resolved through the system resolver at start-up and every 30 seconds; the addresses they resolve to now are trusted in addition to `LORE_TRUSTED_PROXIES`. A new address replaces the old one at once; a name that stops resolving keeps its last addresses for 5 minutes; one that does not resolve at start-up is a warning. Changes are logged at info level. Never the agent networks, and never on the runner listener. |
 | `LORE_DATA_DIR` | `/data` in Docker | Where the database and model cache live. |
 | `LORE_BIND` | `0.0.0.0:8080` | Listen address. |
 | `LORE_RUNNER_TOKENS` | | The built-in agents: `agent:secret` pairs (`claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>`), each secret 24 characters or longer. An entry may name the agent's CLI and provider, `agent:kind:secret` or `agent:opencode/<provider>:secret`, which a name not starting with `claude`, `codex` or `deepseek` must; a runner claiming anything else is refused. Unset: no built-in agent, no runner listener, nothing changes. A name may not also be in `LORE_TOKENS` or belong to another agent. |

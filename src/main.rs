@@ -291,29 +291,45 @@ async fn main() -> Result<()> {
         runner_listener = Some((listeners, hub.clone().router()));
     }
     let trusted_proxies = auth::parse_trusted_proxies(&env_or("LORE_TRUSTED_PROXIES", ""))?;
+    let trusted_hosts = auth::parse_trusted_proxy_hosts(&env_or("LORE_TRUSTED_PROXY_HOSTS", ""))?;
     if trust_proxy {
         let never = builtin::agent_networks(&agent_addresses);
-        let trust = if !trusted_proxies.is_empty() {
+        let trust = if !trusted_proxies.is_empty() || !trusted_hosts.is_empty() {
+            let hosts = if trusted_hosts.is_empty() {
+                None
+            } else {
+                // Resolved once before serving (a name that does not
+                // resolve yet is a warning: the proxy may start later),
+                // then again in the background.
+                let hosts = Arc::new(auth::HostTrust::new(trusted_hosts));
+                hosts.refresh().await;
+                hosts.spawn_refresh();
+                Some(hosts)
+            };
             auth::ProxyTrust::Listed {
                 trusted: trusted_proxies,
+                hosts,
                 never,
             }
         } else if hub.is_some() {
             tracing::warn!(
-                "LORE_TRUST_PROXY is on without LORE_TRUSTED_PROXIES: X-Forwarded-For is believed \
-                 from any private or loopback peer outside the agent networks. Set \
-                 LORE_TRUSTED_PROXIES to your reverse proxy's own address (for Dokploy, \
-                 Traefik's address on dokploy-network as a /32, not that network's subnet, \
-                 which every Dokploy application shares) so other containers cannot choose \
-                 their address."
+                "LORE_TRUST_PROXY is on without LORE_TRUSTED_PROXIES or LORE_TRUSTED_PROXY_HOSTS: \
+                 X-Forwarded-For is believed from any private or loopback peer outside the agent \
+                 networks. Name your reverse proxy in LORE_TRUSTED_PROXY_HOSTS (for Dokploy, \
+                 dokploy-traefik) or set LORE_TRUSTED_PROXIES to its own address, not to the \
+                 subnet of a network every Dokploy application shares, so other containers \
+                 cannot choose their address."
             );
             auth::ProxyTrust::Private { never }
         } else {
             auth::ProxyTrust::Any
         };
         auth::set_proxy_trust(trust);
-    } else if !trusted_proxies.is_empty() {
-        tracing::warn!("LORE_TRUSTED_PROXIES is set but LORE_TRUST_PROXY is off: it has no effect");
+    } else if !trusted_proxies.is_empty() || !trusted_hosts.is_empty() {
+        tracing::warn!(
+            "LORE_TRUSTED_PROXIES or LORE_TRUSTED_PROXY_HOSTS is set but LORE_TRUST_PROXY is \
+             off: it has no effect"
+        );
     }
     for warning in startup_warnings(
         &db,
