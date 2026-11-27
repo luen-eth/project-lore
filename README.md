@@ -1490,6 +1490,17 @@ limited to a task's scope**: there is no task, the person at the terminal acts w
 the agent's full authority, which is one more reason only the `agents` permission can
 open a terminal.
 
+**What that means for services.** A run may change only what its task names; a CLI in
+a terminal may call `github`, `github_org`, `git_server`, `dokploy`, `cloudflare` and
+`mail` on anything the agent's service levels allow. The risk is prompt injection: a
+CLI in a terminal that reads a hostile repository, issue or web page can be talked
+into such calls. What still holds: the kill switch, the per-agent levels (set the
+built-in agent's levels on the Integrations panel to what you would let it do
+unattended), the leak scan for public repositories, `LORE_DOKPLOY_PROTECTED`, the
+redaction and the operations log. The interactive CLIs ask before each tool call by
+default; do not switch that off in a terminal. There is no separate service cap for
+terminals yet (it would need one more column in `builtin_agents`).
+
 On the board a terminal's CLI is a caller of its own, neither a run nor an ordinary
 agent: it may add tasks, to-dos and notes, log entries, and claim open tasks; it
 releases or finishes only a task it claimed in a terminal (lore writes `[claimed in a
