@@ -20,6 +20,23 @@ pub use builtin::*;
 
 pub const KINDS: &[&str] = &["update", "decision", "bug", "note", "todo"];
 
+/// The line a note-style to-do gets when it is moved to the board.
+pub fn moved_to_board_line(task_id: i64) -> String {
+    format!("Moved to the board as task #{task_id}.")
+}
+
+/// The task a note-style to-do was already moved to, read from the line
+/// `moved_to_board_line` wrote.
+pub fn moved_to_board(body: &str) -> Option<i64> {
+    body.lines().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix("Moved to the board as task #")?
+            .strip_suffix('.')?
+            .parse()
+            .ok()
+    })
+}
+
 /// The project a to-do without one is filed under (`todo_add`, the page's
 /// To-do view). A task there without a repository is never taken by a
 /// built-in agent.

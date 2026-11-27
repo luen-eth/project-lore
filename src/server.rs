@@ -1961,6 +1961,12 @@ impl Lore {
                         entry.kind
                     ));
                 }
+                if let Some(task) = db::moved_to_board(&entry.body) {
+                    return Ok(format!(
+                        "Entry #{id} was already moved to the board as task #{task}; nothing new \
+                         was added."
+                    ));
+                }
                 if title.trim().is_empty() {
                     title = entry.title.clone();
                 }
@@ -2004,10 +2010,10 @@ impl Lore {
             .unwrap_or("?")
             .to_string();
         let db = self.db.clone();
-        let body = format!(
-            "{}\n\nMoved to the board as task #{task_id}.",
-            entry.body.trim_end()
-        );
+        let body = format!("{}\n\n{}", entry.body.trim_end(), {
+            let id: i64 = task_id.parse().unwrap_or(0);
+            db::moved_to_board_line(id)
+        });
         let id = entry.id;
         blocking(move || {
             db.amend(
@@ -5105,6 +5111,30 @@ mod tests {
                 .unwrap()
                 .body
                 .ends_with(&format!("Moved to the board as task #{task_id}."))
+        );
+        // A second move adds nothing and names the task.
+        let tasks_before = lore.db.tasks(None, &[], 100).unwrap().len();
+        let again = lore
+            .todo_add(
+                call(&session, json!({"from_entry": other.id})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            again.contains(&format!("already moved to the board as task #{task_id}")),
+            "{again}"
+        );
+        assert_eq!(lore.db.tasks(None, &[], 100).unwrap().len(), tasks_before);
+        assert_eq!(
+            lore.db
+                .get(other.id)
+                .unwrap()
+                .unwrap()
+                .body
+                .matches("Moved to the board")
+                .count(),
+            1
         );
         // Done, as task_update does it.
         let done = lore

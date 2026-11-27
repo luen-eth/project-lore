@@ -3957,6 +3957,16 @@ mod tests {
                 .body
                 .contains(&format!("task #{}", moved["id"]))
         );
+        let twice = call(
+            reqwest::Method::POST,
+            &format!("/admin/api/todos/from-entry/{}", todo.id),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(twice.status(), 400);
+        assert_eq!(admin.db.tasks(None, &[], 100).unwrap().len(), 2);
         let refused = call(
             reqwest::Method::POST,
             &format!("/admin/api/todos/from-entry/{id}"),

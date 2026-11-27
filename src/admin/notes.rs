@@ -245,6 +245,15 @@ pub(super) async fn todo_from_entry(
         if entry.kind != "todo" {
             anyhow::bail!("entry #{id} is not a note-style to-do");
         }
+        if let Some(task) = crate::db::moved_to_board(&entry.body) {
+            anyhow::bail!("entry #{id} was already moved to the board as task #{task}");
+        }
+        if entry.body.chars().count() > crate::db::BODY_MAX_CHARS {
+            anyhow::bail!(
+                "its text is longer than a task may be ({} characters); shorten the entry first",
+                crate::db::BODY_MAX_CHARS
+            );
+        }
         let mut title: String = entry.title.chars().take(200).collect();
         if title.trim().is_empty() {
             title = format!("To-do #{id}");
@@ -263,9 +272,9 @@ pub(super) async fn todo_from_entry(
             id,
             &Patch {
                 body: Some(format!(
-                    "{}\n\nMoved to the board as task #{}.",
+                    "{}\n\n{}",
                     entry.body.trim_end(),
-                    task.id
+                    crate::db::moved_to_board_line(task.id)
                 )),
                 ..Default::default()
             },
