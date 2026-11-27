@@ -32,7 +32,7 @@ pub(super) async fn list_notes(
     State(admin): State<Arc<Admin>>,
     Query(query): Query<NotesQuery>,
 ) -> Response {
-    let project = filter(query.project);
+    let project = super::resolved_project(&admin.db, query.project);
     let q = query
         .q
         .map(|q| q.trim().to_string())
@@ -207,7 +207,7 @@ pub(super) async fn list_todos(
     State(admin): State<Arc<Admin>>,
     Query(query): Query<TodosQuery>,
 ) -> Response {
-    let project = filter(query.project);
+    let project = super::resolved_project(&admin.db, query.project);
     let status = filter(query.status).unwrap_or_else(|| "open".into());
     let statuses: &'static [&'static str] = match status.as_str() {
         "done" => &["done"],

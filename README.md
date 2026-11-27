@@ -89,8 +89,8 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `files` | The files kept, newest first, or a search over their paths and descriptions |
 | `file_get` | One file with its description, its other versions and its content, by id or by project and path |
 | `file_delete` | Delete one version of a file |
-| `project_rename` | Rename a project: moves every memory, task, note and file (and the sessions, messages, handoffs, activity, project rules and built-in runs) from the old name to the new one in one step, ids kept; the old name stays an alias. `merge: true` merges into a name that already exists; `keep_alias: false` keeps no alias (see [Renaming a project](#renaming-a-project)) |
-| `project_aliases` | List the old project names lore keeps as aliases, or remove one with `remove` |
+| `project_rename` | Rename a project: moves every memory, task, note and file (and the sessions, messages, handoffs, activity, project rules and built-in runs) from the old name to the new one in one step, ids kept; the old name always stays an alias. Over MCP only a plain rename onto a free name: merging (permanent) and dropping the alias are done on the admin page (see [Renaming a project](#renaming-a-project)) |
+| `project_aliases` | List the old project names lore keeps as aliases (list only; aliases are removed on the admin page) |
 | `integrations` | The services you may operate through lore (Cloudflare, GitHub personal and organization, a self-hosted GitLab, Dokploy) and the mailbox: which are configured, your own access level on each, and how to address them |
 | `cloudflare` | Call the Cloudflare API (zones, DNS records, …) |
 | `github` | Call the GitHub REST API with the personal account's token (repositories, pull requests, issues, …) |
@@ -337,9 +337,8 @@ Details:
 
 A `project` is the lowercase repository or folder name; when the folder or the
 repository is renamed, everything logged under the old name would stay there.
-`project_rename` (or **Rename** next to a project in the page's Projects panel, for
-users with `write`) moves it all to the new name in one transaction, every row
-keeping its id:
+`project_rename` (or **Rename** next to a project in the page's Projects panel)
+moves it all to the new name in one transaction, every row keeping its id:
 
 - memories, notes and to-dos (`entries`; the full-text index holds no project name,
   so search finds them under the new name at once), board tasks (their owner notes
@@ -347,34 +346,63 @@ keeping its id:
   handoff notes, the activity feed, project rules, and the built-in agents' runs
   (delegations, pushes and run writes go by task or run id). The page and the
   graph reload without a page reload; runs in progress report under the new name.
+- **Who may do what.** Over MCP (any agent token or OAuth client that may write
+  entries, the same as `amend`/`forget`, a built-in agent's terminal included) only
+  a *plain* rename: the new name holds nothing and is not another project's alias,
+  and the old name always stays an alias. `merge: true`, `keep_alias: false` and
+  removing an alias are refused there with a pointer to the admin page, where a
+  signed-in user with `write` can do them: any agent can be talked into something
+  by text it reads, a merge cannot be undone, and a merge can change the repository
+  built-in runs push to. A built-in agent's run token may not rename at all (it is
+  not on a run's tool list).
 - **Refusals:** both names are checked like `log` checks a project (trimmed,
-  lowercase, not empty); the old name must hold something; the two must differ; an
-  old name that is itself an alias is refused (rename the project it points at).
-- **Merging:** when the new name already holds data the rename is refused unless
-  `merge: true` (on the page: the "Merge into the existing project" box, which shows
-  only then). Rows are simply moved under the new name. Files kept at the same path
-  under both names keep every version: that path's versions are renumbered 1..n in
-  the order they were saved (time, then id), so the most recently saved is the
-  current one; the answer names those paths. "Who last logged which commit" in
+  lowercase, not empty); the two must differ; the old name must hold something (a
+  name that is only an alias is refused: rename the project it points at); the new
+  name must not be an alias of a *different* project (agents still sending that name
+  would land in the wrong project; remove that alias first, on the page). The
+  page's preview shows the same refusals before anything is done.
+- **Merging is permanent.** When the new name already holds data, the page offers
+  "Merge into the existing project". Rows are moved under the new name; nothing
+  records which came from where, so a merge cannot be undone. Files kept at the same
+  path under both names keep every version: that path's versions are renumbered
+  1..n in the order they were saved (time, then id), so the most recently saved is
+  the current one; the answer names those paths. "Who last logged which commit" in
   `projects` is computed from the entries, so after a merge each agent's newest
   entry wins.
+- **Repositories of open tasks.** A task without a repository of its own goes to
+  the newest repository recorded for its project, and a merge can change that. The
+  page's confirmation lists the open tasks of either project whose newest recorded
+  GitHub repository (written in a session whose token lore verified) would change,
+  with the old and new repository; the merge sets those tasks to **Manual**
+  (`manual_by` `user:<name>`, with a note), so no built-in agent takes one until
+  someone sets its repository or clears Manual. lore compares only the recorded
+  repositories here; which credential can push and the agents' levels are checked
+  by the task runner as always.
 - **The old name keeps working.** It becomes an alias (a `meta` row
-  `project_alias.<old>`): every tool that takes a `project` — `hello`, `log`,
+  `project_alias.<old>` holding the new name; a merge adds
+  `project_alias_merge.<old>`, so that the plain value stays readable by an older
+  build after a rollback): every tool that takes a `project` — `hello`, `log`,
   `recall`, `recent`, the board, notes, to-dos, files, `handoff`, `delegate`, `ask`
   — uses the new name instead, and says so once per session ("project `a` was
   renamed to `b`; using `b`"); every write the store makes resolves the alias too,
-  so the old name never comes back as a separate project. `projects` shows
-  "also known as: a". Chains collapse (a → b, then b → c gives a → c and b → c);
-  renaming to a name that is an alias makes it a project again and drops that alias;
-  renaming back (b → a after a → b) undoes the rename and leaves no alias.
-  `keep_alias: false` keeps none. `project_aliases` (and the × next to an alias on
-  the page) lists and removes aliases.
+  and so do the page's project filters. `projects` shows "also known as: a".
+  Chains collapse (a → b, then b → c gives a → c and b → c).
+- **Renaming back.** b → a right after a plain rename a → b undoes it and leaves no
+  alias. After a *merge* of a into b (or once b has taken in another project's rows
+  by a merge), b → a is an ordinary rename: everything in b moves to a, the alias
+  b → a is kept, and the answer says the earlier merge is not undone.
+- **Dropping the alias** (`keep_alias` unticked, page only) is refused while a
+  built-in run of the project is starting or running, or one of its open tasks is
+  delegated: that work would write under the old name again. Aliases are removed
+  with the × next to them in the Projects panel.
+- **Rows under an alias.** A build from before aliases (after a rollback, or a
+  restore by such a build) may store rows under a name that is now an alias. No
+  agent reaches them, since every call is sent to the alias's project. lore logs a
+  warning at start-up and the Projects panel marks the name; the way out is
+  **Rename** on that name: merge it into the alias's project, or rename it to a new
+  name. The alias itself stays as it is.
 - **Recorded:** a line in the activity feed and a note in the new project, tagged
   `rename`: `project a renamed to b by <agent or user>`, with the counts.
-
-Who may rename: any agent token or OAuth client that may write entries (the same as
-`amend`/`forget`), including a built-in agent's terminal; a built-in agent's run
-token may not (it is not on a run's tool list).
 
 ## Operating services through lore
 
@@ -872,11 +900,23 @@ search index included. The vectors are reused when the instance runs the same
 embedding model as the one the backup came from; with a different model they are
 recomputed in the background, and the page redraws the links when that finishes.
 
-The JSON backup also carries the project aliases (`project_aliases`). A restore
-replaces the aliases with the backup's (a backup without them clears them, since its
-rows are under the names they had); a merge keeps the aliases here and files
+The JSON backup also carries the project aliases (`project_aliases`, and
+`project_alias_merges` for those left by a merge). A restore replaces the aliases
+with the backup's, after checking them: names trimmed, lowercase, not empty and at
+most 200 characters, no alias of itself, no chain or cycle, no old name that holds
+rows in the same backup, at most 10 000; anything else refuses the whole restore
+with the reason and changes nothing (dropping a bad alias silently could send
+agents' writes to the wrong project). A merge keeps the aliases here and files
 incoming rows under an old name with the project it stands for. The full database
 backup carries them as it carries every `meta` row.
+
+**A JSON backup from before a rename, restored after it, splits the project.** It
+carries no aliases (so they are cleared) and has its rows under the old name: the
+memories, tasks, messages, sessions and rules — and the kept files, for a version 5
+backup — come back under the old name, while the built-in agents' runs (never part
+of the JSON backup) and, for a backup older than version 5, the files stay under the
+new name. To join them again, rename the old name to the new one on the page with
+**Merge into the existing project**, and the alias is back too.
 
 Older backups still load. Restoring one only replaces what it carries: a backup
 older than version 5 leaves the kept files as they are, one older than version 4

@@ -2282,6 +2282,13 @@ impl TaskRunner {
         }
     }
 
+    /// Whether a run of `project` is going, or any run is being started
+    /// (its project is not known yet, so it counts).
+    pub fn busy_with(&self, project: &str) -> bool {
+        let state = self.state();
+        !state.starting.is_empty() || state.active.values().any(|run| run.project == project)
+    }
+
     /// Whether `name` is one of the built-in agents.
     pub fn is_builtin(&self, name: &str) -> bool {
         self.hub.is_builtin(name)

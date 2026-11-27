@@ -591,12 +591,12 @@ pub struct ProjectRenameArgs {
     pub from: String,
     /// The new name.
     pub to: String,
-    /// Merge into `to` when it already holds data. Default false: the
-    /// rename is refused when `to` exists.
+    /// Not available over MCP (a merge cannot be undone): `true` is
+    /// refused; merges are done on the admin page.
     #[serde(default)]
     pub merge: Option<bool>,
-    /// Keep `from` as an alias of `to`, so agents that still use the old
-    /// name land on the new one. Default true.
+    /// Over MCP the old name always stays an alias: `false` is refused;
+    /// dropping the alias is done on the admin page.
     #[serde(default)]
     pub keep_alias: Option<bool>,
 }
@@ -605,7 +605,8 @@ pub struct ProjectRenameArgs {
 pub struct ProjectAliasesArgs {
     /// Session id returned by `hello` for this chat.
     pub session_id: String,
-    /// An old name whose alias to remove; omit to list the aliases.
+    /// Not available over MCP: aliases are removed on the admin page. A
+    /// call that names one is refused.
     #[serde(default)]
     pub remove: Option<String>,
 }
@@ -3020,7 +3021,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Rename a project in lore's memory (for example after the repository or folder was renamed): moves every memory, task, note and file from the old name to the new one, with its sessions, messages, handoffs, activity, project rules and built-in runs, in one step that keeps every id. The old name stays an alias (unless `keep_alias` is false), so agents that still use it land on the new project. When the new name already holds data the rename is refused unless `merge` is true. The answer says how many rows of each kind moved."
+        description = "Rename a project in lore's memory (for example after the repository or folder was renamed): moves every memory, task, note and file from the old name to the new one, with its sessions, messages, handoffs, activity, project rules and built-in runs, in one step that keeps every id. The old name always stays an alias, so agents that still use it land on the new project. Over MCP only a plain rename is done: the new name must hold nothing and must not be another project's alias. Merging into an existing project (permanent: a merge cannot be undone) and dropping the alias are done on the admin page; `merge: true` and `keep_alias: false` are refused here. The answer says how many rows of each kind moved."
     )]
     async fn project_rename(
         &self,
@@ -3041,6 +3042,7 @@ impl Lore {
                 keep_alias: args.keep_alias.unwrap_or(true),
                 by: actor.clone(),
                 session_id: Some(session.id.clone()),
+                page: false,
             };
             let outcome = this.db.rename_project(&request).map_err(internal)??;
             this.embed_entry(&outcome.note);
@@ -3063,7 +3065,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "List the project aliases lore keeps (old project names left by `project_rename`, each with the project it now stands for), or remove one with `remove`: the old name then becomes free again and is no longer sent to the new project."
+        description = "List the project aliases lore keeps: old project names left by `project_rename`, each with the project it now stands for (calls naming an old name use that project). List only; aliases are removed on the admin page."
     )]
     async fn project_aliases(
         &self,
@@ -3075,33 +3077,19 @@ impl Lore {
         let session_id = args.session_id.trim().to_string();
         let this = self.clone();
         blocking(move || {
-            let session = this.require_session(&session_id, &agent, shared)?;
-            let actor = session_agent(&agent, &session);
-            if let Some(name) = args
+            this.require_session(&session_id, &agent, shared)?;
+            if args
                 .remove
                 .as_deref()
-                .map(str::trim)
-                .filter(|n| !n.is_empty())
+                .is_some_and(|name| !name.trim().is_empty())
             {
-                let name = normalize_project(name)?;
-                return match this.db.remove_project_alias(&name).map_err(internal)? {
-                    Some(project) => {
-                        this.note(
-                            actor,
-                            "project_rename",
-                            &project,
-                            Some(&session.id),
-                            None,
-                            &[],
-                            &format!("alias {name} of {project} removed"),
-                        );
-                        Ok(format!(
-                            "Removed the alias `{name}` (of `{project}`): `{name}` is a free \
-                             project name again."
-                        ))
-                    }
-                    None => Err(format!("`{name}` is not an alias.")),
-                };
+                return Err(
+                    "removing an alias is done on the admin page (Projects, the × next to the \
+                     alias, by a user with the write permission): without it, agents that \
+                     still use the old name start a separate project, and any agent could be \
+                     talked into that"
+                        .into(),
+                );
             }
             let aliases = this.db.project_aliases().map_err(internal)?;
             if aliases.is_empty() {
@@ -5250,12 +5238,39 @@ fn rename_answer(outcome: &crate::db::RenameOutcome) -> String {
             "This undid the earlier rename of `{to}` to `{from}`: the alias `{to}` is gone and \
              no new alias was made.\n"
         ));
-    } else {
+    } else if outcome.shadowed_alias_of.is_none() {
         out.push_str(&format!(
             "No alias was kept: `{from}` is a free name again.\n"
         ));
     }
-    if let Some(removed) = outcome.removed_alias.as_ref().filter(|_| !outcome.undo) {
+    if outcome.merge_not_undone {
+        out.push_str(&format!(
+            "`{to}` had been merged into `{from}` earlier; a merge cannot be undone, so this was \
+             an ordinary rename: everything in `{from}` is now in `{to}`.\n"
+        ));
+    }
+    if let Some(project) = &outcome.shadowed_alias_of {
+        out.push_str(&format!(
+            "`{from}` is an alias of `{project}`; the rows stored under the alias itself moved, \
+             and the alias stays.\n"
+        ));
+    }
+    if !outcome.held_tasks.is_empty() {
+        out.push_str(&format!(
+            "Set to manual because their repository may change: {}.\n",
+            outcome
+                .held_tasks
+                .iter()
+                .map(|held| format!("#{}", held.task_id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(removed) = outcome
+        .removed_alias
+        .as_ref()
+        .filter(|_| !outcome.undo && !outcome.merge_not_undone)
+    {
         out.push_str(&format!(
             "`{removed}` was an alias; it is a project now, so the alias was removed.\n"
         ));

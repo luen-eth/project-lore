@@ -12,9 +12,14 @@
 //!   `activity.project` (the feed), `agent_runs.project` (built-in runs;
 //!   `delegations`, `agent_run_refs`, `run_writes` go by task or run id).
 //! - `rules.target` of rules with scope `project`.
-//! - `meta` keys `project_alias.<old>` (the aliases themselves).
+//! - `meta` keys `project_alias.<old>` (the aliases themselves) and
+//!   `project_alias_merge.<old>` (set when the alias came from a merge).
 //!
-//! No table is added: aliases are `meta` rows.
+//! No table is added: aliases are `meta` rows. The alias's value stays
+//! the plain project name, as the first build with aliases wrote it, so
+//! a build rolled back to that one still reads every alias; whether it
+//! came from a merge is kept under a key of its own, which that build
+//! does not see.
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -24,6 +29,17 @@ use super::{Db, Entry, get_entry, set_meta};
 /// The `meta` key prefix of an alias: `project_alias.<old>` holds the
 /// project the old name now stands for.
 pub const ALIAS_PREFIX: &str = "project_alias.";
+
+/// The `meta` key prefix marking an alias that came from a merge (or
+/// whose project has since taken in another project's rows): such a
+/// rename cannot be undone, since nothing records where rows came from.
+pub const MERGE_PREFIX: &str = "project_alias_merge.";
+
+/// Most aliases a JSON backup may carry.
+pub const MAX_BACKUP_ALIASES: usize = 10_000;
+
+/// Longest project name an alias in a JSON backup may have.
+pub const MAX_ALIAS_CHARS: usize = 200;
 
 /// How many rows of each kind a project holds (or a rename moved).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -81,6 +97,18 @@ impl ProjectCounts {
     }
 }
 
+/// An open task with no repository of its own whose repository a merge
+/// may change: the newest GitHub repository recorded for its project
+/// before, and for the merged project after.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RepoChange {
+    pub task_id: i64,
+    pub title: String,
+    pub project: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
 /// What a rename would do, without doing it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RenamePreview {
@@ -95,6 +123,15 @@ pub struct RenamePreview {
     pub conflicting_paths: Vec<String>,
     /// Why the rename cannot happen at all, if it cannot (merge aside).
     pub refusal: Option<String>,
+    /// What the caller should know before confirming (shadowed rows, a
+    /// merge that is not undone, …).
+    pub notices: Vec<String>,
+    /// Tasks a merge would hold back as manual (their repository may
+    /// change).
+    pub repo_changes: Vec<RepoChange>,
+    /// Runs or delegations of `from` still going: `keep_alias: false` is
+    /// refused while there are any.
+    pub busy: Vec<String>,
 }
 
 /// What a rename did.
@@ -110,10 +147,19 @@ pub struct RenameOutcome {
     pub alias_kept: bool,
     /// The alias `to` that was removed because `to` is a project now.
     pub removed_alias: Option<String>,
-    /// Whether this undid an earlier rename (`to` was an alias of `from`).
+    /// Whether this undid an earlier plain rename (`to` was an alias of
+    /// `from`).
     pub undo: bool,
+    /// `to` was an alias of `from` left by a merge: this is an ordinary
+    /// rename and the merge stays.
+    pub merge_not_undone: bool,
+    /// `from` was itself an alias of this project (its rows were stored
+    /// under the alias); the alias stays as it was.
+    pub shadowed_alias_of: Option<String>,
     /// Other aliases that pointed at `from` and now point at `to`.
     pub repointed: Vec<String>,
+    /// Tasks set to manual because their repository may have changed.
+    pub held_tasks: Vec<RepoChange>,
     /// The note recording the rename, in `to`.
     pub note: Entry,
 }
@@ -128,6 +174,10 @@ pub struct RenameRequest {
     /// The agent or user, for the note.
     pub by: String,
     pub session_id: Option<String>,
+    /// From the admin page (a signed-in user with `write`). Without it
+    /// (MCP) only a plain rename onto a free name, alias kept, is done:
+    /// any agent can be prompt-injected and a merge cannot be undone.
+    pub page: bool,
 }
 
 /// A project name as every tool takes it: trimmed, lowercase, not empty.
@@ -149,6 +199,59 @@ pub(super) fn alias_of(conn: &Connection, name: &str) -> Result<Option<String>> 
             |row| row.get(0),
         )
         .optional()?)
+}
+
+/// Whether the alias `name` came from a merge (or its project has taken
+/// in other rows since).
+fn alias_merged(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM meta WHERE key = ?1",
+            params![format!("{MERGE_PREFIX}{name}")],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Writes one alias and its merge mark.
+pub(super) fn set_alias(conn: &Connection, old: &str, project: &str, merged: bool) -> Result<()> {
+    set_meta(conn, &format!("{ALIAS_PREFIX}{old}"), project)?;
+    if merged {
+        set_meta(conn, &format!("{MERGE_PREFIX}{old}"), "1")?;
+    } else {
+        conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![format!("{MERGE_PREFIX}{old}")],
+        )?;
+    }
+    Ok(())
+}
+
+/// Removes one alias and its merge mark.
+fn delete_alias(conn: &Connection, old: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM meta WHERE key IN (?1, ?2)",
+        params![
+            format!("{ALIAS_PREFIX}{old}"),
+            format!("{MERGE_PREFIX}{old}")
+        ],
+    )?;
+    Ok(())
+}
+
+/// Removes every alias and merge mark (a JSON restore).
+pub(super) fn delete_all_aliases(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM meta WHERE substr(key, 1, ?1) = ?2 OR substr(key, 1, ?3) = ?4",
+        params![
+            ALIAS_PREFIX.len() as i64,
+            ALIAS_PREFIX,
+            MERGE_PREFIX.len() as i64,
+            MERGE_PREFIX
+        ],
+    )?;
+    Ok(())
 }
 
 /// `name`, or the project it is an alias of. Aliases never chain, so one
@@ -175,6 +278,15 @@ pub(super) fn all_aliases(conn: &Connection) -> Result<Vec<(String, String)>> {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The old names whose alias is marked as from a merge.
+pub(super) fn merged_aliases(conn: &Connection) -> Result<Vec<String>> {
+    Ok(all_aliases(conn)?
+        .into_iter()
+        .map(|(old, _)| old)
+        .filter(|old| alias_merged(conn, old).unwrap_or(false))
+        .collect())
 }
 
 fn count(conn: &Connection, sql: &str, name: &str) -> Result<i64> {
@@ -240,6 +352,104 @@ fn conflicting_paths(conn: &Connection, from: &str, to: &str) -> Result<Vec<Stri
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// The runs (starting or running) and delegations (of an open or claimed
+/// task) of a project still going, described.
+fn busy(conn: &Connection, project: &str) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT id, agent, status FROM agent_runs
+         WHERE project = ?1 AND status IN ('starting', 'running') ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map(params![project], |row| {
+        Ok(format!(
+            "run {} of {} ({})",
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?
+        ))
+    })?;
+    for row in rows {
+        found.push(row?);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT d.task_id, d.agent FROM delegations d JOIN tasks t ON t.id = d.task_id
+         WHERE t.project = ?1 AND t.status IN ('open', 'claimed') ORDER BY d.task_id",
+    )?;
+    let rows = stmt.query_map(params![project], |row| {
+        Ok(format!(
+            "task #{} delegated to {}",
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?
+        ))
+    })?;
+    for row in rows {
+        found.push(row?);
+    }
+    Ok(found)
+}
+
+/// The newest GitHub repository (`owner/repo`, lowercase) recorded for
+/// any of `projects` by a session whose token agent lore verified: the
+/// records the task runner chooses from for a task without a repository.
+/// The runner also checks credentials and access levels, which a merge
+/// does not change; this is the part a merge does change.
+fn newest_repo(conn: &Connection, projects: &[&str]) -> Result<Option<String>> {
+    let marks = vec!["?"; projects.len()].join(", ");
+    let sql = format!(
+        "SELECT repo FROM (
+             SELECT e.repo AS repo, COALESCE(s.token_agent, '') AS token_agent,
+                    e.created_at AS at
+               FROM entries e LEFT JOIN sessions s ON s.id = e.session_id
+              WHERE e.project IN ({marks}) AND e.repo != '' AND lower(e.repo) != 'none'
+             UNION ALL
+             SELECT repo, token_agent, started_at AS at FROM sessions
+              WHERE project IN ({marks}) AND repo != '' AND lower(repo) != 'none'
+         ) WHERE token_agent != '' ORDER BY at DESC LIMIT 200"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let args: Vec<&str> = projects.iter().chain(projects.iter()).copied().collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
+        row.get::<_, String>(0)
+    })?;
+    for row in rows {
+        if let Some((owner, repo)) = super::parse_github_repo(&row?) {
+            return Ok(Some(format!("{owner}/{repo}").to_lowercase()));
+        }
+    }
+    Ok(None)
+}
+
+/// The open tasks without a repository of their own, in `from` or `to`,
+/// whose newest recorded repository a merge of the two changes.
+fn repo_changes(conn: &Connection, from: &str, to: &str) -> Result<Vec<RepoChange>> {
+    let after = newest_repo(conn, &[from, to])?;
+    let mut changes = Vec::new();
+    for project in [from, to] {
+        let before = newest_repo(conn, &[project])?;
+        if before == after {
+            continue;
+        }
+        let mut stmt = conn.prepare(
+            "SELECT id, title FROM tasks
+             WHERE project = ?1 AND status = 'open' AND repo = ''
+               AND COALESCE(manual, 0) = 0 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![project], |row| {
+            Ok(RepoChange {
+                task_id: row.get(0)?,
+                title: row.get(1)?,
+                project: project.to_string(),
+                before: before.clone(),
+                after: after.clone(),
+            })
+        })?;
+        for row in rows {
+            changes.push(row?);
+        }
+    }
+    Ok(changes)
+}
+
 /// Moves every row from `from` to `to`, ids unchanged; the caller holds
 /// the transaction. Files stored at the same path under both names keep
 /// every version: the versions of that path are renumbered 1..n in the
@@ -284,32 +494,125 @@ pub(super) fn move_rows(conn: &Connection, from: &str, to: &str) -> Result<Vec<S
     Ok(conflicts)
 }
 
+/// What `check` found: how the rename goes.
+struct Plan {
+    moving: ProjectCounts,
+    target: ProjectCounts,
+    /// `from` is an alias of this project but has rows of its own.
+    shadowed_alias_of: Option<String>,
+    /// `to` is an alias of `from`; whether that alias came from a merge.
+    back_onto: Option<bool>,
+    notices: Vec<String>,
+}
+
 /// Checks a rename. `Err` carries the refusal shown to the caller.
-fn check(conn: &Connection, from: &str, to: &str) -> Result<std::result::Result<(), String>> {
+/// `merge` and `page` as in the request; the preview passes the page's
+/// most permissive values and reports the merge separately.
+fn check(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    merge: bool,
+    page: bool,
+) -> Result<std::result::Result<Plan, String>> {
     if from == to {
         return Ok(Err(format!(
             "`{from}` and `{to}` are the same name: nothing to rename"
         )));
     }
-    if let Some(project) = alias_of(conn, from)? {
-        return Ok(Err(format!(
-            "`{from}` is not a project but an alias of `{project}` (it was renamed): rename \
-             `{project}` instead, or remove the alias"
-        )));
+    let moving = project_counts(conn, from)?;
+    let from_alias = alias_of(conn, from)?;
+    if moving.total() == 0 {
+        return Ok(Err(match from_alias {
+            Some(project) => format!(
+                "`{from}` is not a project but an alias of `{project}` (it was renamed): rename \
+                 `{project}` instead"
+            ),
+            None => format!(
+                "lore has nothing under the project `{from}`: no entries, tasks, files, \
+                 sessions, messages, activity, rules or runs"
+            ),
+        }));
     }
-    if project_counts(conn, from)?.total() == 0 {
-        return Ok(Err(format!(
-            "lore has nothing under the project `{from}`: no entries, tasks, files, sessions, \
-             messages, activity, rules or runs"
-        )));
+    let mut notices = Vec::new();
+    if let Some(project) = &from_alias {
+        notices.push(format!(
+            "`{from}` is an alias of `{project}` but still has rows of its own ({}); they \
+             move, and the alias `{from}` → `{project}` stays as it is",
+            moving.describe()
+        ));
     }
-    Ok(Ok(()))
+    let mut back_onto = None;
+    if let Some(project) = alias_of(conn, to)? {
+        if project != from {
+            return Ok(Err(format!(
+                "`{to}` is another name for `{project}` (an alias): renaming onto it would send \
+                 the agents that still use `{to}` to a different project; remove that alias \
+                 first (on the admin page)"
+            )));
+        }
+        let merged = alias_merged(conn, to)?;
+        if merged {
+            notices.push(format!(
+                "`{to}` was merged into `{from}` earlier; a merge cannot be undone (nothing \
+                 records which rows came from where), so this is an ordinary rename of \
+                 everything in `{from}` to `{to}`"
+            ));
+        }
+        back_onto = Some(merged);
+    }
+    let target = project_counts(conn, to)?;
+    if target.total() > 0 {
+        if !page {
+            return Ok(Err(format!(
+                "the project `{to}` already exists ({}); merging two projects cannot be undone, \
+                 so lore does it only on the admin page (Projects → Rename, by a user with the \
+                 write permission)",
+                target.describe()
+            )));
+        }
+        if !merge {
+            return Ok(Err(format!(
+                "the project `{to}` already exists ({}); tick \"merge\" to merge `{from}` into \
+                 it (a merge cannot be undone)",
+                target.describe()
+            )));
+        }
+    }
+    Ok(Ok(Plan {
+        moving,
+        target,
+        shadowed_alias_of: from_alias,
+        back_onto,
+        notices,
+    }))
 }
 
 impl Db {
     /// Every alias as (old name, project), by old name.
     pub fn project_aliases(&self) -> Result<Vec<(String, String)>> {
         all_aliases(&self.lock())
+    }
+
+    /// The old names whose alias is marked as from a merge.
+    pub fn merged_project_aliases(&self) -> Result<Vec<String>> {
+        merged_aliases(&self.lock())
+    }
+
+    /// Aliases that still have rows of their own, as (old name, project,
+    /// rows): stored there by a build without aliases (a rollback, or a
+    /// restore by one). MCP never reaches them; a rename on the page moves
+    /// them.
+    pub fn shadowed_aliases(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.lock();
+        let mut found = Vec::new();
+        for (old, project) in all_aliases(&conn)? {
+            let rows = project_counts(&conn, &old)?.total();
+            if rows > 0 {
+                found.push((old, project, rows));
+            }
+        }
+        Ok(found)
     }
 
     /// `name` (normalised), or the project it is an alias of, with the
@@ -332,23 +635,25 @@ impl Db {
         let conn = self.lock();
         let project = alias_of(&conn, &name)?;
         if project.is_some() {
-            conn.execute(
-                "DELETE FROM meta WHERE key = ?1",
-                params![format!("{ALIAS_PREFIX}{name}")],
-            )?;
+            delete_alias(&conn, &name)?;
         }
         Ok(project)
     }
 
-    /// What renaming `from` to `to` would move, and whether it may.
+    /// What renaming `from` to `to` on the page would move, and whether
+    /// it may (a merge counts as allowed; `target_exists` says it is one).
     pub fn rename_preview(&self, from: &str, to: &str) -> Result<RenamePreview> {
         let (from, to) = (normalize_project(from)?, normalize_project(to)?);
         let conn = self.lock();
-        let refusal = check(&conn, &from, &to)?.err();
-        let target = if alias_of(&conn, &to)?.is_some() {
-            ProjectCounts::default()
+        let (refusal, notices) = match check(&conn, &from, &to, true, true)? {
+            Ok(plan) => (None, plan.notices),
+            Err(refusal) => (Some(refusal), Vec::new()),
+        };
+        let target = project_counts(&conn, &to)?;
+        let repo_changes = if target.total() > 0 {
+            repo_changes(&conn, &from, &to)?
         } else {
-            project_counts(&conn, &to)?
+            Vec::new()
         };
         Ok(RenamePreview {
             moving: project_counts(&conn, &from)?,
@@ -356,6 +661,9 @@ impl Db {
             target,
             conflicting_paths: conflicting_paths(&conn, &from, &to)?,
             refusal,
+            notices,
+            repo_changes,
+            busy: busy(&conn, &from)?,
             from,
             to,
         })
@@ -363,9 +671,11 @@ impl Db {
 
     /// Renames a project in one transaction: every row moves from `from`
     /// to `to` with its id, `from` becomes an alias of `to` (unless
-    /// `keep_alias` is off, or this undoes an earlier rename), aliases of
-    /// `from` now point at `to`, and a note in `to` tagged `rename`
-    /// records it. `Ok(Err(..))` is a refusal: nothing changed.
+    /// `keep_alias` is off, or this undoes an earlier plain rename),
+    /// aliases of `from` now point at `to`, and a note in `to` tagged
+    /// `rename` records it. A merge marks every alias of `to` as merged
+    /// (no undo) and sets open tasks whose repository may change to
+    /// manual. `Ok(Err(..))` is a refusal: nothing changed.
     pub fn rename_project(
         &self,
         request: &RenameRequest,
@@ -378,59 +688,102 @@ impl Db {
             Ok(name) => name,
             Err(error) => return Ok(Err(format!("to: {error}"))),
         };
+        if !request.page && request.merge {
+            return Ok(Err(
+                "merging projects cannot be undone, so lore does it only on the admin page \
+                 (Projects → Rename, by a user with the write permission)"
+                    .into(),
+            ));
+        }
+        if !request.page && !request.keep_alias {
+            return Ok(Err(
+                "over MCP a rename always keeps the old name as an alias; dropping it is done \
+                 on the admin page (Projects → Rename, by a user with the write permission)"
+                    .into(),
+            ));
+        }
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        if let Err(refusal) = check(&tx, &from, &to)? {
-            return Ok(Err(refusal));
+        let plan = match check(&tx, &from, &to, request.merge, request.page)? {
+            Ok(plan) => plan,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        if !request.keep_alias && plan.shadowed_alias_of.is_none() {
+            let going = busy(&tx, &from)?;
+            if !going.is_empty() {
+                return Ok(Err(format!(
+                    "`{from}` has work going on ({}); without an alias it would write under the \
+                     old name again. Keep the alias, or wait until it is done",
+                    going.join(", ")
+                )));
+            }
         }
-        // A name that is an alias is not a project: renaming to it makes
-        // it one, so the alias goes. When it pointed back at `from` this
-        // is a rename back, which leaves no alias behind.
-        let to_alias = alias_of(&tx, &to)?;
-        let undo = to_alias.as_deref() == Some(from.as_str());
-        let target = project_counts(&tx, &to)?;
-        if target.total() > 0 && !request.merge {
-            return Ok(Err(format!(
-                "the project `{to}` already exists ({}); pass merge: true to merge `{from}` into \
-                 it",
-                target.describe()
-            )));
-        }
-        let moved = project_counts(&tx, &from)?;
-        if to_alias.is_some() {
-            tx.execute(
-                "DELETE FROM meta WHERE key = ?1",
-                params![format!("{ALIAS_PREFIX}{to}")],
-            )?;
+        let merged = plan.target.total() > 0;
+        // Back onto an alias of `from` left by a plain rename, with no
+        // rows of its own: the earlier rename is undone.
+        let undo = plan.back_onto == Some(false) && !merged;
+        let merge_not_undone = plan.back_onto == Some(true);
+        // Open tasks whose repository may change wait for a user.
+        let held_tasks = if merged {
+            repo_changes(&tx, &from, &to)?
+        } else {
+            Vec::new()
+        };
+        if plan.back_onto.is_some() {
+            delete_alias(&tx, &to)?;
         }
         let renumbered_paths = move_rows(&tx, &from, &to)?;
         // Chains collapse: every alias of `from` now names `to`.
-        let repointed: Vec<String> = all_aliases(&tx)?
-            .into_iter()
-            .filter(|(_, project)| *project == from)
-            .map(|(old, _)| old)
-            .collect();
-        tx.execute(
-            "UPDATE meta SET value = ?2 WHERE substr(key, 1, ?3) = ?4 AND value = ?1",
-            params![from, to, ALIAS_PREFIX.len() as i64, ALIAS_PREFIX],
-        )?;
-        let alias_kept = request.keep_alias && !undo;
+        let mut repointed = Vec::new();
+        for (old, project) in all_aliases(&tx)? {
+            if project == from && old != from {
+                let was_merged = alias_merged(&tx, &old)?;
+                set_alias(&tx, &old, &to, was_merged || merged)?;
+                repointed.push(old);
+            }
+        }
+        // `to` took in rows of another project: none of its aliases can
+        // be undone any more.
+        if merged {
+            for (old, project) in all_aliases(&tx)? {
+                if project == to {
+                    set_alias(&tx, &old, &to, true)?;
+                }
+            }
+        }
+        let alias_kept = plan.shadowed_alias_of.is_none() && request.keep_alias && !undo;
         if alias_kept {
-            set_meta(&tx, &format!("{ALIAS_PREFIX}{from}"), &to)?;
+            set_alias(&tx, &from, &to, merged)?;
         }
         let by = if request.by.trim().is_empty() {
             "unknown".to_string()
         } else {
             request.by.trim().to_string()
         };
+        for held in &held_tasks {
+            tx.execute(
+                "UPDATE tasks SET manual = 1, manual_by = ?2, note = ?3 WHERE id = ?1",
+                params![
+                    held.task_id,
+                    format!("user:{by}"),
+                    format!(
+                        "Held as manual by the merge of `{from}` into `{to}`: the repository \
+                         this task resolves to may change ({} → {}). Set its repository or \
+                         clear Manual to let a built-in agent take it.",
+                        held.before.as_deref().unwrap_or("none"),
+                        held.after.as_deref().unwrap_or("none")
+                    )
+                ],
+            )?;
+        }
         let mut body = format!(
             "The project `{from}` was renamed to `{to}` by {by}. Moved: {}.",
-            moved.describe()
+            plan.moving.describe()
         );
-        if target.total() > 0 {
+        if merged {
             body.push_str(&format!(
-                " Merged into the existing `{to}` ({}).",
-                target.describe()
+                " Merged into the existing `{to}` ({}); a merge cannot be undone.",
+                plan.target.describe()
             ));
         }
         if !renumbered_paths.is_empty() {
@@ -440,7 +793,12 @@ impl Db {
                 renumbered_paths.join(", ")
             ));
         }
-        if alias_kept {
+        if let Some(project) = &plan.shadowed_alias_of {
+            body.push_str(&format!(
+                " `{from}` is an alias of `{project}`; these were rows stored under the alias \
+                 itself, and the alias stays."
+            ));
+        } else if alias_kept {
             body.push_str(&format!(
                 " `{from}` stays an alias: agents that still use it are sent to `{to}`."
             ));
@@ -452,10 +810,26 @@ impl Db {
         } else {
             body.push_str(&format!(" No alias was kept for `{from}`."));
         }
+        if merge_not_undone {
+            body.push_str(&format!(
+                " The earlier merge of `{to}` into `{from}` is not undone: everything in \
+                 `{from}` moved to `{to}`."
+            ));
+        }
         if !repointed.is_empty() {
             body.push_str(&format!(
                 " Aliases now pointing at `{to}`: {}.",
                 repointed.join(", ")
+            ));
+        }
+        if !held_tasks.is_empty() {
+            body.push_str(&format!(
+                " Set to manual because their repository may change: {}.",
+                held_tasks
+                    .iter()
+                    .map(|held| format!("#{}", held.task_id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         tx.execute(
@@ -474,18 +848,92 @@ impl Db {
             .ok_or_else(|| anyhow::anyhow!("the rename note vanished after insert"))?;
         tx.commit()?;
         Ok(Ok(RenameOutcome {
-            merged: target.total() > 0,
-            removed_alias: to_alias.map(|_| to.clone()),
+            merged,
+            removed_alias: plan.back_onto.map(|_| to.clone()),
             from,
             to,
-            moved,
+            moved: plan.moving,
             renumbered_paths,
             alias_kept,
             undo,
+            merge_not_undone,
+            shadowed_alias_of: plan.shadowed_alias_of,
             repointed,
+            held_tasks,
             note,
         }))
     }
+}
+
+/// Checks the aliases of a JSON backup before a restore puts them in
+/// place: every name normalised (trimmed, lowercase, not empty, at most
+/// `MAX_ALIAS_CHARS`, no control characters), no alias of itself, no
+/// chain or cycle (an alias's project is never an alias itself), no old
+/// name that holds rows in the same backup, at most `MAX_BACKUP_ALIASES`,
+/// and merge marks only for aliases it has. Any of these refuses the
+/// whole restore: an alias decides where agents' writes go, so a guess
+/// would misfile them; the file can be corrected and loaded again.
+pub(super) fn validate_backup_aliases(backup: &super::Backup) -> Result<()> {
+    let aliases = &backup.project_aliases;
+    if aliases.len() > MAX_BACKUP_ALIASES {
+        anyhow::bail!(
+            "the backup has {} project aliases; at most {MAX_BACKUP_ALIASES} are accepted",
+            aliases.len()
+        );
+    }
+    let valid = |name: &str| {
+        !name.is_empty()
+            && name.chars().count() <= MAX_ALIAS_CHARS
+            && name.trim() == name
+            && name.to_lowercase() == name
+            && !name.chars().any(char::is_control)
+    };
+    let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    used.extend(backup.entries.iter().map(|row| row.project.as_str()));
+    used.extend(backup.tasks.iter().map(|row| row.project.as_str()));
+    used.extend(backup.files.iter().map(|row| row.info.project.as_str()));
+    used.extend(backup.sessions.iter().map(|row| row.project.as_str()));
+    used.extend(backup.messages.iter().map(|row| row.project.as_str()));
+    used.extend(backup.activity.iter().map(|row| row.project.as_str()));
+    used.extend(
+        backup
+            .rules
+            .iter()
+            .filter(|rule| rule.scope == "project")
+            .map(|rule| rule.target.as_str()),
+    );
+    for (old, project) in aliases {
+        if !valid(old) || !valid(project) {
+            anyhow::bail!(
+                "the backup's project alias {old:?} → {project:?} is not a valid pair of project \
+                 names (trimmed, lowercase, not empty, at most {MAX_ALIAS_CHARS} characters)"
+            );
+        }
+        if old == project {
+            anyhow::bail!("the backup's project alias `{old}` points at itself");
+        }
+        if aliases.contains_key(project) {
+            anyhow::bail!(
+                "the backup's project aliases chain: `{old}` → `{project}` → `{}`; lore keeps \
+                 every alias pointing straight at a project",
+                aliases[project]
+            );
+        }
+        if used.contains(old.as_str()) {
+            anyhow::bail!(
+                "the backup holds rows under `{old}`, which its aliases send to `{project}`; \
+                 those rows could not be reached"
+            );
+        }
+    }
+    if let Some(stray) = backup
+        .project_alias_merges
+        .iter()
+        .find(|old| !aliases.contains_key(old.as_str()))
+    {
+        anyhow::bail!("the backup marks `{stray}` as a merged alias but has no such alias");
+    }
+    Ok(())
 }
 
 /// A copy of a backup with every project name that is an alias here
@@ -654,6 +1102,7 @@ mod tests {
             keep_alias: true,
             by: "claude".into(),
             session_id: None,
+            page: true,
         }
     }
 
@@ -898,31 +1347,217 @@ mod tests {
         assert_eq!(counts(&db, "b"), ProjectCounts::default());
         assert_eq!(counts(&db, "c"), ProjectCounts::default());
 
-        // Renaming another project to a name that is an alias makes it a
-        // project: the alias goes, and the new rename's alias stays.
+        // Renaming another project onto a name that is an alias of a
+        // different project is refused: agents still sending that name
+        // would land in the wrong project. The preview says the same.
         rename(&db, "a", "b");
         fill(&db, "x");
-        let onto = rename(&db, "x", "a");
-        assert!(!onto.undo && onto.alias_kept);
-        assert_eq!(onto.removed_alias.as_deref(), Some("a"));
+        let onto = refused(&db, request("x", "a"));
+        assert!(onto.contains("`a` is another name for `b`"), "{onto}");
+        let preview = db.rename_preview("x", "a").unwrap();
+        assert_eq!(preview.refusal.as_deref(), Some(onto.as_str()));
         assert_eq!(
             db.project_aliases().unwrap(),
-            vec![("x".into(), "a".into())]
+            vec![("a".into(), "b".into())]
         );
-        assert_eq!(db.resolve_project("a").unwrap(), ("a".to_string(), None));
-        assert_eq!(counts(&db, "b").tasks, 1);
-        assert_eq!(counts(&db, "a").tasks, 1);
 
-        // Without an alias the old name is free again; an alias can also
-        // be removed by itself.
+        // Without an alias the old name is free again, but not while its
+        // work is going on; an alias can also be removed by itself.
         let mut free = request("b", "d");
         free.keep_alias = false;
+        let busy = refused(&db, free.clone());
+        assert!(
+            busy.contains("work going on") && busy.contains("run "),
+            "{busy}"
+        );
+        db.execute_for_test("UPDATE agent_runs SET status = 'done'");
         let outcome = db.rename_project(&free).unwrap().unwrap();
         assert!(!outcome.alias_kept);
         assert_eq!(db.resolve_project("b").unwrap(), ("b".to_string(), None));
-        assert_eq!(db.remove_project_alias("X").unwrap().as_deref(), Some("a"));
-        assert_eq!(db.remove_project_alias("x").unwrap(), None);
+        assert_eq!(
+            db.project_aliases().unwrap(),
+            vec![("a".into(), "d".into())]
+        );
+        assert_eq!(db.remove_project_alias("A").unwrap().as_deref(), Some("d"));
+        assert_eq!(db.remove_project_alias("a").unwrap(), None);
         assert!(db.project_aliases().unwrap().is_empty());
+    }
+
+    /// A merge cannot be undone: after merging `a` into `b` (which had
+    /// rows of its own), `b → a` is an ordinary rename that moves
+    /// everything, keeps the alias `b → a`, and says the merge stays.
+    #[test]
+    fn a_rename_back_after_a_merge_is_an_ordinary_rename() {
+        let db = temp_db("merge-back");
+        fill(&db, "a");
+        fill(&db, "b");
+        let mut merge = request("a", "b");
+        merge.merge = true;
+        let merged = db.rename_project(&merge).unwrap().unwrap();
+        assert!(merged.merged && merged.alias_kept);
+        assert_eq!(db.merged_project_aliases().unwrap(), ["a"]);
+        let preview = db.rename_preview("b", "a").unwrap();
+        assert!(preview.refusal.is_none());
+        assert!(
+            preview
+                .notices
+                .iter()
+                .any(|n| n.contains("a merge cannot be undone")),
+            "{:?}",
+            preview.notices
+        );
+        let back = rename(&db, "b", "a");
+        assert!(!back.undo && back.merge_not_undone && back.alias_kept);
+        assert_eq!(
+            db.project_aliases().unwrap(),
+            vec![("b".into(), "a".into())]
+        );
+        assert!(db.merged_project_aliases().unwrap().is_empty());
+        assert_eq!(counts(&db, "b"), ProjectCounts::default());
+        assert_eq!(counts(&db, "a").tasks, 2);
+        assert!(
+            back.note.body.contains("is not undone"),
+            "{}",
+            back.note.body
+        );
+        // That plain rename can be undone in turn.
+        let again = rename(&db, "a", "b");
+        assert!(again.undo && !again.alias_kept);
+        assert!(db.project_aliases().unwrap().is_empty());
+
+        // A plain rename whose project later took in another project's
+        // rows cannot be undone either.
+        let db = temp_db("merge-later");
+        fill(&db, "p");
+        rename(&db, "p", "q");
+        fill(&db, "r");
+        let mut merge = request("r", "q");
+        merge.merge = true;
+        db.rename_project(&merge).unwrap().unwrap();
+        let mut marked = db.merged_project_aliases().unwrap();
+        marked.sort();
+        assert_eq!(marked, ["p", "r"]);
+        let back = rename(&db, "q", "p");
+        assert!(back.merge_not_undone && !back.undo);
+        assert_eq!(counts(&db, "p").tasks, 2);
+    }
+
+    /// Rows stored under a name that is also an alias (an older build
+    /// wrote them) can be moved: the preview says what it found, a merge
+    /// into the alias's project takes them in, and the alias stays.
+    #[test]
+    fn rows_under_an_alias_can_be_moved_out() {
+        let db = temp_db("shadowed");
+        fill(&db, "shop");
+        rename(&db, "shop", "store");
+        // What an older build would do: write under the name itself.
+        db.execute_for_test(
+            "INSERT INTO entries (project, kind, title, body) VALUES ('shop', 'note', 'old build', 'x');
+             INSERT INTO tasks (project, title, created_by, created_at, updated_at)
+             VALUES ('shop', 'old task', 'codex', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        );
+        assert_eq!(
+            db.shadowed_aliases().unwrap(),
+            vec![("shop".to_string(), "store".to_string(), 2)]
+        );
+        let preview = db.rename_preview("shop", "store").unwrap();
+        assert!(preview.refusal.is_none() && preview.target_exists);
+        assert!(
+            preview.notices[0].contains("`shop` is an alias of `store` but still has rows"),
+            "{:?}",
+            preview.notices
+        );
+        // Over MCP: the target exists, so only the page may merge.
+        let mut mcp = request("shop", "store");
+        mcp.page = false;
+        assert!(refused(&db, mcp).contains("admin page"));
+        let mut merge = request("shop", "store");
+        merge.merge = true;
+        let moved = db.rename_project(&merge).unwrap().unwrap();
+        assert_eq!(moved.shadowed_alias_of.as_deref(), Some("store"));
+        assert!(!moved.alias_kept);
+        assert_eq!(counts(&db, "shop"), ProjectCounts::default());
+        assert!(db.shadowed_aliases().unwrap().is_empty());
+        assert_eq!(db.resolve_project("shop").unwrap().0, "store");
+        // Elsewhere works too, and leaves the alias as it was.
+        db.execute_for_test(
+            "INSERT INTO entries (project, kind, title, body) VALUES ('shop', 'note', 'again', 'x');",
+        );
+        rename(&db, "shop", "archive");
+        assert_eq!(counts(&db, "archive").entries, 2);
+        assert_eq!(db.resolve_project("shop").unwrap().0, "store");
+    }
+
+    /// Over MCP (not the page) only a plain rename onto a free name with
+    /// the alias kept is done.
+    #[test]
+    fn without_the_page_only_a_plain_rename_is_done() {
+        let db = temp_db("mcp");
+        fill(&db, "shop");
+        fill(&db, "store");
+        let mcp = |merge: bool, keep_alias: bool, to: &str| RenameRequest {
+            merge,
+            keep_alias,
+            page: false,
+            ..request("shop", to)
+        };
+        assert!(refused(&db, mcp(true, true, "store")).contains("only on the admin page"));
+        assert!(refused(&db, mcp(false, true, "store")).contains("only on the admin page"));
+        assert!(refused(&db, mcp(false, false, "fresh")).contains("always keeps the old name"));
+        let done = db
+            .rename_project(&mcp(false, true, "fresh"))
+            .unwrap()
+            .unwrap();
+        assert!(done.alias_kept);
+    }
+
+    /// A merge holds back the open tasks without a repository of their
+    /// own whose newest recorded repository changes, as manual.
+    #[test]
+    fn a_merge_holds_tasks_whose_repository_may_change() {
+        let db = temp_db("repos");
+        let session = |project: &str, repo: &str, at: &str| {
+            let id = format!("s_{project}");
+            db.execute_for_test(&format!(
+                "INSERT INTO sessions (id, agent, project, repo, title, started_at, last_seen_at, token_agent)
+                 VALUES ('{id}', 'codex', '{project}', '{repo}', 't', '{at}', '{at}', 'codex')"
+            ));
+        };
+        session("old", "https://github.com/me/old", "2026-01-01T00:00:00Z");
+        session("new", "https://github.com/me/new", "2026-02-01T00:00:00Z");
+        let task = |project: &str, repo: &str| {
+            db.add_task(&NewTask {
+                project: project.into(),
+                title: format!("work on {project}"),
+                created_by: "codex".into(),
+                targets: crate::db::TaskTargets {
+                    repo: repo.into(),
+                    ..Default::default()
+                },
+                ..NewTask::default()
+            })
+            .unwrap()
+            .id
+        };
+        let held = task("old", "");
+        let own_repo = task("old", "github.com/me/elsewhere");
+        let unchanged = task("new", "");
+        let preview = db.rename_preview("old", "new").unwrap();
+        assert_eq!(preview.repo_changes.len(), 1);
+        let change = &preview.repo_changes[0];
+        assert_eq!(change.task_id, held);
+        assert_eq!(change.before.as_deref(), Some("me/old"));
+        assert_eq!(change.after.as_deref(), Some("me/new"));
+        let mut merge = request("old", "new");
+        merge.merge = true;
+        let outcome = db.rename_project(&merge).unwrap().unwrap();
+        assert_eq!(outcome.held_tasks, preview.repo_changes);
+        let task = db.task(held).unwrap().unwrap();
+        assert!(task.manual);
+        assert_eq!(task.manual_by, "user:claude");
+        assert!(task.note.contains("me/old → me/new"), "{}", task.note);
+        assert!(!db.task(own_repo).unwrap().unwrap().manual);
+        assert!(!db.task(unchanged).unwrap().unwrap().manual);
     }
 
     /// A JSON backup carries the aliases; a restore puts them back with
@@ -988,6 +1623,96 @@ mod tests {
         // the new name.
         let (added, _) = db.merge(&incoming).unwrap();
         assert_eq!(added, 0);
+    }
+
+    /// A restore refuses aliases that would misfile writes: chains and
+    /// cycles, an alias of itself, names that are not normalised, an old
+    /// name that holds rows in the same backup, a stray merge mark.
+    /// Nothing changes when it refuses.
+    #[test]
+    fn a_restore_refuses_aliases_that_would_misfile_writes() {
+        let db = temp_db("bad-aliases");
+        fill(&db, "shop");
+        rename(&db, "shop", "store");
+        let good = db.export().unwrap();
+        type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, Vec<&'a str>);
+        let cases: Vec<Case> = vec![
+            ("chain", vec![("a", "b"), ("b", "c")], vec![]),
+            ("chain", vec![("a", "b"), ("b", "a")], vec![]),
+            ("points at itself", vec![("a", "a")], vec![]),
+            ("not a valid pair", vec![("Shop", "store")], vec![]),
+            ("not a valid pair", vec![(" a", "store")], vec![]),
+            ("not a valid pair", vec![("a", "")], vec![]),
+            (
+                "holds rows under `store`",
+                vec![("store", "elsewhere")],
+                vec![],
+            ),
+            ("no such alias", vec![("a", "store")], vec!["zzz"]),
+        ];
+        for (expected, aliases, merges) in cases {
+            let mut backup = good.clone();
+            backup.project_aliases = aliases
+                .iter()
+                .map(|(old, project)| (old.to_string(), project.to_string()))
+                .collect();
+            backup.project_alias_merges = merges.iter().map(|m| m.to_string()).collect();
+            let error = db.restore(&backup).unwrap_err().to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+            assert_eq!(
+                db.project_aliases().unwrap(),
+                vec![("shop".into(), "store".into())]
+            );
+        }
+        let mut many = good.clone();
+        many.project_aliases = (0..=MAX_BACKUP_ALIASES)
+            .map(|n| (format!("old-{n}"), "store".to_string()))
+            .collect();
+        assert!(
+            db.restore(&many)
+                .unwrap_err()
+                .to_string()
+                .contains("at most")
+        );
+        // The merge marks come back with a good backup.
+        let mut merge = request("store", "other");
+        fill(&db, "other");
+        merge.merge = true;
+        db.rename_project(&merge).unwrap().unwrap();
+        let backup = db.export().unwrap();
+        let mut marks = backup.project_alias_merges.clone();
+        marks.sort();
+        assert_eq!(marks, ["shop", "store"]);
+        let fresh = temp_db("bad-aliases-fresh");
+        fresh.restore(&backup).unwrap();
+        let mut marks = fresh.merged_project_aliases().unwrap();
+        marks.sort();
+        assert_eq!(marks, ["shop", "store"]);
+    }
+
+    /// A backup taken before a rename, restored after it, brings the
+    /// entries, tasks and files back under the old name; the built-in
+    /// runs (not in the JSON backup) stay under the new one and the
+    /// aliases are cleared. A rename with merge on the page joins them.
+    #[test]
+    fn a_backup_from_before_a_rename_splits_the_project_until_merged_again() {
+        let db = temp_db("old-backup");
+        fill(&db, "shop");
+        let before = db.export().unwrap();
+        rename(&db, "shop", "store");
+        db.restore(&before).unwrap();
+        assert!(db.project_aliases().unwrap().is_empty());
+        let (shop, store) = (counts(&db, "shop"), counts(&db, "store"));
+        assert_eq!((shop.entries, shop.tasks, shop.files), (2, 1, 3));
+        assert_eq!(store.agent_runs, 1);
+        assert_eq!(shop.agent_runs, 0);
+        assert_eq!((store.entries, store.tasks, store.files), (0, 0, 0));
+        let mut merge = request("shop", "store");
+        merge.merge = true;
+        db.rename_project(&merge).unwrap().unwrap();
+        assert_eq!(counts(&db, "shop"), ProjectCounts::default());
+        assert_eq!(counts(&db, "store").agent_runs, 1);
+        assert_eq!(counts(&db, "store").tasks, 1);
     }
 
     /// The rename on a copy of a database the production build wrote

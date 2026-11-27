@@ -2047,10 +2047,11 @@ async fn sessions(State(admin): State<Arc<Admin>>, Query(query): Query<SessionsQ
         Some(_) => return bad_request("status must be open or closed"),
     };
     let limit = query.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let project = resolved_project(&admin.db, query.project);
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Session>> {
         state.db.close_idle_sessions(state.idle_hours)?;
-        state.db.sessions(status, query.project.as_deref(), limit)
+        state.db.sessions(status, project.as_deref(), limit)
     })
     .await;
     match result {
@@ -2107,12 +2108,7 @@ struct BoardQuery {
 /// The shared board: every task, the latest messages and the totals, for
 /// the Board panel. Any signed-in role can read it.
 async fn board(State(admin): State<Arc<Admin>>, Query(query): Query<BoardQuery>) -> Response {
-    let project = query
-        .project
-        .as_deref()
-        .map(str::trim)
-        .filter(|project| !project.is_empty())
-        .map(str::to_lowercase);
+    let project = resolved_project(&admin.db, query.project);
     let limit = query.limit.unwrap_or(100).clamp(1, 300) as usize;
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
@@ -2437,12 +2433,7 @@ struct FilesQuery {
 /// The latest version of each file, newest first, or the files a search
 /// matches, with the totals. Any signed-in role can read it.
 async fn files(State(admin): State<Arc<Admin>>, Query(query): Query<FilesQuery>) -> Response {
-    let project = query
-        .project
-        .as_deref()
-        .map(str::trim)
-        .filter(|project| !project.is_empty())
-        .map(str::to_lowercase);
+    let project = resolved_project(&admin.db, query.project);
     let search = query
         .q
         .as_deref()
@@ -3627,6 +3618,18 @@ async fn rename_project(
     Extension(me): Extension<SignedIn>,
     Json(body): Json<RenameBody>,
 ) -> Response {
+    // Without an alias a run that is starting would write under the old
+    // name; the store refuses for runs it knows of, this for the ones the
+    // task runner is still setting up.
+    if !body.keep_alias
+        && let Some(runner) = &admin.task_runner
+        && runner.busy_with(&body.from.trim().to_lowercase())
+    {
+        return bad_request(
+            "a built-in run is starting or running for this project; keep the alias, or wait \
+             until it is done",
+        );
+    }
     let state = admin.clone();
     let by = me.username.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -3637,6 +3640,7 @@ async fn rename_project(
             keep_alias: body.keep_alias,
             by,
             session_id: None,
+            page: true,
         })?;
         if let Ok(outcome) = &outcome {
             if let Ok(Some(vector)) = state.embedder.embed_passage(&outcome.note.embedding_text())
@@ -3673,6 +3677,9 @@ async fn rename_project(
                 "renumbered_paths": outcome.renumbered_paths,
                 "alias_kept": outcome.alias_kept,
                 "undo": outcome.undo,
+                "merge_not_undone": outcome.merge_not_undone,
+                "shadowed_alias_of": outcome.shadowed_alias_of,
+                "held_tasks": outcome.held_tasks,
                 "repointed": outcome.repointed,
                 "note_id": outcome.note.id,
             }))
@@ -3697,7 +3704,13 @@ async fn project_aliases(State(admin): State<Arc<Admin>>) -> Response {
             .into_iter()
             .map(|(old, project)| json!({ "old": old, "project": project }))
             .collect();
-        Ok(json!({ "aliases": aliases }))
+        let shadowed: Vec<serde_json::Value> = state
+            .db
+            .shadowed_aliases()?
+            .into_iter()
+            .map(|(old, project, rows)| json!({ "old": old, "project": project, "rows": rows }))
+            .collect();
+        Ok(json!({ "aliases": aliases, "shadowed": shadowed }))
     })
     .await;
     respond(result)
@@ -3734,6 +3747,22 @@ async fn remove_project_alias(
         Err(error) => {
             tracing::error!(%error, "removing an alias failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// A page filter's project (`?project=`): trimmed, lowercase, through the
+/// aliases like an agent's, so a renamed project's old name shows the new
+/// one. Empty is no filter.
+pub(super) fn resolved_project(db: &Db, value: Option<String>) -> Option<String> {
+    let name = value
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())?;
+    match db.resolve_project(&name) {
+        Ok((project, _)) => Some(project),
+        Err(error) => {
+            tracing::warn!(%error, "resolving a project alias failed");
+            Some(name)
         }
     }
 }
@@ -6711,6 +6740,25 @@ mod tests {
             listed["aliases"],
             json!([{ "old": "shop", "project": "store" }])
         );
+        assert_eq!(listed["shadowed"], json!([]));
+        // The page's filters take the old name like an agent's calls do.
+        for path in [
+            "/admin/api/board?project=shop",
+            "/admin/api/todos?project=Shop",
+        ] {
+            let shown: serde_json::Value = as_user(reqwest::Method::GET, path, "viewer-token")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(
+                shown["tasks"].as_array().map(Vec::len),
+                Some(1),
+                "{path}: {shown}"
+            );
+        }
         let response = as_user(
             reqwest::Method::DELETE,
             "/admin/api/projects/aliases/shop",

@@ -1395,6 +1395,10 @@ pub struct Backup {
     /// aliases here as they are and files incoming rows under them.
     #[serde(default)]
     pub project_aliases: std::collections::BTreeMap<String, String>,
+    /// The old names among `project_aliases` that came from a merge (no
+    /// undo).
+    #[serde(default)]
+    pub project_alias_merges: Vec<String>,
 }
 
 /// The backup version this build writes.
@@ -2201,6 +2205,7 @@ impl Db {
         let task_runner = self.task_runner_states()?;
         let delegations = self.delegations()?;
         let project_aliases = self.project_aliases()?.into_iter().collect();
+        let project_alias_merges = self.merged_project_aliases()?;
         Ok(Backup {
             format: BACKUP_FORMAT.to_string(),
             version: BACKUP_VERSION,
@@ -2221,6 +2226,7 @@ impl Db {
             task_runner,
             delegations,
             project_aliases,
+            project_alias_merges,
         })
     }
 
@@ -2232,6 +2238,7 @@ impl Db {
     /// files, since it has none to put in their place.
     pub fn restore(&self, backup: &Backup) -> Result<usize> {
         validate_backup(backup)?;
+        rename::validate_backup_aliases(backup)?;
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let reusable = reusable_vectors(&tx, backup)?;
@@ -2240,16 +2247,12 @@ impl Db {
              DELETE FROM run_writes WHERE kind = 'entry';
              DELETE FROM sqlite_sequence WHERE name IN ('entries', 'activity');",
         )?;
-        // The aliases go with the rows they were made for.
-        tx.execute(
-            "DELETE FROM meta WHERE substr(key, 1, ?1) = ?2",
-            params![rename::ALIAS_PREFIX.len() as i64, rename::ALIAS_PREFIX],
-        )?;
+        // The aliases go with the rows they were made for (checked
+        // above).
+        rename::delete_all_aliases(&tx)?;
         for (old, project) in &backup.project_aliases {
-            let (old, project) = (normalize_project(old)?, normalize_project(project)?);
-            if old != project {
-                set_meta(&tx, &format!("{}{old}", rename::ALIAS_PREFIX), &project)?;
-            }
+            let merged = backup.project_alias_merges.contains(old);
+            rename::set_alias(&tx, old, project, merged)?;
         }
         // Backups older than version 3 know nothing of sessions, the profile
         // or rules, and ones older than version 4 know nothing of the board.

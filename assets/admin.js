@@ -839,7 +839,7 @@ const state = {
   siteKey: null, decorative: false, role: "viewer",
   username: "", perms: new Set(), stored: false,
   sessions: [], openSessions: 0, openTasks: 0, fileCount: 0,
-  aliases: [],
+  aliases: [], shadowed: [],
 };
 
 async function api(path, options) {
@@ -874,7 +874,7 @@ function showLogin() {
   closeFiles();
   resetFiles();
   closeRename();
-  state.aliases = [];
+  state.aliases = []; state.shadowed = [];
   closeIntegrations();
   resetIntegrations();
   closeDetail();
@@ -1563,6 +1563,13 @@ function renderProjects() {
       item.append(rename);
     }
     const aliases = state.aliases.filter((alias) => alias.project === project);
+    const shadowed = state.shadowed.find((alias) => alias.old === project);
+    if (shadowed) {
+      /* Rows under a name that is also an alias: no agent reaches them. */
+      const warn = el("span", "sub shadowed",
+        `alias of ${shadowed.project}, yet ${plural(shadowed.rows, "row", "rows")} of its own that agents cannot reach: Rename to move them`);
+      item.append(warn);
+    }
     if (aliases.length) {
       const sub = el("span", "sub", "also known as: ");
       aliases.forEach((alias, index) => {
@@ -1597,7 +1604,9 @@ async function loadAliases() {
   try {
     const response = await api("/admin/api/projects/aliases");
     if (!response.ok) return;
-    state.aliases = (await response.json()).aliases || [];
+    const body = await response.json();
+    state.aliases = body.aliases || [];
+    state.shadowed = body.shadowed || [];
   } catch (_) {
     return;
   }
@@ -1679,11 +1688,20 @@ async function checkRename() {
     text = body.refusal;
   } else {
     text = `This moves from ${body.from} to ${body.to}: ${describeCounts(body.moving)}.`;
+    for (const notice of body.notices || []) text += ` ${notice}.`;
     if (body.target_exists) {
-      text += ` ${body.to} already exists (${describeCounts(body.target)}); tick the box to merge into it.`;
+      text += ` ${body.to} already exists (${describeCounts(body.target)}); tick the box to merge into it. A merge is permanent: it cannot be undone, since nothing records which rows came from where.`;
       if (body.conflicting_paths.length) {
         text += ` Files at the same path in both (${body.conflicting_paths.join(", ")}) keep every version, renumbered in the order they were saved.`;
       }
+      if ((body.repo_changes || []).length) {
+        const tasks = body.repo_changes.map((change) =>
+          `#${change.task_id} ${change.title} (${change.project}: ${change.before || "no repository"} → ${change.after || "no repository"})`);
+        text += ` These open tasks have no repository of their own and the one they resolve to may change; they are set to manual, so no built-in agent takes them until someone sets their repository or clears Manual: ${tasks.join("; ")}.`;
+      }
+    }
+    if ((body.busy || []).length) {
+      text += ` Work is going on (${body.busy.join(", ")}): the old name must stay an alias until it is done.`;
     }
   }
   $("rename-summary").textContent = text;
@@ -1721,6 +1739,13 @@ async function submitRename(event) {
     return;
   }
   renamedProject(body.from, body.to);
+  if ((body.held_tasks || []).length) {
+    /* Stay open to say which tasks now wait for a person. */
+    renameState.preview = null;
+    updateRenameButton();
+    $("rename-summary").textContent = `Done. Set to manual because their repository may change: ${body.held_tasks.map((held) => "#" + held.task_id).join(", ")}. Set each one's repository, or clear Manual on the board, to let a built-in agent take it.`;
+    return;
+  }
   closeRename();
 }
 

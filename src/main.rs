@@ -156,6 +156,24 @@ async fn run() -> Result<()> {
     }
 
     let db = Db::open(&data_dir.join("lore.db"))?;
+    // Rows under a name that is also an alias (written by an older build,
+    // or restored by one) are out of reach of every agent until someone
+    // moves them on the page.
+    match db.shadowed_aliases() {
+        Ok(shadowed) => {
+            for (old, project, rows) in shadowed {
+                tracing::warn!(
+                    alias = %old,
+                    %project,
+                    rows,
+                    "a project alias still has rows of its own, which agents cannot reach; move \
+                     them with Rename on the admin page (merge into the alias's project, or a \
+                     rename elsewhere)"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(%error, "checking the project aliases failed"),
+    }
     let semantic = flag("LORE_EMBEDDINGS", true);
     let embedder = if semantic {
         db.use_embedding_model(model.name())?;
@@ -1795,6 +1813,57 @@ mod tests {
         assert!(listed.contains("also known as: shop"), "{listed}");
         let aliases = call("project_aliases", json!({"session_id": session})).await;
         assert!(aliases.contains("`shop` → `store`"), "{aliases}");
+        // Over MCP: no merge, no dropping the alias, no removing one.
+        let refused = |tool: &str, arguments: Value| {
+            let request = http
+                .post(format!("{base}/mcp"))
+                .header(header::AUTHORIZATION, format!("Bearer {ENV_TOKEN}"))
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2025-06-18")
+                .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": { "name": tool, "arguments": arguments } }));
+            async move {
+                let value: Value = request.send().await.unwrap().json().await.unwrap();
+                assert_eq!(value["result"]["isError"], true, "{value}");
+                value["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            }
+        };
+        db.insert(&crate::db::NewEntry {
+            project: "other".into(),
+            kind: "note".into(),
+            title: "o".into(),
+            body: "o".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        for (arguments, expect) in [
+            (
+                json!({"session_id": session, "from": "store", "to": "other", "merge": true}),
+                "admin page",
+            ),
+            (
+                json!({"session_id": session, "from": "store", "to": "other"}),
+                "admin page",
+            ),
+            (
+                json!({"session_id": session, "from": "store", "to": "fresh", "keep_alias": false}),
+                "admin page",
+            ),
+        ] {
+            let said = refused("project_rename", arguments).await;
+            assert!(said.contains(expect), "{said}");
+        }
+        let said = refused(
+            "project_aliases",
+            json!({"session_id": session, "remove": "shop"}),
+        )
+        .await;
+        assert!(said.contains("admin page"), "{said}");
+        assert_eq!(db.project_aliases().unwrap().len(), 1);
+        assert_eq!(db.recent(Some("other"), None, 5).unwrap().len(), 1);
 
         // A new chat under the old name: `hello` says so and opens the
         // session under the new name.
