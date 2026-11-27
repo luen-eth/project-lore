@@ -240,6 +240,19 @@ pub struct Assistant {
     pub detail: String,
 }
 
+/// A built-in agent as the `hello` briefing lists it.
+#[derive(Debug, Clone)]
+pub struct BriefingAgent {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub kind: String,
+    /// Why it cannot help other agents (not available, not connected,
+    /// not signed in); `None` when it can (now, or once it is free).
+    pub why_not: Option<String>,
+    /// Whether it works on idle board tasks.
+    pub board_tasks: bool,
+}
+
 /// Where a task's work goes, once resolved.
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -2167,21 +2180,36 @@ impl TaskRunner {
         Ok(out)
     }
 
-    /// The names of the built-in agents that may help now or once they are
-    /// free (available, connected, signed in), for the `hello` briefing.
+    /// Every built-in agent as the `hello` briefing names it: its name,
+    /// display name and kind, why it cannot help other agents (`None`: it
+    /// can, now or once it is free) and whether it takes board tasks.
     /// Synchronous: it reads the database directly.
-    pub fn helpers(&self) -> Result<Vec<String>> {
-        let mut names = Vec::new();
+    pub fn briefing_agents(&self) -> Result<Vec<BriefingAgent>> {
+        let mut out = Vec::new();
         for name in self.hub.agents() {
-            if let Some(agent) = self.db.builtin_agent(&name)?
-                && agent.available
-                && agent.signed_in
-                && self.hub.link(&name).is_some()
-            {
-                names.push(name);
-            }
+            let Some(agent) = self.db.builtin_agent(&name)? else {
+                continue;
+            };
+            let why_not = self
+                .why_not_helping(&agent)
+                .filter(|why| !why.starts_with("busy with "));
+            let kind = self
+                .hub
+                .link(&name)
+                .map(|(kind, _)| kind.id().to_string())
+                .unwrap_or_else(|| agent.kind.clone());
+            out.push(BriefingAgent {
+                display_name: self
+                    .db
+                    .registry_agent(&name)?
+                    .and_then(|row| row.display_name),
+                name,
+                kind,
+                why_not,
+                board_tasks: agent.enabled,
+            });
         }
-        Ok(names)
+        Ok(out)
     }
 
     /// Whether `name` is one of the built-in agents.

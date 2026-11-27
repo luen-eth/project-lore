@@ -63,7 +63,7 @@ Queries take a few tens of milliseconds because everything happens in one proces
 
 | Tool | Purpose |
 |---|---|
-| `hello` | Open the session for this chat, once, at the very start. Returns the briefing: how to address the user, the reply language, the user's rules, handoff notes left for this project, unread messages, open tasks, other open sessions and where the project was left off |
+| `hello` | Open the session for this chat, once, at the very start. Returns the briefing: how to address the user, the reply language, the user's rules, handoff notes left for this project, unread messages, open tasks, other open sessions, where the project was left off, the built-in agents (when there are any) and, last, the names of the tools lore offers now. Optional `tools`: the names the client can call, to be told which are missing |
 | `recall` | Search past work, decisions, bugs and notes by topic |
 | `log` | Record an update, decision, bug, note or todo, with the directory, repo and commit it was made at |
 | `recent` | Newest entries, to see where a project was left off |
@@ -1732,8 +1732,16 @@ built-in agents. A built-in agent helps **only when you switched "Available to h
 other agents" on** in its settings (off by default) **and only while it is idle**:
 connected, signed in, and not in a run. The board switch ("Works on idle board
 tasks"), the daily cap and the active hours are about board tasks and do not apply
-to help. The hello briefing tells an agent in one line that assistants exist when at
-least one is available.
+to help. The `hello` briefing (and an implicit session's briefing) of every agent that
+is not itself built-in has a short section on them: each built-in agent by name (and
+display name), its kind, whether it can help now (or why not: not switched on, not
+connected, not signed in) and whether it takes board tasks, then one line on
+`delegate`, `ask` and `assistants`, or, when none can help, that the user should
+change something on the Agents page. The server's MCP `instructions` say that lore
+may have built-in agents and that `assistants` lists them. A chat app that connected
+before the built-in agents were enabled holds a tool list without `assistants`,
+`delegate` and `ask`: refresh the connector in the app's settings (see *Connecting a
+chat web app*).
 
 | Tool | What it does |
 |---|---|
@@ -2091,6 +2099,18 @@ Dokploy and Cloudflare in the Integrations panel. lore's side was built with the
 clients in mind, but each vendor's connector settings change over time and are not
 under lore's control: if a step above no longer matches, follow the vendor's own
 documentation for adding a remote MCP server.
+
+**A stale tool list.** A chat app keeps the tool list it read when the connector was
+added; tools lore gained since (for example `assistants`, `delegate` and `ask` once
+built-in agents are enabled) stay invisible to it, and asking the chat to "refresh"
+does nothing. Refresh or reconnect the connector in the app's settings. lore cannot
+see the app's copy, so every `hello` briefing ends with one line naming the tools lore
+offers this caller right now (the same list `tools/list` answers) and their count,
+and tells the model to name what it is missing and to ask the user to refresh the
+connector. A client that passes the optional `hello` argument `tools` (the names it
+can call) is told exactly which ones are missing, or that its list is current. lore
+does not declare `tools.listChanged`: it serves MCP as stateless JSON responses and
+has no channel to push that notification.
 
 ## Configuration
 
