@@ -1865,14 +1865,36 @@ when the name is wrong instead of starting lore on an empty database.
      can make its requests look as if they came from any client (and spread its
      failed attempts over made-up addresses to dodge the rate limits).
 
-   What the name protects against, and what not: while Traefik runs, no other
-   container on `dokploy-network` can take the name `dokploy-traefik` there, and an
-   address Traefik gave up is no longer trusted within 30 seconds. If the name stops
-   resolving (Traefik is down), lore keeps its last address for 5 minutes, then
-   trusts nothing for it until it resolves again; a name that does not resolve at
-   start-up is a warning, not an error. It does not protect against someone who can
-   create containers on the host: they can start one with that name while Traefik is
-   down, or simply be root on the server, and such a person owns the host already.
+   What the name protects against, and what not. A name is trusted only while it
+   resolves to one address per address family. Docker lets any container on
+   `dokploy-network` claim the same name as a network alias (`--network-alias
+   dokploy-traefik`, or `aliases:` in a compose file), and its DNS then answers
+   both addresses; deploying a compose application on that network is enough, no
+   root on the host is needed. lore treats such an answer as ambiguous: it never
+   trusts a new address from it, keeps the address it already trusted only while
+   that address is still among the answers, and otherwise trusts nothing for the
+   name. So an alias cannot add a second trusted address. What it can do:
+
+   - make lore fail closed: once Traefik's address changes (a restart) while the
+     alias exists, lore trusts nothing for the name, every client looks like
+     Traefik and shares one failed-sign-in counter, as described above. The log
+     shows *a trusted proxy's name resolves to more than one address of a family*,
+     with the addresses answered and the one kept (logged once per change, not at
+     every refresh); `docker exec <lore container> getent ahosts dokploy-traefik`
+     lists them, and `docker network inspect dokploy-network` shows whose they are;
+   - be believed when it is the only one answering: if Traefik is not on the
+     network (stopped, or before it starts) and the alias holds the name alone, the
+     answer is clean and lore trusts that container. A fixed address has the same
+     weakness when Traefik's old address goes to another container.
+
+   When the name resolves to a new single address, the old one stops being trusted
+   at the next refresh (within 30 seconds). When the name stops resolving
+   (Traefik is down), lore keeps its last address for 90 seconds (long enough for a
+   resolver hiccup or a quick restart, short enough that an address Docker may hand
+   to another container is not trusted for long), then trusts nothing for it until
+   it resolves again; a name that does not resolve at start-up is a warning, not an
+   error. Whoever can deploy containers on `dokploy-network` can do all of the
+   above; root on the host can do anything anyway.
    Every change is in the log at info level, with the old and the new addresses
    (*a trusted proxy's address changed*). Without either setting lore keeps believing
    any peer, as before (with built-in agents: any private or loopback peer outside
@@ -2020,7 +2042,7 @@ documentation for adding a remote MCP server.
 | `LORE_ALLOWED_HOSTS` | any | Hostnames accepted in the `Host` header. |
 | `LORE_TRUST_PROXY` | `on` in Docker | Read the client address from `X-Forwarded-For`. Turn off if the port is exposed directly. |
 | `LORE_TRUSTED_PROXIES` | | With `LORE_TRUST_PROXY=on`: the peers whose `X-Forwarded-For` is believed, as address ranges, comma separated (`10.0.1.7/32`, `127.0.0.1`): your reverse proxy's own address. On Dokploy prefer `LORE_TRUSTED_PROXY_HOSTS`: Traefik's address on `dokploy-network` changes when its container restarts, and a fixed `/32` then either locks every client into one rate-limit counter or, once another container gets the old address, believes that container (see *Moving a single-container install to compose*, step 6). Never the subnet of `dokploy-network`, which every Dokploy application shares. Without this and `LORE_TRUSTED_PROXY_HOSTS`: any peer, as before; with built-in agents, any private or loopback peer (and a warning at start-up). Never the agent networks, and never on the runner listener. |
-| `LORE_TRUSTED_PROXY_HOSTS` | | With `LORE_TRUST_PROXY=on`: host names of your reverse proxy, comma separated (on Dokploy `dokploy-traefik`). Resolved through the system resolver at start-up and every 30 seconds; the addresses they resolve to now are trusted in addition to `LORE_TRUSTED_PROXIES`. A new address replaces the old one at once; a name that stops resolving keeps its last addresses for 5 minutes; one that does not resolve at start-up is a warning. Changes are logged at info level. Never the agent networks, and never on the runner listener. |
+| `LORE_TRUSTED_PROXY_HOSTS` | | With `LORE_TRUST_PROXY=on`: host names of your reverse proxy, comma separated (on Dokploy `dokploy-traefik`). Resolved through the system resolver at start-up and every 30 seconds; the addresses they resolve to now are trusted in addition to `LORE_TRUSTED_PROXIES`. A name must resolve to one address per family: an answer with two (another container added the name as a network alias) never adds an address, keeps the one already trusted only while it is still answered, and else trusts nothing for the name. A new single address replaces the old one at once; a name that stops resolving keeps its last address for 90 seconds; one that does not resolve at start-up is a warning. Changes are logged at info level. Never the agent networks, and never on the runner listener. |
 | `LORE_DATA_DIR` | `/data` in Docker | Where the database and model cache live. |
 | `LORE_BIND` | `0.0.0.0:8080` | Listen address. |
 | `LORE_RUNNER_TOKENS` | | The built-in agents: `agent:secret` pairs (`claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>`), each secret 24 characters or longer. An entry may name the agent's CLI and provider, `agent:kind:secret` or `agent:opencode/<provider>:secret`, which a name not starting with `claude`, `codex` or `deepseek` must; a runner claiming anything else is refused. Unset: no built-in agent, no runner listener, nothing changes. A name may not also be in `LORE_TOKENS` or belong to another agent. |

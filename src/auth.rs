@@ -280,17 +280,24 @@ pub fn parse_trusted_proxy_hosts(value: &str) -> Result<Vec<String>> {
 /// How often the names of `LORE_TRUSTED_PROXY_HOSTS` are resolved again.
 pub const PROXY_HOSTS_REFRESH: Duration = Duration::from_secs(30);
 
-/// How long the last addresses of a name that no longer resolves stay
-/// trusted.
-pub const PROXY_HOSTS_STALE: Duration = Duration::from_secs(5 * 60);
+/// How long the last address of a name that no longer resolves stays
+/// trusted: long enough to ride out a resolver hiccup or a quick restart of
+/// the proxy (three refreshes), short enough that an address the proxy gave
+/// up is not trusted for long once Docker may hand it to someone else.
+pub const PROXY_HOSTS_STALE: Duration = Duration::from_secs(90);
 
 /// The reverse proxy trusted by name (`LORE_TRUSTED_PROXY_HOSTS`): the
-/// addresses its names resolve to, kept current by [`HostTrust::refresh`].
-/// A name that resolves to new addresses replaces its old ones at once
-/// (the old address stops being trusted, which is the point: Docker hands
-/// a restarted container a new one, and the old one to whoever comes
-/// next); a name that stops resolving keeps its last addresses for
-/// [`PROXY_HOSTS_STALE`], then loses them.
+/// address its names resolve to, kept current by [`HostTrust::refresh`].
+///
+/// A name must resolve to one address per address family. A clean answer
+/// replaces the name's old address at once (the old address stops being
+/// trusted, which is the point: Docker hands a restarted container a new
+/// one, and the old one to whoever comes next). An ambiguous answer (two
+/// IPv4 or two IPv6 addresses: another container took the name as a
+/// network alias) adds nothing: the name keeps only the address it already
+/// had, and only while that address is still in the answer; otherwise
+/// nothing is trusted for it. A name that stops resolving keeps its last
+/// address for [`PROXY_HOSTS_STALE`], then loses it.
 #[derive(Debug)]
 pub struct HostTrust {
     names: Vec<String>,
@@ -301,9 +308,19 @@ pub struct HostTrust {
 
 #[derive(Debug, Clone)]
 struct Known {
+    /// Trusted now: at most one address per family.
     addresses: Vec<IpAddr>,
-    resolved_at: Instant,
-    failing: bool,
+    /// When the trusted addresses were last seen in an answer.
+    confirmed_at: Instant,
+    /// What was last logged about this name, so that a state is logged
+    /// once when it starts, not at every refresh.
+    noted: String,
+}
+
+/// Whether an answer holds more than one address of a family.
+fn ambiguous(addresses: &[IpAddr]) -> bool {
+    addresses.iter().filter(|ip| ip.is_ipv4()).count() > 1
+        || addresses.iter().filter(|ip| ip.is_ipv6()).count() > 1
 }
 
 fn shown_addresses(addresses: &[IpAddr]) -> String {
@@ -353,6 +370,12 @@ impl HostTrust {
     /// why it failed (an empty answer is a failure too).
     pub fn apply(&self, name: &str, answer: std::io::Result<Vec<IpAddr>>, now: Instant) {
         let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = known.entry(name.to_string()).or_insert_with(|| Known {
+            addresses: Vec::new(),
+            confirmed_at: now,
+            noted: String::new(),
+        });
+        let before = entry.addresses.clone();
         let answer = answer.and_then(|addresses| {
             let mut addresses: Vec<IpAddr> = addresses.into_iter().map(unmapped).collect();
             addresses.sort();
@@ -363,87 +386,97 @@ impl HostTrust {
                 Ok(addresses)
             }
         });
-        // A name that never resolved is kept with no address, so that its
-        // warning is given once, not every refresh.
-        let never_resolved = known
-            .get(name)
-            .is_some_and(|entry| entry.addresses.is_empty());
-        let entry = known
-            .get_mut(name)
-            .filter(|entry| !entry.addresses.is_empty());
-        match (answer, entry) {
-            (Ok(addresses), Some(entry)) => {
-                if entry.addresses != addresses {
-                    tracing::info!(
-                        host = name,
-                        old = %shown_addresses(&entry.addresses),
-                        new = %shown_addresses(&addresses),
-                        "a trusted proxy's address changed; only the new one is trusted now"
-                    );
-                } else if entry.failing {
-                    tracing::info!(host = name, addresses = %shown_addresses(&addresses), "a trusted proxy's name resolves again");
+        let note = match answer {
+            Ok(addresses) if !ambiguous(&addresses) => {
+                entry.addresses = addresses;
+                entry.confirmed_at = now;
+                format!("clean {}", shown_addresses(&entry.addresses))
+            }
+            Ok(addresses) => {
+                // Keep what was trusted only while it is still answered;
+                // never take a new address from an ambiguous answer.
+                entry.addresses.retain(|ip| addresses.contains(ip));
+                if !entry.addresses.is_empty() {
+                    entry.confirmed_at = now;
                 }
-                *entry = Known {
-                    addresses,
-                    resolved_at: now,
-                    failing: false,
-                };
-            }
-            (Ok(addresses), None) => {
-                tracing::info!(
-                    host = name,
-                    addresses = %shown_addresses(&addresses),
-                    "trusting X-Forwarded-For from this reverse proxy"
+                let note = format!(
+                    "ambiguous {} keeping {}",
+                    shown_addresses(&addresses),
+                    shown_addresses(&entry.addresses)
                 );
-                known.insert(
-                    name.to_string(),
-                    Known {
-                        addresses,
-                        resolved_at: now,
-                        failing: false,
-                    },
-                );
+                if entry.noted != note {
+                    tracing::warn!(
+                        host = name,
+                        answered = %shown_addresses(&addresses),
+                        kept = %shown_addresses(&entry.addresses),
+                        "a trusted proxy's name resolves to more than one address of a family \
+                         (another container may have taken it as a network alias): no new \
+                         address is trusted from it; only the one already trusted is kept, \
+                         while it is still among them"
+                    );
+                }
+                note
             }
-            (Err(error), Some(entry)) => {
-                if now.duration_since(entry.resolved_at) >= PROXY_HOSTS_STALE {
+            Err(error) => {
+                if !entry.addresses.is_empty()
+                    && now.duration_since(entry.confirmed_at) >= PROXY_HOSTS_STALE
+                {
                     tracing::warn!(
                         host = name,
                         %error,
                         dropped = %shown_addresses(&entry.addresses),
-                        "a trusted proxy's name has not resolved for {} minutes; its last \
-                         addresses are no longer trusted",
-                        PROXY_HOSTS_STALE.as_secs() / 60
+                        "a trusted proxy's name has not resolved for {} seconds; its last \
+                         address is no longer trusted",
+                        PROXY_HOSTS_STALE.as_secs()
                     );
-                    known.remove(name);
-                } else if !entry.failing {
-                    tracing::warn!(
-                        host = name,
-                        %error,
-                        kept = %shown_addresses(&entry.addresses),
-                        "a trusted proxy's name did not resolve; its last addresses stay \
-                         trusted for now"
-                    );
-                    entry.failing = true;
+                    entry.addresses.clear();
                 }
+                let note = format!("failing {}", shown_addresses(&entry.addresses));
+                if entry.noted != note && !entry.noted.starts_with("failing") {
+                    if entry.addresses.is_empty() {
+                        tracing::warn!(
+                            host = name,
+                            %error,
+                            "a name in LORE_TRUSTED_PROXY_HOSTS does not resolve: nothing is \
+                             trusted for it until it does"
+                        );
+                    } else {
+                        tracing::warn!(
+                            host = name,
+                            %error,
+                            kept = %shown_addresses(&entry.addresses),
+                            "a trusted proxy's name did not resolve; its last address stays \
+                             trusted for {} seconds",
+                            PROXY_HOSTS_STALE.as_secs()
+                        );
+                    }
+                }
+                note
             }
-            (Err(_), None) if never_resolved => {}
-            (Err(error), None) => {
-                tracing::warn!(
+        };
+        if entry.addresses != before && note.starts_with("clean") {
+            if before.is_empty() {
+                tracing::info!(
                     host = name,
-                    %error,
-                    "a name in LORE_TRUSTED_PROXY_HOSTS does not resolve (yet): nothing is \
-                     trusted for it until it does"
+                    addresses = %shown_addresses(&entry.addresses),
+                    "trusting X-Forwarded-For from this reverse proxy"
                 );
-                known.insert(
-                    name.to_string(),
-                    Known {
-                        addresses: Vec::new(),
-                        resolved_at: now,
-                        failing: true,
-                    },
+            } else {
+                tracing::info!(
+                    host = name,
+                    old = %shown_addresses(&before),
+                    new = %shown_addresses(&entry.addresses),
+                    "a trusted proxy's address changed; only the new one is trusted now"
                 );
             }
+        } else if note.starts_with("clean") && entry.noted != note && !entry.noted.is_empty() {
+            tracing::info!(
+                host = name,
+                addresses = %shown_addresses(&entry.addresses),
+                "a trusted proxy's name resolves cleanly again"
+            );
         }
+        entry.noted = note;
         let mut union: Vec<IpAddr> = known
             .values()
             .flat_map(|entry| entry.addresses.iter().copied())
@@ -967,9 +1000,10 @@ mod tests {
 
     /// `LORE_TRUSTED_PROXY_HOSTS`: the peer is trusted while it is what
     /// the name resolves to now; a new address replaces the old one at
-    /// once; a name that stops resolving keeps its last addresses for a
-    /// while, then loses them; a name that never resolved trusts nothing;
-    /// the agent networks are never trusted, whatever a name says.
+    /// once; an ambiguous answer (an alias) never adds an address; a name
+    /// that stops resolving keeps its last address for a while, then loses
+    /// it; a name that never resolved trusts nothing; the agent networks
+    /// are never trusted, whatever a name says.
     #[tokio::test]
     async fn a_proxy_trusted_by_name_follows_its_address() {
         let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
@@ -1018,6 +1052,45 @@ mod tests {
         assert!(peer_may_forward(&trust, peer("10.0.1.9")));
         assert!(!peer_may_forward(&trust, peer("10.0.1.5")));
 
+        // Another container takes the name as a network alias: Docker's DNS
+        // answers both. The address trusted already is kept; the alias's is
+        // never trusted.
+        set("dokploy-traefik", Ok(vec![ip("10.0.1.66"), ip("10.0.1.9")]));
+        hosts.refresh_with(resolve).await;
+        assert!(peer_may_forward(&trust, peer("10.0.1.9")));
+        assert!(!peer_may_forward(&trust, peer("10.0.1.66")));
+        // The proxy restarts with a new address while the alias is there:
+        // nothing is trusted for the name (fail closed).
+        set(
+            "dokploy-traefik",
+            Ok(vec![ip("10.0.1.20"), ip("10.0.1.66")]),
+        );
+        hosts.refresh_with(resolve).await;
+        assert!(!peer_may_forward(&trust, peer("10.0.1.9")));
+        assert!(!peer_may_forward(&trust, peer("10.0.1.20")));
+        assert!(!peer_may_forward(&trust, peer("10.0.1.66")));
+        assert!(hosts.addresses().is_empty());
+        // The alias goes away: the name is clean again.
+        set("dokploy-traefik", Ok(vec![ip("10.0.1.9")]));
+        hosts.refresh_with(resolve).await;
+        assert!(peer_may_forward(&trust, peer("10.0.1.9")));
+
+        // An ambiguous answer at start-up trusts nothing.
+        let fresh = HostTrust::new(vec!["dokploy-traefik".into()]);
+        fresh.apply(
+            "dokploy-traefik",
+            Ok(vec![ip("10.0.1.9"), ip("10.0.1.66")]),
+            Instant::now(),
+        );
+        assert!(fresh.addresses().is_empty());
+        // One address per family is not ambiguous.
+        fresh.apply(
+            "dokploy-traefik",
+            Ok(vec![ip("10.0.1.9"), ip("fd00::9")]),
+            Instant::now(),
+        );
+        assert_eq!(fresh.addresses(), vec![ip("10.0.1.9"), ip("fd00::9")]);
+
         // The name stops resolving: the last address is kept a while...
         let start = Instant::now();
         hosts.apply(
@@ -1030,7 +1103,7 @@ mod tests {
         hosts.apply(
             "dokploy-traefik",
             Ok(Vec::new()),
-            start + Duration::from_secs(60),
+            start + PROXY_HOSTS_STALE / 2,
         );
         assert!(peer_may_forward(&trust, peer("10.0.1.9")));
         // ... and dropped once the failures last too long (counted from
