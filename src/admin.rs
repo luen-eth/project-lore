@@ -187,6 +187,7 @@ const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/admin/api/files/{id}/download", Access::SignedIn),
     ("GET", "/admin/api/integrations", Access::SignedIn),
     ("GET", "/admin/api/agents", Access::SignedIn),
+    ("GET", "/admin/api/projects/aliases", Access::SignedIn),
     ("PUT", "/admin/api/password", Access::SignedIn),
     // The consent page: anyone signed in sees the request (and is told
     // when they lack `agents`) and may deny it; approving needs `agents`.
@@ -217,6 +218,22 @@ const ROUTES: &[(&str, &str, Access)] = &[
         Access::Needs(Perm::Agents),
     ),
     ("POST", "/admin/api/tasks", Access::Needs(Perm::Write)),
+    // Renaming a project: the preview, the rename, removing an alias.
+    (
+        "GET",
+        "/admin/api/projects/rename",
+        Access::Needs(Perm::Write),
+    ),
+    (
+        "POST",
+        "/admin/api/projects/rename",
+        Access::Needs(Perm::Write),
+    ),
+    (
+        "DELETE",
+        "/admin/api/projects/aliases/{name}",
+        Access::Needs(Perm::Write),
+    ),
     (
         "POST",
         "/admin/api/tasks/{id}/notes",
@@ -630,6 +647,15 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
         .route(
             "/admin/api/tasks",
             post(add_task).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/projects/rename",
+            get(rename_preview).post(rename_project.layer(DefaultBodyLimit::max(MAX_JSON_BYTES))),
+        )
+        .route("/admin/api/projects/aliases", get(project_aliases))
+        .route(
+            "/admin/api/projects/aliases/{name}",
+            axum::routing::delete(remove_project_alias),
         )
         .route(
             "/admin/api/tasks/{id}",
@@ -3556,6 +3582,162 @@ async fn delete_rule(State(admin): State<Arc<Admin>>, Path(id): Path<i64>) -> Re
 }
 
 /// A validation failure the page can show next to the field it came from.
+#[derive(Debug, Deserialize)]
+struct RenameQuery {
+    from: String,
+    to: String,
+}
+
+/// What renaming a project would move, for the page's confirmation.
+async fn rename_preview(
+    State(admin): State<Arc<Admin>>,
+    Query(query): Query<RenameQuery>,
+) -> Response {
+    let state = admin.clone();
+    let result =
+        tokio::task::spawn_blocking(move || state.db.rename_preview(&query.from, &query.to)).await;
+    match result {
+        Ok(Ok(preview)) => Json(preview).into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "rename preview failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameBody {
+    from: String,
+    to: String,
+    #[serde(default)]
+    merge: bool,
+    #[serde(default = "default_true")]
+    keep_alias: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Renames a project (the same as the `project_rename` tool), records it
+/// in the feed and tells the task runner.
+async fn rename_project(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    Json(body): Json<RenameBody>,
+) -> Response {
+    let state = admin.clone();
+    let by = me.username.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let outcome = state.db.rename_project(&crate::db::RenameRequest {
+            from: body.from,
+            to: body.to,
+            merge: body.merge,
+            keep_alias: body.keep_alias,
+            by,
+            session_id: None,
+        })?;
+        if let Ok(outcome) = &outcome {
+            if let Ok(Some(vector)) = state.embedder.embed_passage(&outcome.note.embedding_text())
+                && let Err(error) = state.db.set_embedding(outcome.note.id, &vector)
+            {
+                tracing::warn!(%error, "storing the rename note's embedding failed");
+            }
+            if let Ok(activity) = state.db.record_activity(
+                ADMIN_ACTOR,
+                "project_rename",
+                &outcome.to,
+                None,
+                Some(outcome.note.id),
+                &[],
+                &outcome.note.title,
+            ) {
+                state.events.publish(activity);
+            }
+        }
+        anyhow::Ok(outcome)
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(outcome))) => {
+            if let Some(runner) = &admin.task_runner {
+                runner.rename_project(&outcome.from, &outcome.to);
+            }
+            Json(json!({
+                "ok": true,
+                "from": outcome.from,
+                "to": outcome.to,
+                "moved": outcome.moved,
+                "merged": outcome.merged,
+                "renumbered_paths": outcome.renumbered_paths,
+                "alias_kept": outcome.alias_kept,
+                "undo": outcome.undo,
+                "repointed": outcome.repointed,
+                "note_id": outcome.note.id,
+            }))
+            .into_response()
+        }
+        Ok(Ok(Err(refusal))) => bad_request(&refusal),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "rename failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Every project alias, as `{ old, project }`.
+async fn project_aliases(State(admin): State<Arc<Admin>>) -> Response {
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let aliases: Vec<serde_json::Value> = state
+            .db
+            .project_aliases()?
+            .into_iter()
+            .map(|(old, project)| json!({ "old": old, "project": project }))
+            .collect();
+        Ok(json!({ "aliases": aliases }))
+    })
+    .await;
+    respond(result)
+}
+
+/// Removes one alias: the old name is a free project name again.
+async fn remove_project_alias(
+    State(admin): State<Arc<Admin>>,
+    Path(name): Path<String>,
+) -> Response {
+    let state = admin.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        let removed = state.db.remove_project_alias(&name)?;
+        if let Some(project) = &removed
+            && let Ok(activity) = state.db.record_activity(
+                ADMIN_ACTOR,
+                "project_rename",
+                project,
+                None,
+                None,
+                &[],
+                &format!("alias {} of {project} removed", name.trim().to_lowercase()),
+            )
+        {
+            state.events.publish(activity);
+        }
+        Ok(removed)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(project))) => Json(json!({ "ok": true, "project": project })).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "removing an alias failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 fn bad_request(message: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
 }
@@ -6378,6 +6560,169 @@ mod tests {
     /// H11: a write from another site (a sibling subdomain included) is
     /// refused before anything happens, even with the session cookie; the
     /// page itself (same origin) and non-browser clients (no Origin) pass.
+    /// Renaming a project from the page: the preview and the rename need
+    /// `write` (the viewer is refused), a cross-site post is refused, and
+    /// the rename moves the rows, records the feed line and the note, and
+    /// leaves an alias the page can list and remove.
+    #[tokio::test]
+    async fn renaming_a_project_from_the_page_needs_write() {
+        let (base, admin) = serve().await;
+        sign_in(
+            &admin,
+            "writer-token",
+            SignedIn {
+                username: "wren".into(),
+                user_id: Some(77),
+                perms: Perms::parse(&["write"]).unwrap(),
+            },
+        );
+        for title in ["one", "two"] {
+            admin
+                .db
+                .insert(&crate::db::NewEntry {
+                    project: "shop".into(),
+                    kind: "update".into(),
+                    title: title.into(),
+                    body: "b".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        admin
+            .db
+            .add_task(&crate::db::NewTask {
+                project: "shop".into(),
+                title: "t".into(),
+                created_by: "codex".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut feed = admin.events.subscribe();
+        let http = reqwest::Client::new();
+        let as_user = |method: reqwest::Method, path: &str, token: &str| {
+            http.request(method, format!("{base}{path}"))
+                .header(header::COOKIE, format!("{COOKIE}={token}"))
+                .header("sec-fetch-site", "same-origin")
+        };
+        let preview = "/admin/api/projects/rename?from=shop&to=store";
+        let body = json!({ "from": "shop", "to": "store" });
+        // The viewer: no preview, no rename, no alias removal; reading the
+        // aliases is open to anyone signed in.
+        for request in [
+            as_user(reqwest::Method::GET, preview, "viewer-token"),
+            as_user(
+                reqwest::Method::POST,
+                "/admin/api/projects/rename",
+                "viewer-token",
+            )
+            .json(&body),
+            as_user(
+                reqwest::Method::DELETE,
+                "/admin/api/projects/aliases/shop",
+                "viewer-token",
+            ),
+        ] {
+            assert_eq!(request.send().await.unwrap().status(), 403);
+        }
+        let response = as_user(
+            reqwest::Method::GET,
+            "/admin/api/projects/aliases",
+            "viewer-token",
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        // The preview shows what moves.
+        let response = as_user(reqwest::Method::GET, preview, "writer-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let shown: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(shown["moving"]["entries"], 2);
+        assert_eq!(shown["moving"]["tasks"], 1);
+        assert_eq!(shown["target_exists"], false);
+        assert!(shown["refusal"].is_null());
+        // Another site cannot post it.
+        let response = http
+            .post(format!("{base}/admin/api/projects/rename"))
+            .header(header::COOKIE, format!("{COOKIE}=writer-token"))
+            .header("sec-fetch-site", "cross-site")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(admin.db.recent(Some("shop"), None, 10).unwrap().len(), 2);
+        // The writer renames it.
+        let response = as_user(
+            reqwest::Method::POST,
+            "/admin/api/projects/rename",
+            "writer-token",
+        )
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let done: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(done["moved"]["entries"], 2);
+        assert_eq!(done["alias_kept"], true);
+        assert!(admin.db.recent(Some("shop"), None, 10).unwrap().is_empty());
+        let moved = admin.db.recent(Some("store"), None, 10).unwrap();
+        assert_eq!(moved.len(), 3);
+        assert_eq!(moved[0].title, "project shop renamed to store by wren");
+        assert_eq!(moved[0].tags, "rename");
+        let activity = feed.recv().await.unwrap();
+        assert_eq!(
+            (activity.tool.as_str(), activity.project.as_str()),
+            ("project_rename", "store")
+        );
+        // Again: refused, the name is an alias now.
+        let response = as_user(
+            reqwest::Method::POST,
+            "/admin/api/projects/rename",
+            "writer-token",
+        )
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400);
+        let refusal: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            refusal["error"].as_str().unwrap().contains("alias"),
+            "{refusal}"
+        );
+        // The alias, listed and removed.
+        let listed: serde_json::Value = as_user(
+            reqwest::Method::GET,
+            "/admin/api/projects/aliases",
+            "viewer-token",
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(
+            listed["aliases"],
+            json!([{ "old": "shop", "project": "store" }])
+        );
+        let response = as_user(
+            reqwest::Method::DELETE,
+            "/admin/api/projects/aliases/shop",
+            "writer-token",
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(admin.db.project_aliases().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn cross_site_writes_are_refused_on_every_admin_route() {
         let (base, admin) = serve().await;

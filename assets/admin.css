@@ -326,6 +326,15 @@ button:focus-visible, [tabindex]:focus-visible {
   background: rgba(255, 255, 255, 0.06); overflow: hidden;
 }
 .projects .meter i { display: block; height: 100%; border-radius: 2px; }
+.projects li.with-rename { grid-template-columns: auto 1fr auto auto; }
+.projects li.with-rename .meter { grid-column: 1 / 5; }
+.projects li .sub { grid-column: 2 / 4; }
+.projects li.with-rename .sub { grid-column: 2 / 5; }
+.projects .rename-button { padding: 2px 8px; font-size: 11px; }
+.projects .alias-remove { padding: 0 6px; font-size: 11px; margin-left: 6px; }
+.rename-form { margin-top: 10px; }
+.rename-check { display: flex; gap: 6px; align-items: flex-start; font-size: 12px; color: var(--muted); }
+.rename-actions { gap: 6px; }
 
 .kinds { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 .kinds button {

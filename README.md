@@ -67,7 +67,7 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `recall` | Search past work, decisions, bugs and notes by topic |
 | `log` | Record an update, decision, bug, note or todo, with the directory, repo and commit it was made at |
 | `recent` | Newest entries, to see where a project was left off |
-| `projects` | Every project with its entry count, last activity and each agent's last logged commit |
+| `projects` | Every project with its entry count, last activity, each agent's last logged commit and its old names (aliases) |
 | `get` | One entry in full |
 | `amend` | Correct an entry instead of logging a contradicting one |
 | `forget` | Delete an entry |
@@ -89,6 +89,8 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `files` | The files kept, newest first, or a search over their paths and descriptions |
 | `file_get` | One file with its description, its other versions and its content, by id or by project and path |
 | `file_delete` | Delete one version of a file |
+| `project_rename` | Rename a project: moves every memory, task, note and file (and the sessions, messages, handoffs, activity, project rules and built-in runs) from the old name to the new one in one step, ids kept; the old name stays an alias. `merge: true` merges into a name that already exists; `keep_alias: false` keeps no alias (see [Renaming a project](#renaming-a-project)) |
+| `project_aliases` | List the old project names lore keeps as aliases, or remove one with `remove` |
 | `integrations` | The services you may operate through lore (Cloudflare, GitHub personal and organization, a self-hosted GitLab, Dokploy) and the mailbox: which are configured, your own access level on each, and how to address them |
 | `cloudflare` | Call the Cloudflare API (zones, DNS records, …) |
 | `github` | Call the GitHub REST API with the personal account's token (repositories, pull requests, issues, …) |
@@ -330,6 +332,49 @@ Details:
   entries, so `files` with a `query` finds files by words and by meaning. `recall`
   ends with up to three **Related files** when its query matches some, and the `hello`
   briefing says how many files the project keeps and names the newest ones.
+
+### Renaming a project
+
+A `project` is the lowercase repository or folder name; when the folder or the
+repository is renamed, everything logged under the old name would stay there.
+`project_rename` (or **Rename** next to a project in the page's Projects panel, for
+users with `write`) moves it all to the new name in one transaction, every row
+keeping its id:
+
+- memories, notes and to-dos (`entries`; the full-text index holds no project name,
+  so search finds them under the new name at once), board tasks (their owner notes
+  follow by task id), every version of every kept file, sessions, messages and
+  handoff notes, the activity feed, project rules, and the built-in agents' runs
+  (delegations, pushes and run writes go by task or run id). The page and the
+  graph reload without a page reload; runs in progress report under the new name.
+- **Refusals:** both names are checked like `log` checks a project (trimmed,
+  lowercase, not empty); the old name must hold something; the two must differ; an
+  old name that is itself an alias is refused (rename the project it points at).
+- **Merging:** when the new name already holds data the rename is refused unless
+  `merge: true` (on the page: the "Merge into the existing project" box, which shows
+  only then). Rows are simply moved under the new name. Files kept at the same path
+  under both names keep every version: that path's versions are renumbered 1..n in
+  the order they were saved (time, then id), so the most recently saved is the
+  current one; the answer names those paths. "Who last logged which commit" in
+  `projects` is computed from the entries, so after a merge each agent's newest
+  entry wins.
+- **The old name keeps working.** It becomes an alias (a `meta` row
+  `project_alias.<old>`): every tool that takes a `project` — `hello`, `log`,
+  `recall`, `recent`, the board, notes, to-dos, files, `handoff`, `delegate`, `ask`
+  — uses the new name instead, and says so once per session ("project `a` was
+  renamed to `b`; using `b`"); every write the store makes resolves the alias too,
+  so the old name never comes back as a separate project. `projects` shows
+  "also known as: a". Chains collapse (a → b, then b → c gives a → c and b → c);
+  renaming to a name that is an alias makes it a project again and drops that alias;
+  renaming back (b → a after a → b) undoes the rename and leaves no alias.
+  `keep_alias: false` keeps none. `project_aliases` (and the × next to an alias on
+  the page) lists and removes aliases.
+- **Recorded:** a line in the activity feed and a note in the new project, tagged
+  `rename`: `project a renamed to b by <agent or user>`, with the counts.
+
+Who may rename: any agent token or OAuth client that may write entries (the same as
+`amend`/`forget`), including a built-in agent's terminal; a built-in agent's run
+token may not (it is not on a run's tool list).
 
 ## Operating services through lore
 
@@ -827,6 +872,12 @@ search index included. The vectors are reused when the instance runs the same
 embedding model as the one the backup came from; with a different model they are
 recomputed in the background, and the page redraws the links when that finishes.
 
+The JSON backup also carries the project aliases (`project_aliases`). A restore
+replaces the aliases with the backup's (a backup without them clears them, since its
+rows are under the names they had); a merge keeps the aliases here and files
+incoming rows under an old name with the project it stands for. The full database
+backup carries them as it carries every `meta` row.
+
 Older backups still load. Restoring one only replaces what it carries: a backup
 older than version 5 leaves the kept files as they are, one older than version 4
 also leaves the board, and one older than version 3 also leaves the sessions, the
@@ -899,6 +950,9 @@ Every admin route is mapped to exactly one access level in a table in
 | `POST` | `/admin/api/builtin/{name}/refresh`, `/login`, `/login/code`, `/login/cancel`, `/credential`, `/logout` | `agents` |
 | `GET` | `/admin/api/builtin/{name}/terminal` (WebSocket; `Origin` must be the page's own) | `agents` |
 | `GET` | `/admin/terminal`, `/admin/terminal.js`, `/admin/terminal.css`, `/admin/vendor/xterm-6.0.0/{xterm.js,xterm.css,LICENSE}`, `/admin/vendor/addon-fit-0.11.0/{addon-fit.js,LICENSE}` | nothing |
+| `GET` | `/admin/api/projects/aliases` | signed in |
+| `GET`, `POST` | `/admin/api/projects/rename` (the preview with the row counts; the rename) | `write` |
+| `DELETE` | `/admin/api/projects/aliases/{name}` | `write` |
 | `POST` | `/admin/api/tasks` | `write` |
 | `PUT` | `/admin/api/tasks/{id}` | `write` |
 | `POST` | `/admin/api/messages` | `write` |

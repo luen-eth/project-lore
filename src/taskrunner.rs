@@ -2271,6 +2271,17 @@ impl TaskRunner {
         Ok(out)
     }
 
+    /// A project was renamed: the runs in progress record their activity,
+    /// answers and end under the new name from now on (the stored runs
+    /// were moved by the rename itself).
+    pub fn rename_project(&self, from: &str, to: &str) {
+        for active in self.state().active.values_mut() {
+            if active.project == from {
+                active.project = to.to_string();
+            }
+        }
+    }
+
     /// Whether `name` is one of the built-in agents.
     pub fn is_builtin(&self, name: &str) -> bool {
         self.hub.is_builtin(name)

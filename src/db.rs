@@ -17,6 +17,8 @@ mod agents;
 pub use agents::*;
 mod builtin;
 pub use builtin::*;
+mod rename;
+pub use rename::*;
 
 pub const KINDS: &[&str] = &["update", "decision", "bug", "note", "todo"];
 
@@ -583,6 +585,8 @@ pub struct ProjectSummary {
     pub last_activity: String,
     /// Where each agent last was in this project, newest first.
     pub heads: Vec<AgentHead>,
+    /// Old names of this project (aliases left by renames).
+    pub aliases: Vec<String>,
 }
 
 /// The commit an agent most recently logged against in a project.
@@ -1323,7 +1327,7 @@ pub struct OpLog {
 }
 
 /// One file version as a backup carries it.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackupFile {
     #[serde(flatten)]
     pub info: FileInfo,
@@ -1337,7 +1341,7 @@ pub struct BackupFile {
 
 /// Everything in the store: entries, their embedding vectors, the activity
 /// log and the agent records. Restoring it reproduces the store exactly.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Backup {
     pub format: String,
     pub version: u32,
@@ -1385,6 +1389,12 @@ pub struct Backup {
     /// Tasks handed to a built-in agent with `delegate`.
     #[serde(default)]
     pub delegations: Vec<builtin::Delegation>,
+    /// Old project names and the project each now stands for (renames).
+    /// A restore replaces the aliases with these (none when a backup has
+    /// none: its rows are under the names it had); a merge leaves the
+    /// aliases here as they are and files incoming rows under them.
+    #[serde(default)]
+    pub project_aliases: std::collections::BTreeMap<String, String>,
 }
 
 /// The backup version this build writes.
@@ -1395,7 +1405,7 @@ const BACKUP_VERSION: u32 = 5;
 /// had no files.
 const BACKUP_VERSIONS: std::ops::RangeInclusive<u32> = 1..=BACKUP_VERSION;
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackupAgent {
     pub name: String,
     #[serde(default)]
@@ -1938,12 +1948,14 @@ impl Db {
 
     pub fn insert(&self, new: &NewEntry) -> Result<Entry> {
         let conn = self.lock();
+        // A renamed project's old name lands on the new one.
+        let project = rename::resolve_alias(&conn, &new.project)?;
         conn.execute(
             "INSERT INTO entries (project, kind, title, body, tags, files, agent,
                                   path, repo, commit_hash, branch, dirty, session_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
-                new.project,
+                project,
                 new.kind,
                 new.title,
                 new.body,
@@ -2058,11 +2070,16 @@ impl Db {
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
         })?;
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        for (old, project) in rename::all_aliases(&conn)? {
+            aliases.entry(project).or_default().push(old);
+        }
         let mut projects = Vec::new();
         for row in rows {
             let (project, entries, last_activity) = row?;
             projects.push(ProjectSummary {
                 heads: heads.remove(&project).unwrap_or_default(),
+                aliases: aliases.remove(&project).unwrap_or_default(),
                 project,
                 entries,
                 last_activity,
@@ -2183,6 +2200,7 @@ impl Db {
         };
         let task_runner = self.task_runner_states()?;
         let delegations = self.delegations()?;
+        let project_aliases = self.project_aliases()?.into_iter().collect();
         Ok(Backup {
             format: BACKUP_FORMAT.to_string(),
             version: BACKUP_VERSION,
@@ -2202,6 +2220,7 @@ impl Db {
             files,
             task_runner,
             delegations,
+            project_aliases,
         })
     }
 
@@ -2221,6 +2240,17 @@ impl Db {
              DELETE FROM run_writes WHERE kind = 'entry';
              DELETE FROM sqlite_sequence WHERE name IN ('entries', 'activity');",
         )?;
+        // The aliases go with the rows they were made for.
+        tx.execute(
+            "DELETE FROM meta WHERE substr(key, 1, ?1) = ?2",
+            params![rename::ALIAS_PREFIX.len() as i64, rename::ALIAS_PREFIX],
+        )?;
+        for (old, project) in &backup.project_aliases {
+            let (old, project) = (normalize_project(old)?, normalize_project(project)?);
+            if old != project {
+                set_meta(&tx, &format!("{}{old}", rename::ALIAS_PREFIX), &project)?;
+            }
+        }
         // Backups older than version 3 know nothing of sessions, the profile
         // or rules, and ones older than version 4 know nothing of the board.
         // Restoring one must not wipe what was set up since, so those tables
@@ -2509,6 +2539,16 @@ impl Db {
     /// all match. Returns (added, already present).
     pub fn merge(&self, backup: &Backup) -> Result<(usize, usize)> {
         validate_backup(backup)?;
+        // Rows under a renamed project's old name are filed under the new
+        // one, and counted as present when they are there already.
+        let aliases: HashMap<String, String> = self.project_aliases()?.into_iter().collect();
+        let remapped;
+        let backup = if aliases.is_empty() {
+            backup
+        } else {
+            remapped = rename::remap_backup(backup, &aliases);
+            &remapped
+        };
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let reusable = reusable_vectors(&tx, backup)?;
@@ -2789,6 +2829,7 @@ impl Db {
         summary: &str,
     ) -> Result<Activity> {
         let conn = self.lock();
+        let project = &rename::resolve_alias(&conn, project)?;
         let joined = targets
             .iter()
             .map(|id| id.to_string())
@@ -3169,6 +3210,7 @@ impl Db {
         let created_by = new.created_by.trim().to_lowercase();
         let targets = normalize_task_targets(&new.targets)?;
         let conn = self.lock();
+        let project = rename::resolve_alias(&conn, &project)?;
         conn.execute(
             "INSERT INTO tasks (project, title, body, assignee, created_by, session_id,
                                  created_at, updated_at, repo, dokploy_project_id,
@@ -3419,6 +3461,7 @@ impl Db {
             new.to_agent.trim().to_lowercase()
         };
         let conn = self.lock();
+        let project = rename::resolve_alias(&conn, &project)?;
         conn.execute(
             "INSERT INTO messages (kind, project, from_agent, to_agent, body, session_id,
                                      created_at)
@@ -3642,6 +3685,7 @@ impl Db {
 
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        let project = rename::resolve_alias(&tx, &project)?;
         if let Some(entry_id) = new.entry_id {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS (SELECT 1 FROM entries WHERE id = ?1)",
@@ -4377,6 +4421,7 @@ impl Db {
     pub fn add_rule(&self, input: &RuleInput) -> Result<Rule> {
         let (scope, target, body) = normalize_rule(&input.scope, &input.target, &input.body)?;
         let conn = self.lock();
+        let target = rule_target(&conn, &scope, target)?;
         conn.execute(
             "INSERT INTO rules (scope, target, body, enabled, position,
                                  created_at, updated_at)
@@ -4392,6 +4437,7 @@ impl Db {
     pub fn update_rule(&self, id: i64, input: &RuleInput) -> Result<Option<Rule>> {
         let (scope, target, body) = normalize_rule(&input.scope, &input.target, &input.body)?;
         let conn = self.lock();
+        let target = rule_target(&conn, &scope, target)?;
         let changed = conn.execute(
             "UPDATE rules SET scope = ?2, target = ?3, body = ?4, enabled = ?5,
                      position = ?6, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
@@ -5409,6 +5455,7 @@ fn get_entry(conn: &Connection, id: i64) -> Result<Option<Entry>> {
 /// random hex characters.
 fn insert_session(conn: &Connection, new: &NewSession) -> Result<Session> {
     let id = new_session_id()?;
+    let project = rename::resolve_alias(conn, &new.project)?;
     conn.execute(
         "INSERT INTO sessions (id, agent, project, path, repo, commit_hash, branch,
                                 title, status, summary, started_at, last_seen_at,
@@ -5419,7 +5466,7 @@ fn insert_session(conn: &Connection, new: &NewSession) -> Result<Session> {
         params![
             id,
             new.agent,
-            new.project,
+            project,
             new.path,
             new.repo,
             new.commit,
@@ -5472,10 +5519,7 @@ fn placeholders(count: usize) -> String {
 /// Checks and normalises a task's project, title and body. Agent and
 /// project names are lowercase everywhere else, so they are here too.
 fn normalize_task(project: &str, title: &str, body: &str) -> Result<(String, String, String)> {
-    let project = project.trim().to_lowercase();
-    if project.is_empty() {
-        anyhow::bail!("project must not be empty");
-    }
+    let project = normalize_project(project)?;
     let title = title.trim();
     if title.is_empty() {
         anyhow::bail!("the task title must not be empty");
@@ -5512,11 +5556,7 @@ fn normalize_message(kind: &str, project: &str, body: &str) -> Result<(String, S
 
 /// A file's project: lowercase and not empty, like every project name.
 fn normalize_file_project(project: &str) -> Result<String> {
-    let project = project.trim().to_lowercase();
-    if project.is_empty() {
-        anyhow::bail!("project must not be empty");
-    }
-    Ok(project)
+    normalize_project(project)
 }
 
 /// One of `PROVIDERS` or the mailbox, lowercased: what the level table,
@@ -5872,6 +5912,16 @@ fn normalize_rule(scope: &str, target: &str, body: &str) -> Result<(String, Stri
         anyhow::bail!("the rule body must be at most {RULE_BODY_MAX_CHARS} characters");
     }
     Ok((scope, target, body.to_string()))
+}
+
+/// A project rule's target through the aliases: a rule written for a
+/// renamed project's old name applies to the new one.
+fn rule_target(conn: &Connection, scope: &str, target: String) -> Result<String> {
+    if scope == "project" {
+        rename::resolve_alias(conn, &target)
+    } else {
+        Ok(target)
+    }
 }
 
 /// Writes one `meta` key.

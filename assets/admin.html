@@ -111,6 +111,22 @@
     <section class="panel">
       <h2>Projects</h2>
       <ul id="projects" class="list projects"><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li><li class="skeleton" aria-hidden="true"></li></ul>
+      <!-- Renaming a project: moves every memory, task, note and file to
+           the new name; shown for users with the write permission. -->
+      <form id="project-rename" class="board-form rename-form" autocomplete="off" hidden>
+        <h4 id="rename-title">Rename a project</h4>
+        <label class="board-field"><span>New name</span>
+          <input id="rename-to" type="text" maxlength="100" required spellcheck="false" autocapitalize="off">
+        </label>
+        <p id="rename-summary" class="small-text muted" role="status"></p>
+        <label id="rename-merge-row" class="rename-check" hidden><input id="rename-merge" type="checkbox"> <span>Merge into the existing project</span></label>
+        <label class="rename-check"><input id="rename-keep-alias" type="checkbox" checked> <span>Keep the old name as an alias (agents that still use it land on the new name)</span></label>
+        <div class="board-form-actions rename-actions">
+          <button id="rename-cancel" class="ghost small" type="button">Cancel</button>
+          <button id="rename-check" class="ghost small" type="button">Check</button>
+          <button id="rename-confirm" class="ghost small" type="submit" disabled>Rename</button>
+        </div>
+      </form>
       <div id="kinds" class="kinds" aria-label="Entry kinds"></div>
     </section>
     <section class="panel">

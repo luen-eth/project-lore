@@ -130,6 +130,9 @@ const FILE_TEXT_CHARS: usize = 200_000;
 #[derive(Clone)]
 pub struct Lore {
     db: Db,
+    /// (session or agent, old name) pairs already told that a project was
+    /// renamed, so the notice comes once.
+    alias_notices: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
     embedder: Embedder,
     min_similarity: f32,
     /// Hours after which an open session is closed as inactive.
@@ -581,6 +584,33 @@ pub struct FilesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectRenameArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// The project's current name (lowercase, like `log`'s `project`).
+    pub from: String,
+    /// The new name.
+    pub to: String,
+    /// Merge into `to` when it already holds data. Default false: the
+    /// rename is refused when `to` exists.
+    #[serde(default)]
+    pub merge: Option<bool>,
+    /// Keep `from` as an alias of `to`, so agents that still use the old
+    /// name land on the new one. Default true.
+    #[serde(default)]
+    pub keep_alias: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectAliasesArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// An old name whose alias to remove; omit to list the aliases.
+    #[serde(default)]
+    pub remove: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FileDeleteArgs {
     /// Session id returned by `hello` for this chat.
     pub session_id: String,
@@ -770,6 +800,7 @@ impl Lore {
     ) -> Self {
         Self {
             db,
+            alias_notices: Default::default(),
             embedder,
             min_similarity,
             idle_hours,
@@ -1329,6 +1360,9 @@ impl Lore {
                         "- `{}`: {} entries, last activity {}\n",
                         p.project, p.entries, p.last_activity
                     ));
+                    if !p.aliases.is_empty() {
+                        out.push_str(&format!("    also known as: {}\n", p.aliases.join(", ")));
+                    }
                     for head in &p.heads {
                         let agent = if head.agent.is_empty() {
                             "unknown agent"
@@ -2986,6 +3020,103 @@ impl Lore {
     }
 
     #[tool(
+        description = "Rename a project in lore's memory (for example after the repository or folder was renamed): moves every memory, task, note and file from the old name to the new one, with its sessions, messages, handoffs, activity, project rules and built-in runs, in one step that keeps every id. The old name stays an alias (unless `keep_alias` is false), so agents that still use it land on the new project. When the new name already holds data the rename is refused unless `merge` is true. The answer says how many rows of each kind moved."
+    )]
+    async fn project_rename(
+        &self,
+        Parameters(args): Parameters<ProjectRenameArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        let outcome = blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session).to_string();
+            let request = crate::db::RenameRequest {
+                from: args.from,
+                to: args.to,
+                merge: args.merge.unwrap_or(false),
+                keep_alias: args.keep_alias.unwrap_or(true),
+                by: actor.clone(),
+                session_id: Some(session.id.clone()),
+            };
+            let outcome = this.db.rename_project(&request).map_err(internal)??;
+            this.embed_entry(&outcome.note);
+            this.note(
+                &actor,
+                "project_rename",
+                &outcome.to,
+                Some(&session.id),
+                Some(outcome.note.id),
+                &[],
+                &outcome.note.title,
+            );
+            Ok(outcome)
+        })
+        .await?;
+        if let Some(runner) = &self.assist {
+            runner.rename_project(&outcome.from, &outcome.to);
+        }
+        Ok(rename_answer(&outcome))
+    }
+
+    #[tool(
+        description = "List the project aliases lore keeps (old project names left by `project_rename`, each with the project it now stands for), or remove one with `remove`: the old name then becomes free again and is no longer sent to the new project."
+    )]
+    async fn project_aliases(
+        &self,
+        Parameters(args): Parameters<ProjectAliasesArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let actor = session_agent(&agent, &session);
+            if let Some(name) = args
+                .remove
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+            {
+                let name = normalize_project(name)?;
+                return match this.db.remove_project_alias(&name).map_err(internal)? {
+                    Some(project) => {
+                        this.note(
+                            actor,
+                            "project_rename",
+                            &project,
+                            Some(&session.id),
+                            None,
+                            &[],
+                            &format!("alias {name} of {project} removed"),
+                        );
+                        Ok(format!(
+                            "Removed the alias `{name}` (of `{project}`): `{name}` is a free \
+                             project name again."
+                        ))
+                    }
+                    None => Err(format!("`{name}` is not an alias.")),
+                };
+            }
+            let aliases = this.db.project_aliases().map_err(internal)?;
+            if aliases.is_empty() {
+                return Ok("No project aliases.".into());
+            }
+            let mut out = String::from("Project aliases (old name → project):\n");
+            for (old, project) in aliases {
+                out.push_str(&format!("- `{old}` → `{project}`\n"));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(
         description = "List the services you may operate through lore — Cloudflare, GitHub (the personal account and the organization account), a self-hosted GitLab, Dokploy — with your access level on each, the API base to address them and a link to each API reference, and whether you may look at the user's mailbox (read-only, through `mail`). The credentials are stored by the administrator and added by lore on the server side; you never see them."
     )]
     async fn integrations(
@@ -4344,6 +4475,10 @@ impl ServerHandler for Lore {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        // A renamed project's old name becomes the new one before anything
+        // else sees the call (run checks, the tool itself).
+        let mut request = request;
+        let alias_notice = self.resolve_project_argument(&mut request, &context).await;
         let scope = context
             .extensions
             .get::<Parts>()
@@ -4396,6 +4531,13 @@ impl ServerHandler for Lore {
         {
             result.content.push(rmcp::model::ContentBlock::text(line));
         }
+        if let Some(notice) = alias_notice
+            && let rmcp::model::CallToolResponse::Complete(result) = &mut response
+        {
+            result
+                .content
+                .insert(0, rmcp::model::ContentBlock::text(notice));
+        }
         Ok(response)
     }
 }
@@ -4433,6 +4575,58 @@ fn service_call_writes(
 }
 
 impl Lore {
+    /// Replaces a `project` argument that is a renamed project's old name
+    /// with the new name. Every tool takes its project as `project`, so
+    /// this one place covers `hello`, `log`, `recall`, `recent`, the board,
+    /// notes, files, `delegate`, `ask` and the rest; the stores resolve the
+    /// alias again on every write. Answers the notice for the tool's
+    /// answer, once per session (or agent, without one) and old name;
+    /// `hello` always gets it, being the start of a chat.
+    async fn resolve_project_argument(
+        &self,
+        request: &mut rmcp::model::CallToolRequestParams,
+        context: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Option<String> {
+        if request.name.as_ref() == "project_rename" {
+            return None;
+        }
+        let args = request.arguments.as_mut()?;
+        let given = args.get("project")?.as_str()?.to_string();
+        let db = self.db.clone();
+        let (project, alias) = blocking(move || db.resolve_project(&given).map_err(internal))
+            .await
+            .ok()?;
+        let old = alias?;
+        args.insert("project".into(), serde_json::Value::String(project.clone()));
+        let session = args
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        let who = match session {
+            Some(id) if request.name.as_ref() != "hello" => id,
+            _ => {
+                let agent = context
+                    .extensions
+                    .get::<Parts>()
+                    .map(agent_of)
+                    .unwrap_or_default();
+                if request.name.as_ref() == "hello" {
+                    // A new chat: told every time.
+                    return Some(alias_notice(&old, &project));
+                }
+                agent
+            }
+        };
+        let mut seen = self.alias_notices.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() > 10_000 {
+            seen.clear();
+        }
+        seen.insert((who, old.clone()))
+            .then(|| alias_notice(&old, &project))
+    }
+
     /// Why a terminal's CLI may not make this service call: the owner set
     /// the agent's "Services in the terminal" to `off`, or to `read` and
     /// the call writes. `None` for anything else (the agent's own levels
@@ -5028,12 +5222,61 @@ fn briefing(
     sections.join("\n\n")
 }
 
-fn normalize_project(project: &str) -> Result<String, String> {
-    let project = project.trim().to_lowercase();
-    if project.is_empty() {
-        return Err("project must not be empty".into());
+/// What `project_rename` answers.
+fn rename_answer(outcome: &crate::db::RenameOutcome) -> String {
+    let (from, to) = (&outcome.from, &outcome.to);
+    let mut out = format!(
+        "Renamed the project `{from}` to `{to}`{}.\nMoved: {}.\n",
+        if outcome.merged {
+            " (merged into the existing project)"
+        } else {
+            ""
+        },
+        outcome.moved.describe()
+    );
+    if !outcome.renumbered_paths.is_empty() {
+        out.push_str(&format!(
+            "Files at the same path under both names keep every version, renumbered 1..n in the \
+             order they were saved: {}.\n",
+            outcome.renumbered_paths.join(", ")
+        ));
     }
-    Ok(project)
+    if outcome.alias_kept {
+        out.push_str(&format!(
+            "`{from}` is now an alias of `{to}`: calls that name `{from}` use `{to}`.\n"
+        ));
+    } else if outcome.undo {
+        out.push_str(&format!(
+            "This undid the earlier rename of `{to}` to `{from}`: the alias `{to}` is gone and \
+             no new alias was made.\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "No alias was kept: `{from}` is a free name again.\n"
+        ));
+    }
+    if let Some(removed) = outcome.removed_alias.as_ref().filter(|_| !outcome.undo) {
+        out.push_str(&format!(
+            "`{removed}` was an alias; it is a project now, so the alias was removed.\n"
+        ));
+    }
+    if !outcome.repointed.is_empty() {
+        out.push_str(&format!(
+            "Aliases that pointed at `{from}` now point at `{to}`: {}.\n",
+            outcome.repointed.join(", ")
+        ));
+    }
+    out.push_str(&format!("Recorded as note #{} in `{to}`.", outcome.note.id));
+    out
+}
+
+/// The line an answer starts with when the call named a renamed project.
+fn alias_notice(old: &str, project: &str) -> String {
+    format!("lore: project `{old}` was renamed to `{project}`; using `{project}`.\n\n")
+}
+
+fn normalize_project(project: &str) -> Result<String, String> {
+    crate::db::normalize_project(project).map_err(|error| error.to_string())
 }
 
 fn normalize_project_filter(project: Option<String>) -> Option<String> {

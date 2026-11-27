@@ -1669,6 +1669,11 @@ mod tests {
                 "task_update",
                 json!({"session_id": "s", "id": 8, "action": "done"}),
             ),
+            (
+                "project_rename",
+                json!({"session_id": "s", "from": "shop", "to": "store"}),
+            ),
+            ("project_aliases", json!({"session_id": "s", "remove": "x"})),
         ] {
             let response = call(&bases[1], tool, arguments).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{tool}");
@@ -1688,6 +1693,162 @@ mod tests {
             let value: Value = response.json().await.unwrap();
             assert!(!text(value.clone()).contains("may not call"), "{value}");
         }
+    }
+
+    /// A renamed project's old name, as agents keep sending it, reaches
+    /// every tool as the new name (through `call_tool`), with a one-line
+    /// notice the first time per session; `project_rename` itself works
+    /// over MCP and says what moved.
+    #[tokio::test]
+    async fn an_old_project_name_reaches_every_tool_as_the_new_one() {
+        let dir = std::env::temp_dir().join(format!("lore-app-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        db.insert(&crate::db::NewEntry {
+            project: "shop".into(),
+            kind: "update".into(),
+            title: "Shipped the pelican checkout".into(),
+            body: "It works.".into(),
+            agent: "claude".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let tokens = auth::load_tokens("", &format!("claude:{ENV_TOKEN}")).unwrap();
+        let events = Events::new();
+        let lore = Lore::new(
+            db.clone(),
+            Embedder::disabled(),
+            0.8,
+            events.clone(),
+            12,
+            None,
+            ops::Guard::default(),
+        );
+        let (public, _agents) = app_and_agents(
+            McpAuth::new(tokens, db.clone(), false),
+            lore,
+            None,
+            events,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                public.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let http = reqwest::Client::new();
+        let call = |tool: &str, arguments: Value| {
+            let request = http
+                .post(format!("{base}/mcp"))
+                .header(header::AUTHORIZATION, format!("Bearer {ENV_TOKEN}"))
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2025-06-18")
+                .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": { "name": tool, "arguments": arguments } }));
+            async move {
+                let value: Value = request.send().await.unwrap().json().await.unwrap();
+                assert_ne!(value["result"]["isError"], true, "{value}");
+                value["result"]["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            }
+        };
+        const NOTICE: &str = "project `shop` was renamed to `store`; using `store`";
+        let place = json!({"path": "/work/shop", "repo": "none", "commit": "none"});
+        let hello = |title: &str| {
+            let mut arguments = place.clone();
+            arguments["project"] = json!("shop");
+            arguments["title"] = json!(title);
+            call("hello", arguments)
+        };
+        // The rename itself, over MCP.
+        let first = hello("rename").await;
+        let session = db.sessions(Some("open"), Some("shop"), 5).unwrap()[0]
+            .id
+            .clone();
+        assert!(!first.contains(NOTICE));
+        let answer = call(
+            "project_rename",
+            json!({"session_id": session, "from": "shop", "to": "store"}),
+        )
+        .await;
+        assert!(
+            answer.contains("Renamed the project `shop` to `store`"),
+            "{answer}"
+        );
+        assert!(answer.contains("Moved: 1 entry, 0 tasks"), "{answer}");
+        assert!(answer.contains("1 session"), "{answer}");
+        assert!(
+            answer.contains("`shop` is now an alias of `store`"),
+            "{answer}"
+        );
+        let listed = call("projects", json!({"session_id": session})).await;
+        assert!(listed.contains("also known as: shop"), "{listed}");
+        let aliases = call("project_aliases", json!({"session_id": session})).await;
+        assert!(aliases.contains("`shop` → `store`"), "{aliases}");
+
+        // A new chat under the old name: `hello` says so and opens the
+        // session under the new name.
+        let opened = hello("after the rename").await;
+        assert!(opened.contains(NOTICE), "{opened}");
+        let sessions = db.sessions(Some("open"), Some("store"), 5).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(db.sessions(None, Some("shop"), 5).unwrap().is_empty());
+        let session = sessions
+            .iter()
+            .find(|row| row.title == "after the rename")
+            .unwrap()
+            .id
+            .clone();
+        let with = |mut arguments: Value| {
+            arguments["session_id"] = json!(session);
+            arguments["project"] = json!("shop");
+            arguments
+        };
+        let mut log = place.clone();
+        log["kind"] = json!("update");
+        log["title"] = json!("Logged under the old name");
+        log["body"] = json!("b");
+        let logged = call("log", with(log.clone())).await;
+        assert!(logged.contains("in `store`"), "{logged}");
+        // Once per session.
+        assert!(logged.contains(NOTICE), "{logged}");
+        let again = call("log", with(log)).await;
+        assert!(!again.contains(NOTICE), "{again}");
+        for (tool, arguments, expect) in [
+            ("recall", json!({"query": "pelican"}), "pelican"),
+            ("recent", json!({}), "Logged under the old name"),
+            ("task_add", json!({"title": "A task"}), "store"),
+            ("tasks", json!({}), "A task"),
+            ("note_add", json!({"title": "A note", "body": "n"}), "store"),
+            ("notes", json!({}), "A note"),
+            ("todos", json!({}), "A task"),
+            (
+                "file_save",
+                json!({"path": "ideas.md", "content": "c", "description": "d"}),
+                "store",
+            ),
+            ("files", json!({}), "ideas.md"),
+            ("handoff", json!({"body": "over to you"}), "store"),
+        ] {
+            let answer = call(tool, with(arguments)).await;
+            assert!(answer.contains(expect), "{tool}: {answer}");
+        }
+        assert_eq!(db.tasks(Some("store"), &[], 10).unwrap().len(), 1);
+        assert_eq!(db.recent(Some("store"), None, 50).unwrap().len(), 5);
+        assert!(db.recent(Some("shop"), None, 50).unwrap().is_empty());
+        assert_eq!(db.files(Some("store"), 10).unwrap().len(), 1);
+        assert_eq!(db.pending_handoffs("store", "s_x").unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// On the runner listener a request is always attributed to its direct

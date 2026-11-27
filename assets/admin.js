@@ -51,11 +51,13 @@ const TOOLS = {
   revoke: { verb: "revoked an authorization", tone: "remove" },
   disable: { verb: "disabled an agent", tone: "remove" },
   enable: { verb: "enabled an agent", tone: "write" },
+  project_rename: { verb: "renamed a project", tone: "write" },
 };
 const WRITES = new Set([
   "hello", "checkin", "bye", "log", "amend", "forget", "profile", "rules", "import", "restore", "reindex",
   "task_add", "task_update", "send", "handoff", "file_save", "file_delete",
   "cloudflare", "github", "github_org", "git_server", "dokploy", "git_push", "users",
+  "project_rename",
 ]);
 /* The permission ids the server knows; a signed-in user holds some of them. */
 const ALL_PERMISSIONS = ["write", "backup", "restore", "settings", "integrations", "agents", "users"];
@@ -837,6 +839,7 @@ const state = {
   siteKey: null, decorative: false, role: "viewer",
   username: "", perms: new Set(), stored: false,
   sessions: [], openSessions: 0, openTasks: 0, fileCount: 0,
+  aliases: [],
 };
 
 async function api(path, options) {
@@ -870,6 +873,8 @@ function showLogin() {
   Object.assign(board, { data: null, tab: "tasks", filter: "open", project: "" });
   closeFiles();
   resetFiles();
+  closeRename();
+  state.aliases = [];
   closeIntegrations();
   resetIntegrations();
   closeDetail();
@@ -1241,6 +1246,7 @@ async function load(first) {
       bootDone(true);
     }
   }
+  loadAliases();
   await loadSessions();
 }
 
@@ -1535,6 +1541,7 @@ function renderProjects() {
     return;
   }
   const peak = Math.max(...state.counts.map((c) => c[1]));
+  const writer = can("write");
   for (const [project, count] of state.counts) {
     const color = state.colors.get(project);
     const swatch = el("span", "swatch");
@@ -1545,11 +1552,215 @@ function renderProjects() {
     fill.style.background = color;
     meter.append(fill);
     const item = el("li", isFilter("project", project) ? "active" : "");
-    item.append(swatch, el("span", "name", project), el("span", "count", String(count)), meter);
+    if (writer) item.classList.add("with-rename");
+    item.append(swatch, el("span", "name", project), el("span", "count", String(count)));
+    if (writer) {
+      const rename = el("button", "ghost small rename-button", "Rename");
+      rename.type = "button";
+      rename.title = `Rename ${project}: moves every memory, task, note and file to a new name`;
+      rename.addEventListener("click", (event) => { event.stopPropagation(); openRename(project); });
+      rename.addEventListener("keydown", (event) => event.stopPropagation());
+      item.append(rename);
+    }
+    const aliases = state.aliases.filter((alias) => alias.project === project);
+    if (aliases.length) {
+      const sub = el("span", "sub", "also known as: ");
+      aliases.forEach((alias, index) => {
+        if (index) sub.append(", ");
+        sub.append(alias.old);
+        if (writer) {
+          const remove = el("button", "ghost small alias-remove", "×");
+          remove.type = "button";
+          remove.title = `Remove the alias ${alias.old}: the name becomes free again`;
+          remove.setAttribute("aria-label", `Remove the alias ${alias.old}`);
+          remove.addEventListener("click", (event) => { event.stopPropagation(); removeAlias(alias); });
+          remove.addEventListener("keydown", (event) => event.stopPropagation());
+          sub.append(remove);
+        }
+      });
+      item.append(sub);
+    }
+    item.append(meter);
     clickable(item, () => toggleFilter("project", project));
     list.append(item);
   }
 }
+
+/* ---------- Renaming a project ---------- */
+
+/* Rename: pick a project's Rename button, type the new name, Check shows
+   what moves (and offers the merge when the name exists), Rename does it.
+   The server refuses anything the preview did not allow. */
+const renameState = { from: null, preview: null, seq: 0 };
+
+async function loadAliases() {
+  try {
+    const response = await api("/admin/api/projects/aliases");
+    if (!response.ok) return;
+    state.aliases = (await response.json()).aliases || [];
+  } catch (_) {
+    return;
+  }
+  renderProjects();
+}
+
+function plural(count, one, many) {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
+function describeCounts(c) {
+  return [
+    plural(c.entries, "memory", "memories"),
+    plural(c.tasks, "task", "tasks"),
+    plural(c.task_notes, "task note", "task notes"),
+    `${plural(c.files, "file version", "file versions")} (${plural(c.file_paths, "path", "paths")})`,
+    plural(c.sessions, "session", "sessions"),
+    plural(c.messages, "message or handoff", "messages and handoffs"),
+    plural(c.activity, "activity line", "activity lines"),
+    plural(c.rules, "project rule", "project rules"),
+    plural(c.agent_runs, "built-in run", "built-in runs"),
+  ].join(", ");
+}
+
+function openRename(project) {
+  renameState.from = project;
+  renameState.preview = null;
+  renameState.seq += 1;
+  $("rename-title").textContent = `Rename ${project}`;
+  $("rename-to").value = "";
+  $("rename-summary").textContent = "Type the new name, then Check to see what moves.";
+  $("rename-merge").checked = false;
+  $("rename-merge-row").hidden = true;
+  $("rename-keep-alias").checked = true;
+  $("rename-confirm").disabled = true;
+  $("project-rename").hidden = false;
+  $("rename-to").focus();
+}
+
+function closeRename() {
+  renameState.from = null;
+  renameState.preview = null;
+  renameState.seq += 1;
+  $("project-rename").hidden = true;
+}
+
+function updateRenameButton() {
+  const preview = renameState.preview;
+  const ready = preview && !preview.refusal
+    && preview.to === $("rename-to").value.trim().toLowerCase()
+    && (!preview.target_exists || $("rename-merge").checked);
+  $("rename-confirm").disabled = !ready;
+  if (ready) $("rename-confirm").textContent = preview.target_exists ? `Merge into ${preview.to}` : `Rename to ${preview.to}`;
+  else $("rename-confirm").textContent = "Rename";
+}
+
+async function checkRename() {
+  const to = $("rename-to").value.trim().toLowerCase();
+  if (!renameState.from) return;
+  if (!to) { $("rename-summary").textContent = "Type the new name first."; return; }
+  const seq = ++renameState.seq;
+  renameState.preview = null;
+  updateRenameButton();
+  $("rename-summary").textContent = "Checking…";
+  let response, body;
+  try {
+    const query = new URLSearchParams({ from: renameState.from, to });
+    response = await api("/admin/api/projects/rename?" + query.toString());
+    body = await response.json().catch(() => ({}));
+  } catch (_) {
+    if (seq === renameState.seq) $("rename-summary").textContent = "The check failed.";
+    return;
+  }
+  if (seq !== renameState.seq) return;
+  if (!response.ok) { $("rename-summary").textContent = body.error || `The check failed (${response.status}).`; return; }
+  renameState.preview = body;
+  let text;
+  if (body.refusal) {
+    text = body.refusal;
+  } else {
+    text = `This moves from ${body.from} to ${body.to}: ${describeCounts(body.moving)}.`;
+    if (body.target_exists) {
+      text += ` ${body.to} already exists (${describeCounts(body.target)}); tick the box to merge into it.`;
+      if (body.conflicting_paths.length) {
+        text += ` Files at the same path in both (${body.conflicting_paths.join(", ")}) keep every version, renumbered in the order they were saved.`;
+      }
+    }
+  }
+  $("rename-summary").textContent = text;
+  $("rename-merge-row").hidden = !body.target_exists || Boolean(body.refusal);
+  if ($("rename-merge-row").hidden) $("rename-merge").checked = false;
+  updateRenameButton();
+}
+
+async function submitRename(event) {
+  event.preventDefault();
+  const preview = renameState.preview;
+  if (!preview || $("rename-confirm").disabled) return;
+  $("rename-confirm").disabled = true;
+  $("rename-summary").textContent = "Renaming…";
+  let response, body;
+  try {
+    response = await api("/admin/api/projects/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: preview.from, to: preview.to,
+        merge: $("rename-merge").checked, keep_alias: $("rename-keep-alias").checked,
+      }),
+    });
+    body = await response.json().catch(() => ({}));
+  } catch (_) {
+    $("rename-summary").textContent = "The rename could not be sent. Nothing changed.";
+    updateRenameButton();
+    return;
+  }
+  if (!response.ok) {
+    $("rename-summary").textContent = body.error || `The rename failed (${response.status}). Nothing changed.`;
+    renameState.preview = null;
+    updateRenameButton();
+    return;
+  }
+  renamedProject(body.from, body.to);
+  closeRename();
+}
+
+/* After a rename here: selections follow the project, and every open view
+   loads again (the feed line also refreshes other pages). */
+function renamedProject(from, to) {
+  if (isFilter("project", from)) state.filter = { type: "project", value: to };
+  if (board.project === from) board.project = to;
+  if (filesState.project === from) filesState.project = to;
+  if (lists.notesProject === from) lists.notesProject = to;
+  if (lists.todoProject === from) lists.todoProject = to;
+  const work = graph.working.get(from);
+  if (work) { graph.work(from, null); graph.work(to, work); }
+  refresh(false).catch(() => {});
+  boardActivity();
+  filesActivity();
+  if (!$("notes").hidden) loadNotes();
+  if (!$("todo").hidden) loadTodo();
+}
+
+async function removeAlias(alias) {
+  if (!window.confirm(`Remove the alias ${alias.old} of ${alias.project}?\n\nAgents that still use ${alias.old} will then start a separate project under that name.`)) return;
+  try {
+    const response = await api("/admin/api/projects/aliases/" + encodeURIComponent(alias.old), { method: "DELETE" });
+    if (!response.ok && response.status !== 404) {
+      const body = await response.json().catch(() => ({}));
+      window.alert(body.error || `The alias could not be removed (${response.status}).`);
+    }
+  } catch (_) { /* the next refresh shows the state */ }
+  loadAliases();
+}
+
+$("rename-check").addEventListener("click", () => checkRename());
+$("rename-cancel").addEventListener("click", () => closeRename());
+$("rename-to").addEventListener("input", () => { renameState.preview = null; renameState.seq += 1; updateRenameButton(); });
+$("rename-to").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !renameState.preview) { event.preventDefault(); checkRename(); }
+});
+$("rename-merge").addEventListener("change", () => updateRenameButton());
+$("project-rename").addEventListener("submit", submitRename);
 
 function renderKinds() {
   const box = $("kinds");
@@ -2510,7 +2721,7 @@ $("message-form").addEventListener("submit", async (event) => {
 const FILE_MAX_BYTES = 2 * 1024 * 1024;
 const FILE_KINDS = ["idea", "doc", "data", "config", "other"];
 /* Actions that change which files exist; only these reload an open panel. */
-const FILE_WRITES = new Set(["file_save", "file_delete", "import", "restore"]);
+const FILE_WRITES = new Set(["file_save", "file_delete", "import", "restore", "project_rename"]);
 const filesState = {
   data: null, loading: null, again: false, timer: null, searchTimer: null,
   query: "", project: "", projects: new Set(), openId: null,

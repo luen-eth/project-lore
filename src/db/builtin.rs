@@ -877,6 +877,7 @@ impl Db {
     /// A new run. Its token is stored only as `token_hash`.
     pub fn insert_run(&self, new: &NewRun) -> Result<Run> {
         let conn = self.lock();
+        let project = super::rename::resolve_alias(&conn, &new.project)?;
         conn.execute(
             "INSERT INTO agent_runs (id, agent, task_id, kind, project, repo, provider, status,
                                      started_at, token_hash, token_expires_at, scope, model,
@@ -888,7 +889,7 @@ impl Db {
                 new.agent,
                 new.task_id,
                 new.kind,
-                new.project,
+                project,
                 new.repo,
                 new.provider,
                 new.token_hash,
