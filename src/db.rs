@@ -19,6 +19,9 @@ mod builtin;
 pub use builtin::*;
 mod rename;
 pub use rename::*;
+#[allow(dead_code, reason = "the sign-in routes use these in a later commit")]
+mod signin;
+pub use signin::*;
 
 pub const KINDS: &[&str] = &["update", "decision", "bug", "note", "todo"];
 
@@ -384,8 +387,11 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// Code is signed in with the subscription only), a task's manual flag
 /// (`tasks.manual`, `tasks.manual_by`) and the owner's notes on tasks
 /// (`task_notes`, each bound to its task's `created_at`); the
-/// columns nullable, NULL being the behaviour before them.
-pub const SCHEMA_VERSION: i64 = 9;
+/// columns nullable, NULL being the behaviour before them. 10: sign-in
+/// security (`builtin_passwords`, `webauthn_users`, `webauthn_credentials`,
+/// `totp_secrets`, `recovery_codes`, `auth_events`); an older binary
+/// ignores these tables, so it does not enforce second factors.
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Columns every database lore ever created has in `entries`: a full
 /// backup without them is not a lore database.
@@ -1880,12 +1886,17 @@ impl Db {
     }
 
     /// Removes one user; returns it, or `None` when there was none.
+    /// Its passkeys, authenticator app and recovery codes go in the same
+    /// transaction.
     pub fn delete_user(&self, id: i64) -> Result<Option<User>> {
-        let conn = self.lock();
-        let Some(user) = get_user(&conn, id)? else {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let Some(user) = get_user(&tx, id)? else {
             return Ok(None);
         };
-        conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+        tx.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+        signin::delete_user_credentials(&tx, id)?;
+        tx.commit()?;
         Ok(Some(user))
     }
 
@@ -4953,6 +4964,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(agents::SCHEMA)?;
     conn.execute_batch(builtin::SCHEMA)?;
+    conn.execute_batch(signin::SCHEMA)?;
     add_missing_columns(conn)?;
     migrate_fts(conn)?;
     // A database from before the registry: every agent it has seen gets a
