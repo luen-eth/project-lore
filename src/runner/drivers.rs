@@ -772,6 +772,29 @@ impl Driver {
     }
 }
 
+/// Why an opencode agent may not have `provider` as its own provider:
+/// opencode's own `opencode` provider (its free and "Zen" models, never
+/// enabled), or a provider lore does not know whose key variable would be
+/// one of the four providers' (`opencode_go`… are fine, `opencode` reads
+/// `OPENCODE_API_KEY`, OpenCode Go's). `None`: it may.
+pub fn provider_conflict(provider: &str) -> Option<String> {
+    if provider == "opencode" {
+        return Some(
+            "`opencode` is opencode's own provider, which lore never enables; use opencode-go \
+             for OpenCode Go"
+                .into(),
+        );
+    }
+    if OPENCODE_PROVIDERS.iter().any(|p| p.id == provider) {
+        return None;
+    }
+    let var = generic_key_var(provider);
+    OPENCODE_PROVIDERS
+        .iter()
+        .find(|p| p.key_var == var)
+        .map(|p| format!("its key would be {var}, which is {}'s", p.label))
+}
+
 /// `<PROVIDER>_API_KEY` for a provider lore does not know.
 fn generic_key_var(provider: &str) -> String {
     let provider: String = provider

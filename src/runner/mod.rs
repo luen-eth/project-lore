@@ -160,6 +160,11 @@ impl Config {
         {
             bail!("LORE_RUNNER_PROVIDER must be a plain provider id such as deepseek");
         }
+        if kind == Kind::Opencode
+            && let Some(why) = drivers::provider_conflict(&provider)
+        {
+            bail!("LORE_RUNNER_PROVIDER \"{provider}\" cannot be used: {why}");
+        }
         let agent = var("LORE_RUNNER_AGENT")
             .unwrap_or_else(|| default_agent(kind, &provider))
             .to_lowercase();

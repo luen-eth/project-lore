@@ -175,6 +175,14 @@ pub fn parse_runner_tokens(value: &str) -> Result<Vec<RunnerToken>> {
                 {
                     bail!("LORE_RUNNER_TOKENS: the provider of \"{agent}\" must be a plain id");
                 }
+                if kind == Kind::Opencode
+                    && let Some(why) = crate::runner::drivers::provider_conflict(&provider)
+                {
+                    bail!(
+                        "LORE_RUNNER_TOKENS: \"{agent}\" names the opencode provider \
+                         \"{provider}\", which cannot be used: {why}"
+                    );
+                }
                 (kind, provider)
             }
             None => kind_of_name(&agent).ok_or_else(|| {
@@ -3397,6 +3405,32 @@ esac
         );
         assert!(parse_runner_tokens(&format!("helper:{CLAUDE_SECRET}")).is_err());
         assert!(parse_runner_tokens(&format!("helper:gemini:{CLAUDE_SECRET}")).is_err());
+        // opencode's own provider, or one whose key variable is another's,
+        // is refused with the entry named.
+        for bad in ["opencode", "OpenCode"] {
+            let error = parse_runner_tokens(&format!("zen:opencode/{bad}:{CLAUDE_SECRET}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("\"zen\"") && error.contains("opencode-go"),
+                "{error}"
+            );
+        }
+        // The only id lore does not know whose variable is another's is
+        // `opencode` itself (`-`/`_` become `_`: OPEN_AI_API_KEY is not
+        // OPENAI_API_KEY); the known ones and others are fine.
+        use crate::runner::drivers::provider_conflict;
+        for fine in [
+            "anthropic",
+            "openai",
+            "opencode-go",
+            "deepseek",
+            "qwen",
+            "open-ai",
+        ] {
+            assert!(provider_conflict(fine).is_none(), "{fine}");
+        }
+        assert!(provider_conflict("opencode").is_some());
         assert_eq!(
             parse_runner_binds("172.31.250.2:8081, 172.31.250.18:8081")
                 .unwrap()
