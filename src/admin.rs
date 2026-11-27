@@ -17,6 +17,7 @@ use std::convert::Infallible;
 
 mod agents;
 mod builtin;
+mod factors;
 mod notes;
 mod security;
 
@@ -159,6 +160,8 @@ struct AdminSession {
     /// Signed in with the environment admin password under
     /// `LORE_ADMIN_BREAK_GLASS`, without a second factor.
     break_glass: bool,
+    /// An authenticator-app secret waiting for its confirming code.
+    totp_setup: Option<factors::TotpSetup>,
 }
 
 impl AdminSession {
@@ -171,6 +174,7 @@ impl AdminSession {
             authenticated_at: now,
             methods,
             break_glass,
+            totp_setup: None,
         }
     }
 
@@ -379,6 +383,45 @@ const ROUTES: &[(&str, &str, Access)] = &[
         "/admin/api/builtin-users/{name}/password",
         Access::SignedIn,
     ),
+    (
+        "DELETE",
+        "/admin/api/builtin-users/{name}/second-factors",
+        Access::SignedIn,
+    ),
+    (
+        "DELETE",
+        "/admin/api/users/{id}/second-factors",
+        Access::Needs(Perm::Users),
+    ),
+    ("GET", "/admin/api/auth-events", Access::Needs(Perm::Users)),
+    // Profile → Security: the signed-in user's own sign-in settings.
+    ("GET", "/admin/api/security", Access::SignedIn),
+    (
+        "POST",
+        "/admin/api/security/reauth/options",
+        Access::SignedIn,
+    ),
+    ("POST", "/admin/api/security/reauth", Access::SignedIn),
+    (
+        "POST",
+        "/admin/api/security/passkeys/options",
+        Access::SignedIn,
+    ),
+    ("POST", "/admin/api/security/passkeys", Access::SignedIn),
+    ("PUT", "/admin/api/security/passkeys/{id}", Access::SignedIn),
+    (
+        "DELETE",
+        "/admin/api/security/passkeys/{id}",
+        Access::SignedIn,
+    ),
+    ("POST", "/admin/api/security/totp/setup", Access::SignedIn),
+    ("POST", "/admin/api/security/totp/confirm", Access::SignedIn),
+    ("DELETE", "/admin/api/security/totp", Access::SignedIn),
+    (
+        "POST",
+        "/admin/api/security/recovery-codes",
+        Access::SignedIn,
+    ),
 ];
 
 /// Routes that also need a fresh authentication (`FRESH_FOR`): a session
@@ -388,6 +431,15 @@ const ROUTES: &[(&str, &str, Access)] = &[
 const FRESH_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/admin/api/password"),
     ("PUT", "/admin/api/builtin-users/{name}/password"),
+    ("DELETE", "/admin/api/builtin-users/{name}/second-factors"),
+    ("DELETE", "/admin/api/users/{id}/second-factors"),
+    ("POST", "/admin/api/security/passkeys/options"),
+    ("POST", "/admin/api/security/passkeys"),
+    ("DELETE", "/admin/api/security/passkeys/{id}"),
+    ("POST", "/admin/api/security/totp/setup"),
+    ("POST", "/admin/api/security/totp/confirm"),
+    ("DELETE", "/admin/api/security/totp"),
+    ("POST", "/admin/api/security/recovery-codes"),
     ("POST", "/admin/api/restore/full"),
 ];
 
@@ -437,7 +489,6 @@ pub struct SignInOptions {
     /// without a second factor, even after a password was set on the page.
     pub break_glass: bool,
     /// `LORE_TOTP_ISSUER`: the name authenticator apps show.
-    #[allow(dead_code, reason = "the authenticator app arrives in a later commit")]
     pub totp_issuer: Option<String>,
 }
 
@@ -855,6 +906,54 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
             put(security::change_own_password)
                 .layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
                 .delete(security::restore_env_password),
+        )
+        .route(
+            "/admin/api/builtin-users/{name}/second-factors",
+            axum::routing::delete(factors::reset_builtin_factors),
+        )
+        .route(
+            "/admin/api/users/{id}/second-factors",
+            axum::routing::delete(factors::reset_user_factors),
+        )
+        .route("/admin/api/auth-events", get(factors::auth_events))
+        .route("/admin/api/security", get(factors::security))
+        .route(
+            "/admin/api/security/reauth/options",
+            post(factors::reauth_options).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/security/reauth",
+            post(factors::reauth).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/security/passkeys/options",
+            post(factors::passkey_create_options).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/security/passkeys",
+            post(factors::passkey_create).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/security/passkeys/{id}",
+            put(factors::passkey_rename)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
+                .delete(factors::passkey_delete),
+        )
+        .route(
+            "/admin/api/security/totp/setup",
+            post(factors::totp_setup).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/security/totp/confirm",
+            post(factors::totp_confirm).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/security/totp",
+            axum::routing::delete(factors::totp_delete),
+        )
+        .route(
+            "/admin/api/security/recovery-codes",
+            post(factors::recovery_codes).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
         )
         .route(
             "/admin/api/builtin-users/{name}/password",
@@ -1583,17 +1682,40 @@ fn note_activity(admin: &Admin, tool: &str, summary: &str) {
 async fn list_users(State(admin): State<Arc<Admin>>) -> Response {
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
-        let mut builtin =
-            vec![json!({ "username": ADMIN_USER, "permissions": Perms::all().ids() })];
+        let source = |name: &str| -> anyhow::Result<&'static str> {
+            Ok(if state.db.builtin_password(name)?.is_some() {
+                "page"
+            } else {
+                "environment"
+            })
+        };
+        let mut builtin = vec![json!({
+            "username": ADMIN_USER,
+            "permissions": Perms::all().ids(),
+            "password_source": source(ADMIN_USER)?,
+            "second_factors": state.db.second_factor_summary(ADMIN_USER)?,
+        })];
         if state.viewer_password.is_some() {
-            builtin.push(json!({ "username": VIEWER_USER, "permissions": Perms::none().ids() }));
+            builtin.push(json!({
+                "username": VIEWER_USER,
+                "permissions": Perms::none().ids(),
+                "password_source": source(VIEWER_USER)?,
+                "second_factors": state.db.second_factor_summary(VIEWER_USER)?,
+            }));
         }
         let permissions: Vec<serde_json::Value> = Perm::ALL
             .iter()
             .map(|perm| json!({ "id": perm.id(), "explanation": perm.explanation() }))
             .collect();
+        let mut users = Vec::new();
+        for user in state.db.users()? {
+            let summary = state.db.second_factor_summary(&db::user_account(user.id))?;
+            let mut value = serde_json::to_value(&user)?;
+            value["second_factors"] = serde_json::to_value(summary)?;
+            users.push(value);
+        }
         Ok(json!({
-            "users": state.db.users()?,
+            "users": users,
             "builtin": builtin,
             "permissions": permissions,
         }))
@@ -8557,5 +8679,633 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), 403, "{method} {path}");
         }
+    }
+    async fn get_as(base: &str, path: &str, token: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("{base}{path}"))
+            .header(header::COOKIE, format!("{COOKIE}={token}"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Registers a passkey over HTTP for the session `token`; returns the
+    /// device, the response body and the rotated token.
+    async fn register_passkey(
+        base: &str,
+        token: &str,
+        name: &str,
+        flags: crate::webauthn::soft::Flags,
+    ) -> (
+        crate::webauthn::soft::Authenticator,
+        serde_json::Value,
+        String,
+    ) {
+        let options = send_as(
+            reqwest::Method::POST,
+            base,
+            "/admin/api/security/passkeys/options",
+            token,
+            json!({ "name": name }),
+        )
+        .await;
+        assert_eq!(options.status(), 200);
+        let options: serde_json::Value = options.json().await.unwrap();
+        let public = &options["publicKey"];
+        assert_eq!(public["rp"]["id"], "127.0.0.1");
+        assert_eq!(public["authenticatorSelection"]["residentKey"], "preferred");
+        assert_eq!(public["attestation"], "none");
+        assert_eq!(public["pubKeyCredParams"].as_array().unwrap().len(), 3);
+        let mut device = crate::webauthn::soft::Authenticator::es256();
+        device.user_handle = crate::webauthn::b64url_decode(public["user"]["id"].as_str().unwrap());
+        let answer = device.register(&challenge_of(&options), base, "127.0.0.1", flags);
+        let response = send_as(
+            reqwest::Method::POST,
+            base,
+            "/admin/api/security/passkeys",
+            token,
+            json!({ "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let rotated = session_token_of(&response).unwrap();
+        (device, response.json().await.unwrap(), rotated)
+    }
+
+    #[tokio::test]
+    async fn passkeys_are_added_renamed_and_removed_from_the_profile() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "luis-token");
+        let account = db::user_account(user.id);
+        let luis = admin.sessions()["luis-token"].user.clone();
+        sign_in(&admin, "luis-other", luis);
+        let (mut device, body, token) = register_passkey(
+            &base,
+            "luis-token",
+            "Laptop",
+            crate::webauthn::soft::Flags::UP_UV,
+        )
+        .await;
+        assert_eq!(body["passkey"]["name"], "Laptop");
+        assert_eq!(body["passkey"]["usable_here"], true);
+        assert_eq!(body["passkey"]["passwordless"], true);
+        // The first factor comes with ten recovery codes; sessions rotate.
+        assert_eq!(body["recovery_codes"].as_array().unwrap().len(), 10);
+        assert!(!has_session(&admin, "luis-token"));
+        assert!(!has_session(&admin, "luis-other"));
+        assert!(has_session(&admin, &token));
+        // The same authenticator again is refused (and was excluded).
+        let options: serde_json::Value = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/passkeys/options",
+            &token,
+            json!({ "name": "Again" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(
+            options["publicKey"]["excludeCredentials"][0]["id"],
+            crate::webauthn::b64url_encode(&device.credential_id)
+        );
+        let answer = device.register(
+            &challenge_of(&options),
+            &base,
+            "127.0.0.1",
+            crate::webauthn::soft::Flags::UP_UV,
+        );
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/passkeys",
+            &token,
+            json!({ "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 409);
+        // A second passkey brings no new codes.
+        let (_, body, token) =
+            register_passkey(&base, &token, "Key", crate::webauthn::soft::Flags::UP).await;
+        assert!(body.get("recovery_codes").is_none());
+        // The Security section lists them.
+        let security: serde_json::Value = get_as(&base, "/admin/api/security", &token)
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(security["passkeys"].as_array().unwrap().len(), 2);
+        assert_eq!(security["recovery"]["left"], 10);
+        assert_eq!(security["second_factor_required"], true);
+        assert_eq!(security["password"]["source"], "stored");
+        assert_eq!(security["rp_id"], "127.0.0.1");
+        let id = security["passkeys"][0]["id"].as_i64().unwrap();
+        // Renaming needs no fresh sign-in.
+        make_stale(&admin, &token);
+        let response = put_json(
+            &base,
+            &format!("/admin/api/security/passkeys/{id}"),
+            &token,
+            json!({ "name": "Work laptop" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let response = put_json(
+            &base,
+            &format!("/admin/api/security/passkeys/{id}"),
+            &token,
+            json!({ "name": "" }),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        // Removing does.
+        let path = format!("/admin/api/security/passkeys/{id}");
+        let response = send_as(reqwest::Method::DELETE, &base, &path, &token, json!({})).await;
+        assert_eq!(response.status(), 403);
+        // The registered passkey confirms it is you (user verification).
+        let options: serde_json::Value = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth/options",
+            &token,
+            json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(options["publicKey"]["userVerification"], "required");
+        let answer = device.assert(
+            &challenge_of(&options),
+            &base,
+            "127.0.0.1",
+            crate::webauthn::soft::Flags::UP_UV,
+        );
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            &token,
+            json!({ "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        let response = send_as(reqwest::Method::DELETE, &base, &path, &token, json!({})).await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        let other = admin.db.credentials(&account).unwrap()[0].id;
+        let response = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            &format!("/admin/api/security/passkeys/{other}"),
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        // The last factor took the recovery codes with it.
+        assert_eq!(admin.db.recovery_remaining(&account).unwrap(), (0, 0));
+        let events: Vec<String> = admin
+            .db
+            .auth_events(Some(&account), 50)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event)
+            .collect();
+        for event in [
+            "passkey.added",
+            "passkey.renamed",
+            "passkey.removed",
+            "reauth.ok",
+            "recovery.generated",
+        ] {
+            assert!(events.contains(&event.to_string()), "{event}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_authenticator_app_is_set_up_with_a_confirming_code() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "luis-token");
+        let account = db::user_account(user.id);
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/totp/setup",
+            "luis-token",
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let setup: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            setup["qr"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/svg+xml;base64,")
+        );
+        assert!(
+            setup["uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("otpauth://totp/lore%20%28127.0.0.1%29:luis?secret=")
+        );
+        let key = crate::totp::decode_secret(setup["secret"].as_str().unwrap()).unwrap();
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/totp/confirm",
+            "luis-token",
+            json!({ "code": "000000" }),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let code = code_now(&key);
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/totp/confirm",
+            "luis-token",
+            json!({ "code": code }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["recovery_codes"].as_array().unwrap().len(), 10);
+        // A second setup while one is enabled is refused.
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/totp/setup",
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 409);
+        // The confirming code cannot sign in; the next step's code can.
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": code }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+        let next = crate::totp::hotp(&key, crate::totp::now() / crate::totp::PERIOD + 1, 6);
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": next }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        // The secret is stored sealed, never in clear.
+        let row = admin.db.totp(&account).unwrap().unwrap();
+        let secret = setup["secret"].as_str().unwrap().replace(' ', "");
+        assert!(!String::from_utf8_lossy(&row.secret).contains(&secret));
+        // New recovery codes replace the old ones.
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/recovery-codes",
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        let response = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            "/admin/api/security/totp",
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        assert!(admin.db.totp(&account).unwrap().is_none());
+        assert_eq!(admin.db.recovery_remaining(&account).unwrap(), (0, 0));
+        let token = session_token_of(&response).unwrap();
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/recovery-codes",
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn the_authenticator_app_needs_the_vault() {
+        let (base, _admin) = serve_with(None).await;
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/totp/setup",
+            "admin-token",
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 409);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("LORE_VAULT_KEY"));
+    }
+
+    #[tokio::test]
+    async fn every_fresh_route_asks_to_confirm_and_reauth_makes_it_fresh() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &Perm::ALL.map(Perm::id), "luis-token");
+        let account = db::user_account(user.id);
+        let key = give_totp(&admin, &account);
+        let (codes, hashes) = crate::totp::new_recovery_codes(&account).unwrap();
+        admin.db.replace_recovery_codes(&account, &hashes).unwrap();
+        make_stale(&admin, "luis-token");
+        for (method, path) in FRESH_ROUTES {
+            let path = path.replace("{id}", "1").replace("{name}", "viewer");
+            let response = send_as(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                &base,
+                &path,
+                "luis-token",
+                json!({}),
+            )
+            .await;
+            assert_eq!(response.status(), 403, "{method} {path}");
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            assert_eq!(body["reauth"], true, "{method} {path}");
+        }
+        // The password alone does not confirm an account with a second step.
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            "luis-token",
+            json!({ "password": "a-long-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            "luis-token",
+            json!({ "password": "wrong-password", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            "luis-token",
+            json!({ "password": "a-long-password", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        assert!(!has_session(&admin, "luis-token"));
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["fresh_for"], 600);
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/recovery-codes",
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        // A recovery code confirms too.
+        let token = session_token_of(&response).unwrap();
+        make_stale(&admin, &token);
+        let codes: Vec<String> = codes;
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            &token,
+            json!({ "password": "a-long-password", "recovery_code": codes[0] }),
+        )
+        .await;
+        // The old codes were replaced a moment ago.
+        assert_eq!(response.status(), 400);
+        let mut fresh_codes = Vec::new();
+        let (shown, hashes) = crate::totp::new_recovery_codes(&account).unwrap();
+        admin.db.replace_recovery_codes(&account, &hashes).unwrap();
+        fresh_codes.extend(shown);
+        // The per-address limit (5 per 15 minutes) counts these attempts;
+        // start from a clean slate for the last one.
+        admin.logins.reset("127.0.0.1");
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            &token,
+            json!({ "password": "a-long-password", "recovery_code": fresh_codes[0] }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        // An account without a second factor confirms with its password.
+        stored_user(&admin, "plain", &[], "plain-token");
+        make_stale(&admin, "plain-token");
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            "plain-token",
+            json!({ "password": "a-long-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn second_factors_are_reset_by_someone_who_may_manage_the_user() {
+        let (base, admin) = serve().await;
+        let clerk = stored_user(&admin, "clerk", &["write"], "clerk-token");
+        let boss = stored_user(&admin, "boss", &["users", "write"], "boss-token");
+        let chief = stored_user(&admin, "chief", &Perm::ALL.map(Perm::id), "chief-token");
+        for user in [&clerk, &chief] {
+            give_totp(&admin, &db::user_account(user.id));
+        }
+        give_totp(&admin, "admin");
+        // The users list shows who has what.
+        let list: serde_json::Value = get_as(&base, "/admin/api/users", "boss-token")
+            .await
+            .json()
+            .await
+            .unwrap();
+        let clerk_row = list["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["username"] == "clerk")
+            .unwrap()
+            .clone();
+        assert_eq!(clerk_row["second_factors"]["totp"], true);
+        assert_eq!(list["builtin"][0]["password_source"], "environment");
+        assert_eq!(list["builtin"][0]["second_factors"]["totp"], true);
+        let reset = |id: i64| format!("/admin/api/users/{id}/second-factors");
+        // A stronger user: refused.
+        let response = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            &reset(chief.id),
+            "boss-token",
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        // Yourself: in your own Security section.
+        let response = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            &reset(boss.id),
+            "boss-token",
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        // A weaker user: done, and their sessions end.
+        let response = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            &reset(clerk.id),
+            "boss-token",
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        assert!(!has_session(&admin, "clerk-token"));
+        assert!(
+            admin
+                .db
+                .totp(&db::user_account(clerk.id))
+                .unwrap()
+                .is_none()
+        );
+        let events = admin
+            .db
+            .auth_events(Some(&db::user_account(clerk.id)), 5)
+            .unwrap();
+        assert_eq!(
+            (events[0].event.as_str(), events[0].actor.as_str()),
+            ("second_factors.reset", "boss")
+        );
+        // The built-in admin's: only admin itself.
+        let response = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            "/admin/api/builtin-users/admin/second-factors",
+            "chief-token",
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        let response = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            "/admin/api/builtin-users/admin/second-factors",
+            "admin-token",
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        assert!(admin.db.totp("admin").unwrap().is_none());
+        // The sign-in log is readable with `users`.
+        let response = get_as(&base, "/admin/api/auth-events?limit=500", "boss-token").await;
+        assert_eq!(response.status(), 200);
+        let response = get_as(&base, "/admin/api/auth-events", "clerk-token").await;
+        assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn a_full_restore_brings_the_backups_credentials() {
+        let (source, source_admin) = serve().await;
+        source_admin
+            .db
+            .set_builtin_password(
+                ADMIN_USER,
+                &users::hash_password("admin-page-pass").unwrap(),
+                "admin",
+            )
+            .unwrap();
+        give_totp(&source_admin, "admin");
+        let client = reqwest::Client::new();
+        let file = get_as(&source, "/admin/api/backup/full", "admin-token")
+            .await
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec();
+        let (target, target_admin) = serve().await;
+        let upload = |body: Vec<u8>| {
+            client
+                .post(format!("{target}/admin/api/restore/full"))
+                .header(header::COOKIE, format!("{COOKIE}=admin-token"))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(body)
+                .send()
+        };
+        // A pending sign-in on the target, cleared by the restore.
+        target_admin
+            .db
+            .replace_recovery_codes("admin", &["x".into()])
+            .unwrap();
+        let pending = pending_for(&target, "admin", "admin-password").await;
+        let response = upload(file.clone()).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(target_admin.pending_map().is_empty());
+        let _ = pending;
+        // The backup's page password and app came with it.
+        let env = login(
+            &target,
+            json!({ "username": "admin", "password": "admin-password" }),
+        )
+        .await;
+        assert_eq!(env.status(), 401);
+        let page = login(
+            &target,
+            json!({ "username": "admin", "password": "admin-page-pass" }),
+        )
+        .await;
+        let body: serde_json::Value = page.json().await.unwrap();
+        assert_eq!(body["second_factor"]["methods"], json!(["totp"]));
+        // A backup from before schema 10 has none: the environment
+        // password signs in again, without a second step.
+        let path =
+            std::env::temp_dir().join(format!("lore-old-backup-{}.sqlite", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE builtin_passwords; DROP TABLE webauthn_users;
+                 DROP TABLE webauthn_credentials; DROP TABLE totp_secrets;
+                 DROP TABLE recovery_codes; DROP TABLE auth_events;
+                 UPDATE meta SET value = '9' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        }
+        let old = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        sign_in(&target_admin, "admin-token", SignedIn::builtin_admin());
+        let response = upload(old).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let env = login(
+            &target,
+            json!({ "username": "admin", "password": "admin-password" }),
+        )
+        .await;
+        assert_eq!(env.status(), 200);
+        let body: serde_json::Value = env.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(target_admin.db.totp("admin").unwrap().is_none());
     }
 }

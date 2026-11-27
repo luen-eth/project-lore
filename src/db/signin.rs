@@ -179,7 +179,6 @@ pub struct NewCredential {
 pub struct TotpRow {
     pub nonce: Vec<u8>,
     pub secret: Vec<u8>,
-    pub last_step: i64,
     pub confirmed_at: String,
 }
 
@@ -495,14 +494,13 @@ impl Db {
         Ok(self
             .lock()
             .query_row(
-                "SELECT nonce, secret, last_step, confirmed_at FROM totp_secrets WHERE account = ?1",
+                "SELECT nonce, secret, confirmed_at FROM totp_secrets WHERE account = ?1",
                 params![account],
                 |row| {
                     Ok(TotpRow {
                         nonce: row.get(0)?,
                         secret: row.get(1)?,
-                        last_step: row.get(2)?,
-                        confirmed_at: row.get(3)?,
+                        confirmed_at: row.get(2)?,
                     })
                 },
             )

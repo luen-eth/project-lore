@@ -19,11 +19,9 @@ mod server;
 mod shutdown;
 mod taskrunner;
 mod toolui;
-#[allow(dead_code, reason = "the sign-in routes use it in a later commit")]
 mod totp;
 mod users;
 mod vault;
-#[allow(dead_code, reason = "the sign-in routes use it in a later commit")]
 mod webauthn;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};

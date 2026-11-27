@@ -43,7 +43,11 @@ fn env_password<'a>(admin: &'a Admin, name: &str) -> Option<&'a str> {
 /// page password when one was set, else its environment password.
 /// Argon2 when a page password exists: call it off the executor, holding a
 /// slot.
-fn builtin_password_matches(admin: &Admin, name: &str, password: &str) -> anyhow::Result<bool> {
+pub(super) fn builtin_password_matches(
+    admin: &Admin,
+    name: &str,
+    password: &str,
+) -> anyhow::Result<bool> {
     Ok(match admin.db.builtin_password(name)? {
         Some(row) => users::verify_password(password, &row.password_hash),
         None => env_password(admin, name)
@@ -189,11 +193,11 @@ pub(super) async fn change_own_password(
 }
 
 /// `{"ok": true}`, with the rotated session cookie when there is one.
-fn ok_with_cookie(token: Option<String>) -> Response {
+pub(super) fn ok_with_cookie(token: Option<String>) -> Response {
     ok_body_with_cookie(json!({ "ok": true }), token)
 }
 
-fn ok_body_with_cookie(body: serde_json::Value, token: Option<String>) -> Response {
+pub(super) fn ok_body_with_cookie(body: serde_json::Value, token: Option<String>) -> Response {
     match token {
         Some(token) => ([(header::SET_COOKIE, session_cookie(&token))], Json(body)).into_response(),
         None => Json(body).into_response(),
@@ -251,7 +255,7 @@ pub(super) async fn restore_env_password(
 /// Who may change a built-in user's password or reset its second factors:
 /// the viewer's needs `users` (and a configured viewer); admin's only the
 /// built-in admin itself, recovery being `LORE_ADMIN_BREAK_GLASS`.
-fn may_manage_builtin(
+pub(super) fn may_manage_builtin(
     admin: &Admin,
     me: &SignedIn,
     name: &str,
@@ -275,7 +279,7 @@ fn may_manage_builtin(
 }
 
 /// The answer to a refused built-in change.
-fn builtin_refusal((status, message): (StatusCode, &'static str)) -> Response {
+pub(super) fn builtin_refusal((status, message): (StatusCode, &'static str)) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
@@ -369,8 +373,7 @@ const MAP_CAP: usize = 1000;
 /// How long the browser may show a passkey prompt for a sign-in.
 const ASSERTION_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the browser may show a passkey prompt for a registration.
-#[allow(dead_code, reason = "passkey registration arrives in the next commit")]
-const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(300);
+pub(super) const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// The answer to every failed passkey step: the reason goes to the log.
 pub(super) const PASSKEY_REFUSED: &str = "This passkey is not known here or could not be verified.";
 
@@ -413,7 +416,6 @@ pub(super) struct PendingSignIn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum CeremonyKind {
     /// Adding a passkey with this name to the signed-in account.
-    #[allow(dead_code, reason = "passkey registration arrives in the next commit")]
     Register { name: String },
     /// Signing in with a passkey alone.
     Passwordless,
@@ -426,17 +428,17 @@ pub(super) enum CeremonyKind {
 /// A WebAuthn challenge handed out and not yet answered. Single use, and
 /// bound to the session, pending sign-in or browser it was made for.
 pub(super) struct Ceremony {
-    challenge: [u8; 32],
-    kind: CeremonyKind,
+    pub(super) challenge: [u8; 32],
+    pub(super) kind: CeremonyKind,
     /// The session token, pending token or `lore_webauthn` cookie value.
     pub(super) bound_to: String,
     /// The account it was made for; `None` for a passwordless sign-in.
     pub(super) account: Option<String>,
-    rp: RelyingParty,
-    user_verification: bool,
+    pub(super) rp: RelyingParty,
+    pub(super) user_verification: bool,
     /// The credential ids offered; empty for a passwordless sign-in.
-    allowed: Vec<Vec<u8>>,
-    expires: Instant,
+    pub(super) allowed: Vec<Vec<u8>>,
+    pub(super) expires: Instant,
 }
 
 /// Which second factors the account has, and which of them work at this
@@ -571,7 +573,7 @@ fn restart(message: &str) -> Response {
 
 /// Stores a new challenge; `None` when the map is full of passwordless
 /// challenges and this one is passwordless too.
-fn insert_ceremony(admin: &Admin, ceremony: Ceremony) -> Option<String> {
+pub(super) fn insert_ceremony(admin: &Admin, ceremony: Ceremony) -> Option<String> {
     let mut id = [0u8; 32];
     getrandom::fill(&mut id).ok()?;
     let id = crate::webauthn::b64url_encode(&id);
@@ -595,7 +597,7 @@ fn insert_ceremony(admin: &Admin, ceremony: Ceremony) -> Option<String> {
 
 /// Takes a challenge out of the map (single use, whatever happens next):
 /// it must exist, be unexpired, be of `kind`'s sort and bound to `bound`.
-fn take_ceremony(
+pub(super) fn take_ceremony(
     admin: &Admin,
     id: &str,
     bound: Option<&str>,
@@ -607,7 +609,7 @@ fn take_ceremony(
     (ceremony.expires > Instant::now() && bound_ok && matches(&ceremony.kind)).then_some(ceremony)
 }
 
-fn new_challenge() -> Option<[u8; 32]> {
+pub(super) fn new_challenge() -> Option<[u8; 32]> {
     let mut challenge = [0u8; 32];
     getrandom::fill(&mut challenge).ok()?;
     Some(challenge)
@@ -642,7 +644,7 @@ fn unknown_host() -> Response {
 /// Makes an assertion challenge for `account`'s passkeys at this relying
 /// party: the second step (UV preferred) or a re-authentication (UV
 /// required). `Ok(None)` when the account has no passkey here.
-fn account_assertion_options(
+pub(super) fn account_assertion_options(
     admin: &Admin,
     account: &str,
     rp: RelyingParty,
@@ -740,7 +742,7 @@ impl std::fmt::Debug for SecondFactorForm {
 }
 
 /// How checking one second factor went.
-enum FactorCheck {
+pub(super) enum FactorCheck {
     /// Right; `Some(n)` recovery codes are left after a recovery code.
     Ok(Option<i64>),
     /// Wrong, with the reason for the log.
@@ -749,7 +751,12 @@ enum FactorCheck {
 
 /// Checks an authenticator-app code for `account` at `now`; a right code
 /// is accepted once (its step must be later than every step used before).
-fn check_totp(admin: &Admin, account: &str, code: &str, now: u64) -> anyhow::Result<FactorCheck> {
+pub(super) fn check_totp(
+    admin: &Admin,
+    account: &str,
+    code: &str,
+    now: u64,
+) -> anyhow::Result<FactorCheck> {
     let Some(row) = admin.db.totp(account)? else {
         return Ok(FactorCheck::Wrong("no authenticator app".into()));
     };
@@ -769,7 +776,11 @@ fn check_totp(admin: &Admin, account: &str, code: &str, now: u64) -> anyhow::Res
 }
 
 /// Spends a recovery code of `account`.
-fn check_recovery(admin: &Admin, account: &str, code: &str) -> anyhow::Result<FactorCheck> {
+pub(super) fn check_recovery(
+    admin: &Admin,
+    account: &str,
+    code: &str,
+) -> anyhow::Result<FactorCheck> {
     let Some(normalized) = crate::totp::normalize_recovery(code) else {
         return Ok(FactorCheck::Wrong("malformed recovery code".into()));
     };
@@ -780,11 +791,9 @@ fn check_recovery(admin: &Admin, account: &str, code: &str) -> anyhow::Result<Fa
     })
 }
 
-/// A verified passkey assertion: the account it signed in, the record.
-struct VerifiedPasskey {
-    account: String,
-    #[allow(dead_code, reason = "re-authentication uses it in the next commit")]
-    credential: db::Credential,
+/// A verified passkey assertion: the account it signed in.
+pub(super) struct VerifiedPasskey {
+    pub(super) account: String,
 }
 
 /// Verifies a passkey answer to a challenge already taken out of the map.
@@ -792,7 +801,7 @@ struct VerifiedPasskey {
 /// offered to that account; for a passwordless sign-in the user handle
 /// names the account. Updates the record (counter, backup state, last
 /// use) on success; logs a counter regression.
-fn verify_passkey(
+pub(super) fn verify_passkey(
     admin: &Admin,
     ceremony: &Ceremony,
     credential: &serde_json::Value,
@@ -864,8 +873,7 @@ fn verify_passkey(
                 )
                 .map_err(|error| error.to_string())?;
             Ok(VerifiedPasskey {
-                account: stored.account.clone(),
-                credential: stored,
+                account: stored.account,
             })
         }
         Err(crate::webauthn::Error::CounterRegression) => {

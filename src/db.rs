@@ -19,7 +19,6 @@ mod builtin;
 pub use builtin::*;
 mod rename;
 pub use rename::*;
-#[allow(dead_code, reason = "the sign-in routes use these in a later commit")]
 mod signin;
 pub use signin::*;
 
