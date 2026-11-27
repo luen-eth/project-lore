@@ -217,6 +217,16 @@ const ROUTES: &[(&str, &str, Access)] = &[
         Access::Needs(Perm::Agents),
     ),
     ("POST", "/admin/api/tasks", Access::Needs(Perm::Write)),
+    (
+        "POST",
+        "/admin/api/tasks/{id}/notes",
+        Access::Needs(Perm::Write),
+    ),
+    (
+        "POST",
+        "/admin/api/tasks/{id}/hand-off",
+        Access::Needs(Perm::Agents),
+    ),
     ("POST", "/admin/api/notes", Access::Needs(Perm::Write)),
     ("PUT", "/admin/api/notes/{id}", Access::Needs(Perm::Write)),
     (
@@ -574,6 +584,14 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
             put(notes::edit_note).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
         )
         .route("/admin/api/todos", get(notes::list_todos))
+        .route(
+            "/admin/api/tasks/{id}/notes",
+            post(notes::add_task_note).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/tasks/{id}/hand-off",
+            post(notes::hand_off).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
         .route(
             "/admin/api/todos/from-entry/{id}",
             post(notes::todo_from_entry),
@@ -2074,9 +2092,12 @@ async fn board(State(admin): State<Arc<Admin>>, Query(query): Query<BoardQuery>)
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         let project = project.as_deref();
         let tasks = state.db.tasks(project, &[], limit)?;
+        let notes = state
+            .db
+            .task_notes(&tasks.iter().map(|task| task.id).collect::<Vec<_>>())?;
         let messages = state.db.messages(project, 100)?;
         let counts = state.db.board_counts()?;
-        Ok(json!({ "tasks": tasks, "messages": messages, "counts": counts }))
+        Ok(json!({ "tasks": tasks, "task_notes": notes, "messages": messages, "counts": counts }))
     })
     .await;
     respond(result)
@@ -2098,6 +2119,9 @@ struct TaskForm {
     dokploy_project_id: String,
     #[serde(default)]
     cloudflare_zone: String,
+    /// Manual: lore never assigns it to a built-in agent by itself.
+    #[serde(default)]
+    manual: bool,
 }
 
 /// The identity a task added or touched on the admin page is recorded
@@ -2150,6 +2174,7 @@ async fn add_task(
             dokploy_project_id: form.dokploy_project_id,
             cloudflare_zone: form.cloudflare_zone,
         },
+        manual: form.manual,
     };
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Task> {
@@ -2194,6 +2219,9 @@ struct TaskUpdateForm {
     dokploy_project_id: String,
     #[serde(default)]
     cloudflare_zone: String,
+    /// With `action` "manual": on (true) or off.
+    #[serde(default)]
+    manual: Option<bool>,
 }
 
 /// Moves one task along its life cycle as the admin, who may release or
@@ -2217,6 +2245,29 @@ async fn update_task(
     }
     let state = admin.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Task>> {
+        if form.action.trim() == "manual" {
+            let manual = form.manual.unwrap_or(true);
+            let Some(task) = state.db.set_task_manual(id, manual)? else {
+                return Ok(None);
+            };
+            let summary = format!(
+                "task #{} {}",
+                task.id,
+                if manual { "manual" } else { "automatic" }
+            );
+            if let Ok(activity) = state.db.record_activity(
+                ADMIN_ACTOR,
+                "task_update",
+                &task.project,
+                None,
+                None,
+                &[],
+                &summary,
+            ) {
+                state.events.publish(activity);
+            }
+            return Ok(Some(task));
+        }
         if form.action.trim() == "targets" {
             let targets = crate::db::TaskTargets {
                 repo: form.repo,
@@ -3770,6 +3821,124 @@ mod tests {
     /// The Notes and To-do views: anyone signed in reads, `write` adds
     /// and edits; only notes are edited; a note-style to-do moves to the
     /// board.
+    /// The owner's notes on tasks and the manual switch need `write`, the
+    /// hand-off `agents`; nobody else gets through, and notes keep the
+    /// author and the order.
+    #[tokio::test]
+    async fn task_notes_manual_and_hand_off_follow_the_roles() {
+        let (base, admin) = serve().await;
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: &str, token: Option<&str>| {
+            let mut request = client.request(method, format!("{base}{path}"));
+            if let Some(token) = token {
+                request = request.header(header::COOKIE, format!("{COOKIE}={token}"));
+            }
+            request
+        };
+        let task: serde_json::Value = call(
+            reqwest::Method::POST,
+            "/admin/api/tasks",
+            Some("admin-token"),
+        )
+        .json(&json!({ "project": "shop", "title": "Hold me", "manual": true }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(task["manual"], true);
+        let id = task["id"].as_i64().unwrap();
+        for token in [None, Some("viewer-token")] {
+            let expected = if token.is_some() { 403 } else { 401 };
+            for request in [
+                call(
+                    reqwest::Method::POST,
+                    &format!("/admin/api/tasks/{id}/notes"),
+                    token,
+                )
+                .json(&json!({"body": "x"})),
+                call(
+                    reqwest::Method::POST,
+                    &format!("/admin/api/tasks/{id}/hand-off"),
+                    token,
+                )
+                .json(&json!({})),
+                call(
+                    reqwest::Method::PUT,
+                    &format!("/admin/api/tasks/{id}"),
+                    token,
+                )
+                .json(&json!({"action": "manual", "manual": false})),
+            ] {
+                assert_eq!(request.send().await.unwrap().status(), expected);
+            }
+        }
+        for body in ["First, read the design.", "Then ask before pushing."] {
+            let note = call(
+                reqwest::Method::POST,
+                &format!("/admin/api/tasks/{id}/notes"),
+                Some("admin-token"),
+            )
+            .json(&json!({ "body": body }))
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(note.status(), 200);
+        }
+        let empty = call(
+            reqwest::Method::POST,
+            &format!("/admin/api/tasks/{id}/notes"),
+            Some("admin-token"),
+        )
+        .json(&json!({ "body": "  " }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(empty.status(), 400);
+        let board: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/board",
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let notes = &board["task_notes"][id.to_string()];
+        assert_eq!(notes[0]["body"], "First, read the design.");
+        assert_eq!(notes[1]["body"], "Then ask before pushing.");
+        assert_eq!(notes[0]["author"], "admin");
+        // The switch, by the page.
+        let changed: serde_json::Value = call(
+            reqwest::Method::PUT,
+            &format!("/admin/api/tasks/{id}"),
+            Some("admin-token"),
+        )
+        .json(&json!({ "action": "manual", "manual": false }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(changed["manual"], false);
+        assert!(!admin.db.task(id).unwrap().unwrap().manual);
+        // No built-in agents here: the hand-off says so.
+        let hand = call(
+            reqwest::Method::POST,
+            &format!("/admin/api/tasks/{id}/hand-off"),
+            Some("admin-token"),
+        )
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(hand.status(), 400);
+    }
+
     #[tokio::test]
     async fn notes_and_to_dos_follow_the_roles() {
         let (base, admin) = serve().await;

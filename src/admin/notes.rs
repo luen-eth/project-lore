@@ -223,7 +223,10 @@ pub(super) async fn list_todos(
             state.db.recent(project.as_deref(), Some("todo"), 200)?
         };
         let projects = state.db.projects()?.into_iter().map(|p| p.project).collect::<Vec<_>>();
-        Ok(json!({ "tasks": tasks, "entries": entries, "projects": projects, "general": GENERAL_PROJECT }))
+        let task_notes = state
+            .db
+            .task_notes(&tasks.iter().map(|task| task.id).collect::<Vec<_>>())?;
+        Ok(json!({ "tasks": tasks, "task_notes": task_notes, "entries": entries, "projects": projects, "general": GENERAL_PROJECT }))
     })
     .await;
     respond(result)
@@ -266,6 +269,7 @@ pub(super) async fn todo_from_entry(
             created_by: ADMIN_ACTOR.into(),
             session_id: None,
             targets: crate::db::TaskTargets::default(),
+            manual: false,
         })?;
         state.db.set_task_author(task.id, &page_author(&me))?;
         state.db.amend(
@@ -298,5 +302,77 @@ pub(super) async fn todo_from_entry(
             tracing::error!(%error, "moving a to-do failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct TaskNoteForm {
+    #[serde(default)]
+    body: String,
+}
+
+/// `POST /admin/api/tasks/{id}/notes` (`write`): the signed-in user's note
+/// on a task, whatever its status; the task itself does not change.
+pub(super) async fn add_task_note(
+    State(admin): State<Arc<Admin>>,
+    Extension(me): Extension<SignedIn>,
+    Path(id): Path<i64>,
+    Json(form): Json<TaskNoteForm>,
+) -> Response {
+    let state = admin.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<crate::db::TaskNote>> {
+            let note = state.db.add_task_note(id, &me.username, &form.body)?;
+            if let Some(note) = &note {
+                note_activity(
+                    &state,
+                    "task_update",
+                    &format!(
+                        "{} noted on task #{}: {}",
+                        me.username,
+                        note.task_id,
+                        note.body.chars().take(80).collect::<String>()
+                    ),
+                );
+            }
+            Ok(note)
+        })
+        .await;
+    match result {
+        Ok(Ok(Some(note))) => Json(note).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(error)) => bad_request(&error.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "adding a task note failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct HandOffForm {
+    /// A built-in agent, or empty for any.
+    #[serde(default)]
+    agent: String,
+}
+
+/// `POST /admin/api/tasks/{id}/hand-off` (`agents`): starts a built-in
+/// agent's run on an open, unclaimed task now, manual or not, under the
+/// checks a delegation passes. The manual flag stays as it is.
+pub(super) async fn hand_off(
+    State(admin): State<Arc<Admin>>,
+    Path(id): Path<i64>,
+    Json(form): Json<HandOffForm>,
+) -> Response {
+    let Some(runner) = admin.task_runner.clone() else {
+        return bad_request("this lore has no built-in agents");
+    };
+    let agent = form.agent.trim().to_lowercase();
+    match runner
+        .hand_off(id, (!agent.is_empty()).then_some(agent.as_str()))
+        .await
+    {
+        Ok(said) => Json(json!({ "ok": true, "message": said })).into_response(),
+        Err(why) => bad_request(&why),
     }
 }

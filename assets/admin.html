@@ -175,6 +175,7 @@
         <option value="open" selected>Open</option>
         <option value="done">Done</option>
         <option value="all">All</option>
+        <option value="manual">Manual only</option>
       </select>
       <select id="todo-project" aria-label="Project"></select>
     </div>
@@ -367,6 +368,7 @@
           <label class="board-field"><span>Details</span>
             <textarea id="task-body" maxlength="4000" placeholder="Optional: what exactly the task involves"></textarea>
           </label>
+          <label class="builtin-check task-manual-check"><input id="task-manual" type="checkbox"> <span>Manual: lore will not assign it to a built-in agent</span></label>
           <details class="task-targets">
             <summary>Where the work goes (optional)</summary>
             <label class="board-field"><span>Repository</span>

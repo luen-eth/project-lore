@@ -736,6 +736,15 @@ impl Db {
             .optional()?)
     }
 
+    /// One open, unclaimed task as the scheduler sees it, for a hand-off
+    /// the owner asked for (manual or not).
+    pub fn auto_task(&self, id: i64) -> Result<Option<AutoTask>> {
+        Ok(self
+            .auto_tasks_where(0, 1, &format!("AND id = {id}"))?
+            .into_iter()
+            .next())
+    }
+
     /// Every open, unclaimed task, oldest first, with whether it is idle
     /// (not updated for `idle_minutes`) and whether the runner already
     /// took or skipped it since it was last re-queued.
@@ -745,8 +754,8 @@ impl Db {
 
     /// The tasks the scheduler may take now, oldest first: open,
     /// unclaimed, idle, not waiting, under `max_attempts` automatic
-    /// attempts, and not delegated (a delegated task waits for its own
-    /// agent). Filtered here, before the limit, so skipped tasks never
+    /// attempts, not delegated (a delegated task waits for its own agent)
+    /// and not manual (lore never assigns a manual task by itself). Filtered here, before the limit, so skipped tasks never
     /// crowd out eligible ones.
     pub fn eligible_auto_tasks(
         &self,
@@ -757,7 +766,8 @@ impl Db {
         let filter = format!(
             "AND updated_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)
              AND NOT {WAITING_SQL} AND auto_attempts < {}
-             AND id NOT IN (SELECT task_id FROM delegations)",
+             AND id NOT IN (SELECT task_id FROM delegations)
+             AND COALESCE(manual, 0) = 0",
             max_attempts.max(0)
         );
         self.auto_tasks_where(idle_minutes, limit, &filter)
@@ -782,10 +792,10 @@ impl Db {
         let rows = stmt.query_map(params![offset, limit as i64], |row| {
             Ok(AutoTask {
                 task: super::Task::from_row(row)?,
-                idle: row.get(18)?,
-                waiting: row.get(19)?,
-                auto_attempts: row.get(20)?,
-                author: row.get(21)?,
+                idle: row.get(19)?,
+                waiting: row.get(20)?,
+                auto_attempts: row.get(21)?,
+                author: row.get(22)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1104,11 +1114,11 @@ impl Db {
             Ok((
                 super::Task::from_row(row)?,
                 Delegation {
-                    task_id: row.get(18)?,
-                    agent: row.get(19)?,
-                    requested_by: row.get(20)?,
-                    via: row.get(21)?,
-                    created_at: row.get(22)?,
+                    task_id: row.get(19)?,
+                    agent: row.get(20)?,
+                    requested_by: row.get(21)?,
+                    via: row.get(22)?,
+                    created_at: row.get(23)?,
                 },
             ))
         })?;

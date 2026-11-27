@@ -215,6 +215,30 @@ lore recorded for the project), `dokploy_project_id` and `cloudflare_zone`. The 
 page sets them when adding a task and changes them later (**Where it goes**). A
 built-in agent working on the task may write only there (see *The task runner*).
 
+**The owner's notes on a task.** On the Board and in the To-do view, a user with the
+`write` permission adds notes to any task (open, claimed or done) with **Add a note**,
+without changing it; they show in order with the user's name and time, below the
+latest status note agents and lore write. They are kept in the `task_notes` table
+(schema 9; the JSON backup does not carry them, the full backup does). Agents see them
+in `tasks` and `todos` as `note from the owner (<user>, <time>)`, and a built-in
+agent's run gets them in its prompt as the owner's notes on the task, outside the
+block of untrusted task text, to follow within lore's rules.
+
+**Manual tasks.** A task can be manual (`tasks.manual`, schema 9; NULL means
+automatic, as before): lore never assigns it to a built-in agent by itself (the idle
+rule of *The task runner* skips it, however long it waits, and the task's line on the
+page and in `tasks`/`todos` says "manual: lore will not assign it to a built-in
+agent"). Everything else is as for any task: agents see it and may claim it, and
+`delegate` still starts the tasks it creates. On the page, a user with `write` sets it
+in the add form or with **Make manual / Make automatic** on a task, and filters with
+**Manual** (Board) or **Manual only** (To-do); with the `agents` permission **Hand to a
+built-in agent now** starts a run on an open, unclaimed task at once, under the checks
+any board task's run passes (its author's rights, where the work goes), and leaves the
+flag as it is, so a task the run does not finish simply waits again. Agents set
+`manual` when adding a task (`task_add`, `todo_add`) and switch it either way with
+`task_update` (`manual: true/false`, with or without an action); a built-in agent's run
+cannot change it.
+
 **Messages** go to one agent (`send` with `to`) or to every agent (`send` without
 it). A message counts as unread for an agent until that agent has seen it; an
 agent never gets its own messages. `hello` lists up to ten unread messages and
@@ -1628,7 +1652,8 @@ Every minute, while at least one built-in agent is enabled (*Works on idle board
 tasks*), lore looks at the board. Nothing runs, and no service is asked anything,
 while no built-in agent is enabled.
 
-**Which task.** A task is taken when it is open and unclaimed, nobody touched it for
+**Which task.** A manual task is never taken (see *The board*). Otherwise a task is
+taken when it is open and unclaimed, nobody touched it for
 `LORE_AUTO_TASK_IDLE_MINUTES` (120), it is meant for anyone (or for that agent), it
 was not already taken or skipped since it was last touched, and its repository
 resolves: the task's own `repo`, else the latest repository lore recorded for the

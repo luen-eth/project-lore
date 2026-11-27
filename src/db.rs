@@ -148,6 +148,17 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_project_status ON tasks (project, status);
 
+-- Notes the owner (a signed-in user) leaves on a task (schema 9), in order;
+-- the task's own `note` stays the latest status note agents and lore write.
+CREATE TABLE IF NOT EXISTS task_notes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    INTEGER NOT NULL,
+    author     TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS task_notes_task ON task_notes (task_id, id);
+
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     kind         TEXT NOT NULL,
@@ -276,7 +287,7 @@ const RULE_BODY_MAX_CHARS: usize = 2000;
 const TASK_COLUMNS: &str = "id, project, title, body, status, assignee, created_by, \
                             claimed_by, done_by, done_commit, note, session_id, \
                             created_at, updated_at, done_at, repo, dokploy_project_id, \
-                            cloudflare_zone";
+                            cloudflare_zone, manual";
 
 /// The columns of a message row, in the order `Message::from_row` reads them.
 const MESSAGE_COLUMNS: &str = "id, kind, project, from_agent, to_agent, body, session_id, \
@@ -359,8 +370,9 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// agent's display name (`agent_registry.display_name`), and per built-in
 /// agent the services of its terminals and the order and fallback of
 /// Claude's credentials (`builtin_agents.terminal_services`,
-/// `claude_priority`, `claude_fallback`); all nullable, NULL being the
-/// behaviour before them.
+/// `claude_priority`, `claude_fallback`), a task's manual flag
+/// (`tasks.manual`) and the owner's notes on tasks (`task_notes`); the
+/// columns nullable, NULL being the behaviour before them.
 pub const SCHEMA_VERSION: i64 = 9;
 
 /// Columns every database lore ever created has in `entries`: a full
@@ -454,6 +466,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("builtin_agents", "terminal_services", "TEXT"),
     ("builtin_agents", "claude_priority", "TEXT"),
     ("builtin_agents", "claude_fallback", "INTEGER"),
+    // Tasks (schema 9): manual, never assigned to a built-in agent by lore
+    // itself (NULL or 0: automatic, as before).
+    ("tasks", "manual", "INTEGER"),
 ];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -817,6 +832,10 @@ pub struct Task {
     /// A Cloudflare zone id the work may change; empty for read-only.
     #[serde(default)]
     pub cloudflare_zone: String,
+    /// Manual (schema 9): lore never assigns it to a built-in agent by
+    /// itself (the idle rule skips it); anything else is as for any task.
+    #[serde(default)]
+    pub manual: bool,
 }
 
 impl Task {
@@ -840,6 +859,30 @@ impl Task {
             repo: row.get(15)?,
             dokploy_project_id: row.get(16)?,
             cloudflare_zone: row.get(17)?,
+            manual: row.get::<_, Option<bool>>(18)?.unwrap_or(false),
+        })
+    }
+}
+
+/// A note the owner (a signed-in user) left on a task.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskNote {
+    pub id: i64,
+    pub task_id: i64,
+    /// The user name.
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+impl TaskNote {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            task_id: row.get(1)?,
+            author: row.get(2)?,
+            body: row.get(3)?,
+            created_at: row.get(4)?,
         })
     }
 }
@@ -859,6 +902,8 @@ pub struct NewTask {
     /// Where the work goes and what it may change (see `Task`); checked
     /// by `normalize_task_targets`.
     pub targets: TaskTargets,
+    /// Manual: never assigned to a built-in agent by lore itself.
+    pub manual: bool,
 }
 
 /// The optional fields that say where a task's work goes: the repository,
@@ -2325,9 +2370,9 @@ impl Db {
                 "INSERT INTO tasks (id, project, title, body, status, assignee, created_by,
                                       claimed_by, done_by, done_commit, note, session_id,
                                       created_at, updated_at, done_at, repo,
-                                      dokploy_project_id, cloudflare_zone)
+                                      dokploy_project_id, cloudflare_zone, manual)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16, ?17, ?18)",
+                         ?16, ?17, ?18, ?19)",
                 params![
                     task.id,
                     task.project,
@@ -2346,7 +2391,8 @@ impl Db {
                     task.done_at,
                     task.repo,
                     task.dokploy_project_id,
-                    task.cloudflare_zone
+                    task.cloudflare_zone,
+                    task.manual.then_some(true)
                 ],
             )?;
         }
@@ -2583,9 +2629,9 @@ impl Db {
                 "INSERT INTO tasks (project, title, body, status, assignee, created_by,
                                       claimed_by, done_by, done_commit, note, session_id,
                                       created_at, updated_at, done_at, repo,
-                                      dokploy_project_id, cloudflare_zone)
+                                      dokploy_project_id, cloudflare_zone, manual)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16, ?17)",
+                         ?16, ?17, ?18)",
                 params![
                     task.project,
                     task.title,
@@ -2603,7 +2649,8 @@ impl Db {
                     task.done_at,
                     task.repo,
                     task.dokploy_project_id,
-                    task.cloudflare_zone
+                    task.cloudflare_zone,
+                    task.manual.then_some(true)
                 ],
             )?;
         }
@@ -3024,6 +3071,70 @@ impl Db {
     }
 
     /// Adds a task to a project's shared to-do list.
+    /// Adds the owner's note to a task (any status), in order.
+    pub fn add_task_note(
+        &self,
+        task_id: i64,
+        author: &str,
+        body: &str,
+    ) -> Result<Option<TaskNote>> {
+        let body = body.trim();
+        if body.is_empty() {
+            anyhow::bail!("the note is empty");
+        }
+        if body.chars().count() > BODY_MAX_CHARS {
+            anyhow::bail!("the note must be at most {BODY_MAX_CHARS} characters");
+        }
+        let conn = self.lock();
+        if get_task(&conn, task_id)?.is_none() {
+            return Ok(None);
+        }
+        conn.execute(
+            "INSERT INTO task_notes (task_id, author, body) VALUES (?1, ?2, ?3)",
+            params![task_id, author, body],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(Some(conn.query_row(
+            "SELECT id, task_id, author, body, created_at FROM task_notes WHERE id = ?1",
+            params![id],
+            TaskNote::from_row,
+        )?))
+    }
+
+    /// The owner's notes on these tasks, oldest first per task.
+    pub fn task_notes(&self, task_ids: &[i64]) -> Result<HashMap<i64, Vec<TaskNote>>> {
+        let mut out: HashMap<i64, Vec<TaskNote>> = HashMap::new();
+        if task_ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, author, body, created_at FROM task_notes WHERE task_id = ?1
+             ORDER BY id",
+        )?;
+        for id in task_ids {
+            let notes = stmt
+                .query_map(params![id], TaskNote::from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !notes.is_empty() {
+                out.insert(*id, notes);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Puts a task on manual (lore never assigns it to a built-in agent by
+    /// itself) or back to automatic.
+    pub fn set_task_manual(&self, id: i64, manual: bool) -> Result<Option<Task>> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE tasks SET manual = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1",
+            params![id, manual.then_some(true)],
+        )?;
+        get_task(&conn, id)
+    }
+
     pub fn add_task(&self, new: &NewTask) -> Result<Task> {
         let (project, title, body) = normalize_task(&new.project, &new.title, &new.body)?;
         let assignee = new.assignee.trim().to_lowercase();
@@ -3033,10 +3144,10 @@ impl Db {
         conn.execute(
             "INSERT INTO tasks (project, title, body, assignee, created_by, session_id,
                                  created_at, updated_at, repo, dokploy_project_id,
-                                 cloudflare_zone)
+                                 cloudflare_zone, manual)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6,
                      strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?7, ?8, ?9)",
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?7, ?8, ?9, ?10)",
             params![
                 project,
                 title,
@@ -3046,7 +3157,8 @@ impl Db {
                 new.session_id,
                 targets.repo,
                 targets.dokploy_project_id,
-                targets.cloudflare_zone
+                targets.cloudflare_zone,
+                new.manual.then_some(true)
             ],
         )?;
         let id = conn.last_insert_rowid();

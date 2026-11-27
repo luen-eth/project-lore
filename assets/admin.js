@@ -2001,7 +2001,7 @@ const board = {
   tab: "tasks", filter: "open", project: "",
   data: null, loading: null, again: false, timer: null,
 };
-const TASK_FILTERS = [["open", "Open"], ["done", "Done"], ["all", "All"]];
+const TASK_FILTERS = [["open", "Open"], ["done", "Done"], ["all", "All"], ["manual", "Manual"]];
 const TASK_ACTIONS = {
   open: ["done", "cancel"],
   claimed: ["done", "release", "cancel"],
@@ -2162,6 +2162,7 @@ function renderTasks(admin) {
     open: (task) => task.status === "open" || task.status === "claimed",
     done: (task) => task.status === "done",
     all: () => true,
+    manual: (task) => task.manual,
   };
   const chips = $("board-chips");
   chips.replaceChildren();
@@ -2183,6 +2184,91 @@ function renderTasks(admin) {
     return;
   }
   for (const task of tasks) list.append(taskItem(task, admin));
+}
+
+/* What the Board and the To-do view add to a task: the manual marker,
+   the owner's notes in order, and with `write` a note field, the manual
+   switch and (with `agents`) "Hand to a built-in agent now". */
+function taskExtras(item, task, notes, reload, statusLine) {
+  if (task.manual) item.append(el("div", "board-meta task-manual", "manual: lore will not assign this to a built-in agent"));
+  if (notes && notes.length) {
+    const list = el("ul", "task-owner-notes");
+    for (const note of notes) {
+      const line = el("li");
+      line.append(el("span", "muted small-text", `${note.author} · ${ago(note.created_at)}`), el("span", "", note.body));
+      list.append(line);
+    }
+    item.append(list);
+  }
+  if (!can("write")) return;
+  const row = el("div", "board-actions");
+  const manual = el("button", "ghost small", task.manual ? "Make automatic" : "Make manual");
+  manual.type = "button";
+  manual.setAttribute("aria-pressed", String(task.manual));
+  manual.title = task.manual ? "lore may assign it to a built-in agent again after its idle time" : "lore will not assign it to a built-in agent by itself";
+  manual.addEventListener("click", async () => {
+    manual.disabled = true;
+    const response = await api("/admin/api/tasks/" + task.id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "manual", manual: !task.manual }),
+    }).catch(() => null);
+    manual.disabled = false;
+    if (!response || !response.ok) { statusLine((response && (await response.json().catch(() => ({}))).error) || "It could not be changed.", "bad"); return; }
+    reload();
+  });
+  row.append(manual);
+  const addNote = el("button", "ghost small", "Add a note");
+  addNote.type = "button";
+  addNote.addEventListener("click", () => {
+    const open = item.querySelector(".task-note-form");
+    if (open) { open.remove(); return; }
+    const form = el("form", "board-form task-note-form");
+    const field = el("textarea");
+    field.maxLength = 4000;
+    field.required = true;
+    field.setAttribute("aria-label", "Note on task #" + task.id);
+    const save = el("button", "ghost small", "Save note");
+    save.type = "submit";
+    const actions = el("div", "board-form-actions");
+    actions.append(save);
+    form.append(field, actions);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      save.disabled = true;
+      const response = await api(`/admin/api/tasks/${task.id}/notes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body: field.value }),
+      }).catch(() => null);
+      save.disabled = false;
+      if (!response || !response.ok) { statusLine((response && (await response.json().catch(() => ({}))).error) || "The note could not be saved.", "bad"); return; }
+      statusLine(`Note added to task #${task.id}.`, "ok");
+      reload();
+    });
+    item.append(form);
+    field.focus();
+  });
+  row.append(addNote);
+  if (can("agents") && task.status === "open" && !task.claimed_by) {
+    const hand = el("button", "ghost small", "Hand to a built-in agent now");
+    hand.type = "button";
+    hand.addEventListener("click", async () => {
+      hand.disabled = true;
+      const response = await api(`/admin/api/tasks/${task.id}/hand-off`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agent: "" }),
+      }).catch(() => null);
+      hand.disabled = false;
+      const answer = response ? await response.json().catch(() => ({})) : {};
+      if (!response || !response.ok) { statusLine(answer.error || "It could not be handed over.", "bad"); return; }
+      statusLine(answer.message || "Started.", "ok");
+      reload();
+    });
+    row.append(hand);
+  }
+  item.append(row);
 }
 
 function taskItem(task, admin) {
@@ -2207,6 +2293,7 @@ function taskItem(task, admin) {
   if (task.cloudflare_zone) targets.push(`zone ${task.cloudflare_zone}`);
   if (targets.length) item.append(el("div", "board-meta", targets.join(" · ")));
   if (task.note) item.append(el("p", "board-note", "Note: " + task.note));
+  taskExtras(item, task, ((board.data && board.data.task_notes) || {})[task.id], () => loadBoard(), boardStatus);
   if (admin) {
     const actions = TASK_ACTIONS[task.status] || [];
     const row = el("div", "board-actions");
@@ -2385,6 +2472,7 @@ $("task-form").addEventListener("submit", async (event) => {
     repo: $("task-repo").value.trim(),
     dokploy_project_id: $("task-dokploy").value.trim(),
     cloudflare_zone: $("task-zone").value.trim(),
+    manual: $("task-manual").checked,
   }, $("task-submit"));
   if (!task) return;
   // The project and the assignee stay for the next task.
@@ -4466,7 +4554,8 @@ $("note-form").addEventListener("submit", async (event) => {
 });
 
 async function loadTodo() {
-  const query = new URLSearchParams({ status: lists.todoStatus });
+  const manualOnly = lists.todoStatus === "manual";
+  const query = new URLSearchParams({ status: manualOnly ? "open" : lists.todoStatus });
   if (lists.todoProject) query.set("project", lists.todoProject);
   let data;
   try {
@@ -4497,6 +4586,11 @@ async function loadTodo() {
   select.value = lists.todoProject;
   const list = $("todo-list");
   list.replaceChildren();
+  if (manualOnly) {
+    data.tasks = data.tasks.filter((task) => task.manual);
+    data.entries = [];
+  }
+  lists.taskNotes = data.task_notes || {};
   const total = data.tasks.length + data.entries.length;
   $("todo-count").textContent = `${total} item${total === 1 ? "" : "s"}`;
   if (!total) list.append(el("li", "none", lists.todoStatus === "done" ? "Nothing done yet." : "Nothing on the list."));
@@ -4515,6 +4609,7 @@ function todoTask(task, general) {
   if (task.done_by) meta.push(`done by ${displayName(task.done_by)}`);
   item.append(head, el("div", "board-meta", meta.join(" · ")));
   if (task.body) item.append(el("p", "note-body clipped", task.body));
+  taskExtras(item, task, (lists.taskNotes || {})[task.id], () => loadTodo(), (text, tone) => listStatus("todo-status-line", text, tone));
   if (can("write") && (task.status === "open" || task.status === "claimed")) {
     const actions = el("div", "board-actions");
     const done = el("button", "ghost small", "Mark done");

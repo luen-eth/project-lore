@@ -416,6 +416,10 @@ pub struct TodoAddArgs {
     /// it) to the board: its title and text become the task (unless you
     /// pass others) and the entry gets a line pointing at the task.
     pub from_entry: Option<i64>,
+    /// True: a manual task. lore never assigns it to a built-in agent by
+    /// itself (its two-hour rule skips it); you and other agents may work
+    /// on it as on any task.
+    pub manual: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -456,6 +460,10 @@ pub struct TaskAddArgs {
     /// A Cloudflare zone id the work may change. Without it a built-in
     /// agent working on the task may only read Cloudflare.
     pub cloudflare_zone: Option<String>,
+    /// True: a manual task. lore never assigns it to a built-in agent by
+    /// itself (its two-hour rule skips it); you and other agents may work
+    /// on it as on any task.
+    pub manual: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -465,8 +473,14 @@ pub struct TaskUpdateArgs {
     /// Id of the task, as shown by `tasks`.
     pub id: i64,
     /// One of: claim (take the task), release (give it back), done
-    /// (finished), cancel (no longer needed), reopen.
+    /// (finished), cancel (no longer needed), reopen. May be omitted when
+    /// only `manual` changes.
+    #[serde(default)]
     pub action: String,
+    /// True puts the task on manual (lore never assigns it to a built-in
+    /// agent by itself), false back to automatic. A built-in agent's run
+    /// may not change it.
+    pub manual: Option<bool>,
     /// Short status note: what changed, or why the task was closed.
     pub note: Option<String>,
     /// The HEAD commit the work was finished at, with `done`.
@@ -1883,6 +1897,10 @@ impl Lore {
                 other => return Err(format!("status must be open, done or all, not `{other}`")),
             };
             let tasks = this.db.tasks(project.as_deref(), statuses, limit).map_err(internal)?;
+            let owner_notes = this
+                .db
+                .task_notes(&tasks.iter().map(|task| task.id).collect::<Vec<_>>())
+                .map_err(internal)?;
             let entries = if status == "done" {
                 Vec::new()
             } else {
@@ -1915,11 +1933,22 @@ impl Lore {
                 if !task.assignee.is_empty() {
                     line.push_str(&format!(" · for {}", task.assignee));
                 }
+                if task.manual {
+                    line.push_str(" · manual (lore will not assign it to a built-in agent)");
+                }
                 if !task.body.is_empty() {
                     line.push_str(&format!("\n  {}", clip(&task.body, 200)));
                 }
                 out.push_str(&line);
                 out.push('\n');
+                for note in owner_notes.get(&task.id).into_iter().flatten() {
+                    out.push_str(&format!(
+                        "  note from the owner ({}, {}): {}\n",
+                        note.author,
+                        note.created_at,
+                        clip(&note.body, 300)
+                    ));
+                }
             }
             for entry in &entries {
                 out.push_str(&format!(
@@ -1997,6 +2026,7 @@ impl Lore {
                     repo: args.repo,
                     dokploy_project_id: args.dokploy_project_id,
                     cloudflare_zone: args.cloudflare_zone,
+                    manual: args.manual,
                 }),
                 Extension(parts),
             )
@@ -2057,6 +2087,7 @@ impl Lore {
                 action: "done".into(),
                 note: args.note,
                 commit: args.commit,
+                manual: None,
             }),
             Extension(parts),
         )
@@ -2155,6 +2186,7 @@ impl Lore {
                 created_by: actor.to_string(),
                 session_id: Some(session.id.clone()),
                 targets,
+                manual: args.manual.unwrap_or(false),
             };
             let task = this.db.add_task(&new).map_err(internal)?;
             // The identity lore verified: the token's agent (a built-in
@@ -2222,6 +2254,45 @@ impl Lore {
                 ));
             }
             let action = args.action.trim().to_lowercase();
+            // Manual or automatic: any caller but a built-in agent's run.
+            let mut manual_said = String::new();
+            if let Some(manual) = args.manual {
+                if run {
+                    return Err(
+                        "a built-in agent's run may not put a task on manual or take it off".into(),
+                    );
+                }
+                let task = this
+                    .db
+                    .set_task_manual(args.id, manual)
+                    .map_err(internal)?
+                    .ok_or_else(|| format!("No task with id {}.", args.id))?;
+                this.note(
+                    actor,
+                    "task_update",
+                    &task.project,
+                    Some(&session.id),
+                    None,
+                    &[],
+                    &format!(
+                        "task #{} {}",
+                        task.id,
+                        if manual { "manual" } else { "automatic" }
+                    ),
+                );
+                manual_said = format!(
+                    "Task #{} is {}.",
+                    task.id,
+                    if manual {
+                        "manual: lore will not assign it to a built-in agent"
+                    } else {
+                        "automatic again"
+                    }
+                );
+                if action.is_empty() {
+                    return Ok(manual_said);
+                }
+            }
             if !TASK_ACTIONS.contains(&action.as_str()) {
                 return Err(format!(
                     "action must be one of: {}",
@@ -2333,7 +2404,11 @@ impl Lore {
                 &[],
                 &format!("task #{} {effect}", task.id),
             );
-            Ok(format!("Task #{} {effect}.", task.id))
+            let mut answer = format!("Task #{} {effect}.", task.id);
+            if !manual_said.is_empty() {
+                answer = format!("{manual_said} {answer}");
+            }
+            Ok(answer)
         })
         .await
     }
@@ -2392,9 +2467,12 @@ impl Lore {
             }
             let scope = project.map(|p| format!(" on `{p}`")).unwrap_or_default();
             let mut out = format!("{}{} tasks{scope}:\n", list.len(), word);
+            let ids: Vec<i64> = list.iter().map(|task| task.id).collect();
+            let notes = this.db.task_notes(&ids).map_err(internal)?;
             for task in &list {
                 out.push('\n');
                 out.push_str(&render_task(task));
+                out.push_str(&render_owner_notes(notes.get(&task.id)));
             }
             Ok(out)
         })
@@ -3198,7 +3276,8 @@ impl Lore {
              read-only (nothing is changed anywhere), within about {} minutes; the answer comes \
              back from `ask` when it takes under {} seconds, otherwise to your lore inbox. Pass \
              the `conversation` it returns to follow up.\n\
-             Limits per agent: {} questions and {} delegations an hour.",
+             Limits per agent: {} questions and {} delegations an hour. Board tasks marked manual \
+             are never taken automatically (a delegated task starts all the same).",
             settings.ask_wall_clock.as_secs().div_ceil(60),
             settings.ask_wait.as_secs(),
             settings.asks_per_hour,
@@ -4516,11 +4595,29 @@ fn capped(name: &str, value: Option<&str>, max: usize) -> Result<String, String>
 /// One task as `tasks` lists it: the id, the status, the title, the project
 /// and the creator, who holds or finished it where that applies, then the
 /// body and the latest note.
+/// The owner's notes on a task, as agents see them: marked as the
+/// owner's, oldest first.
+fn render_owner_notes(notes: Option<&Vec<crate::db::TaskNote>>) -> String {
+    let mut out = String::new();
+    for note in notes.into_iter().flatten() {
+        out.push_str(&format!(
+            "note from the owner ({}, {}): {}\n",
+            note.author,
+            note.created_at,
+            clip(&note.body, 600)
+        ));
+    }
+    out
+}
+
 fn render_task(task: &Task) -> String {
     let mut out = format!(
         "#{} [{}] {} · {} · by {}",
         task.id, task.status, task.title, task.project, task.created_by
     );
+    if task.manual {
+        out.push_str(" · manual (lore will not assign it to a built-in agent)");
+    }
     if !task.claimed_by.is_empty() {
         out.push_str(&format!(" → claimed by {}", task.claimed_by));
     }
@@ -4628,7 +4725,7 @@ fn builtin_section(agents: &[crate::taskrunner::BriefingAgent]) -> String {
     if agents.iter().any(|agent| agent.why_not.is_none()) {
         lines.push(
             "`delegate` hands one a task, `ask` asks one a question; `assistants` shows the \
-             details and limits."
+             details and limits. Manual tasks are never taken automatically."
                 .into(),
         );
     } else {
@@ -6963,6 +7060,7 @@ mod tests {
                     created_by: "codex".into(),
                     session_id: None,
                     targets: Default::default(),
+                    manual: false,
                 })
                 .unwrap()
         };
@@ -7140,6 +7238,91 @@ mod tests {
                 .set_builtin_terminal_services(BUILTIN, Some("full"), "admin")
                 .is_err()
         );
+    }
+
+    /// Agents may set manual when adding a task and switch it either way
+    /// with task_update; a built-in agent's run may not; tasks and todos
+    /// show the marker and the owner's notes.
+    #[tokio::test]
+    async fn agents_set_manual_but_runs_cannot_and_the_owner_s_notes_show() {
+        let (lore, world) = helping("manual-agents", |_| {}).await;
+        let (session, _) = hello_as(&lore, "codex").await;
+        let added = lore
+            .task_add(
+                args(json!({"session_id": session, "project": "shop", "title": "On hold", "manual": true})),
+                as_agent(Some("codex")),
+            )
+            .await
+            .unwrap();
+        let id: i64 = added
+            .strip_prefix("Task #")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(world.db.task(id).unwrap().unwrap().manual);
+        world
+            .db
+            .add_task_note(id, "luis", "Wait for the design.")
+            .unwrap();
+        let listed = lore
+            .tasks(
+                args(json!({"session_id": session})),
+                as_agent(Some("codex")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.contains("manual (lore will not assign it to a built-in agent)"),
+            "{listed}"
+        );
+        assert!(listed.contains("note from the owner (luis,"), "{listed}");
+        let todos = lore
+            .todos(
+                args(json!({"session_id": session})),
+                as_agent(Some("codex")),
+            )
+            .await
+            .unwrap();
+        assert!(todos.contains("note from the owner (luis,"), "{todos}");
+        // Either way, by an ordinary agent.
+        let said = lore
+            .task_update(
+                args(json!({"session_id": session, "id": id, "manual": false})),
+                as_agent(Some("codex")),
+            )
+            .await
+            .unwrap();
+        assert!(said.contains("automatic again"), "{said}");
+        lore.task_update(
+            args(json!({"session_id": session, "id": id, "manual": true})),
+            as_agent(Some("codex")),
+        )
+        .await
+        .unwrap();
+        assert!(world.db.task(id).unwrap().unwrap().manual);
+        // Not by a run.
+        let (run_session, _) = hello_as(&lore, BUILTIN).await;
+        let Extension(mut parts) = as_agent(Some(BUILTIN));
+        parts.extensions.insert(RunScope {
+            agent: BUILTIN.into(),
+            task_id: Some(id),
+            ..RunScope::default()
+        });
+        let refused = lore
+            .task_update(
+                args(json!({"session_id": run_session, "id": id, "action": "release", "manual": false})),
+                Extension(parts),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("may not put a task on manual"),
+            "{refused}"
+        );
+        assert!(world.db.task(id).unwrap().unwrap().manual);
     }
 
     #[tokio::test]
