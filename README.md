@@ -1445,6 +1445,12 @@ the organization's, and remembers the answer for ten minutes). A task whose
 repository cannot be resolved gets one note saying why, and waits until someone
 touches it. The oldest task goes first.
 
+Runs work with GitHub repositories only. A repository on the self-hosted GitLab
+(`git_server`) is never a run's target: its address does not resolve, so the task
+gets the note above, and a run's token can push only through the GitHub credential
+its run was started with. The checks the git proxy makes for a run's push (such as
+asking whether a branch it creates already exists) are written for GitHub's API.
+
 **Which agent.** One that is enabled, connected, signed in, idle (one run per agent),
 inside its active hours and under its daily cap, with `full` access to the GitHub
 account that can push. The agents take turns.
