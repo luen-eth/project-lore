@@ -851,6 +851,7 @@ async function api(path, options) {
 }
 
 function showLogin() {
+  bootDone(false);
   clearInterval(state.timer); clearInterval(state.clock);
   if (state.source) { state.source.close(); state.source = null; }
   state.version = null; state.brain = null;
@@ -996,6 +997,53 @@ function applySession(session) {
   if (!can("agents")) closeAgentsPanel();
 }
 
+/* ---------- Loading ---------- */
+
+/* The loader in the HTML shows from the first paint. It goes when the
+   first data is drawn or the sign-in shows; a first load that fails or
+   takes longer than BOOT_PATIENCE_MS becomes a message with Retry. Later
+   reloads and a reconnecting event stream never bring it back. */
+const BOOT_PATIENCE_MS = 10000;
+const boot = { timer: null, loaded: false };
+
+function bootStart() {
+  if (boot.loaded) return;
+  const node = $("boot");
+  node.hidden = false;
+  node.classList.remove("done", "failed");
+  $("boot-failed").hidden = true;
+  $("boot-text").textContent = "Loading memories…";
+  clearTimeout(boot.timer);
+  boot.timer = setTimeout(() => bootFail("Still loading after 10 seconds. The server may be busy or the connection slow."), BOOT_PATIENCE_MS);
+}
+
+function bootFail(message) {
+  if (boot.loaded) return;
+  clearTimeout(boot.timer);
+  const node = $("boot");
+  node.hidden = false;
+  node.classList.remove("done");
+  node.classList.add("failed");
+  $("boot-error").textContent = message;
+  $("boot-failed").hidden = false;
+}
+
+/* `loaded`: the first data is on screen (else the sign-in replaced it). */
+function bootDone(loaded) {
+  clearTimeout(boot.timer);
+  if (loaded) {
+    boot.loaded = true;
+    $("app").classList.remove("loading");
+    $("app").removeAttribute("aria-busy");
+  }
+  const node = $("boot");
+  if (node.hidden) return;
+  node.classList.add("done");
+  setTimeout(() => { if (node.classList.contains("done")) node.hidden = true; }, 400);
+}
+
+$("boot-retry").addEventListener("click", () => location.reload());
+
 async function enter(session) {
   applySession(session || {});
   $("login").hidden = true;
@@ -1003,7 +1051,16 @@ async function enter(session) {
   graph.byId = new Map();
   graph.chrome = true;
   state.decorative = false;
-  await refresh(true);
+  bootStart();
+  try {
+    await refresh(true);
+  } catch (error) {
+    // Signed out meanwhile: the sign-in shows instead.
+    if (!$("login").hidden) return;
+    bootFail("The memories could not be loaded. Check the connection and try again.");
+    return;
+  }
+  bootDone(true);
   connectStream();
   loadWorking();
   clearInterval(state.timer); clearInterval(state.clock);
@@ -1157,6 +1214,9 @@ async function load(first) {
       renderBars(payload.brain.activity);
       applyFocus();
       $("empty").hidden = payload.brain.neurons.length > 0;
+      // The counters, the lists and the graph are drawn: the loader goes
+      // without waiting for the sessions.
+      bootDone(true);
     }
   }
   await loadSessions();
@@ -4173,8 +4233,8 @@ syncTabs();
     loadRecaptcha(state.siteKey);
     if (session.authenticated) await enter(session); else showLogin();
   } catch (_) {
-    showLogin();
-    $("login-error").textContent = "The server cannot be reached.";
+    // The session check itself failed: say so where the loader is.
+    bootFail("The server cannot be reached. Check the connection and try again.");
   }
 })();
 

@@ -4425,15 +4425,17 @@ impl Db {
         }
         drop(conn);
 
+        // Every pair's similarity once (the matrix is symmetric), spread
+        // over the machine's cores: this is most of what the page's first
+        // load waits for (about 1.4 billion multiplications for 1200
+        // entries of 1024 dimensions).
+        let similar = similar_pairs(&vectors, min_similarity);
         let mut synapses: Vec<Synapse> = Vec::new();
         let mut seen: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
-        for (i, (id, vector)) in vectors.iter().enumerate() {
-            let mut scored: Vec<(i64, f32)> = vectors
+        for (i, (id, _)) in vectors.iter().enumerate() {
+            let mut scored: Vec<(i64, f32)> = similar[i]
                 .iter()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, (other, other_vector))| (*other, dot(vector, other_vector)))
-                .filter(|(_, similarity)| *similarity >= min_similarity)
+                .map(|&(j, similarity)| (vectors[j].0, similarity))
                 .collect();
             scored.sort_by(|a, b| b.1.total_cmp(&a.1));
             for (other, similarity) in scored.into_iter().take(neighbours) {
@@ -5798,12 +5800,87 @@ fn decode_vector(blob: &[u8]) -> Vec<f32> {
 }
 
 /// Dot product; vectors are stored L2-normalised, so this is cosine similarity.
+/// For each vector, the others at least `min_similarity` alike, by index
+/// and in index order, as one pass over every pair would find them. Each
+/// pair is computed once, on as many threads as the machine offers (at
+/// most 8).
+fn similar_pairs(vectors: &[(i64, Vec<f32>)], min_similarity: f32) -> Vec<Vec<(usize, f32)>> {
+    let n = vectors.len();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(n.max(1));
+    // Rows are dealt round-robin, so the long first rows and the short last
+    // ones (only j > i is computed) share out evenly.
+    let upper: Vec<Vec<(usize, usize, f32)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    let mut found = Vec::new();
+                    for i in (t..n).step_by(threads) {
+                        for j in i + 1..n {
+                            let similarity = dot(&vectors[i].1, &vectors[j].1);
+                            if similarity >= min_similarity {
+                                found.push((i, j, similarity));
+                            }
+                        }
+                    }
+                    found
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    });
+    let mut rows: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+    for (i, j, similarity) in upper.into_iter().flatten() {
+        rows[i].push((j, similarity));
+        rows[j].push((i, similarity));
+    }
+    for row in &mut rows {
+        row.sort_by_key(|&(j, _)| j);
+    }
+    rows
+}
+
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 #[cfg(test)]
 mod tests {
+    /// The parallel, once-per-pair similarity pass finds exactly what the
+    /// plain pass over every ordered pair finds, in the same order.
+    #[test]
+    fn similar_pairs_match_the_plain_pass() {
+        let mut seed = 7u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / u32::MAX as f32) - 0.25
+        };
+        let vectors: Vec<(i64, Vec<f32>)> = (0..97)
+            .map(|id| (id * 3, (0..16).map(|_| next()).collect()))
+            .collect();
+        for min in [-1.0, 0.0, 0.05, 0.2] {
+            let fast = super::similar_pairs(&vectors, min);
+            for (i, (_, a)) in vectors.iter().enumerate() {
+                let plain: Vec<(usize, f32)> = vectors
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(j, (_, b))| (j, super::dot(a, b)))
+                    .filter(|(_, s)| *s >= min)
+                    .collect();
+                assert_eq!(fast[i], plain, "row {i} at {min}");
+            }
+        }
+    }
+
     #[test]
     fn lore_s_git_proxy_addresses_stand_for_their_github_repository() {
         for address in [

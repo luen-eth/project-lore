@@ -215,6 +215,17 @@ button:focus-visible, [tabindex]:focus-visible {
 .brand strong { font-size: 16px; letter-spacing: -0.015em; }
 .actions { display: flex; gap: 8px; align-items: center; min-width: 0; }
 #search { width: min(280px, 40vw); padding: 7px 13px; background: var(--panel); backdrop-filter: blur(12px); }
+/* The buttons keep one line; the search field gives way first. */
+.actions > button { white-space: nowrap; flex: none; }
+.brand strong { white-space: nowrap; }
+#search { flex: 0 1 auto; min-width: 110px; }
+/* Narrower desktops: tighter buttons, and the row scrolls sideways rather
+   than running off the screen. */
+@media (max-width: 1280px) and (min-width: 761px) {
+  .actions { overflow-x: auto; scrollbar-width: none; padding: 2px; }
+  .actions::-webkit-scrollbar { display: none; }
+  .actions > button { padding-left: 9px; padding-right: 9px; font-size: 13px; }
+}
 
 .live {
   display: inline-flex; align-items: center; gap: 7px;
@@ -1076,6 +1087,61 @@ a.button-link:hover { background: rgba(255, 255, 255, 0.11); }
   .tab { font-size: 10px; }
 }
 
+/* Loading: from the first paint until the first data is drawn. The
+   counters show a dash, the lists grey rows, the graph area the lore mark
+   with a short text; a failure turns the text into a message and Retry. */
+.boot {
+  position: fixed; inset: 0; z-index: 3; display: grid; place-content: center; justify-items: center;
+  gap: 14px; pointer-events: none; text-align: center; padding: 16px;
+  transition: opacity 0.35s ease;
+}
+.boot.done { opacity: 0; }
+.boot[hidden] { display: none; }
+.boot-mark { position: relative; width: 64px; height: 64px; }
+.boot-mark span {
+  position: absolute; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 16px 2px rgba(111, 182, 255, 0.7); animation: boot-pulse 1.6s ease-in-out infinite;
+}
+.boot-mark span:nth-child(1) { width: 14px; height: 14px; left: 25px; top: 4px; }
+.boot-mark span:nth-child(2) { width: 11px; height: 11px; left: 6px; top: 42px; background: var(--violet); animation-delay: 0.25s; }
+.boot-mark span:nth-child(3) { width: 12px; height: 12px; left: 46px; top: 41px; background: #7ee0a1; animation-delay: 0.5s; }
+.boot-mark i {
+  position: absolute; height: 1.5px; background: rgba(160, 190, 255, 0.45); transform-origin: left center;
+  animation: boot-link 1.6s ease-in-out infinite;
+}
+.boot-mark i:nth-of-type(1) { left: 32px; top: 11px; width: 34px; transform: rotate(122deg); }
+.boot-mark i:nth-of-type(2) { left: 32px; top: 11px; width: 34px; transform: rotate(58deg); animation-delay: 0.3s; }
+.boot-mark i:nth-of-type(3) { left: 12px; top: 47px; width: 40px; transform: rotate(-1deg); animation-delay: 0.6s; }
+@keyframes boot-pulse { 0%, 100% { transform: scale(0.8); opacity: 0.6; } 50% { transform: scale(1.15); opacity: 1; } }
+@keyframes boot-link { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.9; } }
+.boot-text { margin: 0; color: var(--muted); font-size: 14px; letter-spacing: 0.02em; }
+.boot-failed {
+  pointer-events: auto; display: grid; gap: 10px; justify-items: center; max-width: 360px;
+  padding: 14px 18px; border-radius: var(--radius); border: 1px solid rgba(255, 122, 144, 0.35);
+  background: var(--panel-solid);
+}
+.boot-failed[hidden] { display: none; }
+.boot-error { margin: 0; color: var(--text); font-size: 14px; }
+.boot.failed .boot-mark span, .boot.failed .boot-mark i { animation: none; opacity: 0.35; }
+.boot.failed .boot-text { display: none; }
+
+.skeleton { pointer-events: none; }
+.list li.skeleton, .feed-list li.skeleton {
+  display: block; height: 34px; margin: 4px 0; border-radius: 10px; border: 0;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.04));
+  background-size: 200% 100%; animation: shimmer 1.4s linear infinite;
+}
+.feed-list li.skeleton { height: 46px; margin: 6px 8px; }
+#app.loading .stat b { color: var(--muted); background: none; -webkit-text-fill-color: var(--muted); }
+#app.loading #activity-bars {
+  min-height: 44px; border-radius: 8px;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.04));
+  background-size: 200% 100%; animation: shimmer 1.4s linear infinite;
+}
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
 @media (prefers-reduced-motion: reduce) {
+  .boot-mark span, .boot-mark i, .skeleton, .list li.skeleton, .feed-list li.skeleton, #app.loading #activity-bars { animation: none; }
+  .boot { transition: none; }
   .backdrop, .aurora, .stars, .live i, .avatar.online::after, .feed-list li.fresh, .agents li.flash, .stat.bump b { animation: none; }
 }

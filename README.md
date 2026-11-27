@@ -651,6 +651,15 @@ graph as diamonds.
 
 ![An agent searching: beams run from the agent to the entries it found](docs/live.jpg)
 
+**While it loads** (a reload, a sign-in) the page shows the lore mark with "Loading
+memories…" over the graph, a dash in every counter and grey rows in the lists and in
+Live activity, never zeros: the first numbers shown are the real ones, and an empty
+database still looks empty once loaded. The loader is in the HTML, so it shows at
+once, and goes as soon as the graph, the counters and the lists are drawn (one request,
+`/admin/api/brain`; the sessions follow). When that first load fails, or takes more
+than 10 seconds, it says so with a **Retry** button. A dropped event stream later only
+changes the pill (Connecting, Reconnecting); what is on screen stays.
+
 **It updates as it happens.** The page holds a server-sent event stream open, so
 nothing needs a reload:
 
