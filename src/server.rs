@@ -3402,6 +3402,10 @@ impl Lore {
             };
             let state = match agent.state.as_str() {
                 "idle" => "idle: can help now".to_string(),
+                // A terminal session is a state, not a piece of work.
+                "busy" if agent.detail.starts_with("a terminal session") => {
+                    format!("busy: {}", agent.detail)
+                }
                 "busy" => format!("busy with {}", agent.detail),
                 _ => format!("off: {}", agent.detail),
             };
