@@ -17,7 +17,9 @@
    remembered per browser, Expand fills the page and a double-click on the
    bar puts it back where it starts. Under 700px wide it takes the whole
    width at the bottom and only its height changes. Every key, Escape too,
-   belongs to the terminal, so the window closes only with Close. */
+   belongs to the terminal, so the window closes only with its buttons:
+   Hide lets the session go on without a window (the card and the menu
+   then offer Resume), End session (after a confirmation) ends it. */
 (() => {
   "use strict";
 
@@ -83,6 +85,33 @@
     if (seconds < 5400) return `${Math.round(seconds / 60)} min ago`;
     if (seconds < 129600) return `${Math.round(seconds / 3600)} h ago`;
     return `${Math.round(seconds / 86400)} days ago`;
+  }
+
+  /* A unix time as the hour and minute here. */
+  function clock(unix) {
+    const date = new Date((Number(unix) || 0) * 1000);
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function agoUnix(unix) {
+    return ago(new Date((Number(unix) || 0) * 1000).toISOString());
+  }
+
+  /* The agent's running terminal session of this kind, if any. */
+  function sessionOf(agent, mode) {
+    return (agent.terminals || []).find((session) => session.mode === mode) || null;
+  }
+
+  const MODE_LABEL = { cli: "Terminal", shell: "Shell" };
+
+  /* "Terminal session running since 10:42 · last output 2 min ago". */
+  function sessionLine(session) {
+    let line = `${MODE_LABEL[session.mode] || "Terminal"} session running since ${clock(session.started_at)}`
+      + ` · last output ${agoUnix(session.last_output_at)}`;
+    if (typeof session.viewer === "string") line += ` · shown in ${session.viewer}'s window`;
+    else if (session.viewer === null || session.viewer === false) line += " · no window shows it";
+    else if (session.viewer === true) line += " · shown in a window";
+    return line;
   }
 
   function day(iso) {
@@ -212,6 +241,16 @@
       if (resources.state_free_bytes) parts.push(`${bytes(resources.state_free_bytes)} free on the volume`);
       if (resources.cleaned) parts.push(`cleaned ${resources.cleaned} leftover item${resources.cleaned === 1 ? "" : "s"}`);
       if (parts.length) lines.push(parts.join(" · "));
+    }
+    const sessions = agent.terminals || [];
+    if (sessions.length) {
+      const since = Math.min(...sessions.map((session) => session.started_at));
+      lines.push(`Busy: a terminal session is open (since ${clock(since)}); board runs and help wait until it ends`);
+      for (const session of sessions) lines.push(sessionLine(session));
+    }
+    for (const ended of agent.terminals_ended || []) {
+      if (sessionOf(agent, ended.mode)) continue;
+      lines.push(`Last ${(MODE_LABEL[ended.mode] || "terminal").toLowerCase()} session ended at ${clock(ended.at)}: ${ended.message}`);
     }
     for (const line of lines) item.append(el("div", "board-meta", line));
     if (resources && resources.state_bytes > STATE_WARN_BYTES) {
@@ -674,16 +713,20 @@
 
   /* ---------- Terminal ---------- */
 
+  /* "Open terminal", or "Resume terminal" while a session runs: a new
+     session is offered only by ending the running one (in its window). */
   function terminalActions(agent) {
     const row = el("div", "board-actions builtin-actions builtin-terminal");
-    row.append(button("Open terminal", "", () => openTerminal(agent, "cli")));
+    row.append(button(sessionOf(agent, "cli") ? "Resume terminal" : "Open terminal", "",
+      () => openTerminal(agent, "cli")));
     const more = el("details", "builtin-more");
     more.append(el("summary", "", "More"));
     const inside = el("div", "builtin-more-body");
     inside.append(
-      button("Shell", "", () => openTerminal(agent, "shell")),
+      button(sessionOf(agent, "shell") ? "Resume shell" : "Shell", "", () => openTerminal(agent, "shell")),
       el("span", "muted small-text", "bash as the agent user, with its sign-in"),
     );
+    if (sessionOf(agent, "shell")) more.open = true;
     more.append(inside);
     row.append(more);
     return row;
@@ -700,8 +743,8 @@
   const EDGES = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
 
   const term = {
-    win: null, frame: null, bar: null, state: null, expand: null, reconnect: null,
-    geo: null, narrowH: null, max: false, closing: null,
+    win: null, frame: null, bar: null, state: null, expand: null, action: null, end: null,
+    confirm: null, geo: null, narrowH: null, max: false, closing: null,
   };
   try { localStorage.removeItem("lore.terminal.mode"); } catch { /* private mode */ }
 
@@ -805,12 +848,64 @@
     tellFrame({ type: "lore-terminal-command", command: "focus" });
   }
 
-  function setTerminalState(name, text) {
-    if (!term.state || !["connecting", "open", "closed"].includes(name)) return;
+  /* The frame's state: connecting, open, ended (the session is over),
+     taken (another window shows it) or detached (this window lost it);
+     `action` is the one button that state offers (Reconnect, Take it
+     back, New session). */
+  function setTerminalState(name, text, action) {
+    if (!term.state || !["connecting", "open", "ended", "taken", "detached"].includes(name)) return;
+    const previous = term.state.dataset.state;
+    term.state.dataset.state = name;
     term.state.className = "term-state " + name;
     term.state.textContent = text || "";
     term.state.title = text || "";
-    term.reconnect.hidden = name !== "closed";
+    term.action.hidden = !action;
+    if (action) term.action.textContent = action;
+    term.end.hidden = name !== "open";
+    if (name !== "open") { closeConfirm(); showNotice(""); }
+    // A session started or ended: the cards and the menu say so.
+    if (previous !== name && (name === "open" || name === "ended")) {
+      if (!panel.hidden) load();
+      launcherLoad();
+    }
+  }
+
+  /* What the session says ahead of its end (its maximum age), under the
+     bar; an empty text removes it. */
+  function showNotice(text) {
+    if (!term.win) return;
+    const old = term.win.querySelector(".term-notice");
+    if (old) old.remove();
+    if (!text) return;
+    const strip = el("p", "term-notice", String(text));
+    strip.setAttribute("role", "status");
+    term.bar.after(strip);
+  }
+
+  /* End session asks first, in the window's own bar. */
+  function askEnd() {
+    if (!term.win || term.confirm) return;
+    const strip = el("div", "term-confirm");
+    strip.setAttribute("role", "alertdialog");
+    strip.setAttribute("aria-label", "End the session?");
+    const yes = button("End session", "danger", () => {
+      closeConfirm();
+      tellFrame({ type: "lore-terminal-command", command: "end" });
+    });
+    const no = button("Keep it running", "", () => { closeConfirm(); focusTerminal(); });
+    strip.append(el("span", "", "End this session? The program and everything started in it stop."), yes, no);
+    strip.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") { event.preventDefault(); closeConfirm(); focusTerminal(); }
+    });
+    term.bar.after(strip);
+    term.confirm = strip;
+    no.focus();
+  }
+
+  function closeConfirm() {
+    if (!term.confirm) return;
+    term.confirm.remove();
+    term.confirm = null;
   }
 
   /* Moving (the bar) and resizing (an edge or the grip) with Pointer
@@ -896,16 +991,20 @@
     stateNode.setAttribute("role", "status");
     stateNode.setAttribute("aria-live", "polite");
     const buttons = el("div", "term-buttons");
-    const reconnect = button("Reconnect", "", () => tellFrame({ type: "lore-terminal-command", command: "reconnect" }));
-    reconnect.hidden = true;
+    const action = button("Reconnect", "", () => tellFrame({ type: "lore-terminal-command", command: "action" }));
+    action.hidden = true;
     const expand = button("Expand", "", () => {
       term.max = !term.max;
       saveWindow();
       applyWindow();
       focusTerminal();
     });
-    const close = button("Close", "", () => closeTerminal());
-    buttons.append(reconnect, expand, close);
+    const hide = button("Hide", "", () => closeTerminal());
+    hide.title = "Close the window; the session goes on and Resume brings it back";
+    const end = button("End session", "danger", askEnd);
+    end.title = "Stop the program and everything started in it";
+    end.hidden = true;
+    buttons.append(action, expand, hide, end);
     bar.append(title, stateNode, buttons);
     bar.addEventListener("pointerdown", (event) => {
       if (event.target.closest("button")) return;
@@ -941,26 +1040,32 @@
     grip.addEventListener("pointerdown", (event) => startDrag(event, "se"));
     win.append(grip);
 
-    Object.assign(term, { win, frame, bar, state: stateNode, expand, reconnect, closing: null });
+    Object.assign(term, { win, frame, bar, state: stateNode, expand, action, end, confirm: null, closing: null });
     document.body.append(win);
     applyWindow();
     launcherSync();
   }
 
-  /* Close asks the frame to end the terminal (it tells the server, then
-     answers); removing the frame closes its socket in any case, so the
-     window goes after a moment even without an answer. */
+  /* Hide asks the frame to let go of the session (it tells the server,
+     then answers); removing the frame closes its socket in any case, which
+     also only detaches, so the window goes after a moment even without an
+     answer. The session goes on either way. */
   function closeTerminal(now) {
     if (!term.win) return;
     if (!now && term.frame && term.frame.contentWindow && !term.closing) {
-      tellFrame({ type: "lore-terminal-command", command: "close" });
+      tellFrame({ type: "lore-terminal-command", command: "hide" });
       term.closing = setTimeout(() => closeTerminal(true), 600);
       return;
     }
     clearTimeout(term.closing);
     term.win.remove();
-    Object.assign(term, { win: null, frame: null, bar: null, state: null, expand: null, reconnect: null, closing: null });
+    Object.assign(term, {
+      win: null, frame: null, bar: null, state: null, expand: null, action: null, end: null,
+      confirm: null, closing: null,
+    });
     launcherSync();
+    if (!panel.hidden) load();
+    launcherLoad();
   }
 
   window.addEventListener("resize", applyWindow);
@@ -970,7 +1075,8 @@
     if (!term.frame || event.origin !== location.origin || event.source !== term.frame.contentWindow) return;
     const data = event.data || {};
     if (data.type === "lore-terminal-close") closeTerminal(true);
-    else if (data.type === "lore-terminal-state" || data.type === "lore-terminal-ready") setTerminalState(data.state, data.text);
+    else if (data.type === "lore-terminal-state" || data.type === "lore-terminal-ready") setTerminalState(data.state, data.text, data.action);
+    else if (data.type === "lore-terminal-notice") showNotice(data.text);
   });
 
   /* ---------- Terminal launcher ---------- */
@@ -1061,9 +1167,14 @@
       const text = el("span", "term-menu-text");
       text.append(el("strong", "", shown(agent)),
         el("span", agent.signed_in ? "ok" : "warn", agent.signed_in ? "signed in" : "not signed in"));
+      const running = sessionOf(agent, "cli");
+      if (running) {
+        text.append(el("span", "muted", `session running since ${clock(running.started_at)}, last output ${agoUnix(running.last_output_at)}`));
+      }
       item.append(image, text);
       if (agent.display_name) item.title = agent.name;
-      if (agent.name === last) item.append(el("span", "muted small-text", "last"));
+      if (running) item.append(el("span", "term-menu-resume", "Resume"));
+      else if (agent.name === last) item.append(el("span", "muted small-text", "last"));
       item.addEventListener("click", () => pickAgent(agent));
       menu.append(item);
     }

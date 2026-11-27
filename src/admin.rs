@@ -455,11 +455,12 @@ impl Admin {
         sessions.retain(|_, session| session.expires > Instant::now());
         match sessions.get(token) {
             None => Err(
-                "the terminal was closed: your session has ended (signed out, expired, or \
-                 ended by an administrator). Sign in again to open it",
+                "this window was detached: your sign-in has ended (signed out, expired, or \
+                 ended by an administrator). The terminal session itself goes on; sign in \
+                 again to see it",
             ),
             Some(session) if !session.user.perms.contains(Perm::Agents) => {
-                Err("the terminal was closed: your account no longer has the agents permission")
+                Err("this window was detached: your account no longer has the agents permission")
             }
             Some(_) => Ok(()),
         }
@@ -467,6 +468,7 @@ impl Admin {
 
     /// Lets the page show and sign in the built-in agents.
     pub fn with_builtin(mut self, hub: Arc<crate::builtin::Hub>) -> Self {
+        hub.set_events(self.events.clone());
         self.builtin = Some(hub);
         self
     }
@@ -5784,9 +5786,27 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), 404, "{missing}");
         }
-        // Other pages are still never cached.
-        let response = client.get(format!("{base}/admin")).send().await.unwrap();
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        // Other pages are still never cached, nor are the scripts and
+        // styles that change with a deploy (the terminal's protocol among
+        // them): a reload always gets the deployed ones.
+        for page in [
+            "/admin",
+            "/admin/app.js",
+            "/admin/app.css",
+            "/admin/builtin.js",
+            "/admin/builtin.css",
+            "/admin/terminal",
+            "/admin/terminal.js",
+            "/admin/terminal.css",
+        ] {
+            let response = client.get(format!("{base}{page}")).send().await.unwrap();
+            assert_eq!(response.status(), 200, "{page}");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-store",
+                "{page}"
+            );
+        }
 
         let call = |method: reqwest::Method, path: &str, token: &str| {
             client

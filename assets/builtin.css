@@ -120,12 +120,25 @@
   background: currentColor; color: var(--muted); font-size: 0;
 }
 .term-state.open { color: var(--ok); }
-.term-state.connecting { color: var(--warn); }
-.term-state.closed { color: var(--danger); }
-/* Closed: the reason in words beside the dot, not only in its tooltip. */
-.term-state.closed {
+.term-state.connecting, .term-state.taken, .term-state.detached { color: var(--warn); }
+.term-state.ended { color: var(--danger); }
+/* Not showing the session: the reason in words beside the dot, not only
+   in its tooltip. */
+.term-state.ended, .term-state.taken, .term-state.detached {
   width: auto; height: auto; max-width: 45%; border-radius: 0; background: none;
   font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* End session, and the question it asks first. */
+.term-buttons .danger, .term-confirm .danger { color: var(--danger); border-color: rgba(255, 122, 144, 0.45); }
+.term-confirm {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px; flex: none;
+  padding: 7px 10px 7px 12px; border-bottom: 1px solid var(--line);
+  background: rgba(255, 122, 144, 0.08); font-size: 12.5px;
+}
+.term-confirm span { flex: 1; min-width: 180px; }
+.term-notice {
+  margin: 0; flex: none; padding: 7px 10px 7px 12px; border-bottom: 1px solid var(--line);
+  background: rgba(230, 193, 90, 0.1); color: var(--warn); font-size: 12.5px;
 }
 .term-buttons { display: flex; gap: 6px; flex: none; }
 .term-body { position: relative; flex: 1; min-height: 0; background: #05080f; }
@@ -196,6 +209,8 @@
 .term-menu-text strong { font-weight: 600; font-size: 13px; }
 .term-menu-text .ok { color: var(--ok); font-size: 11px; }
 .term-menu-text .warn { color: var(--warn); font-size: 11px; }
+.term-menu-text .muted { font-size: 11px; }
+.term-menu-resume { font-size: 11px; font-weight: 600; color: var(--accent); }
 
 @media (max-width: 760px) {
   .builtin-row { grid-template-columns: minmax(0, 1fr); }

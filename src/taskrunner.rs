@@ -317,6 +317,9 @@ struct State {
     repos: HashMap<String, (Option<(Provider, String)>, Instant)>,
     /// The latest reason each task was passed over without a note.
     passed: HashMap<i64, String>,
+    /// Why no enabled agent could take a board task at the last tick
+    /// (`claude-builtin: busy: …`), or `None` when one could.
+    waiting: Option<String>,
     /// `ask` calls waiting for their answer, by run id.
     waiters: HashMap<String, oneshot::Sender<String>>,
     /// When each calling agent asked and delegated, for the hourly limits.
@@ -326,6 +329,10 @@ struct State {
     /// first await, so two starts never race for one agent.
     starting: HashSet<String>,
 }
+
+/// How an agent whose container a terminal session holds is said to be
+/// busy (the task runner's notes, `assistants`, the readiness list).
+const TERMINAL_BUSY: &str = "busy: ";
 
 /// How many passed-over reasons are kept, at most.
 const PASSED_KEPT: usize = 2000;
@@ -460,7 +467,8 @@ impl TaskRunner {
         if !agents.iter().any(|agent| agent.enabled) {
             return Ok(());
         }
-        let ready = self.ready_agents(&agents).await?;
+        let (ready, reasons) = self.ready_agents(&agents).await?;
+        self.state().waiting = ready.is_empty().then(|| reasons.join("; "));
         if ready.is_empty() {
             return Ok(());
         }
@@ -656,21 +664,28 @@ impl TaskRunner {
         .await
     }
 
-    /// The agents that may take a task now, in turn order.
-    async fn ready_agents(&self, agents: &[BuiltinAgent]) -> Result<Vec<BuiltinAgent>> {
+    /// The agents that may take a task now, in turn order, and why each
+    /// enabled one that may not cannot.
+    async fn ready_agents(
+        &self,
+        agents: &[BuiltinAgent],
+    ) -> Result<(Vec<BuiltinAgent>, Vec<String>)> {
         let mut ready = Vec::new();
+        let mut reasons = Vec::new();
         let turn = self.state().turn;
         let count = agents.len().max(1);
         for offset in 0..agents.len() {
             let agent = &agents[(turn + offset) % count];
-            if self.why_not_ready(agent).await?.is_none() {
-                ready.push(agent.clone());
+            match self.why_not_ready(agent).await? {
+                None => ready.push(agent.clone()),
+                Some(why) if agent.enabled => reasons.push(format!("{}: {why}", agent.name)),
+                Some(_) => {}
             }
         }
         if !ready.is_empty() {
             self.state().turn = (turn + 1) % count;
         }
-        Ok(ready)
+        Ok((ready, reasons))
     }
 
     /// Why an agent cannot take a task now, or `None` when it can.
@@ -680,6 +695,9 @@ impl TaskRunner {
         }
         if self.hub.link(&agent.name).is_none() {
             return Ok(Some("its container is not connected".into()));
+        }
+        if let Some(why) = self.terminal_busy(&agent.name) {
+            return Ok(Some(why));
         }
         if !agent.signed_in {
             return Ok(Some("not signed in".into()));
@@ -708,6 +726,17 @@ impl TaskRunner {
         Ok(None)
     }
 
+    /// `busy: a terminal session is open (since 10:42 UTC)` while one holds
+    /// the agent's container: its runner starts no run then.
+    fn terminal_busy(&self, agent: &str) -> Option<String> {
+        self.hub.terminal_busy(agent).map(|since| {
+            format!(
+                "{TERMINAL_BUSY}a terminal session is open (since {})",
+                crate::builtin::clock(since)
+            )
+        })
+    }
+
     /// Why an agent cannot help another agent now, or `None` when it can:
     /// the owner switched "available for help" on, and it is connected,
     /// signed in and idle. Its board settings (enabled, hours, cap) do not
@@ -718,6 +747,9 @@ impl TaskRunner {
         }
         if self.hub.link(&agent.name).is_none() {
             return Some("its container is not connected".into());
+        }
+        if let Some(why) = self.terminal_busy(&agent.name) {
+            return Some(why);
         }
         if !agent.signed_in {
             return Some("not signed in".into());
@@ -1986,6 +2018,11 @@ impl TaskRunner {
                 )
             } else if let Some(why) = state.passed.get(&task.id) {
                 ("passed", why.clone())
+            } else if let Some(why) = &state.waiting {
+                (
+                    "eligible",
+                    format!("next when an agent is free; waiting: {why}"),
+                )
             } else {
                 ("eligible", "next when an agent is free".to_string())
             };
@@ -2180,6 +2217,9 @@ impl TaskRunner {
                 Some(why) if why.starts_with("busy with ") => {
                     ("busy", why.trim_start_matches("busy with ").to_string())
                 }
+                Some(why) if why.starts_with(TERMINAL_BUSY) => {
+                    ("busy", why.trim_start_matches(TERMINAL_BUSY).to_string())
+                }
                 Some(why) => ("off", why),
             };
             let display_name = self
@@ -2223,7 +2263,7 @@ impl TaskRunner {
             };
             let why_not = self
                 .why_not_helping(&agent)
-                .filter(|why| !why.starts_with("busy with "));
+                .filter(|why| !why.starts_with("busy with ") && !why.starts_with(TERMINAL_BUSY));
             let kind = self
                 .hub
                 .link(&name)
@@ -3965,6 +4005,71 @@ echo '{"type":"step_finish","timestamp":4,"sessionID":"ses_1","part":{"type":"st
         assert!(owner < begin, "{prompt}");
         assert!(prompt.contains("- (luis, 2026-11-27T10:00:00Z) Use the friendly greeting."));
         assert_eq!(prompt.matches("TASK-ABCDEF>>>").count(), 1);
+    }
+
+    /// While a terminal session is open in an agent's container, shown in
+    /// a window or not, no board run starts there: the queue, the
+    /// readiness list and `assistants` say why and since when. Once it
+    /// ends, the task runs.
+    #[tokio::test]
+    async fn a_board_task_waits_while_a_terminal_session_is_open_and_says_why() {
+        use crate::builtin::{AttachRequest, Opener};
+        use crate::runner::protocol::TerminalMode;
+        let world = world("terminal-busy", Duration::from_secs(3600)).await;
+        let db = &world.db;
+        let hub = world.runner.hub.clone();
+        let task = idle_task(db, "Greet people", "shop", "github.com/me/shop");
+        let session = hub
+            .terminal_attach(AttachRequest {
+                agent: AGENT.into(),
+                mode: TerminalMode::Shell,
+                cols: 80,
+                rows: 24,
+                model: None,
+                opener: Opener {
+                    username: "admin".into(),
+                    user_id: None,
+                },
+                fresh: true,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        // The window goes: the session, and the wait, stay.
+        assert!(hub.terminal_detach(&session.term_id, session.viewer, ""));
+        drop(session.events);
+        for _ in 0..3 {
+            world.runner.tick().await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(db.runs(10).unwrap().is_empty());
+        let since = crate::builtin::clock(hub.terminal_busy(AGENT).unwrap());
+        let why = format!("busy: a terminal session is open (since {since})");
+        let queue = world.runner.queue().await.unwrap();
+        let item = queue.iter().find(|item| item["id"] == task.id).unwrap();
+        assert_eq!(item["state"], "eligible");
+        assert_eq!(
+            item["why"],
+            format!("next when an agent is free; waiting: {AGENT}: {why}")
+        );
+        let readiness = world.runner.readiness().await.unwrap();
+        assert_eq!(readiness[0]["why"], why.as_str());
+        let assistants = world.runner.assistants().await.unwrap();
+        assert_eq!(assistants[0].state, "busy");
+        assert_eq!(
+            assistants[0].detail,
+            format!("a terminal session is open (since {since})")
+        );
+        // Ended: the next tick takes the task.
+        assert!(hub.end_terminal(&session.term_id, None, "ended by the test".into()));
+        assert!(hub.terminal_busy(AGENT).is_none());
+        world.runner.tick().await.unwrap();
+        for _ in 0..500 {
+            if !db.runs(10).unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(db.runs(10).unwrap().len(), 1);
     }
 
     #[tokio::test]

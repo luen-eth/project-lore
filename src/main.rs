@@ -207,7 +207,10 @@ async fn run() -> Result<()> {
         // The terminals' CLIs reach lore's MCP endpoint where runs do.
         let mcp_url = format!("{}/mcp", taskrunner::lore_url_from_env()?);
         Some(Arc::new(
-            builtin::Hub::new(db.clone(), runner_tokens).with_mcp_url(mcp_url),
+            builtin::Hub::new(db.clone(), runner_tokens)
+                .with_mcp_url(mcp_url)
+                .with_terminal_idle(terminal_idle())
+                .with_terminal_max_age(terminal_max_age()),
         ))
     };
     let mut auth = McpAuth::new(tokens, db.clone(), trust_proxy);
@@ -684,6 +687,55 @@ fn healthcheck() -> Result<()> {
             response.lines().next().unwrap_or("no response")
         )
     }
+}
+
+/// A whole number from an environment variable, within `range`, times
+/// `unit`. Unset: `default`. A value that is not one: a warning and
+/// `default` (lore does not refuse to start over a tuning knob).
+fn tuning(
+    key: &str,
+    range: std::ops::RangeInclusive<u64>,
+    unit: std::time::Duration,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    let value = env_or(key, "");
+    let value = value.trim();
+    if value.is_empty() {
+        return default;
+    }
+    match value.parse::<u64>() {
+        Ok(number) if range.contains(&number) => unit * number as u32,
+        _ => {
+            tracing::warn!(
+                "{key} must be a whole number from {} to {}; using the default",
+                range.start(),
+                range.end()
+            );
+            default
+        }
+    }
+}
+
+/// How long a terminal session nobody looks at may print nothing before
+/// it ends: `LORE_TERMINAL_IDLE_MINUTES`, 30 by default, 1 to 1440.
+fn terminal_idle() -> std::time::Duration {
+    tuning(
+        "LORE_TERMINAL_IDLE_MINUTES",
+        1..=1440,
+        std::time::Duration::from_secs(60),
+        builtin::TERMINAL_IDLE,
+    )
+}
+
+/// How long a terminal session may live at most:
+/// `LORE_TERMINAL_MAX_HOURS`, 12 by default, 1 to 168.
+fn terminal_max_age() -> std::time::Duration {
+    tuning(
+        "LORE_TERMINAL_MAX_HOURS",
+        1..=168,
+        std::time::Duration::from_secs(3600),
+        builtin::TERMINAL_MAX_AGE,
+    )
 }
 
 fn env_or(key: &str, default: &str) -> String {

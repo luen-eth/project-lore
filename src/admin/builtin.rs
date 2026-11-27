@@ -3,10 +3,12 @@
 //! runners carry out. A pasted credential passes through here to the
 //! runner and is dropped: it is never stored, logged or sent back.
 //!
-//! The terminal (part 6d) is a WebSocket between the page and one PTY in
-//! an agent's container. Its bytes are relayed as they are, never stored
-//! or logged; a terminal cannot be redacted reliably, so whoever may open
-//! one (`agents`) has a shell in that container with its credentials.
+//! The terminal (part 6d) is a WebSocket between one window of the page
+//! and one terminal session (a PTY in an agent's container) that outlives
+//! the window: closing it detaches, the next window attaches. Its bytes
+//! are relayed as they are, never stored or logged; a terminal cannot be
+//! redacted reliably, so whoever may open one (`agents`) has a shell in
+//! that container with its credentials.
 
 use super::*;
 use axum::extract::ws::{
@@ -16,7 +18,7 @@ use base64::Engine;
 
 use crate::{
     avatars,
-    builtin::{Hub, HubError, TerminalEvent},
+    builtin::{AttachRequest, Attached, Hub, HubError, Opener, TerminalEvent, ViewerState},
     db::{BuiltinSettings, MAX_DAILY_CAP},
     runner::{
         drivers::{CLAUDE_MODELS, DEEPSEEK_MODELS, MAX_CREDENTIAL_BYTES},
@@ -347,17 +349,27 @@ fn same_origin(headers: &HeaderMap) -> bool {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PageFrame {
+    /// Show the agent's session of this kind: attach to the one running,
+    /// or start one. `fresh`: start one even right after one ended (the
+    /// owner pressed "New session").
     Open {
         mode: TerminalMode,
         cols: u16,
         rows: u16,
+        #[serde(default)]
+        fresh: bool,
     },
     Resize {
         cols: u16,
         rows: u16,
     },
-    /// The page is shown: someone is looking, so the terminal is not idle.
+    /// The page is shown: someone is looking, so the session is not idle.
     Alive,
+    /// Hide the window: the session goes on.
+    Hide,
+    /// End the session (the window's "End session").
+    End,
+    /// What an older page sends for its Close: ends the session, as it did.
     Close,
 }
 
@@ -385,7 +397,7 @@ async fn terminal(
         Err(rejection) => return rejection.into_response(),
     };
     // The session this page is signed in with: looked at again while
-    // the terminal is open. The guard has just accepted it.
+    // the page shows the terminal. The guard has just accepted it.
     let Some(session) = super::cookie(&headers, super::COOKIE) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -401,36 +413,64 @@ async fn terminal(
     upgrade
         .max_message_size(TERMINAL_FRAME_BYTES)
         .max_frame_size(TERMINAL_FRAME_BYTES)
-        .on_upgrade(move |socket| relay(admin, hub, name, me.username, session, model, socket))
+        .on_upgrade(move |socket| relay(admin, hub, name, me, session, model, socket))
 }
 
 /// Sends one small JSON frame to the page.
 async fn tell(socket: &mut WebSocket, value: serde_json::Value) -> bool {
-    socket
-        .send(WsMessage::text(value.to_string()))
-        .await
-        .is_ok()
+    send_within(socket, WsMessage::text(value.to_string())).await
 }
 
-/// One page and one terminal, from the page's `open` to either side's end.
-/// While it is open, the page's session and its `agents` permission are
-/// checked again every `terminal_recheck` (30 seconds): a terminal does
-/// not outlive the sign-in or the permission it was opened with.
+/// How long one write to a terminal window may take: a window that does
+/// not read (a stalled tab, a dead connection) is let go after it.
+const SEND_WAIT: Duration = Duration::from_secs(10);
+
+/// Sends one frame to the page, or gives up after `SEND_WAIT`.
+async fn send_within(socket: &mut WebSocket, message: WsMessage) -> bool {
+    matches!(
+        tokio::time::timeout(SEND_WAIT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// What a window is told before the session reaches its maximum age.
+fn ends_soon_frame(hub: &Hub, at: i64) -> serde_json::Value {
+    json!({
+        "type": "ends_soon",
+        "at": at,
+        "max_hours": hub.terminal_max_hours(),
+    })
+}
+
+/// Largest binary frame of a replay.
+const REPLAY_FRAME: usize = 64 * 1024;
+
+/// One page showing one terminal session, from the page's `open` until
+/// either the page goes (the session goes on without it) or the session
+/// ends. While it shows it, the page's session and its `agents` permission
+/// are checked again every `terminal_recheck` (30 seconds): a page does not
+/// outlive the sign-in or the permission it was opened with. (Whether the
+/// session itself may go on is the hub's check of the user who opened it.)
 async fn relay(
     admin: Arc<Admin>,
     hub: Arc<Hub>,
     agent: String,
-    who: String,
+    me: SignedIn,
     session: String,
     model: Option<String>,
     mut socket: WebSocket,
 ) {
+    let who = me.username.clone();
+    // The first `open`; a size or a keep-alive sent before it is passed
+    // over.
     let open = tokio::time::timeout(TERMINAL_OPEN_WAIT, async {
         while let Some(Ok(frame)) = socket.recv().await {
             match frame {
-                WsMessage::Text(text) => {
-                    return serde_json::from_str::<PageFrame>(text.as_str()).ok();
-                }
+                WsMessage::Text(text) => match serde_json::from_str::<PageFrame>(text.as_str()) {
+                    Ok(open @ PageFrame::Open { .. }) => return Some(open),
+                    Ok(_) => {}
+                    Err(_) => return None,
+                },
                 WsMessage::Close(_) => return None,
                 _ => {}
             }
@@ -440,7 +480,13 @@ async fn relay(
     .await
     .ok()
     .flatten();
-    let Some(PageFrame::Open { mode, cols, rows }) = open else {
+    let Some(PageFrame::Open {
+        mode,
+        cols,
+        rows,
+        fresh,
+    }) = open
+    else {
         tell(
             &mut socket,
             json!({ "type": "error", "message": "the page did not say what to open" }),
@@ -448,8 +494,29 @@ async fn relay(
         .await;
         return;
     };
-    let (term_id, mut events) = match hub.terminal_open(&agent, mode, cols, rows, model).await {
-        Ok(opened) => opened,
+    let request = AttachRequest {
+        agent: agent.clone(),
+        mode,
+        cols,
+        rows,
+        model,
+        opener: Opener {
+            username: me.username.clone(),
+            user_id: me.user_id,
+        },
+        fresh,
+    };
+    let attached = match hub.terminal_attach(request).await {
+        Ok(attached) => attached,
+        Err(HubError::Ended(ended)) => {
+            tell(
+                &mut socket,
+                json!({ "type": "ended", "at": ended.at, "message": ended.message }),
+            )
+            .await;
+            send_within(&mut socket, WsMessage::Close(None)).await;
+            return;
+        }
         Err(error) => {
             tell(
                 &mut socket,
@@ -459,90 +526,187 @@ async fn relay(
             return;
         }
     };
-    let what = match mode {
-        TerminalMode::Cli => "the CLI's terminal",
-        TerminalMode::Shell => "a shell",
+    let Attached {
+        term_id,
+        viewer,
+        mut events,
+        started,
+        replay,
+        started_at,
+        ends_at,
+        ends_soon,
+        opened_by,
+        taken_from,
+    } = attached;
+    tracing::info!(%agent, user = %who, %term_id, ?mode, started, "a page shows a terminal session");
+    let mut live = if started {
+        tell(
+            &mut socket,
+            json!({
+                "type": "opened",
+                "since": started_at,
+                "ends_at": ends_at,
+                "opened_by": opened_by,
+            }),
+        )
+        .await
+    } else {
+        // The recent screen first, then the program draws its screen
+        // again for this page's size, then live output.
+        let mut sent = tell(
+            &mut socket,
+            json!({
+                "type": "attached",
+                "since": started_at,
+                "ends_at": ends_at,
+                "opened_by": opened_by,
+                "taken_from": taken_from,
+            }),
+        )
+        .await;
+        for piece in replay.chunks(REPLAY_FRAME) {
+            if !sent {
+                break;
+            }
+            sent = send_within(&mut socket, WsMessage::Binary(piece.to_vec().into())).await;
+        }
+        drop(replay);
+        sent && tell(&mut socket, json!({ "type": "replayed" })).await
     };
-    note_activity(
-        &admin,
-        "builtin",
-        &format!("{who} opened {what} in {agent}"),
-    );
-    tracing::info!(%agent, user = %who, %term_id, ?mode, "a terminal opened");
-    let mut ended = false;
+    // Attached in the last minutes before the maximum age: said at once.
+    if live && ends_soon {
+        live = tell(&mut socket, ends_soon_frame(&hub, ends_at)).await;
+    }
+    if live && !started {
+        let redraw = hub.clone();
+        let id = term_id.clone();
+        tokio::spawn(async move {
+            let _ = redraw.terminal_redraw(&id, viewer, cols, rows).await;
+        });
+    }
     let mut recheck = tokio::time::interval_at(
         tokio::time::Instant::now() + admin.terminal_recheck,
         admin.terminal_recheck,
     );
     recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    if tell(&mut socket, json!({ "type": "opened" })).await {
-        loop {
-            tokio::select! {
-                _ = recheck.tick() => {
-                    if let Err(why) = admin.terminal_access(&session) {
-                        tracing::info!(%agent, user = %who, %term_id, "a terminal was closed: its session or permission is gone");
-                        tell(&mut socket, json!({ "type": "exit", "code": null, "message": why })).await;
-                        break;
-                    }
+    // Why this page stopped showing the session while it goes on, for the
+    // activity feed.
+    let mut left = "";
+    // The page was told the session ended or moved to another window.
+    let mut settled = false;
+    while live {
+        tokio::select! {
+            _ = recheck.tick() => {
+                if let Err(why) = admin.terminal_access(&session) {
+                    tracing::info!(%agent, user = %who, %term_id, "a terminal window was detached: its session or permission is gone");
+                    tell(&mut socket, json!({ "type": "detached", "message": why })).await;
+                    left = " (the window's sign-in or permission ended)";
+                    break;
                 }
-                frame = socket.recv() => {
-                    let command = match frame {
-                        Some(Ok(WsMessage::Binary(bytes))) => ToRunner::TerminalInput {
+            }
+            frame = socket.recv() => {
+                let command = match frame {
+                    Some(Ok(WsMessage::Binary(bytes))) => ToRunner::TerminalInput {
+                        term_id: term_id.clone(),
+                        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    },
+                    Some(Ok(WsMessage::Text(text))) => match serde_json::from_str::<PageFrame>(text.as_str()) {
+                        Ok(PageFrame::Resize { cols, rows }) => ToRunner::TerminalResize {
                             term_id: term_id.clone(),
-                            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            cols,
+                            rows,
                         },
-                        Some(Ok(WsMessage::Text(text))) => match serde_json::from_str::<PageFrame>(text.as_str()) {
-                            Ok(PageFrame::Resize { cols, rows }) => ToRunner::TerminalResize {
-                                term_id: term_id.clone(),
-                                cols,
-                                rows,
-                            },
-                            // An empty input types nothing and keeps the
-                            // terminal from being closed as idle.
-                            Ok(PageFrame::Alive) => ToRunner::TerminalInput {
-                                term_id: term_id.clone(),
-                                data: String::new(),
-                            },
-                            Ok(PageFrame::Close) => break,
-                            Ok(PageFrame::Open { .. }) | Err(_) => continue,
+                        // Someone looks. Passed on as an empty input too: a
+                        // runner built before lore kept the idle limit counts
+                        // it as input, this one types nothing.
+                        Ok(PageFrame::Alive) => ToRunner::TerminalInput {
+                            term_id: term_id.clone(),
+                            data: String::new(),
                         },
-                        Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
-                        Some(Ok(_)) => continue,
-                    };
-                    if hub.terminal_send(&term_id, command).await.is_err() {
+                        Ok(PageFrame::Hide) => break,
+                        Ok(PageFrame::End | PageFrame::Close) => {
+                            // The end comes back as the session's exit.
+                            hub.end_terminal(
+                                &term_id,
+                                Some(viewer),
+                                format!("{who} ended it with End session"),
+                            );
+                            continue;
+                        }
+                        Ok(PageFrame::Open { .. }) | Err(_) => continue,
+                    },
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => continue,
+                };
+                if hub.terminal_send(&term_id, viewer, command).await.is_err() {
+                    live = false;
+                }
+            }
+            event = events.recv() => match event {
+                Some(TerminalEvent::Output(bytes)) => {
+                    if !send_within(&mut socket, WsMessage::Binary(bytes.into())).await {
                         break;
                     }
                 }
-                event = events.recv() => match event {
-                    Some(TerminalEvent::Output(bytes)) => {
-                        if socket.send(WsMessage::Binary(bytes.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(TerminalEvent::Exit { code, message }) => {
-                        ended = true;
-                        tell(&mut socket, json!({ "type": "exit", "code": code, "message": message })).await;
+                Some(TerminalEvent::Exit { code, message }) => {
+                    tell(&mut socket, json!({
+                        "type": "exit",
+                        "code": code,
+                        "message": message,
+                        "at": crate::builtin::unix_now(),
+                    }))
+                    .await;
+                    settled = true;
+                    live = false;
+                }
+                Some(TerminalEvent::EndsSoon { at }) => {
+                    if !tell(&mut socket, ends_soon_frame(&hub, at)).await {
                         break;
                     }
-                    None => {
-                        ended = true;
-                        tell(&mut socket, json!({
+                }
+                Some(TerminalEvent::TakenOver { by }) => {
+                    tell(&mut socket, json!({ "type": "taken", "by": by })).await;
+                    settled = true;
+                    live = false;
+                }
+                None => live = false,
+            },
+        }
+    }
+    // Events stopped or input could not go: say where the page stands.
+    if !live && !settled && left.is_empty() {
+        match hub.terminal_viewer_state(&term_id, viewer, &agent, mode) {
+            ViewerState::Current => {}
+            ViewerState::Elsewhere(Some(by)) => {
+                tell(&mut socket, json!({ "type": "taken", "by": by })).await;
+            }
+            ViewerState::Elsewhere(None) => {
+                tell(&mut socket, json!({
+                    "type": "detached",
+                    "message": "this window fell behind the terminal's output and was detached; the session goes on. Reconnect to see it again",
+                }))
+                .await;
+            }
+            ViewerState::Ended(ended) => {
+                // An end whose event did not fit in the page's queue.
+                if let Some(ended) = ended {
+                    tell(
+                        &mut socket,
+                        json!({
                             "type": "exit",
                             "code": null,
-                            "message": "the terminal ended: the agent's container disconnected, or this page fell behind",
-                        }))
-                        .await;
-                        break;
-                    }
-                },
+                            "message": ended.message,
+                            "at": ended.at,
+                        }),
+                    )
+                    .await;
+                }
             }
         }
     }
-    if !ended {
-        hub.terminal_close(&term_id).await;
-    }
-    let _ = socket.send(WsMessage::Close(None)).await;
-    tracing::info!(%agent, %term_id, "a terminal's page closed");
+    hub.terminal_detach(&term_id, viewer, left);
+    send_within(&mut socket, WsMessage::Close(None)).await;
+    tracing::info!(%agent, %term_id, "a terminal window closed");
 }
 
 /// The hub and a built-in agent's name from a path, or the answer to send.
@@ -655,6 +819,17 @@ fn agent_view(
         // and the model a start without a chosen one uses.
         "keys": hub.keys(name).map(|keys| keys.keys).unwrap_or_default(),
         "default_model": hub.keys(name).and_then(|keys| keys.default_model),
+        // Running terminal sessions (who opened and who shows them only
+        // to the agents permission) and how the last ones ended.
+        "terminals": hub.terminal_sessions(name).into_iter().map(|session| {
+            let mut view = json!(session);
+            if !manage {
+                view["opened_by"] = serde_json::Value::Null;
+                view["viewer"] = json!(session.viewer.is_some());
+            }
+            view
+        }).collect::<Vec<_>>(),
+        "terminals_ended": if manage { json!(hub.terminal_ended(name)) } else { json!([]) },
         "methods": methods,
         "credentials": credentials,
         "login": if manage { hub.login_state(name).map(|login| json!(login)) } else { None },

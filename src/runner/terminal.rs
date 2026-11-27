@@ -8,12 +8,12 @@
 //! redacted reliably, so lore only lets the `agents` permission open one.
 //!
 //! Each terminal gets its own session (`setsid`) with the PTY as its
-//! controlling terminal. Closing it, its idle limit, or the link dropping
-//! kills that whole session: the program, its process group, and anything
-//! it started in another group (a shell's background jobs). At most
-//! [`MAX_TERMINALS`] are open at once; one without input and without anyone
-//! looking (the page sends an empty input every minute while it is shown)
-//! is closed after [`IDLE_LIMIT`].
+//! controlling terminal. It lives until its program ends, lore closes it,
+//! or the link drops; the last two kill that whole session: the program,
+//! its process group, and anything it started in another group (a shell's
+//! background jobs). Whether anyone looks at it is lore's business: lore
+//! keeps a session running while no page shows it and ends it after its
+//! own idle limit. At most [`MAX_TERMINALS`] are open at once.
 
 use std::{
     collections::HashMap,
@@ -33,7 +33,7 @@ use rustix::{
     pty::OpenptFlags,
     termios::Winsize,
 };
-use tokio::{io::unix::AsyncFd, process::Child, sync::mpsc, time::Instant};
+use tokio::{io::unix::AsyncFd, process::Child, sync::mpsc};
 
 use super::{
     drivers::{CliHome, Driver, Source},
@@ -43,9 +43,6 @@ use super::{
 
 /// Terminals one runner keeps open at once.
 pub const MAX_TERMINALS: usize = 2;
-
-/// A terminal with no input and nobody looking is closed after this long.
-pub const IDLE_LIMIT: Duration = Duration::from_secs(15 * 60);
 
 /// Most bytes read from a terminal per frame.
 const READ_CHUNK: usize = 16 * 1024;
@@ -65,7 +62,6 @@ const MAX_SIZE: u16 = 1000;
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub max: usize,
-    pub idle: Duration,
     /// The shell a `shell` terminal runs.
     pub shell: PathBuf,
 }
@@ -74,7 +70,6 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max: MAX_TERMINALS,
-            idle: IDLE_LIMIT,
             shell: PathBuf::from("bash"),
         }
     }
@@ -213,7 +208,7 @@ impl Terminals {
                 term_id,
                 None,
                 Some(format!(
-                    "this agent already has {} terminals open; close one first",
+                    "this agent already has {} terminals open; end one first",
                     self.limits.max
                 )),
             );
@@ -231,10 +226,9 @@ impl Terminals {
         let (tx, rx) = mpsc::channel(INPUT_QUEUE);
         open.insert(term_id.clone(), tx);
         drop(open);
-        let (out, registry, idle, shell) = (
+        let (out, registry, shell) = (
             self.out.clone(),
             self.open.clone(),
-            self.limits.idle,
             self.limits.shell.clone(),
         );
         let (driver, occupancy, turnstile, pending) = (
@@ -298,7 +292,7 @@ impl Terminals {
                 }
             };
             tracing::info!(%term_id, mode = ?mode, "a terminal opened");
-            let (code, message) = run(&term_id, child, master, rx, &out, idle).await;
+            let (code, message) = run(&term_id, child, master, rx, &out).await;
             registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -450,11 +444,9 @@ async fn run(
     master: AsyncFd<OwnedFd>,
     mut commands: mpsc::Receiver<Command>,
     out: &mpsc::Sender<FromRunner>,
-    idle: Duration,
 ) -> (Option<i32>, Option<String>) {
     let session = child.id().and_then(|pid| Pid::from_raw(pid as i32));
     let mut buffer = vec![0u8; READ_CHUNK];
-    let mut last_active = Instant::now();
     let mut code = None;
     let mut exited = false;
     let mut message = None;
@@ -494,13 +486,11 @@ async fn run(
             }
             command = commands.recv() => match command {
                 Some(Command::Input(bytes)) => {
-                    last_active = Instant::now();
                     if !bytes.is_empty() && write_all(&master, &bytes).await.is_err() {
                         break;
                     }
                 }
                 Some(Command::Resize(cols, rows)) => {
-                    last_active = Instant::now();
                     let _ = rustix::termios::tcsetwinsize(master.get_ref(), size(cols, rows));
                 }
                 Some(Command::Close) => {
@@ -512,13 +502,6 @@ async fn run(
                     break;
                 }
             },
-            _ = tokio::time::sleep_until(last_active + idle) => {
-                message = Some(format!(
-                    "closed after {} minutes without input and without anyone looking",
-                    idle.as_secs() / 60
-                ));
-                break;
-            }
         }
     }
     // Whatever is left of the session goes, before the program is reaped
@@ -637,8 +620,9 @@ fn session_members(session: Pid) -> Vec<Pid> {
 mod tests {
     use super::*;
     use crate::runner::{drivers::Settings, protocol::Kind};
+    use tokio::time::Instant;
 
-    /// A viewer's keep-alive, as the page's minute tick has lore send it.
+    /// An empty input: what an older lore sent as a viewer's keep-alive.
     fn keep_alive(term_id: &str) -> ToRunner {
         ToRunner::TerminalInput {
             term_id: term_id.into(),
@@ -858,32 +842,27 @@ mod tests {
         assert_eq!(exit.unwrap().1.as_deref(), Some("no such terminal"));
     }
 
+    /// The runner has no idle limit of its own (lore keeps one): a
+    /// terminal nobody types into stays, and keeps printing.
     #[tokio::test]
-    async fn an_idle_terminal_is_closed_unless_someone_is_looking() {
-        let mut bench = bench(
-            "idle",
-            None,
-            Limits {
-                idle: Duration::from_millis(600),
-                ..sh()
-            },
-        );
+    async fn a_terminal_without_input_stays_open() {
+        let mut bench = bench("quiet", None, sh());
         bench
             .terminals
-            .handle(open("i1", TerminalMode::Shell, 80, 24));
-        // A viewer's keep-alive holds it open past the limit...
-        for _ in 0..4 {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            bench.terminals.handle(keep_alive("i1"));
-        }
+            .handle(open("q1", TerminalMode::Shell, 80, 24));
+        bench.terminals.handle(input(
+            "q1",
+            "i=0; while [ $i -lt 4 ]; do sleep 0.3; i=$((i+1)); echo tick-$i; done\n",
+        ));
+        collect(&mut bench.rx, "q1", "tick-4").await;
+        // An empty input, as an older lore's keep-alive, types nothing.
+        bench.terminals.handle(keep_alive("q1"));
         assert_eq!(bench.terminals.count(), 1);
-        // ...and without one it closes.
-        let started = Instant::now();
-        let (_, exit) = collect(&mut bench.rx, "i1", "").await;
-        let (_, message) = exit.unwrap();
-        assert!(message.unwrap().contains("without input"));
-        assert!(started.elapsed() >= Duration::from_millis(400));
-        assert_eq!(bench.terminals.count(), 0);
+        bench.terminals.handle(ToRunner::TerminalClose {
+            term_id: "q1".into(),
+        });
+        let (_, exit) = collect(&mut bench.rx, "q1", "").await;
+        assert_eq!(exit.unwrap().1.as_deref(), Some("closed"));
     }
 
     #[tokio::test]
