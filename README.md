@@ -2801,7 +2801,9 @@ terminal and run homes for a separate agent uid after dropping `CAP_DAC_OVERRIDE
 `CAP_DAC_READ_SEARCH` and `CAP_FOWNER` from its own thread, as the agent container
 has none of them: a write into a home after its hand-over fails it with "Permission
 denied" (run it with `doas target/debug/deps/lore-<hash> --ignored
-a_terminal_home_is_prepared`).
+a_terminal_home_is_prepared`). It needs the default temporary directory (`/tmp`, no
+`TMPDIR` pointing into a home): root without `CAP_DAC_READ_SEARCH` cannot enter a
+0700 home directory such as `/home/<you>`.
 
 Run with `--ignored` but without root, they fail with "needs root"
 instead of skipping. The fork-bomb test (`kill_all_ends_a_fork_bomb_that_holds_every_pid`)
