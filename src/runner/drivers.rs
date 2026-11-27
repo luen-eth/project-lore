@@ -99,6 +99,11 @@ pub struct Fresh {
     /// The user every CLI process runs as; `None` runs it as the runner's
     /// own user (a runner started by hand, the tests).
     pub user: Option<AgentUser>,
+    /// `LORE_RUNNER_EXEC_TMP`: a small mount that allows exec (`/work` and
+    /// `/tmp` do not), for opencode only: Bun extracts its native render
+    /// library to its temporary directory and maps it executable. Each
+    /// home gets a fresh directory there, deleted with it.
+    pub exec_tmp: Option<PathBuf>,
 }
 
 /// The output of one quick command, with every known secret removed.
@@ -113,6 +118,9 @@ pub struct Output {
 pub struct CliHome {
     path: PathBuf,
     fresh: bool,
+    /// opencode's directory on the exec-capable mount (`Fresh::exec_tmp`),
+    /// deleted with the home.
+    exec_tmp: Option<PathBuf>,
     /// The driver's set of paths in use, which the janitor leaves alone;
     /// this home leaves it when dropped.
     live: Option<Live>,
@@ -182,10 +190,17 @@ impl Drop for CliHome {
         {
             tracing::warn!(path = %self.path.display(), %error, "a CLI home could not be deleted");
         }
+        if let Some(exec_tmp) = &self.exec_tmp
+            && let Err(error) = sandbox::remove_tree(exec_tmp)
+        {
+            tracing::warn!(path = %exec_tmp.display(), %error, "a CLI's exec temporary directory could not be deleted");
+        }
         if let Some(live) = &self.live {
-            live.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.path);
+            let mut live = live.lock().unwrap_or_else(|e| e.into_inner());
+            live.remove(&self.path);
+            if let Some(exec_tmp) = &self.exec_tmp {
+                live.remove(exec_tmp);
+            }
         }
     }
 }
@@ -383,6 +398,15 @@ impl Driver {
                 }
             }
         }
+        if let Some(root) = &fresh.exec_tmp
+            && let Ok(entries) = std::fs::read_dir(root)
+        {
+            for entry in entries.flatten() {
+                if !live.contains(&entry.path()) && remove_entry(&entry.path()) {
+                    removed += 1;
+                }
+            }
+        }
         if let Some(conversations) = self.conversations()
             && let Ok(entries) = std::fs::read_dir(&conversations)
         {
@@ -550,6 +574,14 @@ impl Driver {
                     let _ = sandbox::remove_tree(&entry.path());
                 }
             }
+            if let Some(root) = &fresh.exec_tmp {
+                sandbox::make_dir(root, 0o711)?;
+                if let Ok(entries) = std::fs::read_dir(root) {
+                    for entry in entries.flatten() {
+                        let _ = remove_entry(&entry.path());
+                    }
+                }
+            }
             if let Some(conversations) = self.conversations() {
                 sandbox::make_dir(&conversations, 0o700)?;
                 prune_store(&conversations);
@@ -560,6 +592,7 @@ impl Driver {
         let home = CliHome {
             path: self.settings.home.clone(),
             fresh: false,
+            exec_tmp: None,
             live: None,
         };
         self.write_cli_config(&home, false)
@@ -641,22 +674,39 @@ impl Driver {
             return Ok(CliHome {
                 path: self.settings.home.clone(),
                 fresh: false,
+                exec_tmp: None,
                 live: None,
             });
         };
         sandbox::make_dir(&fresh.homes, 0o711)?;
         let path = fresh.homes.join(sandbox::random_name("h-"));
-        self.live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(path.clone());
+        let exec_tmp = match (&fresh.exec_tmp, self.kind()) {
+            (Some(root), Kind::Opencode) => Some(root.join(sandbox::random_name("x-"))),
+            _ => None,
+        };
+        {
+            let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            live.insert(path.clone());
+            if let Some(exec_tmp) = &exec_tmp {
+                live.insert(exec_tmp.clone());
+            }
+        }
         let home = CliHome {
             path,
             fresh: true,
+            exec_tmp,
             live: Some(self.live.clone()),
         };
         sandbox::make_dir(home.path(), 0o700)?;
         sandbox::make_dir(&home.tmp(), 0o700)?;
+        if let Some(exec_tmp) = &home.exec_tmp {
+            // A new name under the mount (the agent user cannot write the
+            // mount itself, 0711), made like the home and handed over the
+            // same way, without following links.
+            sandbox::make_dir(exec_tmp, 0o700)?;
+            sandbox::hand_over(exec_tmp, fresh.user)
+                .with_context(|| format!("handing {} to the agent user", exec_tmp.display()))?;
+        }
         self.write_cli_config(&home, true)?;
         match self.kind() {
             Kind::Codex => {
@@ -907,6 +957,11 @@ impl Driver {
                 .env("TMPDIR", home.tmp())
                 .env("USER", "agent")
                 .env("LOGNAME", "agent");
+            // Bun (opencode) puts the native library it loads in
+            // BUN_TMPDIR before TMPDIR: only that goes to the exec mount.
+            if let Some(exec_tmp) = &home.exec_tmp {
+                command.env("BUN_TMPDIR", exec_tmp);
+            }
         } else if let Ok(user) = std::env::var("USER") {
             command.env("USER", user);
         }
@@ -2085,6 +2140,7 @@ mod tests {
                 program: script(dir, body),
             },
             Isolation::Fresh(Fresh {
+                exec_tmp: None,
                 state: dir.join("state"),
                 homes: dir.join("work/.homes"),
                 user: None,
@@ -2092,6 +2148,73 @@ mod tests {
         );
         driver.prepare().unwrap();
         driver
+    }
+
+    /// opencode gets a fresh directory on the exec mount for Bun's native
+    /// library (BUN_TMPDIR only; TMPDIR stays in the noexec home), deleted
+    /// with the home and swept by the janitor; the other CLIs never do.
+    #[test]
+    fn only_opencode_gets_an_exec_temporary_directory_and_it_goes_with_the_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("exec-tmp");
+        let exec_root = dir.join("exec");
+        let make = |kind: Kind| {
+            let driver = Driver::with_isolation(
+                Settings {
+                    kind,
+                    provider: crate::runner::default_provider(kind).into(),
+                    home: dir.join(format!("runner-home-{kind:?}")),
+                    program: script(&dir, "exit 0\n"),
+                },
+                Isolation::Fresh(Fresh {
+                    exec_tmp: Some(exec_root.clone()),
+                    state: dir.join(format!("state-{kind:?}")),
+                    homes: dir.join(format!("work-{kind:?}/.homes")),
+                    user: None,
+                }),
+            );
+            driver.prepare().unwrap();
+            driver
+        };
+        // A leftover from before a restart goes at start.
+        std::fs::create_dir_all(exec_root.join("x-old")).unwrap();
+        let opencode = make(Kind::Opencode);
+        assert!(!exec_root.join("x-old").exists());
+        let home = opencode.home().unwrap();
+        let exec = home.exec_tmp.clone().expect("opencode gets one");
+        assert!(exec.starts_with(&exec_root));
+        assert_eq!(
+            std::fs::metadata(&exec).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let command = opencode.run_command(Path::new("/bin/true"), &[], &dir, &home);
+        let env: std::collections::HashMap<String, String> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(env.get("BUN_TMPDIR").map(PathBuf::from), Some(exec.clone()));
+        assert_eq!(env.get("TMPDIR").map(PathBuf::from), Some(home.tmp()));
+        // The janitor leaves the one in use and removes a stray one.
+        std::fs::create_dir_all(exec_root.join("x-stray")).unwrap();
+        opencode.clean_now();
+        assert!(exec.exists());
+        assert!(!exec_root.join("x-stray").exists());
+        drop(home);
+        assert!(!exec.exists());
+        for kind in [Kind::Claude, Kind::Codex] {
+            let driver = make(kind);
+            let home = driver.home().unwrap();
+            assert!(home.exec_tmp.is_none());
+            let command = driver.run_command(Path::new("/bin/true"), &[], &dir, &home);
+            assert!(command.as_std().get_envs().all(|(k, _)| k != "BUN_TMPDIR"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A planted link at the old, predictable temporary name no longer

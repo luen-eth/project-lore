@@ -33,6 +33,9 @@
 //! - `LORE_RUNNER_CLI`: the CLI executable; default the kind's name.
 //! - `LORE_RUNNER_WORK`: where runs clone their repositories; default
 //!   `/work`. `LORE_RUNNER_GIT`: the git executable; default `git`.
+//! - `LORE_RUNNER_EXEC_TMP`: for opencode, a small mount that allows exec,
+//!   where each fresh home gets the directory Bun (`BUN_TMPDIR`) extracts
+//!   its native library to; `/work` and `/tmp` stay noexec.
 
 pub mod drivers;
 pub mod protocol;
@@ -211,9 +214,24 @@ pub fn isolation_from_env(settings: &mut Settings, work: &std::path::Path) -> Re
     };
     settings.home = state.join("home");
     sandbox::make_dir(&settings.home, 0o700)?;
+    let exec_tmp = var("LORE_RUNNER_EXEC_TMP").map(PathBuf::from);
+    if exec_tmp.is_none() && settings.kind == Kind::Opencode {
+        tracing::warn!(
+            "LORE_RUNNER_EXEC_TMP is not set: opencode's interface cannot load its native \
+             library from /work, which is noexec. Add the exec tmpfs (/run/lore-exec) and \
+             LORE_RUNNER_EXEC_TMP=/run/lore-exec to this agent's service, as \
+             docker-compose.agents.yml does"
+        );
+    }
+    if let Some(root) = &exec_tmp
+        && !root.is_absolute()
+    {
+        bail!("LORE_RUNNER_EXEC_TMP must be an absolute path");
+    }
     Ok(Isolation::Fresh(Fresh {
         state,
         homes: work.join(".homes"),
+        exec_tmp,
         user,
     }))
 }

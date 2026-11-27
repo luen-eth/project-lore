@@ -1935,6 +1935,7 @@ esac
                 program,
             },
             Isolation::Fresh(Fresh {
+                exec_tmp: None,
                 state: dir.join("state"),
                 homes: dir.join("work/.homes"),
                 user: None,

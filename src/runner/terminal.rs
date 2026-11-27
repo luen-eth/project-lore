@@ -905,6 +905,7 @@ mod tests {
                 program: PathBuf::from("/nonexistent/claude"),
             },
             Isolation::Fresh(Fresh {
+                exec_tmp: None,
                 state: dir.join("state"),
                 homes: dir.join("homes"),
                 user: None,

@@ -1032,6 +1032,23 @@ is working on. Helping other agents on request comes in a later part.
   memory limit, `noexec` unless `LORE_AGENT_WORK_EXEC=exec`), their own state
   volume, no access to lore's data volume and none of lore's `.env`: each gets only
   its own runner secret.
+  The opencode agent (`agent-deepseek`, and any opencode agent defined like it) has
+  one more tmpfs, `/run/lore-exec` (256m, `nosuid,nodev`, mode 0711, **exec
+  allowed**), named to its runner by `LORE_RUNNER_EXEC_TMP`. opencode is a Bun program:
+  its interface extracts a native library (OpenTUI's renderer) to Bun's temporary
+  directory and maps it executable, which a `noexec` mount refuses ("Failed to
+  initialize OpenTUI render library … failed to map segment from shared object"). The
+  runner gives each fresh home a directory of its own there (mode 0700, the agent
+  user's, made and handed over like the home, deleted with it and swept with the other
+  leftovers) and points only `BUN_TMPDIR` at it; `TMPDIR` and everything else stay on
+  the `noexec` mounts. Only opencode's interface needs it: `opencode run`, `opencode
+  models` and the sign-in check work on `noexec`, and Claude Code and Codex do not
+  load native code from their temporary directory. What it weakens: `noexec` was
+  defence in depth against dropping a native binary and running it (the agent can
+  run interpreters anyway, so it never stopped running code); the opencode agent now
+  has one small place where it can, as the unprivileged agent user, inside its
+  container. Without `LORE_RUNNER_EXEC_TMP` (an older compose file) the runner behaves
+  as before and logs a warning saying what to add.
 - **Each built-in agent is an agent in lore's registry** (kind `builtin`, with an
   avatar you can change in the Agents panel), so its work shows up like any other
   agent's. It has no standing token for `/mcp` or the git proxy: outside a run it has
@@ -2100,6 +2117,7 @@ documentation for adding a remote MCP server.
 | `LORE_PROXY_ALLOW` | the providers' hosts | The egress proxy's allowlist (compose service `egress`): host names, comma separated; `.example.com` allows every name under it. See *Network*. |
 | `LORE_PROXY_BIND`, `LORE_PROXY_PORTS` | `0.0.0.0:3128`, `443` | Where the egress proxy listens, and the ports it tunnels to. |
 | `LORE_AGENT_WORK_SIZE`, `LORE_AGENT_WORK_EXEC` | `2g`, `noexec` | Size of each agent's `/work` tmpfs; `exec` lets the agents run programs they build in a checkout. |
+| `LORE_RUNNER_EXEC_TMP` | compose: `/run/lore-exec` for the opencode agent only | The runner's exec-capable temporary mount: each fresh home of an opencode agent gets a directory there for `BUN_TMPDIR` (Bun's native library). Unset: none, and opencode's interface cannot start on a `noexec` `/work`. Never point it at the state volume. |
 | `LORE_AGENT_CPUS`, `LORE_AGENT_MEMORY` | `2`, `4g` | Limits of each agent container. |
 | `LORE_AGENT_CODEX_API_KEY` | | Optional OpenAI API key for the Codex agent only (compose passes it to that container as `CODEX_API_KEY`; lore's own environment gets it empty). |
 

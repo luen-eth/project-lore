@@ -31,11 +31,11 @@ x-agent: &agent
     - egress
   read_only: true
   tmpfs:
-    - /tmp:size=512m,mode=1777,nosuid,nodev,noexec
+    - &tmpfs-tmp /tmp:size=512m,mode=1777,nosuid,nodev,noexec
     # Set LORE_AGENT_WORK_EXEC=exec if the agents must run programs they
     # build in a checkout (compiled tests); scripts run through an
     # interpreter (`sh x.sh`, `python x.py`, `node x.js`) work either way.
-    - /work:size=${LORE_AGENT_WORK_SIZE:-2g},mode=0711,nosuid,nodev,${LORE_AGENT_WORK_EXEC:-noexec}
+    - &tmpfs-work /work:size=${LORE_AGENT_WORK_SIZE:-2g},mode=0711,nosuid,nodev,${LORE_AGENT_WORK_EXEC:-noexec}
   cpus: ${LORE_AGENT_CPUS:-2}
   mem_limit: ${LORE_AGENT_MEMORY:-4g}
   pids_limit: 512
@@ -152,10 +152,20 @@ services:
       args:
         AGENT: deepseek
     image: project-lore-agent-deepseek:latest
+    # opencode is a Bun program: it extracts its native render library to
+    # its temporary directory and maps it executable, which /work and /tmp
+    # (noexec) refuse. This one small mount allows exec; the runner gives
+    # each fresh home a directory of its own there (BUN_TMPDIR), deleted
+    # with the home. Claude Code and Codex do not need it.
+    tmpfs:
+      - *tmpfs-tmp
+      - *tmpfs-work
+      - /run/lore-exec:size=256m,mode=0711,nosuid,nodev,exec
     environment:
       <<: *agent-env
       LORE_RUNNER_AGENT: deepseek-builtin
       LORE_RUNNER_TOKEN: ${LORE_RUNNER_TOKEN_DEEPSEEK:-}
+      LORE_RUNNER_EXEC_TMP: /run/lore-exec
     volumes:
       - agent-deepseek-state:/var/lib/lore-runner
     networks:
