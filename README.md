@@ -1629,8 +1629,14 @@ lore asks GitHub with its own credential before it lets a push create one, and
 refuses the push when the branch is there or when it cannot tell. lore marks the
 task done only when the default branch, read again with its own credential, points
 at a commit this run made: one that came in the run's own pack, or one
-`repo_commit` made for it, and that moved the branch. Pointing the branch at a
-commit that was already there credits nothing. Anything else is *not confirmed* and
+`repo_commit` made for it, and that moved the branch. The pack may be an earlier
+push of the same run: a run that pushes a feature branch and then fast-forwards the
+default branch to the same commit sends no objects the second time, and is still
+credited, because its first push brought that commit as the tip of a branch. (A
+fast-forward to a commit in the middle of an earlier pack, not its tip, is not
+recognised: lore records the tip of each update, not every commit of a pack.)
+Pointing the branch at a commit that was already there before the run, and that the
+run never sent, credits nothing. Anything else is *not confirmed* and
 the task is released with a note.
 
 **Notes.** A released task's note and the activity line say only how the run ended,

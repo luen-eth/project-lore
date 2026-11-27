@@ -1131,11 +1131,42 @@ impl RunRef {
     /// at a commit that was already there (`push-existing`) credits
     /// nothing.
     pub fn credits(&self, name: &str, sha: &str) -> bool {
-        self.name == name
-            && self.new == sha
-            && self.old != self.new
-            && matches!(self.via.as_str(), "push" | "repo_commit")
+        self.name == name && self.new == sha && self.moved() && self.brought_its_commit()
     }
+
+    fn moved(&self) -> bool {
+        self.old != self.new
+    }
+
+    /// Whether the new commit is the run's own: it came in this update's
+    /// pack (`push`) or `repo_commit` made it.
+    fn brought_its_commit(&self) -> bool {
+        matches!(self.via.as_str(), "push" | "repo_commit")
+    }
+}
+
+/// Whether a run's recorded ref updates (oldest first, as
+/// [`Db::run_refs`] answers them) credit it with `sha` on `name` (a full
+/// ref). Either one update credits it on its own ([`RunRef::credits`]),
+/// or an update moved `name` to `sha` without sending it
+/// (`push-existing`) after an earlier update of the same run brought
+/// `sha` itself (a `push` whose pack carried it, or a `repo_commit`), on
+/// any branch: a run that pushes a feature branch and then fast-forwards
+/// the default branch to it sends an empty pack the second time, and the
+/// commit is still its own. A run is bound to one repository, so every
+/// update of it is to that one. Pointing a branch at a commit the run
+/// never sent credits nothing.
+pub fn run_credited(refs: &[RunRef], name: &str, sha: &str) -> bool {
+    refs.iter().enumerate().any(|(at, update)| {
+        update.credits(name, sha)
+            || (update.name == name
+                && update.new == sha
+                && update.moved()
+                && update.via == "push-existing"
+                && refs[..at].iter().any(|earlier| {
+                    earlier.new == sha && earlier.moved() && earlier.brought_its_commit()
+                }))
+    })
 }
 
 impl Db {
@@ -1345,6 +1376,65 @@ mod tests {
         assert!(!credited("r4", &theirs));
         assert!(!credited("r1", &theirs));
         assert_eq!(db.run_created_branches("r5").unwrap(), vec!["side"]);
+    }
+
+    /// A run that pushes a feature branch (its commit comes in that pack)
+    /// and then fast-forwards the default branch to the same commit (an
+    /// empty pack: `push-existing`) is credited; pointing the default
+    /// branch at a commit the run never sent is not, nor is a commit the
+    /// run only sent after pointing the branch at it.
+    #[test]
+    fn a_fast_forward_to_the_run_s_own_earlier_push_credits_it() {
+        let (db, _) = temp_db("credits-ff");
+        let (zero, base, mine, theirs) = (
+            "0".repeat(40),
+            "a".repeat(40),
+            "b".repeat(40),
+            "e".repeat(40),
+        );
+        let (main, feature) = ("refs/heads/main", "refs/heads/feature");
+        let credited = |run: &str, sha: &str| run_credited(&db.run_refs(run).unwrap(), main, sha);
+
+        // Feature branch first, then main fast-forwarded to it.
+        db.record_run_ref("ff", feature, &zero, &mine, "push")
+            .unwrap();
+        db.record_run_ref("ff", main, &base, &mine, "push-existing")
+            .unwrap();
+        assert!(credited("ff", &mine));
+
+        // The same with a commit `repo_commit` made on the feature branch.
+        db.record_run_ref("rc", feature, &base, &mine, "repo_commit")
+            .unwrap();
+        db.record_run_ref("rc", main, &base, &mine, "push-existing")
+            .unwrap();
+        assert!(credited("rc", &mine));
+
+        // The run's own pack carried another commit; main points at one
+        // that was upstream before the run.
+        db.record_run_ref("other", feature, &zero, &mine, "push")
+            .unwrap();
+        db.record_run_ref("other", main, &base, &theirs, "push-existing")
+            .unwrap();
+        assert!(!credited("other", &theirs));
+
+        // Only someone else's commit, on both branches.
+        db.record_run_ref("theirs", feature, &zero, &theirs, "push-existing")
+            .unwrap();
+        db.record_run_ref("theirs", main, &base, &theirs, "push-existing")
+            .unwrap();
+        assert!(!credited("theirs", &theirs));
+
+        // The commit "arrives" only after main was pointed at it.
+        db.record_run_ref("late", main, &base, &mine, "push-existing")
+            .unwrap();
+        db.record_run_ref("late", feature, &zero, &mine, "push")
+            .unwrap();
+        assert!(!credited("late", &mine));
+
+        // Another run's push of the commit does not make it this run's.
+        db.record_run_ref("elsewhere", main, &base, &mine, "push-existing")
+            .unwrap();
+        assert!(!credited("elsewhere", &mine));
     }
 
     #[test]

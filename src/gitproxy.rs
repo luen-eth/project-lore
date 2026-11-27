@@ -919,9 +919,10 @@ impl RunPushed {
 }
 
 /// How a run's pushed ref is recorded: `push` when its commit came in the
-/// run's own pack (only such a push, or a `repo_commit`, credits a task),
-/// `push-existing` when the run pointed the ref at a commit that was
-/// already there.
+/// run's own pack, `push-existing` when the run pointed the ref at a
+/// commit that was already there. A task is credited by a `push`, a
+/// `repo_commit`, or a `push-existing` to a commit an earlier `push` or
+/// `repo_commit` of the same run brought (`db::run_credited`).
 fn push_via(update: &RunUpdate) -> &'static str {
     if update.own { "push" } else { "push-existing" }
 }

@@ -1781,9 +1781,10 @@ impl TaskRunner {
 
     /// Whether the run's default branch, read by lore itself, now points
     /// at a commit this run pushed through the git proxy in its own pack
-    /// (upstream reported the update `ok`, and it moved the branch) or
-    /// made with `repo_commit` (lore's own record, `agent_run_refs`; see
-    /// `RunRef::credits`), and moved since
+    /// (upstream reported the update `ok`, and it moved the branch; or an
+    /// earlier push of the run carried the commit and this one only
+    /// fast-forwarded the branch to it) or made with `repo_commit` (lore's
+    /// own record, `agent_run_refs`; see `run_credited`), and moved since
     /// the head lore read before the run started. The commit, when it
     /// does. Anything else is not confirmed, whatever the runner says.
     async fn confirmed_push(&self, active: &Active) -> Option<String> {
@@ -1796,9 +1797,7 @@ impl TaskRunner {
         let (db, id) = (self.db.clone(), active.run_id.clone());
         let refs = blocking(move || db.run_refs(&id)).await.ok()?;
         let wanted = format!("refs/heads/{}", active.branch);
-        refs.iter()
-            .any(|update| update.credits(&wanted, &sha))
-            .then_some(sha)
+        crate::db::run_credited(&refs, &wanted, &sha).then_some(sha)
     }
 
     /// Passes a conversation's answer on: to the `ask` call still waiting
