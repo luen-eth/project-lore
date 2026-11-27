@@ -2615,7 +2615,7 @@ as), `LORE_RUNNER_WORK` (`/work`), `LORE_RUNNER_CLI` (the CLI's path) and
 
 Chat web apps can use lore as a remote MCP connector through the OAuth flow above.
 In claude.ai, add `https://<your lore host>/mcp` as a custom connector; in ChatGPT,
-add it as a connector in developer mode. The app opens lore's consent page, where
+add it under Plugins as a custom MCP server (formerly a developer-mode connector). The app opens lore's consent page, where
 you sign in and approve it as an agent of its own. Such a client has no shell and
 no checkout, so it reads and changes code through `repo_tree`, `repo_read`,
 `repo_search` and `repo_commit`. Consider giving it `read` rather than `full` on
@@ -2638,6 +2638,30 @@ can call) is told exactly which ones are missing, or that its list is current. l
 does not declare `tools.listChanged`: it serves MCP as stateless JSON responses and
 has no channel to push that notification.
 
+**What ChatGPT shows.** Every tool in `tools/list` carries a `title`, the MCP
+annotations `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint`, and
+two status texts in its `_meta` (`openai/toolInvocation/invoking` while it runs,
+`openai/toolInvocation/invoked` when it is done; at most 64 characters each).
+ChatGPT asks for confirmation before any tool not marked read-only, so the
+read-only tools (`recall`, `recent`, `projects`, `get`, `notes`, `todos`, `tasks`,
+`files`, `file_get`, `project_aliases`, `integrations`, `assistants`, `repo_tree`,
+`repo_read`, `repo_search`, `mail`) now run without asking. Everything else still asks
+(once per conversation if you tell it to remember). Tools that can delete or
+overwrite are marked destructive: `forget`, `note_delete`, `note_edit`, `amend`,
+`file_delete`, `project_rename`, `repo_commit`, `delegate` (its agent pushes to the
+default branch) and the five provider tools. A provider tool's GET only reads, but
+annotations describe a tool, not a call, so they carry the worst case. `inbox` is not
+read-only because it marks messages read. The status texts are in Turkish by default;
+`LORE_TOOL_STATUS_LANG=en` switches them to English and `off` leaves them out. ChatGPT
+may show them only for tools that also have a widget, and lore has none yet;
+otherwise it shows its own "Calling tool" text. On a ChatGPT plan without full MCP
+(Pro: read and fetch only) the write tools may be refused whatever lore says.
+After a deploy that changes the tool list, refresh or reconnect the connector so
+the app reads the new list. Claude Code, Codex, opencode and other MCP clients
+ignore `_meta` keys they do not know, and the annotations are hints: unannotated
+tools count as writing, destructive and open-world, so a client that uses them can
+only ask less, never more, than before.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -2653,6 +2677,7 @@ has no channel to push that notification.
 | `LORE_EMBEDDING_MODEL` | `bge-m3` | `bge-m3`, `e5-large`, `e5-base` or `e5-small`. Changing it re-embeds every entry. |
 | `LORE_EMBEDDINGS` | `on` | `off` gives keyword-only search with no model download. |
 | `LORE_MIN_SIMILARITY` | per model | Similarity below which a meaning-only match is dropped. |
+| `LORE_TOOL_STATUS_LANG` | `tr` | Language of the status texts ChatGPT shows while a tool runs (see *Connecting a chat web app*): `tr`, `en` or `off`. Anything else refuses to start. Read at start-up. |
 | `LORE_SESSION_IDLE_HOURS` | `12` | Hours without activity after which an open session is closed. Whole number between 1 and 720. |
 | `LORE_ALLOWED_HOSTS` | any | Hostnames accepted in the `Host` header. |
 | `LORE_TRUST_PROXY` | `on` in Docker | Read the client address from `X-Forwarded-For`. Turn off if the port is exposed directly. |

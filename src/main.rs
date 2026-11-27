@@ -18,6 +18,7 @@ mod runscope;
 mod server;
 mod shutdown;
 mod taskrunner;
+mod toolui;
 mod users;
 mod vault;
 
@@ -174,6 +175,11 @@ async fn run() -> Result<()> {
         }
         Err(error) => tracing::warn!(%error, "checking the project aliases failed"),
     }
+    let status_lang = env_or("LORE_TOOL_STATUS_LANG", "tr");
+    let Some(status_lang) = toolui::Lang::parse(&status_lang) else {
+        bail!("LORE_TOOL_STATUS_LANG must be tr, en or off");
+    };
+    toolui::set_lang(status_lang);
     let semantic = flag("LORE_EMBEDDINGS", true);
     let embedder = if semantic {
         db.use_embedding_model(model.name())?;
@@ -1271,6 +1277,28 @@ mod tests {
         assert_eq!(response.status(), 200);
         let text = response.text().await.unwrap();
         assert!(text.contains("\"hello\""), "{text}");
+        // Every tool carries its title, the four annotation hints and the
+        // two ChatGPT status texts (`_meta`), as the client receives them.
+        let body: Value = serde_json::from_str(&text).unwrap();
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert!(!tools.is_empty());
+        for tool in tools {
+            assert!(tool["title"].is_string(), "{tool}");
+            for hint in [
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ] {
+                assert!(tool["annotations"][hint].is_boolean(), "{hint}: {tool}");
+            }
+            for key in [toolui::INVOKING_KEY, toolui::INVOKED_KEY] {
+                assert!(tool["_meta"][key].is_string(), "{key}: {tool}");
+            }
+        }
+        let recall = tools.iter().find(|tool| tool["name"] == "recall").unwrap();
+        assert_eq!(recall["annotations"]["readOnlyHint"], true);
+        assert_eq!(recall["_meta"][toolui::INVOKING_KEY], "Hafıza aranıyor…");
         assert!(seen(&server.db, "cursor-laptop").await);
         let registered = server.db.registry_agent("cursor-laptop").unwrap().unwrap();
         assert_eq!(
