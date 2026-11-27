@@ -1646,8 +1646,14 @@ when each was stored in `keys.json` next to it, without the key), never in lore'
 database, logs, API answers or the activity feed (which says only which provider's
 key was stored or removed), and redacts it from everything the CLI prints. The keys
 are given to the `opencode` process only, in its environment, never written to a
-file the CLI can read and never given to runner git. As before, a **Shell** in the
-agent's terminal runs with the same stored credentials (*Terminal* below).
+file the CLI can read and never given to runner git, and each start gets only the
+keys it needs: a board run and a question (`ask`) get only the key of the provider
+of the model they use, with only that provider enabled in their configuration; a
+provider's **Check** gets only that provider's key; the model list gets every key
+(`opencode models` lists the built-in catalogue and makes no request). The owner's
+**terminal** (the CLI's interface) gets every stored key, so models of every keyed
+provider can be switched to there; a **Shell** runs with every stored credential
+too, as it always has (*Terminal* below).
 
 **Only the providers with a key.** Every opencode command (runs, `ask`, checks, the
 model list and terminals) starts in a fresh home whose `opencode.json` the runner

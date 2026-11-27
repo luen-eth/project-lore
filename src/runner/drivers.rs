@@ -191,6 +191,10 @@ const CLAUDE_LEFTOVER_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 pub struct CliHome {
     path: PathBuf,
     fresh: bool,
+    /// opencode: the only providers this start may use and whose keys
+    /// it gets (a run, `ask`, a provider check: the one of its model);
+    /// `None`: every provider with a key (the model list, a terminal).
+    providers: Option<Vec<String>>,
     /// opencode's directory on the exec-capable mount (`Fresh::exec_tmp`),
     /// deleted with the home.
     exec_tmp: Option<PathBuf>,
@@ -880,6 +884,7 @@ impl Driver {
         let home = CliHome {
             path: self.settings.home.clone(),
             fresh: false,
+            providers: None,
             exec_tmp: None,
             side: None,
             live: None,
@@ -927,7 +932,11 @@ impl Driver {
     /// model the start uses. Written into the home before it is handed
     /// over; a terminal's or a run's MCP file (`OPENCODE_CONFIG`) adds
     /// lore's server and never names a provider or a model.
-    pub fn opencode_config(&self, model: Option<&str>) -> serde_json::Value {
+    pub fn opencode_config(
+        &self,
+        model: Option<&str>,
+        only: Option<&[String]>,
+    ) -> serde_json::Value {
         let mut config = serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
             "autoupdate": false,
@@ -936,6 +945,7 @@ impl Driver {
                 .keyed_providers()
                 .into_iter()
                 .map(|p| p.id)
+                .filter(|id| only.is_none_or(|only| only.contains(id)))
                 .collect::<Vec<_>>(),
         });
         if let Some(model) = model {
@@ -1000,7 +1010,7 @@ impl Driver {
                 if let Some(parent) = path.parent() {
                     create_private_dir(parent)?;
                 }
-                let config = self.opencode_config(model);
+                let config = self.opencode_config(model, home.providers.as_deref());
                 write_private(&path, serde_json::to_string_pretty(&config)?.as_bytes())?;
             }
         }
@@ -1028,10 +1038,34 @@ impl Driver {
     /// configuration (`model`, already checked by
     /// [`Driver::opencode_model`]). Ignored for the other CLIs.
     pub fn home_for_model(&self, purpose: HomePurpose, model: Option<&str>) -> Result<CliHome> {
+        self.make_home(purpose, model, None)
+    }
+
+    /// The home of a run or a question: for opencode, only the provider of
+    /// the run's model is enabled in its configuration and only that
+    /// provider's key reaches the CLI (`model` already checked by
+    /// [`Driver::opencode_model`]). The other CLIs get their usual home.
+    pub fn home_for_run(&self, model: Option<&str>) -> Result<CliHome> {
+        let providers = match (self.kind(), model) {
+            (Kind::Opencode, Some(model)) => Some(vec![
+                model.split('/').next().unwrap_or_default().to_string(),
+            ]),
+            _ => None,
+        };
+        self.make_home(HomePurpose::Plain, model, providers)
+    }
+
+    fn make_home(
+        &self,
+        purpose: HomePurpose,
+        model: Option<&str>,
+        providers: Option<Vec<String>>,
+    ) -> Result<CliHome> {
         let Isolation::Fresh(fresh) = &self.isolation else {
             let home = CliHome {
                 path: self.settings.home.clone(),
                 fresh: false,
+                providers,
                 exec_tmp: None,
                 side: None,
                 live: None,
@@ -1060,6 +1094,7 @@ impl Driver {
         let home = CliHome {
             path,
             fresh: true,
+            providers,
             exec_tmp: None,
             side,
             live: Some(self.live.clone()),
@@ -1415,16 +1450,28 @@ impl Driver {
             }
         }
         // Only the names this CLI uses: Claude Code never gets
-        // ANTHROPIC_API_KEY (it is signed in with the subscription only).
+        // ANTHROPIC_API_KEY (it is signed in with the subscription only),
+        // and an opencode start scoped to some providers (a run, `ask`, a
+        // provider check) gets only their keys.
+        let allowed = |name: &str| match &home.providers {
+            Some(only) if self.kind() == Kind::Opencode => self
+                .opencode_providers()
+                .iter()
+                .any(|p| p.key_var == name && only.contains(&p.id)),
+            _ => true,
+        };
         for name in self.passthrough_vars() {
             if let Ok(value) = std::env::var(&name)
                 && !value.trim().is_empty()
+                && allowed(&name)
             {
                 command.env(&name, value.trim());
             }
         }
         for (name, value) in self.stored_vars() {
-            command.env(name, value);
+            if allowed(&name) {
+                command.env(name, value);
+            }
         }
         if let Some(user) = self.user() {
             command.uid(user.uid).gid(user.gid);
@@ -1842,43 +1889,16 @@ impl Driver {
         // Held like a credential change: no run or terminal is going, and
         // whatever the check leaves is ended with it.
         let _slot = self.exclusive("a provider check").await?;
-        let home = self.home_for_model(HomePurpose::Plain, Some(&model))?;
-        // Only this provider, whatever else has a key.
-        let mut config = self.opencode_config(Some(&model));
-        config["enabled_providers"] = serde_json::json!([provider.id]);
-        if home.is_fresh() {
-            // The home is the agent user's now: the check's own
-            // configuration goes beside it, in the runner's directory.
-            let Isolation::Fresh(fresh) = &self.isolation else {
-                unreachable!("a fresh home has fresh isolation");
-            };
-            let side = fresh.homes.join(sandbox::random_name("c-"));
-            let held = self.hold(&side);
-            sandbox::make_dir(&side, 0o755)?;
-            let path = side.join("opencode.json");
-            write_private(&path, serde_json::to_string_pretty(&config)?.as_bytes())?;
-            if self.user().is_some() {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
-            }
-            let answer = self.check_in(&home, &model, &path).await;
-            let _ = sandbox::remove_tree(&side);
-            drop(held);
-            return answer;
-        }
-        let path = home.path().join(".lore-check.json");
-        write_private(&path, serde_json::to_string_pretty(&config)?.as_bytes())?;
-        let answer = self.check_in(&home, &model, &path).await;
-        let _ = std::fs::remove_file(&path);
-        answer
+        // Only this provider is enabled, and only its key is given.
+        let home = self.make_home(HomePurpose::Plain, Some(&model), Some(vec![provider.id]))?;
+        self.check_in(&home, &model).await
     }
 
-    async fn check_in(&self, home: &CliHome, model: &str, config: &Path) -> Result<(bool, String)> {
+    async fn check_in(&self, home: &CliHome, model: &str) -> Result<(bool, String)> {
         let args = opencode_check_args(model);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut command = self.command_for(&self.settings.program, &args, home);
         command
-            .env("OPENCODE_CONFIG", config)
             .env("OPENCODE_DISABLE_PROJECT_CONFIG", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -3530,6 +3550,72 @@ esac
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Least privilege: a run (and `ask`) of a model gets only that model's
+    /// provider, enabled alone and with only its key; a provider check
+    /// likewise; the model list and the owner's terminal get every key.
+    #[tokio::test]
+    async fn an_opencode_run_gets_only_its_model_s_provider_and_key() {
+        let dir = temp("oc-least");
+        let driver = opencode(
+            &dir,
+            "deepseek",
+            "#!/bin/sh\necho \"{\\\"type\\\":\\\"text\\\",\\\"part\\\":{\\\"text\\\":\\\"$(env | grep _API_KEY= | cut -d= -f1 | sort | tr '\\n' ' ')\\\"}}\"\n",
+        );
+        let all = [
+            ("deepseek", "DEEPSEEK_API_KEY", "deepseek/deepseek-flash"),
+            ("opencode-go", "OPENCODE_API_KEY", "opencode-go/glm-5.3"),
+            (
+                "anthropic",
+                "ANTHROPIC_API_KEY",
+                "anthropic/claude-opus-5-5",
+            ),
+            ("openai", "OPENAI_API_KEY", "openai/gpt-5.5"),
+        ];
+        for (provider, _, _) in all {
+            store_key(&driver, provider, &format!("sk-{provider}-fake-key-000001")).await;
+        }
+        let config = |home: &CliHome| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(home.opencode_config()).unwrap()).unwrap()
+        };
+        let keys_of = |home: &CliHome| -> Vec<String> {
+            let mut keys: Vec<String> =
+                env_of(&driver.run_command(Path::new("/bin/true"), &[], &dir, home))
+                    .into_keys()
+                    .filter(|k| k.ends_with("_API_KEY"))
+                    .collect();
+            keys.sort();
+            keys
+        };
+        for (provider, var, model) in all {
+            let model = driver.opencode_model(Some(model)).unwrap();
+            let home = driver.home_for_run(Some(&model)).unwrap();
+            let written = config(&home);
+            assert_eq!(written["enabled_providers"], serde_json::json!([provider]));
+            assert_eq!(written["model"], model.as_str());
+            assert_eq!(keys_of(&home), vec![var.to_string()], "{provider}");
+            drop(home);
+            // A provider check: its key alone (the fake CLI prints the key
+            // variables it was given).
+            let (ok, said) = driver.check_provider(provider).await.unwrap();
+            assert!(ok, "{said}");
+            assert_eq!(said, format!("the provider answered: {var}"), "{provider}");
+        }
+        // The model list and the owner's terminal: every key.
+        let home = driver.home().unwrap();
+        assert_eq!(keys_of(&home).len(), 4);
+        assert_eq!(
+            config(&home)["enabled_providers"].as_array().unwrap().len(),
+            4
+        );
+        drop(home);
+        let home = driver
+            .terminal_home(TerminalMode::Cli, Some("openai/gpt-5.5"))
+            .unwrap();
+        assert_eq!(keys_of(&home).len(), 4);
+        drop(home);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The argument vector of every opencode invocation the runner makes
     /// carries only flags opencode 2.3.2 accepts there (`opencode <cmd>
     /// --help` in the agent image): the interface none (it refuses
@@ -3716,6 +3802,9 @@ esac
                     let (ok, _) = rt.block_on(driver.check_provider("opencode-go")).unwrap();
                     assert!(!ok, "/bin/true answers nothing");
                 }
+                // A run's home: only its model's provider.
+                let run_home = (kind == Kind::Opencode)
+                    .then(|| driver.home_for_run(Some("opencode-go/glm-5.3")).unwrap());
                 let mut home = driver.terminal_home(TerminalMode::Cli, None).unwrap();
                 driver.give_exec_tmp(&mut home).unwrap();
                 let command = driver
@@ -3762,6 +3851,16 @@ esac
                         serde_json::json!(["opencode-go"])
                     );
                     assert_eq!(config["model"], "opencode-go/glm-5.3");
+                    let run_home = run_home.as_ref().unwrap();
+                    let run_config = run_home.opencode_config();
+                    assert_eq!(std::fs::metadata(&run_config).unwrap().uid(), user.uid);
+                    let run_config: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(&run_config).unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        run_config["enabled_providers"],
+                        serde_json::json!(["opencode-go"])
+                    );
                     let secrets = std::fs::read_to_string(base.join("state/secrets.env")).unwrap();
                     assert!(
                         secrets.contains("OPENCODE_API_KEY=") && !secrets.contains("ANTHROPIC")

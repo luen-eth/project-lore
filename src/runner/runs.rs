@@ -42,7 +42,7 @@ use tokio::{
 };
 
 use super::{
-    drivers::{CliHome, Driver, HomePurpose, redact_with, shorten},
+    drivers::{CliHome, Driver, redact_with, shorten},
     protocol::{FromRunner, Kind, RunKind, RunLine, RunSpec, ToRunner},
     sandbox::{self, Occupancy},
 };
@@ -544,9 +544,7 @@ impl Run {
     /// The CLI's home for this run; a conversation's earlier transcripts
     /// are put back in it.
     fn cli_home(&mut self) -> Result<CliHome> {
-        let home = self
-            .driver
-            .home_for_model(HomePurpose::Plain, self.model.as_deref())?;
+        let home = self.driver.home_for_run(self.model.as_deref())?;
         if self.spec.kind == RunKind::Chat
             && let Some(name) = &self.spec.workdir
         {
