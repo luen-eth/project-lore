@@ -821,8 +821,15 @@ impl Driver {
     /// relies on, without touching anything the owner set. With fresh
     /// homes, the homes a previous runner left are deleted.
     pub fn prepare(&self) -> Result<()> {
-        if self.kind() == Kind::Claude {
-            self.remove_leftover_claude_key()?;
+        // A key that cannot be removed is unused anyway (`stored_names`):
+        // the rest of the preparation goes on.
+        if self.kind() == Kind::Claude
+            && let Err(error) = self.remove_leftover_claude_key()
+        {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "a stored Anthropic API key could not be removed; it is not used"
+            );
         }
         if let Isolation::Fresh(fresh) = &self.isolation {
             sandbox::make_dir(&fresh.state, 0o700)?;
@@ -3121,6 +3128,45 @@ esac
         let settings = std::fs::read_to_string(home.claude_dir().join("settings.json")).unwrap();
         assert!(!settings.contains("apiKeyHelper"), "{settings}");
         drop(home);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A leftover key that cannot be removed does not stop the rest of
+    /// the preparation (the homes directory is still made and cleaned).
+    #[test]
+    fn a_failed_key_removal_does_not_skip_the_preparation() {
+        use std::os::unix::fs::PermissionsExt;
+        if sandbox::can_switch_user() {
+            return; // root writes anywhere: nothing to fail
+        }
+        let dir = temp("claude-prepare");
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("secrets.env"),
+            "ANTHROPIC_API_KEY=sk-ant-api03-test-key-0123456789abcdef\n", // lore:allow-secret (fake test value)
+        )
+        .unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let leftover = dir.join("work/.homes/h-left");
+        std::fs::create_dir_all(&leftover).unwrap();
+        let driver = Driver::with_isolation(
+            Settings {
+                kind: Kind::Claude,
+                provider: "anthropic".into(),
+                home: dir.join("runner-home"),
+                program: PathBuf::from("/bin/true"),
+            },
+            Isolation::Fresh(Fresh {
+                exec_tmp: None,
+                state: state.clone(),
+                homes: dir.join("work/.homes"),
+                user: None,
+            }),
+        );
+        driver.prepare().unwrap();
+        assert!(!leftover.exists(), "the homes were still cleaned");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
