@@ -113,6 +113,65 @@ pub struct Output {
     pub text: String,
 }
 
+/// Claude Code's subscription sign-in made with `claude setup-token`.
+const CLAUDE_TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+/// An Anthropic API key for Claude Code (billed per token).
+const CLAUDE_KEY_VAR: &str = "ANTHROPIC_API_KEY";
+
+/// Which credential a Claude Code process gets: never both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeAuth {
+    /// The setup token or the claude.ai sign-in; no API key.
+    Subscription,
+    /// The API key; no setup token, no claude.ai credentials.
+    ApiKey,
+    /// Nothing is stored.
+    None,
+}
+
+/// What lore knows about one stored Claude credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CredentialState {
+    pub stored: bool,
+    /// Known unusable now (missing pieces, expired, or refused at its last
+    /// use), so a fallback may skip it.
+    pub unusable: bool,
+}
+
+/// The credential a Claude Code process starts with: the one first in
+/// `priority` that is stored; with `fallback`, the other one when the
+/// first is known unusable and the other is stored and not. Never a
+/// credential that is not stored. A pure function, so the choice is the
+/// same for runs, questions, checks and terminals.
+pub fn choose_claude_auth(
+    subscription: CredentialState,
+    key: CredentialState,
+    priority: ClaudeAuth,
+    fallback: bool,
+) -> ClaudeAuth {
+    let (first, first_kind, second, second_kind) = match priority {
+        ClaudeAuth::ApiKey => (
+            key,
+            ClaudeAuth::ApiKey,
+            subscription,
+            ClaudeAuth::Subscription,
+        ),
+        _ => (
+            subscription,
+            ClaudeAuth::Subscription,
+            key,
+            ClaudeAuth::ApiKey,
+        ),
+    };
+    match (first.stored, second.stored) {
+        (false, false) => ClaudeAuth::None,
+        (true, false) => first_kind,
+        (false, true) => second_kind,
+        (true, true) if fallback && first.unusable && !second.unusable => second_kind,
+        (true, true) => first_kind,
+    }
+}
+
 /// The home a CLI command runs in. A fresh one is deleted when dropped;
 /// the shared one stays.
 pub struct CliHome {
@@ -556,7 +615,7 @@ impl Driver {
     /// write there) is ignored, and nothing else is ever written.
     fn stored_names(&self) -> Vec<String> {
         match self.kind() {
-            Kind::Claude => vec!["CLAUDE_CODE_OAUTH_TOKEN".into()],
+            Kind::Claude => vec![CLAUDE_TOKEN_VAR.into(), CLAUDE_KEY_VAR.into()],
             Kind::Codex => Vec::new(),
             Kind::Opencode => vec![self.provider_key_var()],
         }
@@ -700,14 +759,15 @@ impl Driver {
                     write_private(&home.codex_home().join("auth.json"), &bytes)?;
                 }
             }
-            Kind::Claude => {
+            // With the API key the claude.ai sign-in stays out of the home.
+            Kind::Claude if self.claude_auth() != ClaudeAuth::ApiKey => {
                 if let Some(bytes) =
                     sandbox::read_regular(&self.claude_credentials(), MAX_CREDENTIAL_FILE)
                 {
                     write_private(&home.claude_dir().join(".credentials.json"), &bytes)?;
                 }
             }
-            Kind::Opencode => {}
+            Kind::Claude | Kind::Opencode => {}
         }
         sandbox::hand_over(home.path(), fresh.user)
             .with_context(|| format!("handing {} to the agent user", home.path().display()))?;
@@ -1007,15 +1067,25 @@ impl Driver {
                 command.env(name, value.trim());
             }
         }
+        // Claude Code gets one credential: the subscription's or the API
+        // key, never both (see `choose_claude_auth`).
+        let skip: &[&str] = match (self.kind(), self.claude_auth()) {
+            (Kind::Claude, ClaudeAuth::ApiKey) => &[CLAUDE_TOKEN_VAR],
+            (Kind::Claude, _) => &[CLAUDE_KEY_VAR],
+            _ => &[],
+        };
         for name in self.passthrough_vars() {
             if let Ok(value) = std::env::var(&name)
                 && !value.trim().is_empty()
+                && !skip.contains(&name.as_str())
             {
                 command.env(&name, value.trim());
             }
         }
         for (name, value) in self.stored_vars() {
-            command.env(name, value);
+            if !skip.contains(&name.as_str()) {
+                command.env(name, value);
+            }
         }
         if let Some(user) = self.user() {
             command.uid(user.uid).gid(user.gid);
@@ -1165,11 +1235,43 @@ impl Driver {
         })
     }
 
+    /// The Claude credentials stored now: the subscription (a setup token,
+    /// in the volume or the container's environment, or a claude.ai
+    /// sign-in) and the API key.
+    fn claude_stored(&self) -> (bool, bool) {
+        let vars = self.stored_vars();
+        let has = |name: &str| vars.iter().any(|(stored, _)| stored == name);
+        let token_env = std::env::var(CLAUDE_TOKEN_VAR).is_ok_and(|v| !v.trim().is_empty());
+        let subscription =
+            has(CLAUDE_TOKEN_VAR) || token_env || self.claude_credentials().is_file();
+        (subscription, has(CLAUDE_KEY_VAR))
+    }
+
+    /// The credential Claude Code starts with now: the subscription first
+    /// (the owner's choice of order and a fallback are not stored yet),
+    /// the API key when it is the only one.
+    pub fn claude_auth(&self) -> ClaudeAuth {
+        let (subscription, key) = self.claude_stored();
+        let state = |stored| CredentialState {
+            stored,
+            unusable: false,
+        };
+        choose_claude_auth(
+            state(subscription),
+            state(key),
+            ClaudeAuth::Subscription,
+            false,
+        )
+    }
+
     async fn claude_status(&self) -> (bool, Option<String>, Option<String>, String) {
-        let stored = self
-            .stored_vars()
-            .iter()
-            .any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN");
+        let (subscription, key) = self.claude_stored();
+        let auth = self.claude_auth();
+        let stored = auth == ClaudeAuth::Subscription
+            && self
+                .stored_vars()
+                .iter()
+                .any(|(name, _)| name == CLAUDE_TOKEN_VAR);
         let output = self.run(&["auth", "status", "--text"], None).await;
         let (success, text) = match output {
             Ok(output) => (output.success, output.text),
@@ -1186,14 +1288,21 @@ impl Driver {
         .any(|phrase| lower.contains(phrase));
         let signed_in = success && !refused;
         let meta = self.sign_in_meta();
-        let (method, ends) = if stored {
+        let both = if subscription && key {
+            " (an API key is stored too; the subscription is used)"
+        } else {
+            ""
+        };
+        let (method, ends) = if auth == ClaudeAuth::ApiKey {
+            (Some("API key".to_string()), None)
+        } else if stored {
             let ends = meta
                 .as_ref()
                 .and_then(|meta| meta.get("ends").and_then(|v| v.as_str()))
                 .map(str::to_string);
-            (Some("setup-token".to_string()), ends)
+            (Some(format!("setup-token{both}")), ends)
         } else if signed_in {
-            (Some("claude.ai sign-in".to_string()), find_date(&text))
+            (Some(format!("claude.ai sign-in{both}")), find_date(&text))
         } else {
             (None, None)
         };
@@ -1351,6 +1460,22 @@ impl Driver {
             CredentialKind::ApiKey => {
                 single_line("API key")?;
                 match self.kind() {
+                    Kind::Claude => {
+                        // Only the shape is checked; Anthropic's formats
+                        // may change, so another prefix is a warning.
+                        if value.chars().count() < 20 {
+                            bail!("that is too short for an Anthropic API key");
+                        }
+                        self.store_var(CLAUDE_KEY_VAR, value)?;
+                        let warning = if value.starts_with("sk-ant-") {
+                            ""
+                        } else {
+                            " (it does not start with sk-ant-, as Anthropic API keys do; check it)"
+                        };
+                        Ok(format!(
+                            "the Anthropic API key is stored in the agent's volume{warning}"
+                        ))
+                    }
                     Kind::Codex => {
                         let home = self.home()?;
                         let output = self
@@ -2448,6 +2573,163 @@ esac
         assert!(driver.harvest(&home, Source::Owner).unwrap());
         assert_eq!(std::fs::read(&stored).unwrap(), planted);
         drop(home);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The credential choice: the first stored one in priority order; the
+    /// other only with the fallback on, when the first is known unusable;
+    /// never one that is not stored.
+    #[test]
+    fn the_claude_credential_choice_never_picks_what_is_not_stored() {
+        use ClaudeAuth::*;
+        let s = |stored, unusable| CredentialState { stored, unusable };
+        let none = s(false, false);
+        for priority in [Subscription, ApiKey] {
+            for fallback in [false, true] {
+                for unusable in [false, true] {
+                    assert_eq!(choose_claude_auth(none, none, priority, fallback), None);
+                    assert_eq!(
+                        choose_claude_auth(s(true, unusable), none, priority, fallback),
+                        Subscription
+                    );
+                    assert_eq!(
+                        choose_claude_auth(none, s(true, unusable), priority, fallback),
+                        ApiKey
+                    );
+                }
+            }
+        }
+        let ok = s(true, false);
+        let bad = s(true, true);
+        assert_eq!(
+            choose_claude_auth(ok, ok, Subscription, false),
+            Subscription
+        );
+        assert_eq!(choose_claude_auth(ok, ok, ApiKey, false), ApiKey);
+        // Without the fallback a failing first credential is just used.
+        assert_eq!(
+            choose_claude_auth(bad, ok, Subscription, false),
+            Subscription
+        );
+        assert_eq!(choose_claude_auth(bad, ok, Subscription, true), ApiKey);
+        assert_eq!(choose_claude_auth(ok, bad, ApiKey, true), Subscription);
+        // Both unusable: the first, as without a fallback.
+        assert_eq!(
+            choose_claude_auth(bad, bad, Subscription, true),
+            Subscription
+        );
+    }
+
+    /// Claude Code gets one credential, never both, for runs and questions
+    /// (`run_command`), checks (`command_for`) and terminals: with only the
+    /// API key, the key and no claude.ai credentials; with both, the
+    /// subscription and no key. Sign out removes the key too, and the key
+    /// is never in the CLI's status text or the stored-message.
+    #[tokio::test]
+    async fn claude_gets_the_subscription_or_the_api_key_never_both() {
+        let dir = temp("claude-key");
+        let driver = fresh(
+            &dir,
+            Kind::Claude,
+            "#!/bin/sh\necho \"API key: ANTHROPIC_API_KEY\"\n",
+        );
+        let key = Secret::new("sk-ant-api03-test-key-0123456789abcdef"); // lore:allow-secret (fake test value)
+        let said = driver
+            .set_credential(CredentialKind::ApiKey, &key)
+            .await
+            .unwrap();
+        assert!(!said.contains(key.expose()), "{said}");
+        assert_eq!(driver.claude_auth(), ClaudeAuth::ApiKey);
+        assert!(driver.secrets().iter().any(|secret| secret == key.expose()));
+        let envs = |command: &Command| -> std::collections::HashMap<String, String> {
+            command
+                .as_std()
+                .get_envs()
+                .filter_map(|(k, v)| {
+                    Some((
+                        k.to_string_lossy().into_owned(),
+                        v?.to_string_lossy().into_owned(),
+                    ))
+                })
+                .collect()
+        };
+        // Only the key: runs, questions and terminals get it alone.
+        let home = driver.home().unwrap();
+        let run = envs(&driver.run_command(Path::new("/bin/true"), &[], &dir, &home));
+        assert_eq!(
+            run.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some(key.expose())
+        );
+        assert!(!run.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        let terminal = envs(
+            &driver
+                .terminal_command(TerminalMode::Cli, None, None, Path::new("/bin/sh"), &home)
+                .unwrap(),
+        );
+        assert_eq!(
+            terminal.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some(key.expose())
+        );
+        assert!(!terminal.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        drop(home);
+        // The claude.ai sign-in stays out of the home while the key is used.
+        write_private(
+            &dir.join("state/claude-credentials.json"),
+            br#"{"claudeAiOauth":{}}"#,
+        )
+        .unwrap();
+        // Now both are stored: the subscription is used, without the key.
+        assert_eq!(driver.claude_auth(), ClaudeAuth::Subscription);
+        let token = Secret::new("sk-ant-oat01-a-pasted-setup-token-0000"); // lore:allow-secret (fake test value)
+        driver
+            .set_credential(CredentialKind::SetupToken, &token)
+            .await
+            .unwrap();
+        let home = driver.home().unwrap();
+        assert!(home.claude_dir().join(".credentials.json").is_file());
+        let run = envs(&driver.run_command(Path::new("/bin/true"), &[], &dir, &home));
+        assert_eq!(
+            run.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some(token.expose())
+        );
+        assert!(!run.contains_key("ANTHROPIC_API_KEY"));
+        let terminal = envs(
+            &driver
+                .terminal_command(TerminalMode::Cli, None, None, Path::new("/bin/sh"), &home)
+                .unwrap(),
+        );
+        assert!(!terminal.contains_key("ANTHROPIC_API_KEY"));
+        drop(home);
+        // Only the key again (the subscription removed by hand): no
+        // claude.ai credentials in the home.
+        std::fs::remove_file(dir.join("state/claude-credentials.json")).unwrap();
+        let lines: Vec<String> = std::fs::read_to_string(dir.join("state/secrets.env"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with(CLAUDE_TOKEN_VAR))
+            .map(str::to_string)
+            .collect();
+        write_private(
+            &dir.join("state/secrets.env"),
+            (lines.join("\n") + "\n").as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(driver.claude_auth(), ClaudeAuth::ApiKey);
+        write_private(
+            &dir.join("state/claude-credentials.json"),
+            br#"{"claudeAiOauth":{}}"#,
+        )
+        .unwrap();
+        // (a claude.ai sign-in counts as the subscription, which comes first)
+        assert_eq!(driver.claude_auth(), ClaudeAuth::Subscription);
+        std::fs::remove_file(dir.join("state/claude-credentials.json")).unwrap();
+        let home = driver.home().unwrap();
+        assert!(!home.claude_dir().join(".credentials.json").exists());
+        drop(home);
+        // Sign out removes the key with everything else.
+        driver.logout().await.unwrap();
+        assert_eq!(driver.claude_auth(), ClaudeAuth::None);
+        assert!(!driver.secrets().iter().any(|secret| secret == key.expose()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

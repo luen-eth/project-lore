@@ -399,7 +399,10 @@
     field.autocomplete = "off";
     field.spellcheck = false;
     label.append(el("span", "", (credential ? credential.label : kind) + " for " + agent.name), field);
-    form.append(label, el("p", "muted small-text", CREDENTIAL_HELP[kind] + " It is stored only in the agent's own volume, never in lore."));
+    const help = agent.kind === "claude" && kind === "api_key"
+      ? "Paste an Anthropic API key from the Anthropic console. With a key, Claude is billed per token to that account instead of the subscription: set a spend limit on the key there."
+      : CREDENTIAL_HELP[kind];
+    form.append(label, el("p", "muted small-text", help + " It is stored only in the agent's own volume, never in lore."));
     const actions = el("div", "board-actions");
     actions.append(button("Cancel", "", () => { ui.credential[agent.name] = undefined; render(); }));
     const save = el("button", "ghost small", "Store");

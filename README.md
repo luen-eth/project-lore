@@ -1394,7 +1394,7 @@ there is no such renewal (see above): a claude.ai sign-in may need signing in ag
 by the owner from time to time, so use a setup token for a Claude agent that runs on
 its own.
 
-**Claude Code** (`agent-claude`), either of:
+**Claude Code** (`agent-claude`), one of:
 
 - *Paste a token from `claude setup-token`* (preferred, lasts a year): on your own
   computer, where you are signed in to Claude Code with your subscription, run
@@ -1402,7 +1402,7 @@ its own.
   prints. In the admin page press **Paste setup token** on `claude-builtin`, paste
   it, press **Store**. The runner keeps it as `CLAUDE_CODE_OAUTH_TOKEN` in
   `/var/lib/lore-runner/secrets.env` and passes it only to `claude` (never to git)
-  (`ANTHROPIC_API_KEY` is never set, so the subscription is used). The page shows
+  (`ANTHROPIC_API_KEY` is then not set, so the subscription is used). The page shows
   *signed in with setup-token* and the end date, a year from when you stored it.
 - *Sign in with claude.ai*: press **Sign in with claude.ai**. The runner starts
   `claude auth login --claudeai` and the page shows its URL. Open it, sign in with
@@ -1410,6 +1410,34 @@ its own.
   under the URL and press **Send code**; the runner types it into the CLI. The
   runner keeps the credentials the CLI wrote (`.credentials.json`) as
   `/var/lib/lore-runner/claude-credentials.json`.
+- *Paste API key*: an Anthropic API key (from the Anthropic console). The runner
+  checks only its shape (one line, at least 20 characters; a key that does not start
+  with `sk-ant-` is stored with a warning) and keeps it as `ANTHROPIC_API_KEY` in
+  `secrets.env`, like the token: never in lore's database, logs or API answers, and
+  the page shows only *signed in with API key*. **Check** runs `claude auth status`,
+  which reports that a key is configured but does not test it against the API: a
+  wrong key shows up at the first run ("Invalid API key", HTTP 401).
+
+**Which one Claude uses.** A Claude Code process gets exactly one credential, never
+both: with the subscription (setup token or claude.ai sign-in) it gets no
+`ANTHROPIC_API_KEY`; with the API key it gets no `CLAUDE_CODE_OAUTH_TOKEN` and its
+fresh home no claude.ai credentials. When only one is stored, that one is used for
+runs, questions (`ask`), checks and terminals; when both are stored, the subscription
+is used and the card says that an API key is stored too. Choosing the order ("Use
+first: subscription / API key") and a fallback to the other credential are not there
+yet: they need two more settings columns in `builtin_agents` (a schema change).
+**Sign out** removes every stored Claude credential, the API key included; there is
+no removal of one credential alone (no other card has one either). In a terminal
+with the API key, Claude Code asks once whether to use the key from the environment.
+
+**Billing with an API key.** With an API key, runs, questions and terminal sessions
+are billed per token to the Anthropic API account instead of drawing on a
+subscription. The only spending limits lore applies are the daily cap of board tasks
+and the per-hour limits on `ask` and `delegate`; set a spend limit on the key in the
+Anthropic console. The egress allowlist already holds `api.anthropic.com`, the host
+Claude Code sent its requests to with a key in a local test; whether it contacts
+anything else with a key was not observed beyond that
+(`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set in the containers).
 
 **Codex** (`agent-codex`), one of:
 

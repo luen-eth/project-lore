@@ -73,7 +73,7 @@ impl Kind {
     /// Which credentials the owner may paste for this kind.
     pub fn credentials(self) -> &'static [CredentialKind] {
         match self {
-            Kind::Claude => &[CredentialKind::SetupToken],
+            Kind::Claude => &[CredentialKind::SetupToken, CredentialKind::ApiKey],
             Kind::Codex => &[CredentialKind::AuthJson, CredentialKind::ApiKey],
             Kind::Opencode => &[CredentialKind::ApiKey],
         }
@@ -131,7 +131,8 @@ pub enum CredentialKind {
     /// The contents of a Codex `auth.json` made elsewhere.
     AuthJson,
     /// A provider API key: `codex login --with-api-key`, or the key of an
-    /// opencode provider (`DEEPSEEK_API_KEY` for DeepSeek).
+    /// opencode provider (`DEEPSEEK_API_KEY` for DeepSeek), or Anthropic's
+    /// for Claude Code (`ANTHROPIC_API_KEY`).
     ApiKey,
 }
 
