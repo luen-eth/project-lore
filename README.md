@@ -783,6 +783,10 @@ everything, an exact copy. See [Backups](#backups) for what each contains.
 
 ![The backup menu](docs/backup.jpg)
 
+The agent settings of the agent registry (avatars, notes, display names, disabled
+agents) and the built-in agents' settings are carried only by the full database
+backup; the JSON backup leaves them out, and restoring one leaves them as they are.
+
 A JSON backup is complete for what it carries: restoring it reproduces the memories,
 search index included. The vectors are reused when the instance runs the same
 embedding model as the one the backup came from; with a different model they are
