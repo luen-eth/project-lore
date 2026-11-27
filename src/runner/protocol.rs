@@ -202,6 +202,16 @@ pub struct RunSpec {
     pub output_cap_bytes: u64,
 }
 
+/// lore's MCP endpoint for one terminal's CLI and the token it calls it
+/// with (`lore_term_…`), which lore accepts only while that terminal is
+/// open, only on its internal listener and only from the agent's runner
+/// address.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminalMcp {
+    pub url: String,
+    pub token: Secret,
+}
+
 /// lore to runner.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -260,6 +270,11 @@ pub enum ToRunner {
         /// missing for the CLI's default.
         #[serde(default)]
         model: Option<String>,
+        /// lore's MCP server for the CLI's interface (never for a shell):
+        /// where it is and the terminal's own token, valid while this
+        /// terminal is open. Missing from an older lore.
+        #[serde(default)]
+        mcp: Option<TerminalMcp>,
     },
     /// Bytes typed into a terminal, base64. Empty data types nothing: it
     /// says someone is still looking, which keeps the terminal from being
@@ -539,6 +554,10 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 model: Some("opus".into()),
+                mcp: Some(TerminalMcp {
+                    url: "http://lore:8081/mcp".into(),
+                    token: Secret::new("lore_term_x"),
+                }),
             },
             ToRunner::TerminalInput {
                 term_id: "t1".into(),

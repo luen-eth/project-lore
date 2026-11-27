@@ -28,7 +28,7 @@ use tokio::{
 };
 
 use super::{
-    protocol::{CredentialKind, FromRunner, Kind, LoginMethod, Secret, TerminalMode},
+    protocol::{CredentialKind, FromRunner, Kind, LoginMethod, Secret, TerminalMcp, TerminalMode},
     sandbox::{self, AgentUser, CopyLimits, Exclusive, Occupancy},
 };
 
@@ -799,13 +799,19 @@ impl Driver {
     /// with the model the owner chose, or `shell`, both with the CLI's
     /// cleared environment and its stored credentials, and a terminal type
     /// that allows colour.
+    /// The CLI's interface also gets lore's MCP server when lore sent one
+    /// (`mcp`): the same arguments and configuration a run gets
+    /// (`runs::mcp_arguments`, the files in `<home>/.lore-mcp`, which hold
+    /// no secret), and the terminal's token in `LORE_AGENT_TOKEN`, in the
+    /// CLI's environment only. A shell never gets either.
     pub fn terminal_command(
         &self,
         mode: TerminalMode,
         model: Option<&str>,
+        mcp: Option<&TerminalMcp>,
         shell: &Path,
         home: &CliHome,
-    ) -> Command {
+    ) -> Result<Command> {
         // A model is a plain name (lore checks it); one that looks like an
         // option is left out rather than passed on.
         let model = model
@@ -826,6 +832,29 @@ impl Driver {
                 }
             }
         }
+        let mut extra_env: Vec<(String, String)> = Vec::new();
+        let token = match (mode, mcp) {
+            (TerminalMode::Cli, Some(mcp)) => {
+                let conf = home.path().join(".lore-mcp");
+                sandbox::make_dir(&conf, 0o755)?;
+                let (mcp_args, env) =
+                    super::runs::mcp_arguments(self.kind(), &mcp.url, &conf, false)?;
+                if self.user().is_some() {
+                    // Readable by the CLI (the agent user), not changeable.
+                    use std::os::unix::fs::PermissionsExt;
+                    for entry in std::fs::read_dir(&conf)?.flatten() {
+                        std::fs::set_permissions(
+                            entry.path(),
+                            std::fs::Permissions::from_mode(0o644),
+                        )?;
+                    }
+                }
+                args.extend(mcp_args);
+                extra_env = env;
+                Some(mcp.token.expose().to_string())
+            }
+            _ => None,
+        };
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut command = match mode {
             TerminalMode::Cli => self.command_for(&self.settings.program, &args, home),
@@ -835,7 +864,11 @@ impl Driver {
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env_remove("NO_COLOR");
-        command
+        command.envs(extra_env);
+        if let Some(token) = token {
+            command.env("LORE_AGENT_TOKEN", token);
+        }
+        Ok(command)
     }
 
     /// A command for a run (part 6b): the CLI's cleared environment and

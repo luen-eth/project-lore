@@ -186,10 +186,15 @@ async fn run() -> Result<()> {
             })
             .collect();
         db.register_builtin_agents(&named)?;
-        Some(Arc::new(builtin::Hub::new(db.clone(), runner_tokens)))
+        // The terminals' CLIs reach lore's MCP endpoint where runs do.
+        let mcp_url = format!("{}/mcp", taskrunner::lore_url_from_env()?);
+        Some(Arc::new(
+            builtin::Hub::new(db.clone(), runner_tokens).with_mcp_url(mcp_url),
+        ))
     };
     let mut auth = McpAuth::new(tokens, db.clone(), trust_proxy);
     auth.allowed_hosts = allowed_hosts;
+    auth.terminals = hub.clone();
 
     let events = Events::new();
     let lore = Lore::new(

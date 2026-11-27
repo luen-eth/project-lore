@@ -604,6 +604,9 @@ pub struct McpAuth {
     pub oauth: bool,
     /// `LORE_ALLOWED_HOSTS`, which the public origin must match when set.
     pub allowed_hosts: Vec<String>,
+    /// The built-in agents' runner links, which know the open terminals and
+    /// their tokens; none without built-in agents.
+    pub terminals: Option<Arc<crate::builtin::Hub>>,
 }
 
 /// Who a presented bearer token belongs to.
@@ -616,12 +619,19 @@ pub enum Authenticated {
     /// A built-in agent's run-scoped token: valid while its run lasts, for
     /// what its scope allows (see `runscope`).
     Run(Box<RunScope>),
+    /// A built-in agent's terminal token (`lore_term_…`): valid while
+    /// that terminal is open, as the agent itself with the levels the
+    /// administrator gave it, without a run's scope (whoever opened the
+    /// terminal holds the `agents` permission).
+    Terminal(String),
 }
 
 impl Authenticated {
     pub fn agent(&self) -> &str {
         match self {
-            Authenticated::Env(agent) | Authenticated::OAuth(agent) => agent,
+            Authenticated::Env(agent)
+            | Authenticated::OAuth(agent)
+            | Authenticated::Terminal(agent) => agent,
             Authenticated::Run(scope) => &scope.agent,
         }
     }
@@ -657,6 +667,7 @@ impl McpAuth {
             requests: RateLimiter::new(600, Duration::from_secs(60)),
             oauth: false,
             allowed_hosts: Vec::new(),
+            terminals: None,
         }
     }
 
@@ -717,6 +728,34 @@ impl McpAuth {
             Ok(Ok(None)) => Err(Refused::Invalid),
             other => {
                 tracing::error!(?other, "checking an OAuth token failed");
+                Err(Refused::Invalid)
+            }
+        }
+    }
+
+    /// A terminal token: only on the internal listener, only while its
+    /// terminal is open and only from the address the agent's runner is
+    /// connected from; its agent must not be disabled. Not accepted by the
+    /// git proxy, which only knows `authenticate_on`.
+    pub async fn authenticate_terminal(
+        &self,
+        presented: &str,
+        internal: bool,
+        peer: Option<std::net::IpAddr>,
+    ) -> Result<Authenticated, Refused> {
+        let (true, Some(hub), Some(peer)) = (internal, self.terminals.as_ref(), peer) else {
+            return Err(Refused::Invalid);
+        };
+        let Some(agent) = hub.terminal_token_agent(presented, peer) else {
+            return Err(Refused::Invalid);
+        };
+        let db = self.db.clone();
+        let name = agent.clone();
+        match tokio::task::spawn_blocking(move || db.registry_agent(&name)).await {
+            Ok(Ok(Some(found))) if found.disabled => Err(Refused::Disabled { agent, env: false }),
+            Ok(Ok(_)) => Ok(Authenticated::Terminal(agent)),
+            other => {
+                tracing::error!(?other, "checking a terminal token failed");
                 Err(Refused::Invalid)
             }
         }
@@ -816,7 +855,18 @@ pub async fn require_token(
         .to_string();
 
     let internal = request.extensions().get::<InternalListener>().is_some();
-    let (agent, scope) = match auth.authenticate_on(&presented, internal).await {
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip());
+    let found = if crate::builtin::looks_like_terminal_token(&presented) {
+        auth.authenticate_terminal(&presented, internal, peer_ip)
+            .await
+    } else {
+        auth.authenticate_on(&presented, internal).await
+    };
+    let terminal = matches!(found, Ok(Authenticated::Terminal(_)));
+    let (agent, scope) = match found {
         Ok(found) => (found.agent().to_string(), found.scope().cloned()),
         Err(Refused::Disabled { agent, env: true }) => {
             tracing::warn!(%agent, "a disabled agent was refused");
@@ -855,7 +905,7 @@ pub async fn require_token(
         return too_many_requests(retry_after);
     }
 
-    let client = request
+    let mut client = request
         .headers()
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -863,6 +913,13 @@ pub async fn require_token(
         .chars()
         .take(120)
         .collect::<String>();
+    // The agents panel tells a terminal's CLI from a run by this.
+    if terminal {
+        client = format!("lore terminal · {client}")
+            .chars()
+            .take(120)
+            .collect();
+    }
     let db = auth.db.clone();
     let name = agent.clone();
     tokio::task::spawn_blocking(move || {

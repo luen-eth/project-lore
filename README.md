@@ -1390,6 +1390,27 @@ CLI the new rows and columns once, when the drag ends), says clearly when it is
 disconnected or has ended, and closes only with its **Close** button: every key,
 Escape included, goes to the terminal.
 
+**The CLI in a terminal comes with lore's MCP server**, as a run's does: Claude Code
+with `--strict-mcp-config --mcp-config` (so only lore is loaded, never the claude.ai
+account's own connectors, which the egress proxy would refuse anyway), Codex with the
+`mcp_servers.lore` overrides, opencode with its config file; the same builder as
+runs (`runner::runs::mcp_arguments`). For each terminal of the CLI's interface lore
+mints a token of its own (`lore_term_` and 64 hex characters), keeps only its hash, in
+memory, and sends it over the runner link; the runner gives it to the CLI alone, in
+`LORE_AGENT_TOKEN` (the configuration files in the terminal's fresh home name the
+variable, never the value). lore accepts it only on the internal listener's `/mcp`
+(not on the public one, not on `/git`), only from the address that agent's runner is
+connected from, and only while that terminal is open: closing it for any reason (Close,
+the page going, the link dropping, the idle limit, the session check failing, lore
+stopping) forgets it. A **Shell** gets no token. A call made with it acts as that
+built-in agent (for example `claude-builtin`) with the levels the administrator gave
+it on the Agents page, through every gate other calls pass (kill switch, levels, leak
+scan, protected Dokploy services, redaction, the operations log, the activity feed;
+the agents panel records the client as `lore terminal · …`). **Unlike a run it is not
+limited to a task's scope**: there is no task, the person at the terminal acts with
+the agent's full authority, which is one more reason only the `agents` permission can
+open a terminal.
+
 **Whoever can open the terminal has a shell in that agent's container, with its
 credentials** (the CLI's sign-in, the stored token or key). That is why only the
 `agents` permission can open it. The bytes are relayed as they are, both ways: a

@@ -1030,18 +1030,7 @@ pub fn cli_arguments(
     let mut env: Vec<(String, String)> = Vec::new();
     match kind {
         Kind::Claude => {
-            let config = serde_json::json!({
-                "mcpServers": { "lore": {
-                    "type": "http",
-                    "url": mcp_url,
-                    "headers": { "Authorization": "Bearer ${LORE_AGENT_TOKEN}" },
-                } }
-            });
-            let path = conf.join("mcp.json");
-            super::drivers::write_private(
-                &path,
-                serde_json::to_string_pretty(&config)?.as_bytes(),
-            )?;
+            let (mcp, _) = mcp_arguments(kind, mcp_url, conf, true)?;
             args.extend(["-p".into(), prompt.into()]);
             args.extend([
                 "--output-format".into(),
@@ -1053,10 +1042,8 @@ pub fn cli_arguments(
                 "bypassPermissions".into(),
                 "--setting-sources".into(),
                 "user".into(),
-                "--strict-mcp-config".into(),
-                "--mcp-config".into(),
-                path.display().to_string(),
             ]);
+            args.extend(mcp);
             if let Some(model) = model {
                 args.extend(["--model".into(), model.into()]);
             }
@@ -1086,16 +1073,8 @@ pub fn cli_arguments(
             if turn.chat {
                 args.push("--skip-git-repo-check".into());
             }
-            args.extend([
-                "-c".into(),
-                "approval_policy=\"never\"".into(),
-                "-c".into(),
-                format!("mcp_servers.lore.url={}", toml_string(mcp_url)),
-                "-c".into(),
-                "mcp_servers.lore.bearer_token_env_var=\"LORE_AGENT_TOKEN\"".into(),
-                "-c".into(),
-                "mcp_servers.lore.required=true".into(),
-            ]);
+            args.extend(["-c".into(), "approval_policy=\"never\"".into()]);
+            args.extend(mcp_arguments(kind, mcp_url, conf, true)?.0);
             if let Some(model) = model {
                 args.extend(["-m".into(), model.into()]);
             }
@@ -1103,6 +1082,83 @@ pub fn cli_arguments(
                 args.push(session.into());
             }
             args.push(prompt.into());
+        }
+        Kind::Opencode => {
+            env.extend(mcp_arguments(kind, mcp_url, conf, true)?.1);
+            args.extend([
+                "run".into(),
+                "--standalone".into(),
+                "--format".into(),
+                "json".into(),
+                "--auto".into(),
+                "--archived".into(),
+                "--title".into(),
+                format!("lore run {run_id}"),
+            ]);
+            if let Some(model) = model {
+                let model = if model.contains('/') {
+                    model.to_string()
+                } else {
+                    format!("{provider}/{model}")
+                };
+                args.extend(["--model".into(), model]);
+            }
+            if let Some(session) = turn.resume {
+                args.extend(["--session".into(), session.into()]);
+            }
+            args.push(prompt.into());
+        }
+    }
+    Ok((args, env))
+}
+
+/// The part of a CLI's command line and environment that gives it lore's
+/// MCP server at `mcp_url`, with the bearer token read from
+/// `LORE_AGENT_TOKEN` (never written anywhere): Claude's `--mcp-config`
+/// file with `--strict-mcp-config` (so no other MCP server, the account's
+/// claude.ai connectors included, is loaded), Codex's `mcp_servers.lore`
+/// overrides, opencode's config file (`OPENCODE_CONFIG`, the
+/// repository's own config ignored). Files go to `conf`. Shared by runs
+/// and terminals. `required`: a run needs lore, so Codex fails without it;
+/// an interactive terminal still starts when lore cannot be reached.
+pub fn mcp_arguments(
+    kind: Kind,
+    mcp_url: &str,
+    conf: &Path,
+    required: bool,
+) -> Result<(Vec<String>, Env)> {
+    let mut args: Vec<String> = Vec::new();
+    let mut env: Env = Vec::new();
+    match kind {
+        Kind::Claude => {
+            let config = serde_json::json!({
+                "mcpServers": { "lore": {
+                    "type": "http",
+                    "url": mcp_url,
+                    "headers": { "Authorization": "Bearer ${LORE_AGENT_TOKEN}" },
+                } }
+            });
+            let path = conf.join("mcp.json");
+            super::drivers::write_private(
+                &path,
+                serde_json::to_string_pretty(&config)?.as_bytes(),
+            )?;
+            args.extend([
+                "--strict-mcp-config".into(),
+                "--mcp-config".into(),
+                path.display().to_string(),
+            ]);
+        }
+        Kind::Codex => {
+            args.extend([
+                "-c".into(),
+                format!("mcp_servers.lore.url={}", toml_string(mcp_url)),
+                "-c".into(),
+                "mcp_servers.lore.bearer_token_env_var=\"LORE_AGENT_TOKEN\"".into(),
+            ]);
+            if required {
+                args.extend(["-c".into(), "mcp_servers.lore.required=true".into()]);
+            }
         }
         Kind::Opencode => {
             let config = serde_json::json!({
@@ -1130,28 +1186,6 @@ pub fn cli_arguments(
                     "1".to_string(),
                 ),
             ]);
-            args.extend([
-                "run".into(),
-                "--standalone".into(),
-                "--format".into(),
-                "json".into(),
-                "--auto".into(),
-                "--archived".into(),
-                "--title".into(),
-                format!("lore run {run_id}"),
-            ]);
-            if let Some(model) = model {
-                let model = if model.contains('/') {
-                    model.to_string()
-                } else {
-                    format!("{provider}/{model}")
-                };
-                args.extend(["--model".into(), model]);
-            }
-            if let Some(session) = turn.resume {
-                args.extend(["--session".into(), session.into()]);
-            }
-            args.push(prompt.into());
         }
     }
     Ok((args, env))
@@ -1618,6 +1652,143 @@ mod tests {
             lore_origin("http://lore:8080/git/github/o/r.git"),
             "http://lore:8080"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A terminal's CLI gets lore's MCP server the way a run's does (the
+    /// same builder), with the terminal's token in its environment only;
+    /// a shell gets neither.
+    #[test]
+    fn a_terminal_s_cli_gets_lore_s_mcp_server_and_a_shell_does_not() {
+        use super::super::drivers::{Driver, Settings};
+        use super::super::protocol::{Secret, TerminalMcp, TerminalMode};
+        let dir = std::env::temp_dir().join(format!("lore-runs-term-{}", std::process::id()));
+        let mcp = TerminalMcp {
+            url: "http://lore:8081/mcp".into(),
+            token: Secret::new(format!("lore_term_{}", "ab".repeat(32))),
+        };
+        for kind in [Kind::Claude, Kind::Codex, Kind::Opencode] {
+            let home = dir.join(format!("{kind:?}"));
+            std::fs::create_dir_all(&home).unwrap();
+            let driver = Driver::new(Settings {
+                kind,
+                provider: crate::runner::default_provider(kind).into(),
+                home: home.clone(),
+                program: PathBuf::from("/bin/true"),
+            });
+            let cli_home = driver.home().unwrap();
+            let command = driver
+                .terminal_command(
+                    TerminalMode::Cli,
+                    Some("m1"),
+                    Some(&mcp),
+                    Path::new("/bin/sh"),
+                    &cli_home,
+                )
+                .unwrap();
+            let std = command.as_std();
+            let args: Vec<String> = std
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let joined = args.join(" ");
+            let env: Vec<(String, String)> = std
+                .get_envs()
+                .filter_map(|(k, v)| {
+                    Some((
+                        k.to_string_lossy().into_owned(),
+                        v?.to_string_lossy().into_owned(),
+                    ))
+                })
+                .collect();
+            let token = env
+                .iter()
+                .find(|(k, _)| k == "LORE_AGENT_TOKEN")
+                .map(|(_, v)| v.clone());
+            assert_eq!(token.as_deref(), Some(mcp.token.expose()), "{kind:?}");
+            // The token is in the environment, never on the command line
+            // or in a file.
+            assert!(!joined.contains("lore_term_"), "{joined}");
+            let conf = cli_home.path().join(".lore-mcp");
+            for entry in std::fs::read_dir(&conf).into_iter().flatten().flatten() {
+                let text = std::fs::read_to_string(entry.path()).unwrap();
+                assert!(!text.contains("lore_term_"), "{text}");
+                assert!(text.contains("http://lore:8081/mcp"), "{text}");
+            }
+            match kind {
+                Kind::Claude => {
+                    assert!(
+                        joined.contains("--strict-mcp-config --mcp-config"),
+                        "{joined}"
+                    );
+                    let config = std::fs::read_to_string(conf.join("mcp.json")).unwrap();
+                    assert!(config.contains("${LORE_AGENT_TOKEN}"));
+                }
+                Kind::Codex => {
+                    assert!(
+                        joined.contains("mcp_servers.lore.url=\"http://lore:8081/mcp\""),
+                        "{joined}"
+                    );
+                    assert!(
+                        joined
+                            .contains("mcp_servers.lore.bearer_token_env_var=\"LORE_AGENT_TOKEN\"")
+                    );
+                    // A terminal still starts when lore cannot be reached.
+                    assert!(!joined.contains("mcp_servers.lore.required"), "{joined}");
+                }
+                Kind::Opencode => {
+                    let config = env
+                        .iter()
+                        .find(|(k, _)| k == "OPENCODE_CONFIG")
+                        .unwrap()
+                        .1
+                        .clone();
+                    assert!(
+                        std::fs::read_to_string(config)
+                            .unwrap()
+                            .contains("{env:LORE_AGENT_TOKEN}")
+                    );
+                    assert!(
+                        env.iter()
+                            .any(|(k, _)| k == "OPENCODE_DISABLE_PROJECT_CONFIG")
+                    );
+                }
+            }
+            // A shell: no token, no MCP arguments.
+            let shell = driver
+                .terminal_command(
+                    TerminalMode::Shell,
+                    None,
+                    Some(&mcp),
+                    Path::new("/bin/sh"),
+                    &cli_home,
+                )
+                .unwrap();
+            assert!(
+                shell
+                    .as_std()
+                    .get_envs()
+                    .all(|(k, _)| k != "LORE_AGENT_TOKEN")
+            );
+            assert_eq!(shell.as_std().get_args().count(), 0);
+            // Without an MCP server from lore (an older lore): as before.
+            let plain = driver
+                .terminal_command(
+                    TerminalMode::Cli,
+                    None,
+                    None,
+                    Path::new("/bin/sh"),
+                    &cli_home,
+                )
+                .unwrap();
+            assert!(
+                plain
+                    .as_std()
+                    .get_envs()
+                    .all(|(k, _)| k != "LORE_AGENT_TOKEN")
+            );
+            assert_eq!(plain.as_std().get_args().count(), 0);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

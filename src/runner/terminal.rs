@@ -37,7 +37,7 @@ use tokio::{io::unix::AsyncFd, process::Child, sync::mpsc, time::Instant};
 
 use super::{
     drivers::{CliHome, Driver, Source},
-    protocol::{FromRunner, TerminalMode, ToRunner},
+    protocol::{FromRunner, TerminalMcp, TerminalMode, ToRunner},
     sandbox::Occupancy,
 };
 
@@ -143,7 +143,8 @@ impl Terminals {
                 cols,
                 rows,
                 model,
-            } => self.start(term_id, mode, cols, rows, model),
+                mcp,
+            } => self.start(term_id, mode, cols, rows, model, mcp),
             ToRunner::TerminalInput { term_id, data } => {
                 match base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) {
                     Ok(bytes) => self.send(&term_id, Command::Input(bytes)),
@@ -198,6 +199,7 @@ impl Terminals {
         cols: u16,
         rows: u16,
         model: Option<String>,
+        mcp: Option<TerminalMcp>,
     ) {
         let mut open = self.open();
         if open.contains_key(&term_id) {
@@ -254,6 +256,7 @@ impl Terminals {
                         &driver,
                         mode,
                         model.as_deref(),
+                        mcp.as_ref(),
                         &shell,
                         size(cols, rows),
                         &home,
@@ -357,6 +360,7 @@ fn spawn(
     driver: &Driver,
     mode: TerminalMode,
     model: Option<&str>,
+    mcp: Option<&TerminalMcp>,
     shell: &std::path::Path,
     winsize: Winsize,
     home: &CliHome,
@@ -379,7 +383,7 @@ fn spawn(
     // The master is never inherited by the program.
     rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)?;
 
-    let mut command = driver.terminal_command(mode, model, shell, home);
+    let mut command = driver.terminal_command(mode, model, mcp, shell, home)?;
     command
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
@@ -671,6 +675,7 @@ mod tests {
             cols,
             rows,
             model: Some("opus".into()),
+            mcp: None,
         }
     }
 

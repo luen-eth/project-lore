@@ -138,22 +138,7 @@ impl Settings {
         let resume = number("LORE_ASK_RESUME_MINUTES", 60, 7 * 24 * 60)?;
         let asks = number("LORE_ASK_PER_HOUR", 6, 1000)?;
         let delegations = number("LORE_DELEGATE_PER_HOUR", 3, 1000)?;
-        let lore_url = std::env::var("LORE_RUNNER_LORE_URL")
-            .map(|v| v.trim().trim_end_matches('/').to_string())
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                let port = std::env::var("LORE_RUNNER_BIND")
-                    .ok()
-                    // One address or several (one per agent network).
-                    .and_then(|bind| crate::builtin::parse_runner_binds(&bind).ok())
-                    .and_then(|binds| binds.first().map(|bind| bind.port()))
-                    .unwrap_or(8081);
-                format!("http://lore:{port}")
-            });
-        if reqwest::Url::parse(&lore_url).is_err() {
-            anyhow::bail!("LORE_RUNNER_LORE_URL must be a URL such as http://lore:8081");
-        }
+        let lore_url = lore_url_from_env()?;
         // A development build may point the push check at a local mock
         // (`LORE_DEV_GITHUB_API_BASE`); a release build always asks GitHub.
         #[cfg(debug_assertions)]
@@ -3050,6 +3035,29 @@ where
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|error| anyhow::anyhow!("a blocking task failed: {error}"))?
+}
+
+/// lore as the agents' containers reach it (`LORE_RUNNER_LORE_URL`, by
+/// default `http://lore:<port of LORE_RUNNER_BIND>`): their clone URL and
+/// MCP endpoint, for runs and terminals alike.
+pub fn lore_url_from_env() -> anyhow::Result<String> {
+    let lore_url = std::env::var("LORE_RUNNER_LORE_URL")
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            let port = std::env::var("LORE_RUNNER_BIND")
+                .ok()
+                // One address or several (one per agent network).
+                .and_then(|bind| crate::builtin::parse_runner_binds(&bind).ok())
+                .and_then(|binds| binds.first().map(|bind| bind.port()))
+                .unwrap_or(8081);
+            format!("http://lore:{port}")
+        });
+    if reqwest::Url::parse(&lore_url).is_err() {
+        anyhow::bail!("LORE_RUNNER_LORE_URL must be a URL such as http://lore:8081");
+    }
+    Ok(lore_url)
 }
 
 /// Builds the task runner as `main` does, when built-in agents exist.

@@ -555,18 +555,58 @@ pub enum TerminalEvent {
     },
 }
 
-/// An open terminal: the agent it runs in and the page that shows it.
+/// An open terminal: the agent it runs in and the page that shows it, and
+/// for the CLI's interface the hash of its lore token (see
+/// `terminal_token_agent`). Forgetting the terminal revokes the token.
 struct Terminal {
     agent: String,
     tx: mpsc::Sender<TerminalEvent>,
+    token_hash: Option<String>,
 }
 
-/// A connected runner.
+/// A connected runner, and the address it connected from (the agent's
+/// container on its own network).
 struct Link {
     generation: u64,
     tx: mpsc::Sender<ToRunner>,
     kind: Kind,
     provider: String,
+    address: Option<std::net::IpAddr>,
+}
+
+/// The prefix of a terminal's lore token: 32 random bytes as 64 hex
+/// characters follow.
+pub const TERMINAL_TOKEN_PREFIX: &str = "lore_term_";
+
+/// A new terminal token.
+fn new_terminal_token() -> Result<String, getrandom::Error> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)?;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!("{TERMINAL_TOKEN_PREFIX}{hex}"))
+}
+
+/// Whether a bearer value has the shape of a terminal token.
+pub fn looks_like_terminal_token(value: &str) -> bool {
+    value
+        .strip_prefix(TERMINAL_TOKEN_PREFIX)
+        .is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+/// An address as one listener reports it: an IPv4-mapped IPv6 address is
+/// the IPv4 address.
+fn plain_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    }
 }
 
 #[derive(Default)]
@@ -609,6 +649,9 @@ pub struct Hub {
     /// Bounded: a runner that floods it loses its link.
     run_tx: mpsc::Sender<HubEvent>,
     run_rx: Mutex<Option<mpsc::Receiver<HubEvent>>>,
+    /// lore's MCP endpoint as the agents reach it, for the terminals'
+    /// CLIs (`with_mcp_url`); without it a terminal gets no MCP server.
+    mcp_url: Option<String>,
 }
 
 impl Hub {
@@ -633,7 +676,15 @@ impl Hub {
             failures: RateLimiter::new(10, Duration::from_secs(15 * 60)),
             run_tx,
             run_rx: Mutex::new(Some(run_rx)),
+            mcp_url: None,
         }
+    }
+
+    /// Gives the terminals' CLIs lore's MCP server at `url` (lore's
+    /// internal address, `LORE_RUNNER_LORE_URL` + `/mcp`).
+    pub fn with_mcp_url(mut self, url: String) -> Self {
+        self.mcp_url = Some(url);
+        self
     }
 
     /// The run events, for the one task runner that listens.
@@ -785,21 +836,41 @@ impl Hub {
             if open >= MAX_TERMINALS {
                 return Err(HubError::TooManyTerminals);
             }
+            // The CLI's interface gets lore's MCP server with a token of
+            // its own; a shell does not.
+            let token = match (mode, &self.mcp_url) {
+                (TerminalMode::Cli, Some(url)) => match new_terminal_token() {
+                    Ok(token) => Some((url.clone(), token)),
+                    Err(error) => {
+                        tracing::error!(%error, "no randomness for a terminal token");
+                        None
+                    }
+                },
+                _ => None,
+            };
             inner.terminals.insert(
                 term_id.clone(),
                 Terminal {
                     agent: agent.to_string(),
                     tx,
+                    token_hash: token
+                        .as_ref()
+                        .map(|(_, token)| crate::oauth::token_hash(token)),
                 },
             );
-            link
+            (link, token)
         };
+        let (link, token) = link;
         let open = ToRunner::TerminalOpen {
             term_id: term_id.clone(),
             mode,
             cols,
             rows,
             model,
+            mcp: token.map(|(url, token)| protocol::TerminalMcp {
+                url,
+                token: protocol::Secret::new(token),
+            }),
         };
         if link.send(open).await.is_err() {
             self.inner().terminals.remove(&term_id);
@@ -847,6 +918,24 @@ impl Hub {
     #[cfg(test)]
     pub fn terminal_count(&self) -> usize {
         self.inner().terminals.len()
+    }
+
+    /// The built-in agent a terminal token speaks for: the token belongs
+    /// to a terminal open right now, and the request comes from the
+    /// address that agent's runner is connected from (its container). A
+    /// closed terminal, a dropped link or another address: none.
+    pub fn terminal_token_agent(&self, presented: &str, peer: std::net::IpAddr) -> Option<String> {
+        if !looks_like_terminal_token(presented) {
+            return None;
+        }
+        let hash = crate::oauth::token_hash(presented);
+        let inner = self.inner();
+        let terminal = inner
+            .terminals
+            .values()
+            .find(|terminal| terminal.token_hash.as_deref() == Some(hash.as_str()))?;
+        let link = inner.links.get(&terminal.agent)?;
+        (link.address == Some(plain_ip(peer))).then(|| terminal.agent.clone())
     }
 
     /// Terminal bytes from a runner, for the page that shows them. Only
@@ -1297,6 +1386,7 @@ impl Hub {
                     tx,
                     kind,
                     provider: provider.clone(),
+                    address: address.parse().ok().map(plain_ip),
                 },
             );
         }
@@ -1579,7 +1669,8 @@ esac
             })
             .collect();
         db.register_builtin_agents(&named).unwrap();
-        let hub = Arc::new(Hub::new(db.clone(), tokens));
+        let hub =
+            Arc::new(Hub::new(db.clone(), tokens).with_mcp_url("http://127.0.0.1:9/mcp".into()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/runner/ws", listener.local_addr().unwrap());
         let router = hub.clone().router();
@@ -2301,6 +2392,149 @@ esac
             Err(tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
             Err(error) => panic!("{error}"),
         }
+    }
+
+    /// A terminal of the CLI's interface gets its own lore token, which
+    /// speaks for that agent only while the terminal is open, only on the
+    /// internal listener and only from the agent runner's address; a shell
+    /// gets none.
+    #[tokio::test]
+    async fn a_terminal_s_token_works_only_while_it_is_open_and_only_from_its_agent() {
+        use crate::auth::{Authenticated, McpAuth, Refused};
+        let pair = listen().await;
+        let script = |name: &str| {
+            let program = pair.dir.join(name);
+            std::fs::write(
+                &program,
+                "#!/bin/sh\ncase \"$1\" in --version) echo \"1.0.0\"; exit 0;; \
+                 auth|login) echo \"Not logged in\"; exit 1;; esac\n\
+                 echo \"tok:${LORE_AGENT_TOKEN:-none}:\"; read line\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            program
+        };
+        let mut claude = config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET);
+        claude.settings.program = script("claude-tok");
+        let mut codex = config(&pair, "codex-builtin", Kind::Codex, CODEX_SECRET);
+        codex.settings.program = script("codex-tok");
+        start(claude);
+        start(codex);
+        connected(&pair.hub, "claude-builtin").await;
+        connected(&pair.hub, "codex-builtin").await;
+
+        async fn token_of(hub: &Hub, agent: &str, mode: TerminalMode) -> (String, String) {
+            let (term_id, mut rx) = hub.terminal_open(agent, mode, 80, 24, None).await.unwrap();
+            if mode == TerminalMode::Shell {
+                // The shell prints it when asked (split, so the echoed
+                // command line does not match).
+                let typed = "printf 'to%s\\n' \"k:${LORE_AGENT_TOKEN:-none}:\"\r";
+                hub.terminal_send(
+                    &term_id,
+                    ToRunner::TerminalInput {
+                        term_id: term_id.clone(),
+                        data: base64::engine::general_purpose::STANDARD.encode(typed),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let mut text = String::new();
+            loop {
+                let event = tokio::time::timeout(WAIT, rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("no token line in {text:?}"))
+                    .expect("the terminal ended");
+                if let TerminalEvent::Output(bytes) = event {
+                    text.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                if let Some(start) = text.find("tok:")
+                    && let Some(end) = text[start + 4..].find(':')
+                {
+                    // Keep the receiver alive: the terminal stays open.
+                    std::mem::forget(rx);
+                    return (term_id, text[start + 4..start + 4 + end].to_string());
+                }
+            }
+        }
+        let (claude_term, token) = token_of(&pair.hub, "claude-builtin", TerminalMode::Cli).await;
+        assert!(looks_like_terminal_token(&token), "{token}");
+        let (codex_term, codex_token) =
+            token_of(&pair.hub, "codex-builtin", TerminalMode::Cli).await;
+        assert_ne!(token, codex_token);
+
+        let mut auth = McpAuth::new(Vec::new(), pair.db.clone(), false);
+        auth.terminals = Some(pair.hub.clone());
+        let runner: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mapped: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let elsewhere: std::net::IpAddr = "10.9.8.7".parse().unwrap();
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, Some(runner)).await,
+            Ok(Authenticated::Terminal("claude-builtin".into()))
+        );
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, Some(mapped)).await,
+            Ok(Authenticated::Terminal("claude-builtin".into()))
+        );
+        // Each terminal's token speaks for its own agent only.
+        assert_eq!(
+            auth.authenticate_terminal(&codex_token, true, Some(runner))
+                .await,
+            Ok(Authenticated::Terminal("codex-builtin".into()))
+        );
+        // Not on the public listener, not from another address, not
+        // without a known peer, not where only run and OAuth tokens count
+        // (the git proxy), not with a changed character.
+        assert_eq!(
+            auth.authenticate_terminal(&token, false, Some(runner))
+                .await,
+            Err(Refused::Invalid)
+        );
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, Some(elsewhere))
+                .await,
+            Err(Refused::Invalid)
+        );
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, None).await,
+            Err(Refused::Invalid)
+        );
+        assert_eq!(
+            auth.authenticate_on(&token, true).await,
+            Err(Refused::Invalid)
+        );
+        let mut forged = token.clone();
+        forged.pop();
+        forged.push(if token.ends_with('0') { '1' } else { '0' });
+        assert_eq!(
+            auth.authenticate_terminal(&forged, true, Some(runner))
+                .await,
+            Err(Refused::Invalid)
+        );
+        // A shell gets no token.
+        let (shell_term, shell_token) =
+            token_of(&pair.hub, "claude-builtin", TerminalMode::Shell).await;
+        assert_eq!(shell_token, "none");
+        pair.hub.terminal_close(&shell_term).await;
+
+        // Closed: the token is gone; the other agent's still works.
+        pair.hub.terminal_close(&claude_term).await;
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, Some(runner)).await,
+            Err(Refused::Invalid)
+        );
+        assert_eq!(
+            auth.authenticate_terminal(&codex_token, true, Some(runner))
+                .await,
+            Ok(Authenticated::Terminal("codex-builtin".into()))
+        );
+        pair.hub.terminal_close(&codex_term).await;
+        assert_eq!(
+            auth.authenticate_terminal(&codex_token, true, Some(runner))
+                .await,
+            Err(Refused::Invalid)
+        );
     }
 
     #[tokio::test]
