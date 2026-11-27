@@ -1939,7 +1939,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Add an item to the to-do list: a task on the board, exactly as `task_add` adds it (same checks and author rules), with an optional `project` (a general to-do without one is filed under `general`). Built-in agents may take a to-do under their usual rules, but never a general one without a `repo`: it has nothing to push to. `from_entry` moves a note-style to-do (entry of kind `todo`) to the board."
+        description = "Add an item to the to-do list: a task on the board, exactly as `task_add` adds it (same checks and author rules), with an optional `project` (a general to-do without one is filed under `general`). Built-in agents may take a to-do under their usual rules, which need a repository: the task's `repo`, or one lore recorded for its project; a general to-do without either is never taken. `from_entry` moves a note-style to-do (entry of kind `todo`) to the board."
     )]
     async fn todo_add(
         &self,

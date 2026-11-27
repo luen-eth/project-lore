@@ -251,8 +251,10 @@ Nothing new is stored: no table was added.
   `done`, `all`) only filter, and the project is a small label on each item.
   `todo_add` creates a board task exactly as `task_add` does (same checks and author
   rules); without a project it goes under `general`. A built-in agent may take a
-  to-do under the usual task runner rules, but **never a `general` one without a
-  repository**: it has nothing to push to (the runner notes that on the task).
+  to-do under the usual task runner rules, which need a repository: the task's own
+  `repo`, or one lore recorded for its project. A `general` to-do without either is
+  never taken (the runner notes why on the task); the name `general` itself changes
+  nothing.
   `todo_done` is `task_update` `done`; a note-style to-do has no status, so
   `todo_add` with `from_entry` moves it to the board (title and text copied, the
   entry gets a line pointing at the task). The To-do panel shows the list with

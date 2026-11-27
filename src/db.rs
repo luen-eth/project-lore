@@ -38,8 +38,8 @@ pub fn moved_to_board(body: &str) -> Option<i64> {
 }
 
 /// The project a to-do without one is filed under (`todo_add`, the page's
-/// To-do view). A task there without a repository is never taken by a
-/// built-in agent.
+/// To-do view). Like any task, one there is taken by a built-in agent only
+/// with a repository of its own or one recorded for the project.
 pub const GENERAL_PROJECT: &str = "general";
 
 const SCHEMA: &str = r#"

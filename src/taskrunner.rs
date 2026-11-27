@@ -738,15 +738,6 @@ impl TaskRunner {
     /// recorded); accepted only on github.com and only when one of lore's
     /// GitHub credentials can push to it (personal first).
     async fn resolve(&self, project: &str, repo: &str, agent: &str) -> Result<Target, Skip> {
-        // A general to-do has no project of its own to push to: without a
-        // repository named on the task, no built-in agent takes it.
-        if repo.trim().is_empty() && project == crate::db::GENERAL_PROJECT {
-            return Err(Skip::Note(
-                "it is a general to-do without a repository; set the task's repo to have a \
-                 built-in agent work on it"
-                    .into(),
-            ));
-        }
         let target = if repo.trim().is_empty() {
             self.recorded_target(project).await?
         } else {
@@ -3653,10 +3644,11 @@ echo '{"type":"step_finish","timestamp":4,"sessionID":"ses_1","part":{"type":"st
         }
     }
 
-    /// A general to-do without a repository is never taken by a built-in
-    /// agent: it has nothing to push to.
+    /// A to-do without a repository of its own is taken only when lore
+    /// has a repository recorded for its project, whatever the project is
+    /// called (`general` included).
     #[tokio::test]
-    async fn a_general_to_do_without_a_repository_is_never_taken() {
+    async fn a_to_do_without_any_repository_is_never_taken() {
         let world = world("general-todo", Duration::from_secs(3600)).await;
         let agent = world.runner.hub.agents()[0].clone();
         let refused = world
@@ -3664,8 +3656,8 @@ echo '{"type":"step_finish","timestamp":4,"sessionID":"ses_1","part":{"type":"st
             .resolve(crate::db::GENERAL_PROJECT, "", &agent)
             .await;
         assert!(
-            matches!(&refused, Err(Skip::Note(why)) if why.contains("general to-do")),
-            "the general project resolved to a repository"
+            matches!(&refused, Err(Skip::Note(why)) if why.contains("no repository for the project general")),
+            "a project without a recorded repository resolved to one"
         );
         let task = idle_task(
             &world.db,
