@@ -743,15 +743,18 @@ list.
 agent's name) is its identity: it is in `LORE_TOKENS` and `LORE_RUNNER_TOKENS`, in
 sessions, entries, tasks, the operations log, commit authorship and the runner link,
 and it never changes. Every agent, built-in or not, may also get a **display name**
-(1 to 40 characters, one line, no control characters; empty clears it), set with the
+(1 to 40 visible characters, one line; empty clears it), set with the
 `agents` permission and kept in `agent_registry.display_name` (schema 9). The admin
 page shows it wherever a person reads an agent's name: the agent cards (with the
 technical name small beneath), Connected models, the graph's agent bubbles, Live
 activity, the board, the built-in agents' cards, the terminal window and the terminal
 icon's menu, with the technical name in a tooltip where it is not shown. It may not
 be another agent's technical name (in any case), so the logs stay unambiguous. Agents
-keep addressing each other by technical name: `assistants` lists a built-in agent as
-`claude-builtin (Claude)`.
+keep addressing each other by technical name: `assistants` and the briefing list a
+built-in agent as `claude-builtin (display name: "Claude")`. A display name may hold
+only visible characters and plain spaces (runs of spaces become one): control
+characters, Unicode format characters (bidi overrides, zero-width characters) and
+other invisible characters are refused.
 
 Every agent has one of ten built-in avatars (`orbit`, `comet`, `nova`, `prism`,
 `wave`, `ember`, `lattice`, `crescent`, `pulsar`, `hexa`), served from the binary at

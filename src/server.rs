@@ -3175,7 +3175,7 @@ impl Lore {
                 _ => format!("off: {}", agent.detail),
             };
             let shown = match &agent.display_name {
-                Some(display) => format!("{} ({display})", agent.name),
+                Some(display) => format!("{} (display name: {display:?})", agent.name),
                 None => agent.name.clone(),
             };
             out.push_str(&format!("- {shown}{kind} · {model} · {state}\n"));
@@ -4514,7 +4514,7 @@ fn builtin_section(agents: &[crate::taskrunner::BriefingAgent]) -> String {
     let mut lines = vec!["Built-in coding agents of this lore (they run next to it):".to_string()];
     for agent in agents {
         let name = match &agent.display_name {
-            Some(display) => format!("{} ({display})", agent.name),
+            Some(display) => format!("{} (display name: {display:?})", agent.name),
             None => agent.name.clone(),
         };
         let help = match &agent.why_not {
@@ -7098,7 +7098,7 @@ mod tests {
             .unwrap();
         let (_, briefing) = hello_as(&lore, "codex").await;
         assert!(
-            briefing.contains("- claude-builtin (Claude) · claude"),
+            briefing.contains("- claude-builtin (display name: \"Claude\") · claude"),
             "{briefing}"
         );
         // Without built-in agents: no section at all.

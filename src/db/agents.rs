@@ -118,22 +118,71 @@ pub struct OAuthClient {
 /// Longest display name, in characters.
 pub const DISPLAY_NAME_MAX_CHARS: usize = 40;
 
-/// A display name as the owner typed it: trimmed, 1 to 40 characters, no
-/// control characters (newlines included). Empty clears it (`None`).
+/// A display name as the owner typed it: trimmed, runs of spaces made
+/// one, 1 to 40 characters. Refused: control characters (newlines
+/// included), Unicode format characters (bidi overrides and isolates,
+/// zero-width characters, the byte order mark, tags...), every space but
+/// the plain one, and the characters that draw nothing (fillers, the blank
+/// braille pattern). Empty clears it (`None`).
 pub fn clean_display_name(raw: &str) -> Result<Option<String>, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if raw
+        .chars()
+        .any(|c| c.is_control() || invisible(c) || (c.is_whitespace() && c != ' '))
+    {
+        return Err(
+            "a display name is one line of visible characters: no control, format or \
+             invisible characters, and no spaces but the plain one"
+                .into(),
+        );
+    }
+    let collapsed = raw
+        .split(' ')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
         return Ok(None);
     }
-    if trimmed.chars().any(char::is_control) {
-        return Err("a display name is one line without control characters".into());
-    }
-    if trimmed.chars().count() > DISPLAY_NAME_MAX_CHARS {
+    if collapsed.chars().count() > DISPLAY_NAME_MAX_CHARS {
         return Err(format!(
             "a display name is at most {DISPLAY_NAME_MAX_CHARS} characters"
         ));
     }
-    Ok(Some(trimmed.to_string()))
+    Ok(Some(collapsed))
+}
+
+/// Unicode format characters (category Cf) and characters that show
+/// nothing although they are not spaces.
+fn invisible(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x034F
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x115F..=0x1160
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x2800
+            | 0x3164
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFA0
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE0FFF
+    )
 }
 
 /// One registry row.
@@ -1123,6 +1172,26 @@ mod tests {
             Ok(Some("é".repeat(40)))
         );
         assert!(clean_display_name(&"x".repeat(41)).is_err());
+        assert_eq!(
+            clean_display_name("  Big   Claude  "),
+            Ok(Some("Big Claude".into()))
+        );
+        for bad in [
+            "evil\u{202E}txt",
+            "a\u{2066}b",
+            "zero\u{200B}width",
+            "joiner\u{200D}",
+            "bom\u{FEFF}",
+            "nbsp\u{00A0}x",
+            "em\u{2003}space",
+            "line\u{2028}sep",
+            "filler\u{3164}",
+            "braille\u{2800}",
+            "tag\u{E0041}",
+            "soft\u{00AD}hyphen",
+        ] {
+            assert!(clean_display_name(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
