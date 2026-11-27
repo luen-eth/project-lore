@@ -20,6 +20,11 @@ pub use builtin::*;
 
 pub const KINDS: &[&str] = &["update", "decision", "bug", "note", "todo"];
 
+/// The project a to-do without one is filed under (`todo_add`, the page's
+/// To-do view). A task there without a repository is never taken by a
+/// built-in agent.
+pub const GENERAL_PROJECT: &str = "general";
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS entries (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3185,6 +3190,18 @@ impl Db {
     /// Tasks on the board, claimed ones first, then open ones, then the
     /// rest, newest first within each status. An empty `statuses` list
     /// means every status.
+    /// The projects that have notes (entries of kind `note`): how many and
+    /// when the newest was written, most recent first.
+    pub fn note_projects(&self) -> Result<Vec<(String, i64, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT project, COUNT(*), MAX(created_at) FROM entries WHERE kind = 'note'
+             GROUP BY project ORDER BY MAX(created_at) DESC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn tasks(
         &self,
         project: Option<&str>,

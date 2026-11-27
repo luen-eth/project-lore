@@ -553,6 +553,22 @@ button:focus-visible, [tabindex]:focus-visible {
 #board-status:empty { display: none; }
 #board-status.ok { color: var(--ok); }
 #board-status.bad { color: var(--danger); }
+/* Notes and To-do reuse the board's panel and cards. */
+.list-status { margin: 0; min-height: 1.4em; color: var(--muted); }
+.list-status:empty { display: none; }
+.list-status.ok { color: var(--ok); }
+.list-status.bad { color: var(--danger); }
+#notes-project, #todo-project, #todo-status { padding: 5px 9px; font-size: 13px; max-width: 220px; }
+#notes-search { flex: 1; min-width: 140px; padding: 6px 12px; font-size: 13px; }
+.list-pick { cursor: pointer; }
+.list-pick:hover { background: rgba(255, 255, 255, 0.05); }
+.note-body { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; color: var(--text); }
+.note-body.clipped { max-height: 4.6em; overflow: hidden; color: var(--muted); }
+.todo-label {
+  font-size: 11px; padding: 1px 8px; border-radius: 999px; color: var(--muted);
+  background: rgba(255, 255, 255, 0.06); border: 1px solid var(--line);
+}
+.todo-label.note-style { color: var(--violet); border-color: rgba(199, 155, 255, 0.4); }
 .board-scroll {
   min-height: 0; overflow-y: auto; margin: 0 -6px; padding: 0 6px 2px;
   scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.14) transparent;

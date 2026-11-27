@@ -17,6 +17,7 @@ use std::convert::Infallible;
 
 mod agents;
 mod builtin;
+mod notes;
 
 use axum::{
     Extension, Json, Router,
@@ -179,6 +180,8 @@ const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/admin/api/sessions", Access::SignedIn),
     ("GET", "/admin/api/sessions/{id}", Access::SignedIn),
     ("GET", "/admin/api/board", Access::SignedIn),
+    ("GET", "/admin/api/notes", Access::SignedIn),
+    ("GET", "/admin/api/todos", Access::SignedIn),
     ("GET", "/admin/api/files", Access::SignedIn),
     ("GET", "/admin/api/files/{id}", Access::SignedIn),
     ("GET", "/admin/api/files/{id}/download", Access::SignedIn),
@@ -214,6 +217,13 @@ const ROUTES: &[(&str, &str, Access)] = &[
         Access::Needs(Perm::Agents),
     ),
     ("POST", "/admin/api/tasks", Access::Needs(Perm::Write)),
+    ("POST", "/admin/api/notes", Access::Needs(Perm::Write)),
+    ("PUT", "/admin/api/notes/{id}", Access::Needs(Perm::Write)),
+    (
+        "POST",
+        "/admin/api/todos/from-entry/{id}",
+        Access::Needs(Perm::Write),
+    ),
     ("PUT", "/admin/api/tasks/{id}", Access::Needs(Perm::Write)),
     ("POST", "/admin/api/messages", Access::Needs(Perm::Write)),
     ("POST", "/admin/api/files", Access::Needs(Perm::Write)),
@@ -553,6 +563,21 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
         .route("/admin/api/sessions", get(sessions))
         .route("/admin/api/sessions/{id}", get(session_detail))
         .route("/admin/api/board", get(board))
+        .route(
+            "/admin/api/notes",
+            get(notes::list_notes)
+                .post(notes::add_note)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/notes/{id}",
+            put(notes::edit_note).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route("/admin/api/todos", get(notes::list_todos))
+        .route(
+            "/admin/api/todos/from-entry/{id}",
+            post(notes::todo_from_entry),
+        )
         .route("/admin/api/integrations", get(integrations))
         .route(
             "/admin/api/password",
@@ -3740,6 +3765,207 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), 413);
+    }
+
+    /// The Notes and To-do views: anyone signed in reads, `write` adds
+    /// and edits; only notes are edited; a note-style to-do moves to the
+    /// board.
+    #[tokio::test]
+    async fn notes_and_to_dos_follow_the_roles() {
+        let (base, admin) = serve().await;
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: &str, token: Option<&str>| {
+            let mut request = client.request(method, format!("{base}{path}"));
+            if let Some(token) = token {
+                request = request.header(header::COOKIE, format!("{COOKIE}={token}"));
+            }
+            request
+        };
+        let note = json!({ "project": "Shop", "title": "Idea", "body": "Annual plans" });
+        for (method, path) in [
+            (reqwest::Method::GET, "/admin/api/notes"),
+            (reqwest::Method::GET, "/admin/api/todos"),
+        ] {
+            assert_eq!(
+                call(method.clone(), path, None)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                401
+            );
+            assert_eq!(
+                call(method, path, Some("viewer-token"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+        for token in [None, Some("viewer-token")] {
+            let expected = if token.is_some() { 403 } else { 401 };
+            for request in [
+                call(reqwest::Method::POST, "/admin/api/notes", token).json(&note),
+                call(reqwest::Method::PUT, "/admin/api/notes/1", token)
+                    .json(&json!({ "title": "x" })),
+                call(
+                    reqwest::Method::POST,
+                    "/admin/api/todos/from-entry/1",
+                    token,
+                ),
+            ] {
+                assert_eq!(request.send().await.unwrap().status(), expected);
+            }
+        }
+        // A project is required.
+        let refused = call(
+            reqwest::Method::POST,
+            "/admin/api/notes",
+            Some("admin-token"),
+        )
+        .json(&json!({ "project": " ", "title": "t", "body": "b" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(refused.status(), 400);
+        let created: serde_json::Value = call(
+            reqwest::Method::POST,
+            "/admin/api/notes",
+            Some("admin-token"),
+        )
+        .json(&note)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(
+            (created["project"].as_str(), created["kind"].as_str()),
+            (Some("shop"), Some("note"))
+        );
+        let id = created["id"].as_i64().unwrap();
+        let listed: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/notes",
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(listed["projects"][0]["project"], "shop");
+        assert_eq!(listed["projects"][0]["count"], 1);
+        let shop: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/notes?project=shop",
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(shop["notes"][0]["title"], "Idea");
+        let edited = call(
+            reqwest::Method::PUT,
+            &format!("/admin/api/notes/{id}"),
+            Some("admin-token"),
+        )
+        .json(&json!({ "title": "Pricing" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(edited.status(), 200);
+        // Not a note: not found here.
+        let todo = admin
+            .db
+            .insert(&crate::db::NewEntry {
+                project: "shop".into(),
+                kind: "todo".into(),
+                title: "Fix the cart".into(),
+                body: "It loses items".into(),
+                tags: String::new(),
+                files: String::new(),
+                agent: "codex".into(),
+                path: "/w".into(),
+                repo: String::new(),
+                commit: String::new(),
+                branch: String::new(),
+                dirty: false,
+                session_id: None,
+            })
+            .unwrap();
+        let refused = call(
+            reqwest::Method::PUT,
+            &format!("/admin/api/notes/{}", todo.id),
+            Some("admin-token"),
+        )
+        .json(&json!({ "title": "x" }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(refused.status(), 404);
+        // The to-do list holds the board's open tasks and the note-style
+        // to-dos; a general one goes under `general`.
+        call(
+            reqwest::Method::POST,
+            "/admin/api/tasks",
+            Some("admin-token"),
+        )
+        .json(&json!({ "project": "general", "title": "Renew the domain" }))
+        .send()
+        .await
+        .unwrap();
+        let list: serde_json::Value = call(
+            reqwest::Method::GET,
+            "/admin/api/todos",
+            Some("viewer-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(list["general"], "general");
+        assert_eq!(list["tasks"][0]["title"], "Renew the domain");
+        assert_eq!(list["entries"][0]["id"], todo.id);
+        let moved: serde_json::Value = call(
+            reqwest::Method::POST,
+            &format!("/admin/api/todos/from-entry/{}", todo.id),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(moved["title"], "Fix the cart");
+        assert_eq!(moved["project"], "shop");
+        assert!(
+            admin
+                .db
+                .get(todo.id)
+                .unwrap()
+                .unwrap()
+                .body
+                .contains(&format!("task #{}", moved["id"]))
+        );
+        let refused = call(
+            reqwest::Method::POST,
+            &format!("/admin/api/todos/from-entry/{id}"),
+            Some("admin-token"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(refused.status(), 400);
     }
 
     #[tokio::test]

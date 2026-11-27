@@ -140,6 +140,8 @@ pub enum Decision {
 const RUN_READ_TOOLS: &[&str] = &[
     "recall",
     "recent",
+    "notes",
+    "todos",
     "projects",
     "get",
     "tasks",

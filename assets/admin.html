@@ -63,6 +63,8 @@
       <button id="feed-toggle" class="ghost only-medium" type="button" aria-expanded="false">Activity</button>
       <button id="files-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="files">Files</button>
       <button id="board-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="board">Board</button>
+      <button id="todo-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="todo">To-do</button>
+      <button id="notes-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="notes">Notes</button>
       <button id="integrations-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="integrations">Integrations</button>
       <button id="profile-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="profile">Profile</button>
       <button id="agents-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="agents-panel" hidden>Agents</button>
@@ -113,6 +115,74 @@
     <ol id="feed-list" class="feed-list"></ol>
     <p id="feed-empty" class="muted small-text feed-empty" hidden>Nothing yet. Actions appear here the moment an agent searches or writes.</p>
   </aside>
+
+
+  <!-- Notes: per project. To-do: one list across everything (the board's
+       open tasks and the note-style to-dos). -->
+  <div id="notes" class="board notes-panel" role="region" aria-labelledby="notes-title" hidden>
+    <div class="board-head">
+      <h2 id="notes-title">Notes</h2>
+      <span id="notes-count" class="muted small-text"></span>
+    </div>
+    <div class="board-filters">
+      <select id="notes-project" aria-label="Project"></select>
+      <input id="notes-search" type="search" placeholder="Search notes" aria-label="Search notes" spellcheck="false">
+    </div>
+    <p id="notes-status" class="small-text list-status" role="status"></p>
+    <div class="board-scroll">
+      <section>
+        <form id="note-form" class="board-form" autocomplete="off" hidden>
+          <h4>Add a note</h4>
+          <label class="board-field"><span>Project</span>
+            <input id="note-project" type="text" maxlength="100" placeholder="project-lore" required spellcheck="false">
+          </label>
+          <label class="board-field"><span>Title</span>
+            <input id="note-title" type="text" maxlength="200" required>
+          </label>
+          <label class="board-field"><span>Note</span>
+            <textarea id="note-body" maxlength="20000" required></textarea>
+          </label>
+          <div class="board-form-actions"><button class="ghost small" type="submit">Add note</button></div>
+        </form>
+        <ul id="notes-list" class="board-list"></ul>
+      </section>
+    </div>
+  </div>
+
+  <div id="todo" class="board todo-panel" role="region" aria-labelledby="todo-title" hidden>
+    <div class="board-head">
+      <h2 id="todo-title">To-do</h2>
+      <span id="todo-count" class="muted small-text"></span>
+    </div>
+    <div class="board-filters">
+      <select id="todo-status" aria-label="Status">
+        <option value="open" selected>Open</option>
+        <option value="done">Done</option>
+        <option value="all">All</option>
+      </select>
+      <select id="todo-project" aria-label="Project"></select>
+    </div>
+    <p id="todo-status-line" class="small-text list-status" role="status"></p>
+    <div class="board-scroll">
+      <section>
+        <form id="todo-form" class="board-form" autocomplete="off" hidden>
+          <h4>Add to the list</h4>
+          <label class="board-field"><span>What needs doing</span>
+            <input id="todo-new-title" type="text" maxlength="200" required>
+          </label>
+          <label class="board-field"><span>Details (optional)</span>
+            <textarea id="todo-new-body" maxlength="20000"></textarea>
+          </label>
+          <label class="board-field"><span>Project (optional; empty for general)</span>
+            <input id="todo-new-project" type="text" maxlength="100" list="todo-projects" placeholder="general" spellcheck="false">
+          </label>
+          <datalist id="todo-projects"></datalist>
+          <div class="board-form-actions"><button class="ghost small" type="submit">Add</button></div>
+        </form>
+        <ul id="todo-list" class="board-list"></ul>
+      </section>
+    </div>
+  </div>
 
   <div id="backup" class="backup" hidden>
     <h2>Backup and restore</h2>
@@ -588,6 +658,8 @@
   <div id="more-scrim" class="more-scrim" hidden></div>
   <div id="more" class="more" role="menu" aria-label="More" hidden>
     <span id="more-role" class="role" hidden>Viewer</span>
+    <button id="more-todo" class="ghost" type="button" role="menuitem">To-do list</button>
+    <button id="more-notes" class="ghost" type="button" role="menuitem">Notes</button>
     <button id="more-integrations" class="ghost" type="button" role="menuitem">Integrations</button>
     <button id="more-profile" class="ghost" type="button" role="menuitem">Profile and rules</button>
     <button id="more-agents" class="ghost" type="button" role="menuitem" hidden>Agents</button>

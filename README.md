@@ -76,6 +76,12 @@ Queries take a few tens of milliseconds because everything happens in one proces
 | `tasks` | The shared to-do list: open and claimed tasks by default, or done, cancelled or all of them |
 | `task_add` | Add a task to a project's to-do list, optionally meant for one agent |
 | `task_update` | Claim, release, finish (with the commit), cancel or reopen a task |
+| `notes` | A project's notes (entries of kind `note`), newest first; without `project`, which projects have notes; `query` searches them |
+| `note_add` | Add a note to a project (`project` required) without the path and commit `log` asks for |
+| `note_edit`, `note_delete` | Change or delete a note by id (only notes; other entries: `amend`, `forget`) |
+| `todos` | The to-do list across every project: the board's open tasks (with who claimed them, since when) and the note-style to-dos (entries of kind `todo`, not on the board); `project` and `status` filter it |
+| `todo_add` | Add to the to-do list: a board task exactly as `task_add` adds it, `project` optional (`general` without one); `from_entry` moves a note-style to-do to the board |
+| `todo_done` | Mark a board task done, as `task_update` `done` does; for a note-style to-do it says how to move it to the board |
 | `send` | Send a message to one agent, or to every agent |
 | `handoff` | Leave a note for whoever works on the project next |
 | `inbox` | Read the messages sent to you, and mark them read |
@@ -223,6 +229,37 @@ the session that wrote it), and the admin page shows who received it.
 
 The administrator sees all of it on the admin page and can add tasks, move them
 along, and write messages and handoff notes too (see below).
+
+### Notes and to-do list
+
+Two views of what lore already keeps, with tools of their own so a chat app asked
+"show my notes" or "what is on my to-do list" finds them, and with their own panels on
+the admin page (**Notes** and **To-do** in the top bar, under **More** on a phone).
+Nothing new is stored: no table was added.
+
+- **Notes belong to a project.** A note is an entry of kind `note`, so `recall`,
+  `recent`, the graph and the backups keep finding it. `notes` without a project lists
+  the projects that have notes (count, newest titles), so a client can ask which one;
+  with `project` it lists that project's notes, and `query` searches them. `note_add`
+  needs `project` (a lowercase repository or folder name; an empty one is refused) but
+  no path or commit; `note_edit` and `note_delete` touch notes only. The Notes panel
+  lists the projects first, then one project's notes (search, open one in full, and,
+  with the `write` permission, add and edit).
+- **The to-do list is one list across everything.** It is the board's open tasks
+  together with the note-style to-dos (entries of kind `todo`, marked as not on the
+  board). `todos` with no arguments returns all of it; `project` and `status` (`open`,
+  `done`, `all`) only filter, and the project is a small label on each item.
+  `todo_add` creates a board task exactly as `task_add` does (same checks and author
+  rules); without a project it goes under `general`. A built-in agent may take a
+  to-do under the usual task runner rules, but **never a `general` one without a
+  repository**: it has nothing to push to (the runner notes that on the task).
+  `todo_done` is `task_update` `done`; a note-style to-do has no status, so
+  `todo_add` with `from_entry` moves it to the board (title and text copied, the
+  entry gets a line pointing at the task). The To-do panel shows the list with
+  filters and, with `write`, adds, marks done and moves note-style to-dos to the
+  board. Viewers see both panels read-only.
+- **Runs** may read `notes` and `todos` like the other read tools, and change nothing
+  through the new tools (they keep `log` and `task_update` on their own task).
 
 ### Project files
 

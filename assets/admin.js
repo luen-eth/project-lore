@@ -4038,8 +4038,8 @@ function closeMore() {
 }
 
 function currentDestination() {
-  for (const name of ["integrations", "profile", "users", "agents", "backup", "board", "files", "side", "feed"]) {
-    if (DESTINATIONS[name].shown()) return name;
+  for (const name of ["integrations", "profile", "users", "agents", "backup", "notes", "todo", "board", "files", "side", "feed"]) {
+    if (DESTINATIONS[name] && DESTINATIONS[name].shown()) return name;
   }
   return "graph";
 }
@@ -4089,7 +4089,7 @@ $("more-logout").addEventListener("click", () => { closeMore(); $("logout").clic
 /* On a phone only one panel shows at a time: whichever opened last wins,
    whatever code path opened it. */
 {
-  const panels = { side: $("side"), feed: $("feed"), board: $("board"), files: $("files"), integrations: $("integrations"), profile: $("profile"), users: $("users"), agents: $("agents-panel"), backup: $("backup") };
+  const panels = { side: $("side"), feed: $("feed"), board: $("board"), files: $("files"), integrations: $("integrations"), profile: $("profile"), users: $("users"), agents: $("agents-panel"), backup: $("backup"), notes: $("notes"), todo: $("todo") };
   const observer = new MutationObserver((records) => {
     if (isPhone()) {
       // The last record is the newest change; the panel it opened stays.
@@ -4177,3 +4177,329 @@ syncTabs();
     $("login-error").textContent = "The server cannot be reached.";
   }
 })();
+
+/* ---------- Notes and To-do ---------- */
+
+/* Notes belong to a project: the view lists the projects that have notes
+   first, then one project's notes. The to-do list is one list across
+   everything: the board's open tasks and the note-style to-dos (entries of
+   kind todo, not on the board), with the project as a small label. Adding
+   and editing need the write permission; everyone else reads. */
+const lists = { notesProject: "", notesQuery: "", notesTimer: null, todoProject: "", todoStatus: "open" };
+
+function listStatus(id, text, tone) {
+  const node = $(id);
+  node.textContent = text || "";
+  node.className = "small-text list-status" + (tone ? " " + tone : "");
+}
+
+async function jsonOf(response) {
+  return response.json().catch(() => ({}));
+}
+
+function closeNotes() {
+  $("notes").hidden = true;
+  $("notes-toggle").setAttribute("aria-expanded", "false");
+}
+
+function closeTodo() {
+  $("todo").hidden = true;
+  $("todo-toggle").setAttribute("aria-expanded", "false");
+}
+
+/* Opens one of the two and closes every other panel. */
+function openList(name) {
+  for (const [other, destination] of Object.entries(DESTINATIONS)) {
+    if (other !== name && other !== "side" && other !== "feed" && destination.shown()) destination.close();
+  }
+  if (isPhone()) for (const other of ["side", "feed"]) if (DESTINATIONS[other].shown()) DESTINATIONS[other].close();
+  const panel = $(name);
+  panel.hidden = false;
+  $(name + "-toggle").setAttribute("aria-expanded", "true");
+  if (name === "notes") { $("note-form").hidden = !can("write"); loadNotes(); }
+  else { $("todo-form").hidden = !can("write"); loadTodo(); }
+}
+
+$("notes-toggle").addEventListener("click", () => { if ($("notes").hidden) openList("notes"); else closeNotes(); });
+$("todo-toggle").addEventListener("click", () => { if ($("todo").hidden) openList("todo"); else closeTodo(); });
+/* Any other panel opening closes these two. */
+for (const id of ["board-toggle", "files-toggle", "integrations-toggle", "profile-toggle", "agents-toggle", "users-toggle", "backup-toggle"]) {
+  $(id).addEventListener("click", () => { closeNotes(); closeTodo(); });
+}
+
+async function loadNotes() {
+  const query = new URLSearchParams();
+  if (lists.notesProject) query.set("project", lists.notesProject);
+  if (lists.notesQuery) query.set("q", lists.notesQuery);
+  let data;
+  try {
+    const response = await api("/admin/api/notes?" + query.toString());
+    if (!response.ok) throw new Error("failed");
+    data = await response.json();
+  } catch (_) {
+    listStatus("notes-status", "The notes could not be loaded.", "bad");
+    return;
+  }
+  listStatus("notes-status", "");
+  const select = $("notes-project");
+  select.replaceChildren();
+  const any = el("option", "", "All projects");
+  any.value = "";
+  select.append(any);
+  const known = data.projects.map((p) => p.project);
+  if (lists.notesProject && !known.includes(lists.notesProject)) known.unshift(lists.notesProject);
+  for (const project of known) {
+    const counted = data.projects.find((p) => p.project === project);
+    const option = el("option", "", counted ? `${project} (${counted.count})` : project);
+    option.value = project;
+    select.append(option);
+  }
+  select.value = lists.notesProject;
+  if (lists.notesProject) $("note-project").value = lists.notesProject;
+  const list = $("notes-list");
+  list.replaceChildren();
+  if (!lists.notesProject && !lists.notesQuery) {
+    $("notes-count").textContent = `${data.projects.length} project${data.projects.length === 1 ? "" : "s"} with notes`;
+    if (!data.projects.length) list.append(el("li", "none", "No notes yet."));
+    for (const project of data.projects) {
+      const item = el("li", "board-item list-pick");
+      const head = el("div", "board-item-head");
+      head.append(el("span", "board-title", project.project), el("span", "board-id", `${project.count} note${project.count === 1 ? "" : "s"}`));
+      item.append(head, el("div", "board-meta", `newest ${ago(project.newest)}`));
+      item.tabIndex = 0;
+      item.setAttribute("role", "button");
+      const pick = () => { lists.notesProject = project.project; loadNotes(); };
+      item.addEventListener("click", pick);
+      item.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); pick(); } });
+      list.append(item);
+    }
+    return;
+  }
+  $("notes-count").textContent = `${data.notes.length} note${data.notes.length === 1 ? "" : "s"}`;
+  if (!data.notes.length) list.append(el("li", "none", lists.notesQuery ? "No note matches." : "No notes in this project yet."));
+  for (const note of data.notes) list.append(noteItem(note));
+}
+
+function noteItem(note) {
+  const item = el("li", "board-item");
+  const head = el("div", "board-item-head");
+  head.append(el("span", "board-title", note.title), el("span", "board-id", "#" + note.id));
+  const meta = [note.project, note.agent ? `by ${displayName(note.agent)}` : "", ago(note.created_at)];
+  if (note.updated_at) meta.push(`changed ${ago(note.updated_at)}`);
+  const body = el("p", "note-body clipped", note.body);
+  const actions = el("div", "board-actions");
+  const more = el("button", "ghost small", "Show all");
+  more.type = "button";
+  more.setAttribute("aria-expanded", "false");
+  more.addEventListener("click", () => {
+    const open = body.classList.toggle("clipped");
+    more.textContent = open ? "Show all" : "Show less";
+    more.setAttribute("aria-expanded", String(!open));
+  });
+  actions.append(more);
+  if (can("write")) {
+    const edit = el("button", "ghost small", "Edit");
+    edit.type = "button";
+    edit.addEventListener("click", () => item.replaceWith(noteEditor(note)));
+    actions.append(edit);
+  }
+  item.append(head, el("div", "board-meta", meta.filter(Boolean).join(" · ")), body, actions);
+  return item;
+}
+
+function noteEditor(note) {
+  const form = el("form", "board-form");
+  form.autocomplete = "off";
+  const title = el("input");
+  title.type = "text";
+  title.maxLength = 200;
+  title.value = note.title;
+  const body = el("textarea");
+  body.maxLength = 20000;
+  body.value = note.body;
+  const titleField = el("label", "board-field");
+  titleField.append(el("span", "", "Title"), title);
+  const bodyField = el("label", "board-field");
+  bodyField.append(el("span", "", "Note"), body);
+  const actions = el("div", "board-actions");
+  const cancel = el("button", "ghost small", "Cancel");
+  cancel.type = "button";
+  cancel.addEventListener("click", () => loadNotes());
+  const save = el("button", "ghost small", "Save");
+  save.type = "submit";
+  actions.append(cancel, save);
+  form.append(titleField, bodyField, actions);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    save.disabled = true;
+    const response = await api("/admin/api/notes/" + note.id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.value, body: body.value }),
+    }).catch(() => null);
+    save.disabled = false;
+    if (!response || !response.ok) {
+      listStatus("notes-status", (response && (await jsonOf(response)).error) || "The note could not be saved.", "bad");
+      return;
+    }
+    listStatus("notes-status", `Saved #${note.id}.`, "ok");
+    loadNotes();
+  });
+  return form;
+}
+
+$("notes-project").addEventListener("change", () => { lists.notesProject = $("notes-project").value; loadNotes(); });
+$("notes-search").addEventListener("input", () => {
+  clearTimeout(lists.notesTimer);
+  lists.notesTimer = setTimeout(() => { lists.notesQuery = $("notes-search").value.trim(); loadNotes(); }, 300);
+});
+$("note-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const project = $("note-project").value.trim().toLowerCase();
+  const response = await api("/admin/api/notes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project, title: $("note-title").value, body: $("note-body").value }),
+  }).catch(() => null);
+  if (!response || !response.ok) {
+    listStatus("notes-status", (response && (await jsonOf(response)).error) || "The note could not be added.", "bad");
+    return;
+  }
+  $("note-title").value = "";
+  $("note-body").value = "";
+  lists.notesProject = project;
+  listStatus("notes-status", "Note added.", "ok");
+  loadNotes();
+});
+
+async function loadTodo() {
+  const query = new URLSearchParams({ status: lists.todoStatus });
+  if (lists.todoProject) query.set("project", lists.todoProject);
+  let data;
+  try {
+    const response = await api("/admin/api/todos?" + query.toString());
+    if (!response.ok) throw new Error("failed");
+    data = await response.json();
+  } catch (_) {
+    listStatus("todo-status-line", "The to-do list could not be loaded.", "bad");
+    return;
+  }
+  listStatus("todo-status-line", "");
+  const projects = [...new Set([data.general, ...data.projects])];
+  const select = $("todo-project");
+  select.replaceChildren();
+  const any = el("option", "", "Every project");
+  any.value = "";
+  select.append(any);
+  const options = $("todo-projects");
+  options.replaceChildren();
+  for (const project of projects) {
+    const option = el("option", "", project);
+    option.value = project;
+    select.append(option);
+    const suggestion = el("option");
+    suggestion.value = project;
+    options.append(suggestion);
+  }
+  select.value = lists.todoProject;
+  const list = $("todo-list");
+  list.replaceChildren();
+  const total = data.tasks.length + data.entries.length;
+  $("todo-count").textContent = `${total} item${total === 1 ? "" : "s"}`;
+  if (!total) list.append(el("li", "none", lists.todoStatus === "done" ? "Nothing done yet." : "Nothing on the list."));
+  for (const task of data.tasks) list.append(todoTask(task, data.general));
+  for (const entry of data.entries) list.append(todoEntry(entry));
+}
+
+function todoTask(task, general) {
+  const item = el("li", "board-item " + task.status);
+  const head = el("div", "board-item-head");
+  head.append(el("span", "pill " + task.status, task.status), el("span", "board-title", task.title),
+    el("span", "todo-label", task.project === general ? "general" : task.project), el("span", "board-id", "task #" + task.id));
+  const meta = [`added by ${displayName(task.created_by)}`];
+  if (task.status === "claimed" && task.claimed_by) meta.push(`claimed by ${displayName(task.claimed_by)} since ${ago(task.updated_at)}`);
+  if (task.assignee) meta.push(`for ${displayName(task.assignee)}`);
+  if (task.done_by) meta.push(`done by ${displayName(task.done_by)}`);
+  item.append(head, el("div", "board-meta", meta.join(" · ")));
+  if (task.body) item.append(el("p", "note-body clipped", task.body));
+  if (can("write") && (task.status === "open" || task.status === "claimed")) {
+    const actions = el("div", "board-actions");
+    const done = el("button", "ghost small", "Mark done");
+    done.type = "button";
+    done.addEventListener("click", async () => {
+      done.disabled = true;
+      const response = await api("/admin/api/tasks/" + task.id, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "done" }),
+      }).catch(() => null);
+      if (!response || !response.ok) {
+        done.disabled = false;
+        listStatus("todo-status-line", (response && (await jsonOf(response)).error) || "It could not be marked done.", "bad");
+        return;
+      }
+      listStatus("todo-status-line", `Task #${task.id} is done.`, "ok");
+      loadTodo();
+    });
+    actions.append(done);
+    item.append(actions);
+  }
+  return item;
+}
+
+function todoEntry(entry) {
+  const item = el("li", "board-item");
+  const head = el("div", "board-item-head");
+  head.append(el("span", "todo-label note-style", "note-style to-do"), el("span", "board-title", entry.title),
+    el("span", "todo-label", entry.project), el("span", "board-id", "entry #" + entry.id));
+  item.append(head, el("div", "board-meta", `${entry.agent ? `by ${displayName(entry.agent)} · ` : ""}${ago(entry.created_at)} · not on the board`));
+  if (entry.body) item.append(el("p", "note-body clipped", entry.body));
+  if (can("write")) {
+    const actions = el("div", "board-actions");
+    const move = el("button", "ghost small", "Move to board");
+    move.type = "button";
+    move.addEventListener("click", async () => {
+      move.disabled = true;
+      const response = await api(`/admin/api/todos/from-entry/${entry.id}`, { method: "POST" }).catch(() => null);
+      if (!response || !response.ok) {
+        move.disabled = false;
+        listStatus("todo-status-line", (response && (await jsonOf(response)).error) || "It could not be moved.", "bad");
+        return;
+      }
+      const task = await jsonOf(response);
+      listStatus("todo-status-line", `Moved to the board as task #${task.id}.`, "ok");
+      loadTodo();
+    });
+    actions.append(move);
+    item.append(actions);
+  }
+  return item;
+}
+
+$("todo-status").addEventListener("change", () => { lists.todoStatus = $("todo-status").value; loadTodo(); });
+$("todo-project").addEventListener("change", () => { lists.todoProject = $("todo-project").value; loadTodo(); });
+$("todo-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const project = $("todo-new-project").value.trim().toLowerCase() || "general";
+  const response = await api("/admin/api/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project, title: $("todo-new-title").value, body: $("todo-new-body").value }),
+  }).catch(() => null);
+  if (!response || !response.ok) {
+    listStatus("todo-status-line", (response && (await jsonOf(response)).error) || "It could not be added.", "bad");
+    return;
+  }
+  $("todo-new-title").value = "";
+  $("todo-new-body").value = "";
+  listStatus("todo-status-line", "Added to the list.", "ok");
+  loadTodo();
+});
+
+/* Phones: both live behind the More tab like the other panels. */
+DESTINATIONS.notes = { shown: () => !$("notes").hidden, open: () => openList("notes"), close: () => closeNotes() };
+DESTINATIONS.todo = { shown: () => !$("todo").hidden, open: () => openList("todo"), close: () => closeTodo() };
+TAB_OF.notes = "more";
+TAB_OF.todo = "more";
+$("more-notes").addEventListener("click", () => showDestination("notes"));
+$("more-todo").addEventListener("click", () => showDestination("todo"));

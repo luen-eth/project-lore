@@ -735,6 +735,15 @@ impl TaskRunner {
     /// recorded); accepted only on github.com and only when one of lore's
     /// GitHub credentials can push to it (personal first).
     async fn resolve(&self, project: &str, repo: &str, agent: &str) -> Result<Target, Skip> {
+        // A general to-do has no project of its own to push to: without a
+        // repository named on the task, no built-in agent takes it.
+        if repo.trim().is_empty() && project == crate::db::GENERAL_PROJECT {
+            return Err(Skip::Note(
+                "it is a general to-do without a repository; set the task's repo to have a \
+                 built-in agent work on it"
+                    .into(),
+            ));
+        }
         let target = if repo.trim().is_empty() {
             self.recorded_target(project).await?
         } else {
@@ -3639,6 +3648,31 @@ echo '{"type":"step_finish","timestamp":4,"sessionID":"ses_1","part":{"type":"st
             assert!(!text.contains("lore_run_"), "{label}: {text}");
             assert_eq!(std::fs::read_dir(&world.work).unwrap().count(), 0);
         }
+    }
+
+    /// A general to-do without a repository is never taken by a built-in
+    /// agent: it has nothing to push to.
+    #[tokio::test]
+    async fn a_general_to_do_without_a_repository_is_never_taken() {
+        let world = world("general-todo", Duration::from_secs(3600)).await;
+        let agent = world.runner.hub.agents()[0].clone();
+        let refused = world
+            .runner
+            .resolve(crate::db::GENERAL_PROJECT, "", &agent)
+            .await;
+        assert!(
+            matches!(&refused, Err(Skip::Note(why)) if why.contains("general to-do")),
+            "the general project resolved to a repository"
+        );
+        let task = idle_task(
+            &world.db,
+            "Renew the domain",
+            crate::db::GENERAL_PROJECT,
+            "",
+        );
+        world.runner.tick().await.unwrap();
+        assert!(world.db.runs(10).unwrap().is_empty());
+        assert_eq!(world.db.task(task.id).unwrap().unwrap().status, "open");
     }
 
     #[tokio::test]

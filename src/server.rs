@@ -304,6 +304,111 @@ pub struct ByeArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NotesArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// The project whose notes to list. Omit to see which projects have
+    /// notes, with their counts and newest titles.
+    pub project: Option<String>,
+    /// Words to search the notes for (keyword and meaning), within
+    /// `project` when given.
+    pub query: Option<String>,
+    /// Most notes to return (default 10, max 50).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NoteAddArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// The project the note belongs to: its repository or folder name in
+    /// lowercase, e.g. `project-lore`. Required.
+    pub project: String,
+    /// One line that says what the note is about.
+    pub title: String,
+    /// The note itself.
+    pub body: String,
+    /// Short topic tags, e.g. ["idea", "pricing"].
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NoteEditArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Id of the note, as `notes` shows it.
+    pub id: i64,
+    /// New title. Omit to keep it.
+    pub title: Option<String>,
+    /// New text, replacing the old. Omit to keep it.
+    pub body: Option<String>,
+    /// New tag list, replacing the old. Omit to keep it.
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NoteDeleteArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Id of the note, as `notes` shows it.
+    pub id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodosArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Only the to-dos of this project (general ones are under
+    /// `general`). Omit for the whole list.
+    pub project: Option<String>,
+    /// One of: open (the default: open and claimed tasks, and note-style
+    /// to-dos), done (finished tasks), all.
+    pub status: Option<String>,
+    /// Most items to return (default 30, max 100).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoAddArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// What needs doing, in one line. Omit only with `from_entry`.
+    pub title: Option<String>,
+    /// The details.
+    pub details: Option<String>,
+    /// The project it belongs to, if any. Omit for a general to-do (filed
+    /// under `general`).
+    pub project: Option<String>,
+    /// The agent it is meant for. Omit for anyone.
+    pub assignee: Option<String>,
+    /// The GitHub repository the work goes to, as `task_add` takes it.
+    pub repo: Option<String>,
+    /// A Dokploy project id the work may change, as `task_add` takes it.
+    pub dokploy_project_id: Option<String>,
+    /// A Cloudflare zone id the work may change, as `task_add` takes it.
+    pub cloudflare_zone: Option<String>,
+    /// Moves a note-style to-do (an entry of kind `todo`, as `todos` shows
+    /// it) to the board: its title and text become the task (unless you
+    /// pass others) and the entry gets a line pointing at the task.
+    pub from_entry: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoDoneArgs {
+    /// Session id returned by `hello` for this chat.
+    pub session_id: String,
+    /// Id of the board task, as `todos` shows it (`task #<id>`).
+    pub id: Option<i64>,
+    /// Id of a note-style to-do (`entry #<id>` in `todos`). It has no
+    /// status: the answer says how to move it to the board.
+    pub entry: Option<i64>,
+    /// Short note: what was done.
+    pub note: Option<String>,
+    /// The HEAD commit the work was finished at, if any.
+    pub commit: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskAddArgs {
     /// Session id returned by `hello` for this chat.
     pub session_id: String,
@@ -844,6 +949,19 @@ impl Lore {
         answer
     }
 
+    /// Refuses an id that is not a note (`note_edit`, `note_delete`).
+    async fn require_note(&self, id: i64) -> Result<(), String> {
+        let db = self.db.clone();
+        match blocking(move || db.get(id).map_err(internal)).await? {
+            Some(entry) if entry.kind == "note" => Ok(()),
+            Some(entry) => Err(format!(
+                "entry #{id} is a {}, not a note: change it with `amend`, delete it with `forget`",
+                entry.kind
+            )),
+            None => Err(format!("No note with id {id}.")),
+        }
+    }
+
     /// The paragraph that tells a client with an outdated tool list what it
     /// is missing and how to get it. The tool names come from the router,
     /// so the list stays current.
@@ -989,7 +1107,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Record a change, decision, bug fix, note or open todo in the shared memory so future sessions and other agents can find it. Call this after any meaningful piece of work. Always include the project directory, its git remote and the current HEAD commit."
+        description = "Record a change, decision, bug fix, note or open todo in the shared memory so future sessions and other agents can find it. Call this after any meaningful piece of work. Always include the project directory, its git remote and the current HEAD commit. (A plain note without them: `note_add`.)"
     )]
     async fn log(
         &self,
@@ -1079,7 +1197,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "List the most recent entries, newest first. Use it to see where a project was left off."
+        description = "List the most recent entries, newest first. Use it to see where a project was left off. (Notes alone: `notes`; the to-do list: `todos`.)"
     )]
     async fn recent(
         &self,
@@ -1493,7 +1611,427 @@ impl Lore {
     }
 
     #[tool(
-        description = "Add a task to the shared to-do list of a project: work that should not be forgotten, or that another agent could pick up. Say exactly what needs doing. Optionally name the GitHub repository the work goes to (`repo`), and a Dokploy project (`dokploy_project_id`) or Cloudflare zone (`cloudflare_zone`) the work may change: a built-in agent that takes the task may write only there."
+        description = "Show the notes of a project (newest first), or, without `project`, which projects have notes. Notes are lore entries of kind `note`; `query` searches them. Add one with `note_add`; `recall` and `recent` also find notes among all entries."
+    )]
+    async fn notes(
+        &self,
+        Parameters(args): Parameters<NotesArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let run = parts.extensions.get::<RunScope>().is_some();
+        let this = self.clone();
+        let query = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(str::to_string);
+        let vector = match &query {
+            Some(query) => self.embedder.embed_query(query).unwrap_or(None),
+            None => None,
+        };
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let project = normalize_project_filter(args.project);
+            let limit = args.limit.unwrap_or(10).clamp(1, 50) as usize;
+            let mut out = String::new();
+            if run {
+                out.push_str(RUN_READ_REMINDER);
+            }
+            let entries: Vec<Entry> = match (&project, &query) {
+                (None, None) => {
+                    let projects = this.db.note_projects().map_err(internal)?;
+                    this.note(
+                        &agent,
+                        "notes",
+                        "",
+                        Some(&session.id),
+                        None,
+                        &[],
+                        "projects with notes",
+                    );
+                    if projects.is_empty() {
+                        out.push_str(
+                            "No notes yet. Add one with `note_add` (a project is required).",
+                        );
+                        return Ok(out);
+                    }
+                    out.push_str(
+                        "Projects with notes (newest first); pass `project` to list one's notes:\n",
+                    );
+                    for (name, count, newest) in projects.iter().take(30) {
+                        let latest = this
+                            .db
+                            .recent(Some(name), Some("note"), 3)
+                            .map_err(internal)?;
+                        let titles: Vec<String> = latest
+                            .iter()
+                            .map(|e| format!("#{} {}", e.id, clip(&e.title, 60)))
+                            .collect();
+                        out.push_str(&format!(
+                            "- `{name}`: {count} note{}, newest {newest} ({})\n",
+                            if *count == 1 { "" } else { "s" },
+                            titles.join("; ")
+                        ));
+                    }
+                    return Ok(out);
+                }
+                (_, Some(query)) => this
+                    .db
+                    .search(
+                        query,
+                        vector.as_deref(),
+                        project.as_deref(),
+                        Some("note"),
+                        limit,
+                        this.min_similarity,
+                    )
+                    .map_err(internal)?
+                    .into_iter()
+                    .map(|hit| hit.entry)
+                    .collect(),
+                (Some(project), None) => this
+                    .db
+                    .recent(Some(project), Some("note"), limit)
+                    .map_err(internal)?,
+            };
+            let seen: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+            this.note(
+                &agent,
+                "notes",
+                project.as_deref().unwrap_or(""),
+                Some(&session.id),
+                None,
+                &seen,
+                &format!("{} notes", seen.len()),
+            );
+            if entries.is_empty() {
+                out.push_str(match &project {
+                    Some(project) => {
+                        return Ok(out
+                            + &format!(
+                                "No notes in `{project}`{}.",
+                                if query.is_some() { " match" } else { "" }
+                            ));
+                    }
+                    None => "No note matches.",
+                });
+                return Ok(out);
+            }
+            out.push_str(&format!(
+                "{} note{}:\n",
+                entries.len(),
+                if entries.len() == 1 { "" } else { "s" }
+            ));
+            let by_run = this.db.run_writes("entry", &seen).map_err(internal)?;
+            for entry in &entries {
+                out.push('\n');
+                out.push_str(&render(entry, None, true, by_run.get(&entry.id)));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Add a note to a project: a fact, an idea or anything worth keeping, without the path and commit `log` asks for. `project` is required (the lowercase repository or folder name). Stored as an entry of kind `note`, so `notes`, `recall` and `recent` find it."
+    )]
+    async fn note_add(
+        &self,
+        Parameters(args): Parameters<NoteAddArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let actor = agent_of(&parts);
+        let shared = actor == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &actor, shared)?;
+            let writer = session_agent(&actor, &session).to_string();
+            let project = args.project.trim().to_lowercase();
+            if project.is_empty() {
+                return Err("name the project the note belongs to (`project`, its lowercase repository or folder name)".into());
+            }
+            let entry = this
+                .db
+                .insert(&NewEntry {
+                    project,
+                    kind: "note".into(),
+                    title: required("title", &args.title)?,
+                    body: required("body", &args.body)?,
+                    tags: join_list(args.tags),
+                    files: String::new(),
+                    agent: writer.clone(),
+                    path: String::new(),
+                    repo: String::new(),
+                    commit: String::new(),
+                    branch: String::new(),
+                    dirty: false,
+                    session_id: Some(session.id.clone()),
+                })
+                .map_err(internal)?;
+            this.embed_entry(&entry);
+            this.note(
+                &writer,
+                "log",
+                &entry.project,
+                Some(&session.id),
+                Some(entry.id),
+                &[],
+                &format!("[note] {}", entry.title),
+            );
+            Ok(format!("Noted #{} in `{}`: {}", entry.id, entry.project, entry.title))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Change a note (title, text or tags) by id, as `notes` shows it. Only notes; other entries are changed with `amend`."
+    )]
+    async fn note_edit(
+        &self,
+        Parameters(args): Parameters<NoteEditArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.require_note(args.id).await?;
+        self.amend(
+            Parameters(AmendArgs {
+                session_id: args.session_id,
+                id: args.id,
+                kind: None,
+                title: args.title,
+                body: args.body,
+                tags: args.tags,
+                files: None,
+            }),
+            Extension(parts),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Delete a note permanently by id, as `notes` shows it. Only notes; other entries are deleted with `forget`."
+    )]
+    async fn note_delete(
+        &self,
+        Parameters(args): Parameters<NoteDeleteArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        self.require_note(args.id).await?;
+        self.forget(
+            Parameters(IdArgs {
+                session_id: args.session_id,
+                id: args.id,
+            }),
+            Extension(parts),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Show the to-do list: one list across every project of what is open on the board (open and claimed tasks, with who claimed them and since when) and the note-style to-dos (entries of kind `todo`, not on the board). `project` and `status` filter it. Add with `todo_add`, finish with `todo_done`; `tasks` lists the board alone."
+    )]
+    async fn todos(
+        &self,
+        Parameters(args): Parameters<TodosArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_of(&parts);
+        let shared = agent == SHARED_AGENT;
+        let session_id = args.session_id.trim().to_string();
+        let run = parts.extensions.get::<RunScope>().is_some();
+        let this = self.clone();
+        blocking(move || {
+            let session = this.require_session(&session_id, &agent, shared)?;
+            let project = normalize_project_filter(args.project);
+            let limit = args.limit.unwrap_or(30).clamp(1, 100) as usize;
+            let status = args.status.as_deref().map(|s| s.trim().to_lowercase()).unwrap_or_else(|| "open".into());
+            let statuses: &[&str] = match status.as_str() {
+                "open" | "" => &["open", "claimed"],
+                "done" => &["done"],
+                "all" => &[],
+                other => return Err(format!("status must be open, done or all, not `{other}`")),
+            };
+            let tasks = this.db.tasks(project.as_deref(), statuses, limit).map_err(internal)?;
+            let entries = if status == "done" {
+                Vec::new()
+            } else {
+                this.db.recent(project.as_deref(), Some("todo"), limit).map_err(internal)?
+            };
+            this.note(
+                &agent,
+                "todos",
+                project.as_deref().unwrap_or(""),
+                Some(&session.id),
+                None,
+                &entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+                &format!("{} tasks, {} note-style to-dos", tasks.len(), entries.len()),
+            );
+            let mut out = String::new();
+            if run {
+                out.push_str(RUN_READ_REMINDER);
+            }
+            if tasks.is_empty() && entries.is_empty() {
+                out.push_str("Nothing on the to-do list. Add with `todo_add`.");
+                return Ok(out);
+            }
+            out.push_str(&format!("To-do list ({status}):\n"));
+            for task in &tasks {
+                let label = if task.project == db::GENERAL_PROJECT { "general".to_string() } else { task.project.clone() };
+                let mut line = format!("- task #{} [{}] {} · {label}", task.id, task.status, task.title);
+                if task.status == "claimed" && !task.claimed_by.is_empty() {
+                    line.push_str(&format!(" · claimed by {} since {}", task.claimed_by, task.updated_at));
+                }
+                if !task.assignee.is_empty() {
+                    line.push_str(&format!(" · for {}", task.assignee));
+                }
+                if !task.body.is_empty() {
+                    line.push_str(&format!("\n  {}", clip(&task.body, 200)));
+                }
+                out.push_str(&line);
+                out.push('\n');
+            }
+            for entry in &entries {
+                out.push_str(&format!(
+                    "- entry #{} [note-style to-do (not on the board)] {} · {} · {} · {}\n  {}\n",
+                    entry.id,
+                    entry.title,
+                    entry.project,
+                    entry.agent,
+                    entry.created_at,
+                    clip(&entry.body, 200)
+                ));
+            }
+            out.push_str("\nFinish a task with `todo_done` (id); move a note-style to-do to the board with `todo_add` and `from_entry`.");
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Add an item to the to-do list: a task on the board, exactly as `task_add` adds it (same checks and author rules), with an optional `project` (a general to-do without one is filed under `general`). Built-in agents may take a to-do under their usual rules, but never a general one without a `repo`: it has nothing to push to. `from_entry` moves a note-style to-do (entry of kind `todo`) to the board."
+    )]
+    async fn todo_add(
+        &self,
+        Parameters(args): Parameters<TodoAddArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        let mut title = args.title.clone().unwrap_or_default();
+        let mut details = args.details.clone();
+        let mut project = args.project.clone().unwrap_or_default();
+        let from = match args.from_entry {
+            Some(id) => {
+                let db = self.db.clone();
+                let entry = blocking(move || db.get(id).map_err(internal))
+                    .await?
+                    .ok_or_else(|| format!("No entry with id {id}."))?;
+                if entry.kind != "todo" {
+                    return Err(format!(
+                        "entry #{id} is a {}, not a note-style to-do (kind `todo`)",
+                        entry.kind
+                    ));
+                }
+                if title.trim().is_empty() {
+                    title = entry.title.clone();
+                }
+                if details.is_none() {
+                    details = Some(entry.body.clone());
+                }
+                if project.trim().is_empty() {
+                    project = entry.project.clone();
+                }
+                Some(entry)
+            }
+            None => None,
+        };
+        if title.trim().is_empty() {
+            return Err("say what needs doing (`title`)".into());
+        }
+        if project.trim().is_empty() {
+            project = db::GENERAL_PROJECT.to_string();
+        }
+        let answer = self
+            .task_add(
+                Parameters(TaskAddArgs {
+                    session_id: args.session_id,
+                    project,
+                    title,
+                    body: details,
+                    assignee: args.assignee,
+                    repo: args.repo,
+                    dokploy_project_id: args.dokploy_project_id,
+                    cloudflare_zone: args.cloudflare_zone,
+                }),
+                Extension(parts),
+            )
+            .await?;
+        let Some(entry) = from else {
+            return Ok(answer);
+        };
+        let task_id = answer
+            .strip_prefix("Task #")
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or("?")
+            .to_string();
+        let db = self.db.clone();
+        let body = format!(
+            "{}\n\nMoved to the board as task #{task_id}.",
+            entry.body.trim_end()
+        );
+        let id = entry.id;
+        blocking(move || {
+            db.amend(
+                id,
+                &db::Patch {
+                    body: Some(body),
+                    ..Default::default()
+                },
+            )
+            .map_err(internal)
+            .map(|_| ())
+        })
+        .await?;
+        Ok(format!(
+            "{answer}\nEntry #{id} now points at task #{task_id}."
+        ))
+    }
+
+    #[tool(
+        description = "Mark an item of the to-do list done: a board task (`id`), exactly as `task_update` with `done` does, with the same permissions. A note-style to-do (`entry`) has no status: the answer says how to move it to the board."
+    )]
+    async fn todo_done(
+        &self,
+        Parameters(args): Parameters<TodoDoneArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, String> {
+        if let Some(entry) = args.entry {
+            return Ok(format!(
+                "Entry #{entry} is a note-style to-do: it has no status of its own. Move it to the \
+                 board with `todo_add` and \"from_entry\": {entry}, then finish the new task with \
+                 `todo_done`; or delete the entry with `forget` if it is no longer needed."
+            ));
+        }
+        let Some(id) = args.id else {
+            return Err("name the task (`id`, as `todos` shows it)".into());
+        };
+        self.task_update(
+            Parameters(TaskUpdateArgs {
+                session_id: args.session_id,
+                id,
+                action: "done".into(),
+                note: args.note,
+                commit: args.commit,
+            }),
+            Extension(parts),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Add a task to the board of a project (`todo_add` does the same for the to-do list, project optional): work that should not be forgotten, or that another agent could pick up. Say exactly what needs doing. Optionally name the GitHub repository the work goes to (`repo`), and a Dokploy project (`dokploy_project_id`) or Cloudflare zone (`cloudflare_zone`) the work may change: a built-in agent that takes the task may write only there."
     )]
     async fn task_add(
         &self,
@@ -1618,7 +2156,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "Update a task on the shared to-do list. Call `tasks` to see the ids. Claim a task with `claim` before you start working on it, and mark it `done` (with the commit) when you finish. Also: `release` a task you are giving up, `cancel` one that is no longer needed, `reopen` one that was closed by mistake."
+        description = "Update a task on the shared to-do list. Call `tasks` to see the ids. Claim a task with `claim` before you start working on it, and mark it `done` (with the commit) when you finish. Also: `release` a task you are giving up, `cancel` one that is no longer needed, `reopen` one that was closed by mistake. (`todo_done` is the same as `done`.)"
     )]
     async fn task_update(
         &self,
@@ -1724,7 +2262,7 @@ impl Lore {
     }
 
     #[tool(
-        description = "List the tasks on the shared to-do list: open and claimed ones by default, or done, cancelled or all of them. Check this before starting work that may already be on the list."
+        description = "List the tasks on the shared to-do list: open and claimed ones by default, or done, cancelled or all of them. Check this before starting work that may already be on the list. (`todos` shows the board together with note-style to-dos.)"
     )]
     async fn tasks(
         &self,
@@ -4311,6 +4849,258 @@ mod tests {
         "This call came without a `session_id`, so lore used the implicit session";
 
     /// The session id an implicit answer names in its notice.
+    /// Notes per project and the one to-do list over the board, through
+    /// their own tools; a run reads them and adds or closes nothing.
+    #[tokio::test]
+    async fn notes_and_the_to_do_list_have_their_own_tools() {
+        let lore = test_lore("notes-todos");
+        let (session, _) = hello_as(&lore, "chatgpt").await;
+        fn call<T: DeserializeOwned>(session: &str, mut value: serde_json::Value) -> Parameters<T> {
+            value["session_id"] = json!(session);
+            args(value)
+        }
+        // Notes: none, a project is required, then per project.
+        let text = lore
+            .notes(call(&session, json!({})), as_agent(Some("chatgpt")))
+            .await
+            .unwrap();
+        assert!(text.contains("No notes yet"), "{text}");
+        let refused = lore
+            .note_add(
+                call(&session, json!({"project": " ", "title": "t", "body": "b"})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("name the project"), "{refused}");
+        let added = lore
+            .note_add(
+                call(&session, json!({"project": "Shop", "title": "Pricing idea", "body": "Annual plan at 10x monthly"})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap();
+        assert!(added.contains("in `shop`: Pricing idea"), "{added}");
+        let note_id: i64 = added
+            .split('#')
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let entry = lore.db.get(note_id).unwrap().unwrap();
+        assert_eq!(
+            (
+                entry.kind.as_str(),
+                entry.path.as_str(),
+                entry.commit.as_str()
+            ),
+            ("note", "", "")
+        );
+        let listed = lore
+            .notes(call(&session, json!({})), as_agent(Some("chatgpt")))
+            .await
+            .unwrap();
+        assert!(listed.contains("- `shop`: 1 note"), "{listed}");
+        let listed = lore
+            .notes(
+                call(&session, json!({"project": "shop"})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap();
+        assert!(listed.contains("Pricing idea"), "{listed}");
+        let found = lore
+            .notes(
+                call(&session, json!({"project": "shop", "query": "annual"})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap();
+        assert!(found.contains("Pricing idea"), "{found}");
+        // Only notes are edited and deleted through the note tools.
+        let other = lore
+            .db
+            .insert(&NewEntry {
+                project: "shop".into(),
+                kind: "todo".into(),
+                title: "Fix the cart".into(),
+                body: "It loses items".into(),
+                tags: String::new(),
+                files: String::new(),
+                agent: "codex".into(),
+                path: "/w".into(),
+                repo: String::new(),
+                commit: String::new(),
+                branch: String::new(),
+                dirty: false,
+                session_id: None,
+            })
+            .unwrap();
+        let refused = lore
+            .note_edit(
+                call(&session, json!({"id": other.id, "title": "x"})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("not a note"), "{refused}");
+        lore.note_edit(
+            call(&session, json!({"id": note_id, "title": "Pricing"})),
+            as_agent(Some("chatgpt")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lore.db.get(note_id).unwrap().unwrap().title, "Pricing");
+
+        // The to-do list: board tasks and note-style to-dos in one list.
+        let general = lore
+            .todo_add(
+                call(&session, json!({"title": "Renew the domain"})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap();
+        assert!(general.contains("added to `general`"), "{general}");
+        lore.todo_add(
+            call(&session, json!({"title": "Ship v2", "project": "shop"})),
+            as_agent(Some("chatgpt")),
+        )
+        .await
+        .unwrap();
+        let list = lore
+            .todos(call(&session, json!({})), as_agent(Some("chatgpt")))
+            .await
+            .unwrap();
+        assert!(list.contains("Renew the domain · general"), "{list}");
+        assert!(list.contains("Ship v2 · shop"), "{list}");
+        assert!(
+            list.contains(&format!(
+                "entry #{} [note-style to-do (not on the board)] Fix the cart",
+                other.id
+            )),
+            "{list}"
+        );
+        let shop_only = lore
+            .todos(
+                call(&session, json!({"project": "shop"})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap();
+        assert!(!shop_only.contains("Renew the domain"), "{shop_only}");
+        // A note-style to-do has no status; moving it puts it on the board.
+        let told = lore
+            .todo_done(
+                call(&session, json!({"entry": other.id})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap();
+        assert!(told.contains("from_entry"), "{told}");
+        let refused = lore
+            .todo_add(
+                call(&session, json!({"from_entry": note_id})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("not a note-style to-do"), "{refused}");
+        let moved = lore
+            .todo_add(
+                call(&session, json!({"from_entry": other.id})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            moved.contains("Fix the cart") && moved.contains("now points at task #"),
+            "{moved}"
+        );
+        let task_id: i64 = moved
+            .strip_prefix("Task #")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            lore.db
+                .get(other.id)
+                .unwrap()
+                .unwrap()
+                .body
+                .ends_with(&format!("Moved to the board as task #{task_id}."))
+        );
+        // Done, as task_update does it.
+        let done = lore
+            .todo_done(
+                call(&session, json!({"id": task_id, "note": "fixed"})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap();
+        assert!(done.to_lowercase().contains("done"), "{done}");
+        let finished = lore
+            .todos(
+                call(&session, json!({"status": "done"})),
+                as_agent(Some("chatgpt")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            finished.contains(&format!("task #{task_id} [done]")),
+            "{finished}"
+        );
+        assert!(!finished.contains("(not on the board)]"), "{finished}");
+        lore.note_delete(
+            call(&session, json!({"id": note_id})),
+            as_agent(Some("chatgpt")),
+        )
+        .await
+        .unwrap();
+        assert!(lore.db.get(note_id).unwrap().is_none());
+        // Every tool is offered to a normal token.
+        let names: Vec<String> = lore
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for tool in [
+            "notes",
+            "note_add",
+            "note_edit",
+            "note_delete",
+            "todos",
+            "todo_add",
+            "todo_done",
+        ] {
+            assert!(names.contains(&tool.to_string()), "{tool}");
+        }
+        // A run reads notes and todos and changes nothing through them.
+        let scope = RunScope {
+            agent: "claude-builtin".into(),
+            task_id: Some(1),
+            ..RunScope::default()
+        };
+        for tool in ["notes", "todos"] {
+            assert!(scope.check_tool(tool, None).is_ok(), "{tool}");
+        }
+        for tool in [
+            "note_add",
+            "note_edit",
+            "note_delete",
+            "todo_add",
+            "todo_done",
+        ] {
+            assert!(scope.check_tool(tool, None).is_err(), "{tool}");
+        }
+    }
+
     fn notice_id(text: &str) -> String {
         let marker = "pass \"session_id\": \"";
         let start = text.find(marker).unwrap() + marker.len();
