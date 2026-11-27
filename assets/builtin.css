@@ -180,6 +180,7 @@
 .term-menu-item {
   display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
   padding: 7px 8px; border: 0; border-radius: 8px; background: transparent;
+  color: var(--text); font-weight: 500;
 }
 .term-menu-item:hover, .term-menu-item:focus-visible { background: rgba(255, 255, 255, 0.07); }
 .term-menu-text { display: flex; flex-direction: column; min-width: 0; flex: 1; line-height: 1.25; }
