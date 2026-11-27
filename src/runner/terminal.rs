@@ -542,12 +542,24 @@ async fn write_all(master: &AsyncFd<OwnedFd>, mut bytes: &[u8]) -> io::Result<()
     Ok(())
 }
 
-/// Kills a terminal's session: its process group, then every process
-/// still in the session (a shell's jobs run in groups of their own). The
-/// group is the session leader's, which is not reaped yet, so its id cannot
-/// name anyone else; each other member is signalled through a pidfd and
-/// only once it is seen, pinned, to still be in the session, so a pid
-/// recycled since the scan of `/proc` is never hit.
+/// Kills a terminal's or a run's session: its process group, then every
+/// process still in the session (a shell's jobs run in groups of their
+/// own). Each member found in `/proc` is signalled through a pidfd and only
+/// once it is seen, pinned, to still be in the session, so a pid recycled
+/// since the scan is never hit.
+///
+/// The group signal goes by number. For a terminal the session leader is
+/// not reaped yet, so the number cannot name anyone else. For a run the CLI
+/// (the leader) has already been reaped by then; the kernel still keeps the
+/// number reserved while any process remains in that group or session, so
+/// the signal can reach a stranger only if the group is already empty and
+/// a new process has since taken the number and made itself a group leader.
+///
+/// This is best effort: a `/proc` that cannot be read finds no member here.
+/// It is not the guarantee. With an agent user, after every run and after
+/// the last terminal the runner ends every process of that user
+/// ([`super::sandbox::sweep`]), whose scan fails closed (the runner exits
+/// rather than go on).
 pub(super) fn kill_session(session: Pid) {
     let _ = rustix::process::kill_process_group(session, Signal::KILL);
     let sid = session.as_raw_nonzero().get();

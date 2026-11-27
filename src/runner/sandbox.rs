@@ -213,7 +213,20 @@ pub fn signal_pinned(
     };
     let pidfd = match pidfd_open(raw, PidfdFlags::empty()) {
         Ok(pidfd) => pidfd,
-        Err(rustix::io::Errno::SRCH) => return Ok(false),
+        // Gone, or (EINVAL) a task being reaped or no longer a thread-group
+        // leader: not signalled; the caller's next scan of /proc decides
+        // whether anything is left, so this stays fail closed.
+        Err(rustix::io::Errno::SRCH | rustix::io::Errno::INVAL) => return Ok(false),
+        Err(error @ (rustix::io::Errno::NOSYS | rustix::io::Errno::PERM)) => {
+            return Err(io::Error::new(
+                io::Error::from(error).kind(),
+                format!(
+                    "pidfd_open is not allowed here ({error}): the runner needs Linux 5.3 or \
+                     newer and a seccomp profile that allows pidfd_open and \
+                     pidfd_send_signal (Docker's default profile does)"
+                ),
+            ));
+        }
         Err(error) => return Err(error.into()),
     };
     if !still_ours(&proc.join(pid.to_string()))? {
@@ -1203,18 +1216,22 @@ mod tests {
     /// re-forks into every freed pid holds the whole pids limit, so the
     /// runner cannot start anything; the sweep must still end it all.
     #[tokio::test]
-    #[ignore = "needs root, LORE_TEST_PID_BOMB=1 and a pids limit"]
+    #[ignore = "needs root, LORE_TEST_PID_BOMB=1 and a pids limit: see the README, Development"]
     async fn kill_all_ends_a_fork_bomb_that_holds_every_pid() {
+        needs_root();
         let limit: Option<u64> = std::fs::read_to_string("/sys/fs/cgroup/pids.max")
             .ok()
             .and_then(|text| text.trim().parse().ok());
-        if !can_switch_user()
-            || std::env::var("LORE_TEST_PID_BOMB").as_deref() != Ok("1")
-            || !limit.is_some_and(|limit| limit <= 4096)
-        {
-            eprintln!("skipped: needs root, LORE_TEST_PID_BOMB=1 and a pids limit");
-            return;
-        }
+        assert!(
+            std::env::var("LORE_TEST_PID_BOMB").as_deref() == Ok("1"),
+            "this test also needs LORE_TEST_PID_BOMB=1, in a container with a small \
+             --pids-limit (the agent image): see the README, Development"
+        );
+        assert!(
+            limit.is_some_and(|limit| limit <= 4096),
+            "this test needs a pids limit of at most 4096 in its cgroup (found {limit:?}): run \
+             it in a container with --pids-limit"
+        );
         let user = AgentUser {
             uid: 64_124,
             gid: 64_124,

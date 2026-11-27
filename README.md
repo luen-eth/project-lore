@@ -2347,15 +2347,23 @@ that nothing in `target/` ends up owned by root:
 
 ```bash
 cargo test --no-run          # prints the test binary, target/debug/deps/lore-<hash>
-doas target/debug/deps/lore-<hash> --ignored kill_all
+doas target/debug/deps/lore-<hash> --ignored kill_all --skip fork_bomb
 ```
 
 Run with `--ignored` but without root, they fail with "needs root"
-instead of skipping. The fork-bomb test additionally wants
-`LORE_TEST_PID_BOMB=1` and a container with a small `--pids-limit` (the
-agent image), and says "skipped" on stderr otherwise. Do not run the
-whole suite as root: a few tests check what another user can not do, and
-root can.
+instead of skipping. The fork-bomb test (`kill_all_ends_a_fork_bomb_that_holds_every_pid`)
+also needs `LORE_TEST_PID_BOMB=1` and a cgroup pids limit of at most 4096, so it
+belongs in a container with a small `--pids-limit` (the agent image), run as root
+there with `LORE_TEST_PID_BOMB=1 <test binary> --ignored fork_bomb`; anywhere else
+it fails and says which of the three is missing, which is why the command above
+skips it. Do not run the whole suite as root: a few tests check what another user
+can not do, and root can.
+
+The runner signals processes through pidfds (`pidfd_open`, `pidfd_send_signal`):
+it needs Linux 5.3 or newer and a seccomp profile that allows both, as Docker's
+default profile does. Where they are refused, ending the agent user's processes
+fails with an error that says so, and the runner exits (code 70) rather than run
+anything.
 
 Rust 1.85 or newer. The source is small:
 
