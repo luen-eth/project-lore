@@ -802,7 +802,7 @@ fn secret_forms(secret: &str) -> Vec<String> {
 fn redact_stack_env(text: &str) -> String {
     static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r#"(LORE_AGENT_[A-Z0-9_]+|LORE_RUNNER_TOKEN[A-Z0-9_]*|CODEX_API_KEY|DEEPSEEK_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=(\\?"[^"\\]*\\?"|'[^']*'|[^\s"'\\]+)"#,
+            r#"(LORE_AGENT_[A-Z0-9_]+|LORE_RUNNER_TOKEN[A-Z0-9_]*|CODEX_API_KEY|DEEPSEEK_API_KEY|OPENCODE_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=(\\?"[^"\\]*\\?"|'[^']*'|[^\s"'\\]+)"#,
         )
         .expect("a fixed pattern")
     });

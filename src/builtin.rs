@@ -109,7 +109,7 @@ impl std::fmt::Debug for RunnerToken {
 
 /// The CLI and provider an agent's name implies: `claude…` is Claude
 /// Code with Anthropic, `codex…` Codex with OpenAI, `deepseek…` opencode
-/// with DeepSeek.
+/// with DeepSeek, `opencode…` opencode with OpenCode Go.
 pub fn kind_of_name(name: &str) -> Option<(Kind, String)> {
     if name.starts_with("claude") {
         Some((Kind::Claude, "anthropic".into()))
@@ -117,16 +117,20 @@ pub fn kind_of_name(name: &str) -> Option<(Kind, String)> {
         Some((Kind::Codex, "openai".into()))
     } else if name.starts_with("deepseek") {
         Some((Kind::Opencode, "deepseek".into()))
+    } else if name.starts_with("opencode") {
+        Some((Kind::Opencode, "opencode-go".into()))
     } else {
         None
     }
 }
 
 /// Reads `LORE_RUNNER_TOKENS`: `agent:secret` entries, comma separated, for
-/// example `claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>`.
+/// example `claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>,
+/// opencode-builtin:<hex>`.
 /// An entry may name the agent's CLI (and provider) between the two:
 /// `agent:kind:secret` or `agent:kind/provider:secret`, which an agent
-/// whose name does not start with `claude`, `codex` or `deepseek` must.
+/// whose name does not start with `claude`, `codex`, `deepseek` or
+/// `opencode` must.
 /// A runner whose hello claims another CLI or provider is refused.
 pub fn parse_runner_tokens(value: &str) -> Result<Vec<RunnerToken>> {
     let mut tokens: Vec<RunnerToken> = Vec::new();
@@ -486,6 +490,8 @@ pub fn kind_and_avatar(name: &str) -> (&'static str, &'static str) {
         ("codex", "prism")
     } else if name.starts_with("deepseek") {
         ("opencode", "wave")
+    } else if name.starts_with("opencode") {
+        ("opencode", "nova")
     } else {
         ("", crate::avatars::default_for(name))
     }
@@ -3260,6 +3266,87 @@ esac
         assert_eq!(kind_and_avatar("deepseek-builtin"), ("opencode", "wave"));
     }
 
+    /// docker-compose.agents.yml: the four agents' default blocks follow
+    /// one pattern (subnet `.N/28`, lore at `.N+2`, the others from
+    /// `.N+8/29`), lore's listener and network addresses use the same
+    /// defaults, the egress proxy reaches every agent network, each agent
+    /// takes its own secret (empty by default: idle), and the opencode
+    /// agents get the exec tmpfs and share one image.
+    #[test]
+    fn the_compose_file_s_agent_defaults_are_consistent() {
+        let compose = include_str!("../docker-compose.agents.yml");
+        let bind = compose
+            .lines()
+            .find(|line| line.trim_start().starts_with("LORE_RUNNER_BIND:"))
+            .unwrap();
+        for (n, (upper, service)) in [
+            ("CLAUDE", "agent-claude"),
+            ("CODEX", "agent-codex"),
+            ("DEEPSEEK", "agent-deepseek"),
+            ("OPENCODE", "agent-opencode"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let base = n * 16;
+            let ip = format!("${{LORE_AGENT_IP_{upper}:-172.31.250.{}}}", base + 2);
+            assert!(bind.contains(&format!("{ip}:8081")), "{upper}: {bind}");
+            assert!(
+                compose.contains(&format!("ipv4_address: {ip}")),
+                "{upper}: lore's address"
+            );
+            assert!(compose.contains(&format!(
+                "subnet: ${{LORE_AGENT_SUBNET_{upper}:-172.31.250.{base}/28}}"
+            )));
+            assert!(compose.contains(&format!(
+                "ip_range: ${{LORE_AGENT_RANGE_{upper}:-172.31.250.{}/29}}",
+                base + 8
+            )));
+            assert!(compose.contains(&format!(
+                "LORE_RUNNER_TOKEN: ${{LORE_RUNNER_TOKEN_{upper}:-}}"
+            )));
+            assert!(
+                compose.contains(&format!("  {service}:\n    <<: *agent\n")),
+                "{service}"
+            );
+            assert!(
+                compose.contains(&format!("      - {service}\n")),
+                "{service}'s network"
+            );
+            assert!(
+                compose.contains(&format!("  {service}-state:\n")),
+                "{service}'s volume"
+            );
+        }
+        // The egress proxy is on all four agent networks.
+        let egress = &compose[compose.find("  egress:\n").unwrap()..];
+        let egress = &egress[..egress.find("\n\n").unwrap()];
+        for service in [
+            "agent-claude",
+            "agent-codex",
+            "agent-deepseek",
+            "agent-opencode",
+        ] {
+            assert!(egress.contains(&format!("- {service}")), "{service}");
+        }
+        // The OpenCode agent: its name and provider, the exec mount, and
+        // the DeepSeek agent's image.
+        let opencode = &compose[compose.find("  agent-opencode:\n    <<").unwrap()..];
+        let opencode = &opencode[..opencode.find("\n\n").unwrap_or(opencode.len())];
+        for line in [
+            "LORE_RUNNER_AGENT: opencode-builtin",
+            "LORE_RUNNER_PROVIDER: opencode-go",
+            "LORE_RUNNER_EXEC_TMP: /run/lore-exec",
+            "/run/lore-exec:size=256m,mode=0711,nosuid,nodev,exec",
+            "image: project-lore-agent-deepseek:latest",
+            "AGENT: deepseek",
+        ] {
+            assert!(opencode.contains(line), "{line}");
+        }
+        let tokens = parse_runner_tokens(&format!("opencode-builtin:{CLAUDE_SECRET}")).unwrap();
+        assert_eq!(tokens[0].provider, "opencode-go");
+    }
+
     /// What an agent is comes from LORE_RUNNER_TOKENS: from its name, or
     /// named in the entry, which a name that says nothing must do.
     #[test]
@@ -3281,6 +3368,33 @@ esac
             (Kind::Codex, "openai")
         );
         assert_eq!(tokens[1].secret(), CODEX_SECRET);
+        // The fourth built-in agent by its name, and opencode with OpenCode
+        // Go named in the entry; DeepSeek's stays as it was.
+        let tokens = parse_runner_tokens(&format!(
+            "opencode-builtin:{CLAUDE_SECRET},go:opencode/opencode-go:{CODEX_SECRET},deepseek-builtin:{CODEX_SECRET}0"
+        ))
+        .unwrap();
+        for token in &tokens[..2] {
+            assert_eq!(
+                (token.kind, token.provider.as_str()),
+                (Kind::Opencode, "opencode-go"),
+                "{}",
+                token.agent
+            );
+        }
+        assert_eq!(
+            (tokens[2].kind, tokens[2].provider.as_str()),
+            (Kind::Opencode, "deepseek")
+        );
+        assert_eq!(kind_and_avatar("opencode-builtin"), ("opencode", "nova"));
+        assert_eq!(
+            crate::runner::default_agent(Kind::Opencode, "opencode-go"),
+            "opencode-builtin"
+        );
+        assert_eq!(
+            crate::runner::default_agent(Kind::Opencode, "deepseek"),
+            "deepseek-builtin"
+        );
         assert!(parse_runner_tokens(&format!("helper:{CLAUDE_SECRET}")).is_err());
         assert!(parse_runner_tokens(&format!("helper:gemini:{CLAUDE_SECRET}")).is_err());
         assert_eq!(

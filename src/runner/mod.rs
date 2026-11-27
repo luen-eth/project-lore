@@ -9,11 +9,13 @@
 //! the runner dials again, waiting a little longer each time.
 //!
 //! Configuration, from the environment:
-//! - `LORE_RUNNER_TOKEN` (required), or `LORE_RUNNER_TOKEN_FILE` naming a
+//! - `LORE_RUNNER_TOKEN`, or `LORE_RUNNER_TOKEN_FILE` naming a
 //!   file that holds it: this runner's secret, the same value lore has for
 //!   it in `LORE_RUNNER_TOKENS`. Both variables are removed from the
 //!   runner's environment once read, and the runner makes itself
-//!   non-dumpable, so the CLI cannot read the secret from `/proc`.
+//!   non-dumpable, so the CLI cannot read the secret from `/proc`. With
+//!   neither set the runner logs one line and stays idle (an agent the
+//!   install does not use).
 //! - `LORE_RUNNER_STATE`: the runner's own directory (stored sign-in,
 //!   transcripts). When set, every CLI command runs in a fresh home under
 //!   `<work>/.homes` (see `drivers::Isolation`); the image sets it.
@@ -25,9 +27,11 @@
 //!   the image was built for (`LORE_RUNNER_IMAGE_AGENT`, where `deepseek`
 //!   means opencode pointed at DeepSeek).
 //! - `LORE_RUNNER_PROVIDER`: the model provider; `anthropic`, `openai`, or
-//!   for opencode `deepseek` by default.
+//!   for opencode its own provider, `deepseek` by default (`opencode-go`
+//!   for the OpenCode agent, which shares the DeepSeek agent's image).
 //! - `LORE_RUNNER_AGENT`: the agent name; `claude-builtin`,
-//!   `codex-builtin`, or `<provider>-builtin` for opencode by default.
+//!   `codex-builtin`, `opencode-builtin` for opencode with `opencode-go`,
+//!   or `<provider>-builtin` for opencode by default.
 //! - `LORE_RUNNER_URL`: default `ws://lore:8081/runner/ws`.
 //! - `LORE_RUNNER_HOME`: the agent's home volume; default `$HOME`.
 //! - `LORE_RUNNER_CLI`: the CLI executable; default the kind's name.
@@ -113,6 +117,7 @@ pub fn default_agent(kind: Kind, provider: &str) -> String {
     match kind {
         Kind::Claude => "claude-builtin".into(),
         Kind::Codex => "codex-builtin".into(),
+        Kind::Opencode if provider == "opencode-go" => "opencode-builtin".into(),
         Kind::Opencode => format!("{provider}-builtin"),
     }
 }
@@ -236,10 +241,30 @@ pub fn isolation_from_env(settings: &mut Settings, work: &std::path::Path) -> Re
     }))
 }
 
+/// Whether a runner secret is set at all (`LORE_RUNNER_TOKEN`, or a file
+/// `LORE_RUNNER_TOKEN_FILE` names). Its length and the file are checked by
+/// [`Config::from_env`].
+fn token_configured() -> bool {
+    std::env::var("LORE_RUNNER_TOKEN").is_ok_and(|value| !value.trim().is_empty())
+        || std::env::var_os("LORE_RUNNER_TOKEN_FILE").is_some_and(|path| !path.is_empty())
+}
+
 /// `lore runner`: connects for ever.
 pub async fn main_from_env() -> Result<()> {
     // First of all: closed to every other process, the CLI's included.
     sandbox::harden()?;
+    // An agent whose secret is not set (an install that does not use it,
+    // with the compose file starting its container anyway) stays idle:
+    // one line in its log, no link to lore, no restart loop. `SIGTERM`
+    // (docker stop) ends it as before.
+    if !token_configured() {
+        tracing::info!(
+            "LORE_RUNNER_TOKEN is empty: this built-in agent is not configured, so the runner \
+             stays idle. To use it, give it a secret in LORE_RUNNER_TOKEN and the same one in \
+             lore's LORE_RUNNER_TOKENS, then recreate this container"
+        );
+        std::future::pending::<()>().await;
+    }
     let mut config = Config::from_env()?;
     let isolation = isolation_from_env(&mut config.settings, &config.work)?;
     tracing::info!(

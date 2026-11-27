@@ -2,7 +2,7 @@
 # (it takes the `lore` service from docker-compose.yml with `extends`).
 #
 #   docker compose -f docker-compose.agents.yml up -d --build
-#                                  lore, the egress proxy and the three agents
+#                                  lore, the egress proxy and the four agents
 #   docker compose -f docker-compose.agents.yml up -d --build lore egress agent-claude
 #                                  lore and one of them
 #
@@ -10,6 +10,11 @@
 # :docker-compose.local.yml on a plain docker host). On Dokploy, set the
 # compose service's compose path to ./docker-compose.agents.yml. Without
 # this file (docker-compose.yml alone) none of what follows exists.
+#
+# An agent whose LORE_RUNNER_TOKEN_* is not set still gets its container,
+# which logs one line ("this built-in agent is not configured") and stays
+# idle: no link to lore, no restart loop. lore itself knows only the agents
+# in LORE_RUNNER_TOKENS.
 #
 # Networks: each built-in agent has an internal network of its own (no route
 # out), shared only with lore (at a fixed address, where the runner listener
@@ -72,7 +77,7 @@ services:
       LORE_RUNNER_TOKENS: ${LORE_RUNNER_TOKENS:-}
       # One listener per agent network, at lore's fixed address there:
       # nothing else (not the network a reverse proxy attaches) reaches it.
-      LORE_RUNNER_BIND: ${LORE_RUNNER_BIND:-${LORE_AGENT_IP_CLAUDE:-172.31.250.2}:8081,${LORE_AGENT_IP_CODEX:-172.31.250.18}:8081,${LORE_AGENT_IP_DEEPSEEK:-172.31.250.34}:8081}
+      LORE_RUNNER_BIND: ${LORE_RUNNER_BIND:-${LORE_AGENT_IP_CLAUDE:-172.31.250.2}:8081,${LORE_AGENT_IP_CODEX:-172.31.250.18}:8081,${LORE_AGENT_IP_DEEPSEEK:-172.31.250.34}:8081,${LORE_AGENT_IP_OPENCODE:-172.31.250.50}:8081}
       # Where the agents' runs reach lore's MCP endpoint and git proxy.
       LORE_RUNNER_LORE_URL: ${LORE_RUNNER_LORE_URL:-http://lore:8081}
     networks:
@@ -83,6 +88,8 @@ services:
         ipv4_address: ${LORE_AGENT_IP_CODEX:-172.31.250.18}
       agent-deepseek:
         ipv4_address: ${LORE_AGENT_IP_DEEPSEEK:-172.31.250.34}
+      agent-opencode:
+        ipv4_address: ${LORE_AGENT_IP_OPENCODE:-172.31.250.50}
 
   # The agents' only way out: `lore proxy`, HTTPS (CONNECT) to the hosts on
   # its allowlist, never to a private, loopback or link-local address; at
@@ -106,6 +113,7 @@ services:
       - agent-claude
       - agent-codex
       - agent-deepseek
+      - agent-opencode
 
   agent-claude:
     <<: *agent
@@ -171,6 +179,33 @@ services:
     networks:
       - agent-deepseek
 
+  # opencode with OpenCode Go as its own provider (it takes DeepSeek,
+  # Anthropic and OpenAI keys too). The same image as agent-deepseek (same
+  # build, same tag: no layer is built or stored twice); the runner is told
+  # its provider and name here.
+  agent-opencode:
+    <<: *agent
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        AGENT: deepseek
+    image: project-lore-agent-deepseek:latest
+    tmpfs:
+      - *tmpfs-tmp
+      - *tmpfs-work
+      - /run/lore-exec:size=256m,mode=0711,nosuid,nodev,exec
+    environment:
+      <<: *agent-env
+      LORE_RUNNER_AGENT: opencode-builtin
+      LORE_RUNNER_PROVIDER: opencode-go
+      LORE_RUNNER_TOKEN: ${LORE_RUNNER_TOKEN_OPENCODE:-}
+      LORE_RUNNER_EXEC_TMP: /run/lore-exec
+    volumes:
+      - agent-opencode-state:/var/lib/lore-runner
+    networks:
+      - agent-opencode
+
 networks:
   default:
   egress:
@@ -195,6 +230,12 @@ networks:
       config:
         - subnet: ${LORE_AGENT_SUBNET_DEEPSEEK:-172.31.250.32/28}
           ip_range: ${LORE_AGENT_RANGE_DEEPSEEK:-172.31.250.40/29}
+  agent-opencode:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${LORE_AGENT_SUBNET_OPENCODE:-172.31.250.48/28}
+          ip_range: ${LORE_AGENT_RANGE_OPENCODE:-172.31.250.56/29}
 
 volumes:
   lore-data:
@@ -205,3 +246,4 @@ volumes:
   agent-claude-state:
   agent-codex-state:
   agent-deepseek-state:
+  agent-opencode-state:

@@ -1167,7 +1167,9 @@ meaningful change, decision or bug fix. Every `log` call includes `path`
 
 Next to the `lore` service, the compose stack can run one container per built-in
 coding agent: `agent-claude` (Claude Code), `agent-codex` (the Codex CLI) and
-`agent-deepseek` (opencode pointed at DeepSeek). You sign each one in once, from the
+`agent-deepseek` (opencode pointed at DeepSeek) and `agent-opencode` (opencode pointed
+at OpenCode Go; both opencode agents also take Anthropic and OpenAI keys). You sign
+each one in once, from the
 admin page, with your own subscription or key, and pick its default model. An
 enabled agent then takes idle board tasks on its own (*The task runner* below), the
 admin page shows its terminal and its runs live, and the graph shows which project it
@@ -1191,7 +1193,8 @@ is working on. Helping other agents on request comes in a later part.
   notes it (its secret may have leaked: make a new one). A runner whose link died is
   replaced as before. The agent's CLI and provider come from `LORE_RUNNER_TOKENS`
   (from the name: `claude…` is Claude Code, `codex…` Codex, `deepseek…` opencode
-  with DeepSeek; or named in the entry, `agent:kind:secret` or
+  with DeepSeek, `opencode…` opencode with OpenCode Go; or named in the entry,
+  `agent:kind:secret` or
   `agent:opencode/<provider>:secret`), and a runner whose hello claims anything
   else is refused. A link that sends more than 500 frames or 8 MiB a second (beyond
   a burst) is closed. A run's output travels in batches of up to 200 lines per
@@ -1216,7 +1219,8 @@ is working on. Helping other agents on request comes in a later part.
   network, no fixed subnet, no runner listener (it sets `LORE_RUNNER_TOKENS` empty
   for lore whatever `.env` says). `docker-compose.agents.yml` is a complete file of
   its own: it takes `lore` from `docker-compose.yml` (`extends`) and adds the egress
-  proxy `egress`, `agent-claude`, `agent-codex` and `agent-deepseek`, their networks,
+  proxy `egress`, `agent-claude`, `agent-codex`, `agent-deepseek` and
+  `agent-opencode`, their networks,
   and lore's attachments to them. Use it with `docker compose -f
   docker-compose.agents.yml …`, or `COMPOSE_FILE=docker-compose.agents.yml` in `.env`
   (`docker-compose.agents.yml:docker-compose.local.yml` on a plain docker host), or
@@ -1234,7 +1238,8 @@ is working on. Helping other agents on request comes in a later part.
   memory limit, `noexec` unless `LORE_AGENT_WORK_EXEC=exec`), their own state
   volume, no access to lore's data volume and none of lore's `.env`: each gets only
   its own runner secret.
-  The opencode agent (`agent-deepseek`, and any opencode agent defined like it) has
+  The opencode agents (`agent-deepseek`, `agent-opencode`, and any opencode agent
+  defined like them) have
   one more tmpfs, `/run/lore-exec` (256m, `nosuid,nodev`, mode 0711, **exec
   allowed**), named to its runner by `LORE_RUNNER_EXEC_TMP`. opencode is a Bun program:
   its interface extracts a native library (OpenTUI's renderer) to Bun's temporary
@@ -1412,12 +1417,15 @@ with the run (at most `LORE_RUN_HARD_LIMIT_MINUTES`).
 Each agent has a compose network of its own, marked `internal: true` (no route out:
 not to the internet, not to the host's LAN or the Docker host's published ports,
 not to cloud metadata, not to the other agents). On it are only the agent, lore (at a
-fixed address: `172.31.250.2`, `.18` and `.34`; the runner listener binds to exactly
+fixed address: `172.31.250.2`, `.18`, `.34` and `.50`; the runner listener binds to
+exactly
 these, so the network a reverse proxy attaches to lore never reaches it) and the
 egress proxy. If those subnets clash with networks on your host, set
 `LORE_AGENT_SUBNET_CLAUDE`, `LORE_AGENT_RANGE_CLAUDE` and `LORE_AGENT_IP_CLAUDE`
-(and the same for `CODEX` and `DEEPSEEK`); `LORE_RUNNER_BIND` follows the three
-`LORE_AGENT_IP_*` by default. These networks exist only when
+(and the same for `CODEX`, `DEEPSEEK` and `OPENCODE`); `LORE_RUNNER_BIND` follows the
+four `LORE_AGENT_IP_*` by default. The defaults are four `/28` blocks in a row:
+`172.31.250.0/28` (Claude), `.16/28` (Codex), `.32/28` (DeepSeek) and `.48/28`
+(OpenCode), each with lore at the block's `.2` and the others from its upper `/29`. These networks exist only when
 `docker-compose.agents.yml` is used. Check before the first `up` that no network on
 the host overlaps them (an overlap makes `up` fail, so lore would not start):
 
@@ -1482,18 +1490,37 @@ out.
 
 ### Setting it up
 
-1. Make one secret per agent (`openssl rand -hex 32`, three times) and put them in
+1. Make one secret per agent (`openssl rand -hex 32`, four times) and put them in
    `.env`, each twice: once in lore's list and once for the agent's container.
 
    ```dotenv
-   LORE_RUNNER_TOKENS=claude-builtin:<secret-1>,codex-builtin:<secret-2>,deepseek-builtin:<secret-3>
+   LORE_RUNNER_TOKENS=claude-builtin:<secret-1>,codex-builtin:<secret-2>,deepseek-builtin:<secret-3>,opencode-builtin:<secret-4>
    LORE_RUNNER_TOKEN_CLAUDE=<secret-1>
    LORE_RUNNER_TOKEN_CODEX=<secret-2>
    LORE_RUNNER_TOKEN_DEEPSEEK=<secret-3>
+   LORE_RUNNER_TOKEN_OPENCODE=<secret-4>
    ```
 
    List only the agents you want; an agent not in `LORE_RUNNER_TOKENS` is refused.
-   An agent whose name does not say its CLI names it: `helper:opencode/qwen:<secret>`.
+   An agent whose name does not say its CLI names it: `helper:opencode/qwen:<secret>`
+   (`opencode-builtin` may also be written `opencode-builtin:opencode/opencode-go:<secret>`).
+   The compose file starts all four containers; one whose `LORE_RUNNER_TOKEN_*` is
+   empty logs *this built-in agent is not configured* once and stays idle (no link to
+   lore, no restart loop), so an install that leaves out an agent behaves as before.
+   No compose profile is used, because Dokploy's compose deployment starts every
+   service of the file.
+
+   If you set your own subnets, give the fourth agent the next block too. With
+   production's `10.250.42.0/28`, `.16/28` and `.32/28` for the first three:
+
+   ```dotenv
+   LORE_AGENT_SUBNET_OPENCODE=10.250.42.48/28
+   LORE_AGENT_RANGE_OPENCODE=10.250.42.56/29
+   LORE_AGENT_IP_OPENCODE=10.250.42.50
+   ```
+
+   (and, if `LORE_RUNNER_BIND` is set explicitly rather than left to follow the
+   `LORE_AGENT_IP_*`, append `,10.250.42.50:8081` to it).
 2. Check the subnets (*Network* above), then start the stack with the agents file:
    `docker compose -f docker-compose.agents.yml up -d --build` (or put
    `COMPOSE_FILE=docker-compose.agents.yml` in `.env`; for just one agent, `… up -d
@@ -2369,11 +2396,13 @@ Dokploy's API at the time of writing).
 ### What a runner is told to use
 
 The runner reads its configuration from the environment the image and compose set:
-`LORE_RUNNER_TOKEN` (or `LORE_RUNNER_TOKEN_FILE`; required; removed from the
-environment once read), `LORE_RUNNER_URL` (`ws://lore:8081/runner/ws`),
-`LORE_RUNNER_AGENT` (`claude-builtin`, `codex-builtin`, `deepseek-builtin`),
-`LORE_RUNNER_KIND` (`claude`, `codex`, `opencode`; by default from the image),
-`LORE_RUNNER_PROVIDER` (`anthropic`, `openai`, `deepseek`), `LORE_RUNNER_STATE`
+`LORE_RUNNER_TOKEN` (or `LORE_RUNNER_TOKEN_FILE`; removed from the environment once
+read; when neither is set the runner stays idle), `LORE_RUNNER_URL` (`ws://lore:8081/runner/ws`),
+`LORE_RUNNER_AGENT` (`claude-builtin`, `codex-builtin`, `deepseek-builtin`,
+`opencode-builtin`), `LORE_RUNNER_KIND` (`claude`, `codex`, `opencode`; by default
+from the image), `LORE_RUNNER_PROVIDER` (`anthropic`, `openai`, `deepseek`,
+`opencode-go`: `agent-opencode` runs the DeepSeek agent's image and is told its
+provider here), `LORE_RUNNER_STATE`
 (`/var/lib/lore-runner`: when set, every CLI command runs in a fresh home),
 `LORE_RUNNER_AGENT_UID` and `LORE_RUNNER_AGENT_GID` (`10002`: the user the CLI runs
 as), `LORE_RUNNER_WORK` (`/work`), `LORE_RUNNER_CLI` (the CLI's path) and
@@ -2457,7 +2486,7 @@ has no channel to push that notification.
 | `LORE_TRUSTED_PROXY_HOSTS` | | With `LORE_TRUST_PROXY=on`: host names of your reverse proxy, comma separated (on Dokploy `dokploy-traefik`). Resolved through the system resolver at start-up and every 30 seconds; the addresses they resolve to now are trusted in addition to `LORE_TRUSTED_PROXIES`. A name must resolve to one address per family: an answer with two (another container added the name as a network alias) never adds an address, keeps the one already trusted only while it is still answered, and else trusts nothing for the name. A new single address replaces the old one at once; a name that stops resolving keeps its last address for 90 seconds; one that does not resolve at start-up is a warning. Changes are logged at info level. Never the agent networks, and never on the runner listener. |
 | `LORE_DATA_DIR` | `/data` in Docker | Where the database and model cache live. |
 | `LORE_BIND` | `0.0.0.0:8080` | Listen address. |
-| `LORE_RUNNER_TOKENS` | | The built-in agents: `agent:secret` pairs (`claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>`), each secret 24 characters or longer. An entry may name the agent's CLI and provider, `agent:kind:secret` or `agent:opencode/<provider>:secret`, which a name not starting with `claude`, `codex` or `deepseek` must; a runner claiming anything else is refused. Unset: no built-in agent, no runner listener, nothing changes. A name may not also be in `LORE_TOKENS` or belong to another agent. |
+| `LORE_RUNNER_TOKENS` | | The built-in agents: `agent:secret` pairs (`claude-builtin:<hex>,codex-builtin:<hex>,deepseek-builtin:<hex>,opencode-builtin:<hex>`), each secret 24 characters or longer. An entry may name the agent's CLI and provider, `agent:kind:secret` or `agent:opencode/<provider>:secret`, which a name not starting with `claude`, `codex`, `deepseek` or `opencode` must; a runner claiming anything else is refused. Unset: no built-in agent, no runner listener, nothing changes. A name may not also be in `LORE_TOKENS` or belong to another agent. |
 | `LORE_AUTO_TASK_IDLE_MINUTES` | `120` | Minutes without a change after which an open, unclaimed task may be taken by a built-in agent. |
 | `LORE_RUN_WALL_CLOCK_MINUTES` | `45` | The runner interrupts a run's CLI after this long. Must be below the hard limit. |
 | `LORE_RUN_HARD_LIMIT_MINUTES` | `90` | A run's token dies and lore stops the run after this long. |
@@ -2470,12 +2499,12 @@ has no channel to push that notification.
 | `LORE_DELEGATE_PER_HOUR` | `3` | Tasks one calling agent may delegate to the built-in agents per hour. |
 | `LORE_RUNNER_LORE_URL` | `http://lore:<port of LORE_RUNNER_BIND>` (8081) | lore as the agents' containers reach it: their clone URL and MCP endpoint. |
 | `LORE_RUNNER_BIND` | `0.0.0.0:8081`; compose: lore's address on each agent network | Where lore listens for the built-in agents' runners (only with `LORE_RUNNER_TOKENS`): one address, or several, comma separated. Internal networks only: never publish this port. Must use another port than `LORE_BIND`. |
-| `LORE_AGENT_SUBNET_*`, `LORE_AGENT_RANGE_*`, `LORE_AGENT_IP_*` (`CLAUDE`, `CODEX`, `DEEPSEEK`) | `172.31.250.0/28`, `.8/29`, `.2`; `.16/28`, `.24/29`, `.18`; `.32/28`, `.40/29`, `.34` | `docker-compose.agents.yml` only: each agent network's subnet, the range everything but lore gets addresses from, and lore's fixed address (the runner listener binds there). Check for overlaps first (*Network*). |
+| `LORE_AGENT_SUBNET_*`, `LORE_AGENT_RANGE_*`, `LORE_AGENT_IP_*` (`CLAUDE`, `CODEX`, `DEEPSEEK`, `OPENCODE`) | `172.31.250.0/28`, `.8/29`, `.2`; `.16/28`, `.24/29`, `.18`; `.32/28`, `.40/29`, `.34`; `.48/28`, `.56/29`, `.50` | `docker-compose.agents.yml` only: each agent network's subnet, the range everything but lore gets addresses from, and lore's fixed address (the runner listener binds there). Check for overlaps first (*Network*). |
 | `LORE_SIGN_IN_HOSTS_CLAUDE`, `LORE_SIGN_IN_HOSTS_CODEX` | the CLIs' documented hosts | The hosts a sign-in link may point to (comma separated); replaces the built-in list, for when a CLI moves its sign-in. |
 | `LORE_PROXY_ALLOW` | the providers' hosts | The egress proxy's allowlist (compose service `egress`): host names, comma separated; `.example.com` allows every name under it. See *Network*. |
 | `LORE_PROXY_BIND`, `LORE_PROXY_PORTS` | `0.0.0.0:3128`, `443` | Where the egress proxy listens, and the ports it tunnels to. |
 | `LORE_AGENT_WORK_SIZE`, `LORE_AGENT_WORK_EXEC` | `2g`, `noexec` | Size of each agent's `/work` tmpfs; `exec` lets the agents run programs they build in a checkout. |
-| `LORE_RUNNER_EXEC_TMP` | compose: `/run/lore-exec` for the opencode agent only | The runner's exec-capable temporary mount: each terminal of an opencode agent's interface gets a directory there for `BUN_TMPDIR` (Bun's native library); runs and checks do not. Unset: none, and opencode's interface cannot start on a `noexec` `/work`. Never point it at the state volume. |
+| `LORE_RUNNER_EXEC_TMP` | compose: `/run/lore-exec` for the opencode agents only | The runner's exec-capable temporary mount: each terminal of an opencode agent's interface gets a directory there for `BUN_TMPDIR` (Bun's native library); runs and checks do not. Unset: none, and opencode's interface cannot start on a `noexec` `/work`. Never point it at the state volume. |
 | `LORE_AGENT_CPUS`, `LORE_AGENT_MEMORY` | `2`, `4g` | Limits of each agent container. |
 | `LORE_AGENT_CODEX_API_KEY` | | Optional OpenAI API key for the Codex agent only (compose passes it to that container as `CODEX_API_KEY`; lore's own environment gets it empty). |
 
