@@ -1584,7 +1584,16 @@ impl Driver {
 
     /// The CLI's version line, or `None` when it cannot be run.
     pub async fn version(&self) -> Option<String> {
-        let output = self.run(&["--version"], None).await.ok()?;
+        let output = match self.kind() {
+            // opencode's version needs no provider and gets no key.
+            Kind::Opencode => {
+                let home = self
+                    .make_home(HomePurpose::Plain, None, Some(Vec::new()))
+                    .ok()?;
+                self.run_in(&home, &["--version"], None).await.ok()?
+            }
+            _ => self.run(&["--version"], None).await.ok()?,
+        };
         output
             .text
             .lines()
@@ -3648,7 +3657,7 @@ esac
 
     /// The model list runs `opencode models --standalone` with every
     /// provider that has a key enabled, and a placeholder, never a key, in
-    /// each key variable.
+    /// each key variable; `opencode --version` gets no key at all.
     #[tokio::test]
     async fn the_model_list_never_gets_a_key() {
         let dir = temp("oc-list");
@@ -3661,6 +3670,14 @@ esac
         store_key(&driver, "openai", "sk-openai-fake-key-0000001").await;
         let (models, source) = driver.models().await;
         assert_eq!(source, "cli");
+        // Nor does `--version` (the status), which needs no provider.
+        let version = opencode(
+            &dir.join("v"),
+            "deepseek",
+            "#!/bin/sh\necho \"2.3.2 keys:$(env | grep -c _API_KEY=)\"\n",
+        );
+        store_key(&version, "deepseek", "sk-deepseek-fake-key-000001").await;
+        assert_eq!(version.version().await.as_deref(), Some("2.3.2 keys:0"));
         assert_eq!(
             models,
             vec![
