@@ -1068,7 +1068,10 @@ async function enter(session) {
   applySession(session || {});
   $("login").hidden = true;
   $("app").hidden = false;
+  // The sign-in's decorative network goes at once: while the loader shows,
+  // nothing is drawn behind it.
   graph.byId = new Map();
+  graph.setData([], []);
   graph.chrome = true;
   state.decorative = false;
   bootStart();
