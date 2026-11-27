@@ -1,4 +1,4 @@
-/* The terminal overlay's own document: a bar with the agent, the state and
+/* The terminal window's own document: a bar with the agent, the state and
    Close, and xterm.js filling the rest. Shown in a frame of the admin page
    (see builtin.js), in the admin page's colours. */
 :root {
@@ -61,10 +61,6 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .state { max-width: 38%; }
 }
 
-/* Docked in the admin page's side column: a narrow bar, so the state keeps
-   only its dot (its words stay in the tooltip). */
-body.docked .title .muted { display: none; }
-body.docked .state { font-size: 0; max-width: none; }
-body.docked .state::before { margin-right: 0; }
-body.docked .bar { gap: 6px; padding-left: 10px; }
-body.docked button { padding: 6px 9px; }
+/* In the admin page's window, which draws the bar itself (see builtin.js). */
+body.embedded .bar { display: none; }
+body.embedded .screen { padding-top: 4px; }

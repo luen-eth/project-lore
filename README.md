@@ -633,7 +633,9 @@ On a wide screen **Hide activity** (above *Hide labels*) hides the Live activity
 column and gives its room to the graph; **Show activity** brings it back. Like the
 labels, the choice is remembered per browser (`lore.feed.hidden` in local storage).
 On narrower screens the **Activity** button in the top bar opens the column as
-before, and the phone layout is unchanged.
+before, and the phone layout is unchanged. With the `agents` permission and built-in
+agents, a terminal icon in the column's head (and beside **Hide activity**) opens a
+built-in agent's terminal; see [Terminal](#terminal).
 
 Click a neuron to read the entry, with the commit it was logged at and its related
 memories. Click a project, an agent or a kind (decision, bug, todo…) to isolate that
@@ -1363,14 +1365,28 @@ first terminal opens, and when the last one closes, every process of the agent u
 ends. A sign-in you make in a terminal (`claude auth login`, `codex login`) is kept,
 as the credential file only, once the last terminal has closed and nothing of the
 agent user is left.
-On a wide screen (where the Live activity column is shown) the terminal **docks in
-that column**: Live activity keeps the top half and the terminal takes the bottom
-half, beside the graph, which keeps its size; with Live activity hidden the terminal
-uses the whole column, and closing it gives Live activity its full height back. The
-terminal's **Expand** button switches to the large overlay and **Dock** back; the
-choice is remembered per browser. On medium widths (Live activity behind the
-Activity button) the terminal opens as the large overlay, and on a phone as a
-full-screen sheet. It follows every size change, says clearly when it is
+It can also be opened from the **terminal icon** in the head of the Live activity
+column, and from the same icon beside **Hide activity** (so it is there when Live
+activity is hidden, and on medium widths in that button's place). The icons show only
+to users with the `agents` permission, and only when the server has built-in agents
+(`LORE_RUNNER_TOKENS`). With one built-in agent the icon opens its terminal; with
+several it shows a small menu of the connected ones (avatar, name, signed in or not);
+the last one picked comes first and is remembered per browser
+(`lore.terminal.agent`). While a terminal is open the icon brings it forward and
+focuses it. The menu works from the keyboard (Enter or Space, the arrow keys, Escape
+closes it).
+
+The terminal opens as a **floating window** over the page, by default at the bottom
+right of the graph, clear of the Live activity column (which keeps its full height).
+Drag its bar to move it, and its edges or the grip in its bottom-right corner to
+resize it (at least 320×200); it is kept inside the page, also when the browser
+window shrinks. Its size and place are remembered per browser (`lore.terminal.window`
+in local storage) and restored the next time, fitted to the page; a double-click on
+its bar puts it back to the default size and place. **Expand** fills the page with
+it and **Restore** returns it to its own size and place. Under 700px wide it takes the
+whole width at the bottom and only its height changes (drag its top edge). The
+terminal follows every size change (during a drag it redraws as it goes and tells the
+CLI the new rows and columns once, when the drag ends), says clearly when it is
 disconnected or has ended, and closes only with its **Close** button: every key,
 Escape included, goes to the terminal.
 

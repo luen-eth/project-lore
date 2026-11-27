@@ -27,7 +27,7 @@ use crate::{
 pub(super) const SCRIPT: &str = include_str!("../../assets/builtin.js");
 pub(super) const STYLE: &str = include_str!("../../assets/builtin.css");
 
-/// The terminal overlay: a document of its own, shown in a frame of the
+/// The terminal window: a document of its own, shown in a frame of the
 /// admin page, so the style relaxation xterm.js needs stays out of the
 /// admin page's policy.
 pub(super) const TERMINAL_PAGE: &str = include_str!("../../assets/terminal.html");
@@ -211,7 +211,7 @@ async fn json_only(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-/// `GET /admin/terminal`: the terminal overlay's document, with its own
+/// `GET /admin/terminal`: the terminal window's document, with its own
 /// policy (the security headers keep a policy a route set).
 async fn terminal_page() -> Response {
     (

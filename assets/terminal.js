@@ -1,11 +1,11 @@
-/* The terminal overlay's document. It opens one WebSocket to lore, which
+/* The terminal window's document. It opens one WebSocket to lore, which
    relays it to one PTY in a built-in agent's container: typed bytes go out
    as binary frames, the terminal's bytes come back as binary frames, and
    open, resize, keep-alive, close and the end travel as small JSON text
    frames. Closing the socket (Close, or the frame being removed) closes the
    terminal and kills what runs in it.
 
-   Every key goes to the terminal, Escape included, so the overlay closes
+   Every key goes to the terminal, Escape included, so the window closes
    only with its Close button, which asks the admin page around it to
    remove the frame. */
 (() => {
@@ -47,6 +47,11 @@
 
   let socket = null;
   let state = "connecting";
+  /* Shown in the admin page's window; a drag in progress; the size the
+     server was last told (see the message handler below). */
+  const embedded = window.parent !== window;
+  let resizing = false;
+  let told = null;
   const encoder = new TextEncoder();
 
   function setState(name, text) {
@@ -57,6 +62,7 @@
     node.title = text;
     $("reconnect").hidden = name !== "closed";
     $("screen").classList.toggle("ended", name === "closed");
+    tellParent({ type: "lore-terminal-state", state: name, text });
   }
 
   function send(frame) {
@@ -70,6 +76,7 @@
     ws.binaryType = "arraybuffer";
     socket = ws;
     ws.addEventListener("open", () => {
+      told = `${term.cols}x${term.rows}`;
       ws.send(JSON.stringify({ type: "open", mode, cols: term.cols, rows: term.rows }));
     });
     ws.addEventListener("message", (event) => {
@@ -106,13 +113,13 @@
     for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 0xff;
     send(bytes);
   });
-  term.onResize(({ cols, rows }) => send(JSON.stringify({ type: "resize", cols, rows })));
+  term.onResize(({ cols, rows }) => { if (!resizing) sendSize(cols, rows); });
 
   // The terminal follows the frame's size (the window, a phone turned).
   let pending = 0;
   new ResizeObserver(() => {
     cancelAnimationFrame(pending);
-    pending = requestAnimationFrame(() => { try { fit.fit(); } catch { /* not laid out yet */ } });
+    pending = requestAnimationFrame(refit);
   }).observe($("screen"));
 
   setInterval(() => {
@@ -125,38 +132,45 @@
     connect();
   });
 
-  /* Docked in the side column or expanded: the admin page says which, and
-     whether docking is possible at its width; Expand / Dock asks it to
-     switch. The terminal refits through the ResizeObserver above. */
-  let layout = "expanded";
+  /* In the admin page the window around the frame draws the bar (the
+     agent, the state, Reconnect, Expand, Close) and moves and resizes the
+     frame; this document then shows only the terminal, tells the page its
+     state and does what the page's buttons ask. While the owner drags an
+     edge the terminal still refits every frame, but the server hears the
+     new size only once, when the drag ends. */
+  function tellParent(message) {
+    if (embedded) window.parent.postMessage(message, location.origin);
+  }
+  function refit() { try { fit.fit(); } catch { /* not laid out yet */ } }
+  function sendSize(cols, rows) {
+    told = `${cols}x${rows}`;
+    send(JSON.stringify({ type: "resize", cols, rows }));
+  }
+  if (embedded) document.body.classList.add("embedded");
   window.addEventListener("message", (event) => {
     if (event.origin !== location.origin || event.source !== window.parent) return;
     const data = event.data || {};
-    if (data.type !== "lore-terminal-layout") return;
-    layout = data.mode === "docked" ? "docked" : "expanded";
-    document.body.classList.toggle("docked", layout === "docked");
-    const button = $("layout");
-    button.hidden = !data.canDock;
-    button.textContent = layout === "docked" ? "Expand" : "Dock";
-    button.title = layout === "docked"
-      ? "Show the terminal large, over the page"
-      : "Put the terminal in the side column, under Live activity";
+    if (data.type === "lore-terminal-resizing") {
+      resizing = Boolean(data.active);
+      if (!resizing) {
+        refit();
+        if (told !== `${term.cols}x${term.rows}`) sendSize(term.cols, term.rows);
+      }
+    } else if (data.type === "lore-terminal-command") {
+      if (data.command === "close") $("close").click();
+      else if (data.command === "reconnect") $("reconnect").click();
+      else if (data.command === "focus") term.focus();
+    }
   });
-  $("layout").addEventListener("click", () => {
-    if (window.parent === window) return;
-    window.parent.postMessage({
-      type: "lore-terminal-mode", mode: layout === "docked" ? "expanded" : "docked",
-    }, location.origin);
-  });
-  if (window.parent !== window) window.parent.postMessage({ type: "lore-terminal-ready" }, location.origin);
 
   $("close").addEventListener("click", () => {
     send(JSON.stringify({ type: "close" }));
     if (socket) socket.close();
     socket = null;
     setState("closed", "Closed");
-    if (window.parent !== window) window.parent.postMessage({ type: "lore-terminal-close" }, location.origin);
+    tellParent({ type: "lore-terminal-close" });
   });
 
   connect();
+  tellParent({ type: "lore-terminal-ready", state, text: $("state").textContent });
 })();

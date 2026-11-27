@@ -9,18 +9,15 @@
    #builtin-section, so the rest of the page does not know about it.
 
    With the agents permission, a connected agent also opens a terminal: the
-   CLI's own interface, or (behind "More") a shell. It is shown in an
-   overlay holding /admin/terminal in a frame, a document with its own
-   policy because xterm.js writes inline styles; the frame asks to be closed
-   with a message, since every key, Escape too, belongs to the terminal.
-
-   On a wide screen (where the Live activity column shows) the terminal
-   docks in that column instead: Live activity takes the top half and the
-   terminal the bottom half (the whole column when Live activity is
-   hidden), beside the graph, which keeps its size. The frame's Expand
-   button switches to the large overlay and Dock back; the choice is
-   remembered per browser. On medium widths and phones it always opens as
-   the overlay (a full-screen sheet on phones). */
+   CLI's own interface, or (behind "More") a shell, from its card or from
+   the terminal icon in Live activity's head. It is shown in a floating
+   window holding /admin/terminal in a frame, a document with its own
+   policy because xterm.js writes inline styles. The window is moved by its
+   bar and resized by its edges and corner grip; its size and place are
+   remembered per browser, Expand fills the page and a double-click on the
+   bar puts it back where it starts. Under 700px wide it takes the whole
+   width at the bottom and only its height changes. Every key, Escape too,
+   belongs to the terminal, so the window closes only with Close. */
 (() => {
   "use strict";
 
@@ -533,8 +530,6 @@
 
   /* ---------- Terminal ---------- */
 
-  let overlay = null;
-
   function terminalActions(agent) {
     const row = el("div", "board-actions builtin-actions builtin-terminal");
     row.append(button("Open terminal", "", () => openTerminal(agent, "cli")));
@@ -550,83 +545,438 @@
     return row;
   }
 
-  /* Docked in the side column, or the large overlay: the owner's last
-     choice; docking needs a screen wide enough for the side column. */
-  const TERMINAL_MODE_KEY = "lore.terminal.mode";
-  const wideScreen = window.matchMedia("(min-width: 1181px)");
-  let terminalMode = "docked";
-  try {
-    if (localStorage.getItem(TERMINAL_MODE_KEY) === "expanded") terminalMode = "expanded";
-  } catch { /* private mode */ }
+  /* The window: a bar to drag it by, the frame, a grip and edges to resize
+     it. Its place and size (floating), its height on narrow screens and
+     whether it is maximised are remembered per browser under one key. */
+  const WINDOW_KEY = "lore.terminal.window";
+  const MIN_W = 320, MIN_H = 200;
+  /* Below this width the window takes the whole width at the bottom and
+     only its height changes. */
+  const narrowScreen = window.matchMedia("(max-width: 699px)");
+  const EDGES = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
+
+  const term = {
+    win: null, frame: null, bar: null, state: null, expand: null, reconnect: null,
+    geo: null, narrowH: null, max: false, closing: null,
+  };
+  try { localStorage.removeItem("lore.terminal.mode"); } catch { /* private mode */ }
+
+  function readWindow() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(WINDOW_KEY) || "null"); } catch { saved = null; }
+    const number = (value) => (typeof value === "number" && isFinite(value) ? value : null);
+    if (!saved || typeof saved !== "object") return;
+    const geo = { x: number(saved.x), y: number(saved.y), w: number(saved.w), h: number(saved.h) };
+    term.geo = Object.values(geo).every((value) => value !== null) ? geo : null;
+    term.narrowH = number(saved.nh);
+    term.max = saved.max === true;
+  }
+
+  function saveWindow() {
+    const value = { max: term.max };
+    if (term.geo) Object.assign(value, term.geo);
+    if (term.narrowH) value.nh = term.narrowH;
+    try { localStorage.setItem(WINDOW_KEY, JSON.stringify(value)); } catch { /* private mode */ }
+  }
+
+  /* Where the window may be: under the top bar, above the phone tab bar. */
+  function bounds() {
+    const top = document.querySelector(".top");
+    const tabs = $("tabbar");
+    let upper = 0, lower = window.innerHeight;
+    const app = $("app");
+    if (top && app && !app.hidden && getComputedStyle(top).display !== "none") {
+      upper = Math.max(0, Math.round(top.getBoundingClientRect().bottom));
+    }
+    if (tabs && getComputedStyle(tabs).display !== "none") lower = Math.round(tabs.getBoundingClientRect().top);
+    return { left: 0, top: upper, right: window.innerWidth, bottom: Math.max(upper + MIN_H, lower) };
+  }
+
+  /* The default place: the bottom right of the graph, clear of the side
+     column and of Live activity when it shows. */
+  function defaultGeo() {
+    const b = bounds();
+    const side = $("side") || document.querySelector(".side");
+    const feed = $("feed");
+    let left = 16, right = window.innerWidth - 16;
+    if (side && getComputedStyle(side).display !== "none" && getComputedStyle(side).position === "fixed") {
+      left = Math.round(side.getBoundingClientRect().right) + 16;
+    }
+    if (feed && window.innerWidth > 1180 && getComputedStyle(feed).display !== "none") {
+      right = Math.round(feed.getBoundingClientRect().left) - 16;
+    }
+    const w = Math.max(MIN_W, Math.min(720, right - left));
+    const h = Math.max(MIN_H, Math.min(440, Math.round((b.bottom - b.top) * 0.55)));
+    return { x: right - w, y: b.bottom - 16 - h, w, h };
+  }
+
+  function clampGeo(geo, b) {
+    const w = Math.min(Math.max(geo.w, MIN_W), b.right - b.left);
+    const h = Math.min(Math.max(geo.h, MIN_H), b.bottom - b.top);
+    const x = Math.min(Math.max(geo.x, b.left), b.right - w);
+    const y = Math.min(Math.max(geo.y, b.top), b.bottom - h);
+    return { x, y, w, h };
+  }
+
+  /* The rectangle the window has now, whatever its mode. */
+  function currentRect() {
+    const b = bounds();
+    if (term.max) {
+      const m = narrowScreen.matches ? 0 : 8;
+      return { x: b.left + m, y: b.top + m, w: b.right - b.left - 2 * m, h: b.bottom - b.top - 2 * m };
+    }
+    if (narrowScreen.matches) {
+      const h = Math.min(Math.max(term.narrowH || Math.round((b.bottom - b.top) * 0.6), MIN_H), b.bottom - b.top);
+      return { x: b.left, y: b.bottom - h, w: b.right - b.left, h };
+    }
+    return clampGeo(term.geo || defaultGeo(), b);
+  }
+
+  /* Geometry goes through the CSSOM, which the page's policy allows. */
+  function place(rect) {
+    const style = term.win.style;
+    style.setProperty("left", rect.x + "px");
+    style.setProperty("top", rect.y + "px");
+    style.setProperty("width", rect.w + "px");
+    style.setProperty("height", rect.h + "px");
+  }
+
+  function applyWindow() {
+    if (!term.win) return;
+    term.win.classList.toggle("maximised", term.max);
+    term.win.classList.toggle("narrow", narrowScreen.matches);
+    term.expand.textContent = term.max ? "Restore" : "Expand";
+    term.expand.title = term.max ? "Back to the window's own size and place" : "Fill the page with the terminal";
+    term.expand.setAttribute("aria-pressed", String(term.max));
+    place(currentRect());
+  }
+
+  function tellFrame(message) {
+    if (term.frame && term.frame.contentWindow) term.frame.contentWindow.postMessage(message, location.origin);
+  }
+
+  function focusTerminal() {
+    if (!term.frame) return;
+    term.frame.focus();
+    tellFrame({ type: "lore-terminal-command", command: "focus" });
+  }
+
+  function setTerminalState(name, text) {
+    if (!term.state || !["connecting", "open", "closed"].includes(name)) return;
+    term.state.className = "term-state " + name;
+    term.state.textContent = text || "";
+    term.state.title = text || "";
+    term.reconnect.hidden = name !== "closed";
+  }
+
+  /* Moving (the bar) and resizing (an edge or the grip) with Pointer
+     Events, captured, so mouse, pen and touch behave alike; a shield over
+     the frame keeps it from swallowing the pointer meanwhile. The terminal
+     refits as the frame changes (its own observer, once a frame) and is
+     told when the drag ends, which sends the new size to the server. */
+  function startDrag(event, edge) {
+    if (event.button !== 0 || !term.win) return;
+    if (!edge && (term.max || narrowScreen.matches)) return;
+    if (edge && term.max) return;
+    event.preventDefault();
+    const target = event.currentTarget;
+    try { target.setPointerCapture(event.pointerId); } catch { /* already released */ }
+    const start = { x: event.clientX, y: event.clientY, rect: currentRect() };
+    let latest = start.rect, frame = 0;
+    term.win.classList.add("moving");
+    if (edge) tellFrame({ type: "lore-terminal-resizing", active: true });
+
+    const compute = (dx, dy) => {
+      const b = bounds();
+      const r = start.rect;
+      if (!edge) return clampGeo({ x: r.x + dx, y: r.y + dy, w: r.w, h: r.h }, b);
+      if (narrowScreen.matches) {
+        const h = Math.min(Math.max(r.h - dy, MIN_H), b.bottom - b.top);
+        return { x: r.x, y: b.bottom - h, w: r.w, h };
+      }
+      let { x, y, w, h } = r;
+      const right = r.x + r.w, bottom = r.y + r.h;
+      if (edge.includes("e")) w = Math.min(Math.max(r.w + dx, MIN_W), b.right - r.x);
+      if (edge.includes("s")) h = Math.min(Math.max(r.h + dy, MIN_H), b.bottom - r.y);
+      if (edge.includes("w")) { x = Math.min(Math.max(r.x + dx, b.left), right - MIN_W); w = right - x; }
+      if (edge.includes("n")) { y = Math.min(Math.max(r.y + dy, b.top), bottom - MIN_H); h = bottom - y; }
+      return { x, y, w, h };
+    };
+    const move = (e) => {
+      if (e.pointerId !== event.pointerId) return;
+      latest = compute(e.clientX - start.x, e.clientY - start.y);
+      if (!frame) frame = requestAnimationFrame(() => { frame = 0; if (term.win) place(latest); });
+    };
+    const end = (e) => {
+      if (e.pointerId !== event.pointerId) return;
+      target.removeEventListener("pointermove", move);
+      target.removeEventListener("pointerup", end);
+      target.removeEventListener("pointercancel", end);
+      cancelAnimationFrame(frame);
+      if (!term.win) return;
+      term.win.classList.remove("moving");
+      place(latest);
+      if (narrowScreen.matches) term.narrowH = latest.h;
+      else term.geo = latest;
+      saveWindow();
+      if (edge) tellFrame({ type: "lore-terminal-resizing", active: false });
+      focusTerminal();
+    };
+    target.addEventListener("pointermove", move);
+    target.addEventListener("pointerup", end);
+    target.addEventListener("pointercancel", end);
+  }
 
   function openTerminal(agent, mode) {
-    closeTerminal();
-    overlay = el("div", "terminal-overlay");
-    overlay.setAttribute("aria-label", `${mode === "shell" ? "Shell" : "Terminal"} of ${agent.name}`);
+    closeTerminal(true);
+    readWindow();
+    const label = `${mode === "shell" ? "Shell" : "Terminal"} of ${agent.name}`;
+    const win = el("section", "term-win");
+    win.setAttribute("role", "dialog");
+    win.setAttribute("aria-label", label);
+    win.dataset.agent = agent.name;
+
+    const bar = el("div", "term-bar");
+    bar.title = "Drag to move · double-click to reset its size and place";
+    if (agent.avatar) {
+      const image = el("img", "term-avatar");
+      image.src = `/admin/avatars/${encodeURIComponent(agent.avatar)}.svg`;
+      image.alt = "";
+      bar.append(image);
+    }
+    const title = el("div", "term-title");
+    title.append(el("strong", "", agent.name),
+      el("span", "muted", mode === "shell" ? "Shell as the agent user" : "The CLI's own interface"));
+    const stateNode = el("span", "term-state connecting", "Connecting…");
+    stateNode.setAttribute("role", "status");
+    stateNode.setAttribute("aria-live", "polite");
+    const buttons = el("div", "term-buttons");
+    const reconnect = button("Reconnect", "", () => tellFrame({ type: "lore-terminal-command", command: "reconnect" }));
+    reconnect.hidden = true;
+    const expand = button("Expand", "", () => {
+      term.max = !term.max;
+      saveWindow();
+      applyWindow();
+      focusTerminal();
+    });
+    const close = button("Close", "", () => closeTerminal());
+    buttons.append(reconnect, expand, close);
+    bar.append(title, stateNode, buttons);
+    bar.addEventListener("pointerdown", (event) => {
+      if (event.target.closest("button")) return;
+      startDrag(event, null);
+    });
+    bar.addEventListener("dblclick", (event) => {
+      if (event.target.closest("button")) return;
+      term.geo = null;
+      term.narrowH = null;
+      term.max = false;
+      try { localStorage.removeItem(WINDOW_KEY); } catch { /* private mode */ }
+      applyWindow();
+      focusTerminal();
+    });
+
+    const body = el("div", "term-body");
     const frame = el("iframe", "terminal-frame");
-    frame.title = `${mode === "shell" ? "Shell" : "Terminal"} of ${agent.name}`;
+    frame.title = label;
     const query = new URLSearchParams({ agent: agent.name, mode, avatar: agent.avatar || "" });
     frame.src = "/admin/terminal?" + query.toString();
-    frame.addEventListener("load", () => {
-      tellLayout();
-      frame.focus();
-    });
-    overlay.append(frame);
-    document.body.append(overlay);
-    applyLayout();
+    frame.addEventListener("load", focusTerminal);
+    body.append(frame, el("div", "term-shield"));
+    win.append(bar, body);
+    for (const edge of EDGES) {
+      const handle = el("div", `term-edge term-edge-${edge}`);
+      handle.setAttribute("aria-hidden", "true");
+      handle.addEventListener("pointerdown", (event) => startDrag(event, edge));
+      win.append(handle);
+    }
+    const grip = el("div", "term-grip");
+    grip.setAttribute("aria-hidden", "true");
+    grip.title = "Drag to resize";
+    grip.addEventListener("pointerdown", (event) => startDrag(event, "se"));
+    win.append(grip);
+
+    Object.assign(term, { win, frame, bar, state: stateNode, expand, reconnect, closing: null });
+    document.body.append(win);
+    applyWindow();
+    launcherSync();
   }
 
-  /* Puts the open terminal where it belongs now. Only classes change: the
-     column's own size and the graph's are left alone. */
-  function applyLayout() {
-    if (!overlay) return;
-    const docked = wideScreen.matches && terminalMode === "docked";
-    overlay.classList.toggle("docked", docked);
-    overlay.setAttribute("role", docked ? "region" : "dialog");
-    if (docked) overlay.removeAttribute("aria-modal");
-    else overlay.setAttribute("aria-modal", "true");
-    document.documentElement.classList.toggle("terminal-open", !docked);
-    document.documentElement.classList.toggle("terminal-docked", docked);
-    tellLayout();
+  /* Close asks the frame to end the terminal (it tells the server, then
+     answers); removing the frame closes its socket in any case, so the
+     window goes after a moment even without an answer. */
+  function closeTerminal(now) {
+    if (!term.win) return;
+    if (!now && term.frame && term.frame.contentWindow && !term.closing) {
+      tellFrame({ type: "lore-terminal-command", command: "close" });
+      term.closing = setTimeout(() => closeTerminal(true), 600);
+      return;
+    }
+    clearTimeout(term.closing);
+    term.win.remove();
+    Object.assign(term, { win: null, frame: null, bar: null, state: null, expand: null, reconnect: null, closing: null });
+    launcherSync();
   }
 
-  /* The frame shows Expand or Dock, and no such button where docking is
-     not possible. */
-  function tellLayout() {
-    const frame = overlay && overlay.querySelector("iframe");
-    if (!frame || !frame.contentWindow) return;
-    const docked = overlay.classList.contains("docked");
-    frame.contentWindow.postMessage({
-      type: "lore-terminal-layout",
-      mode: docked ? "docked" : "expanded",
-      canDock: wideScreen.matches,
-    }, location.origin);
-  }
-
-  wideScreen.addEventListener("change", applyLayout);
-
-  /* Removing the frame closes its socket, which closes the terminal. */
-  function closeTerminal() {
-    if (!overlay) return;
-    overlay.remove();
-    overlay = null;
-    document.documentElement.classList.remove("terminal-open", "terminal-docked");
-  }
+  window.addEventListener("resize", applyWindow);
+  narrowScreen.addEventListener("change", applyWindow);
 
   window.addEventListener("message", (event) => {
-    if (!overlay || event.origin !== location.origin) return;
-    const frame = overlay.querySelector("iframe");
-    if (!frame || event.source !== frame.contentWindow) return;
+    if (!term.frame || event.origin !== location.origin || event.source !== term.frame.contentWindow) return;
     const data = event.data || {};
-    if (data.type === "lore-terminal-close") closeTerminal();
-    else if (data.type === "lore-terminal-ready") tellLayout();
-    else if (data.type === "lore-terminal-mode" && (data.mode === "docked" || data.mode === "expanded")) {
-      terminalMode = data.mode;
-      try { localStorage.setItem(TERMINAL_MODE_KEY, terminalMode); } catch { /* private mode */ }
-      applyLayout();
-      frame.focus();
-    }
+    if (data.type === "lore-terminal-close") closeTerminal(true);
+    else if (data.type === "lore-terminal-state" || data.type === "lore-terminal-ready") setTerminalState(data.state, data.text);
   });
+
+  /* ---------- Terminal launcher ---------- */
+
+  /* The terminal icon in Live activity's head and the one beside "Hide
+     activity" (which stays when Live activity is hidden). Shown only to
+     users with the agents permission on a server with built-in agents.
+     One connected agent: its terminal opens. Several: a menu lists them;
+     the last one picked comes first and is remembered per browser. */
+  const LAST_KEY = "lore.terminal.agent";
+  const launchers = ["terminal-launch", "terminal-launch-float"].map($).filter(Boolean);
+  const launch = { configured: false, manage: false, agents: [], menu: null, from: null };
+
+  function launcherVisible() {
+    const app = $("app");
+    const toggle = $("agents-toggle");
+    return Boolean(app && !app.hidden && toggle && !toggle.hidden && launch.configured && launch.manage);
+  }
+
+  function launcherSync() {
+    const show = launcherVisible();
+    for (const node of launchers) {
+      node.hidden = !show;
+      node.classList.toggle("active", Boolean(term.win));
+    }
+    if (!show) closeMenu();
+  }
+
+  async function launcherLoad() {
+    const app = $("app");
+    const toggle = $("agents-toggle");
+    if (!app || app.hidden || !toggle || toggle.hidden) { launcherSync(); return false; }
+    let result;
+    try { result = await call("/admin/api/builtin"); } catch { result = null; }
+    if (result && result.ok) {
+      launch.configured = Boolean(result.body.configured);
+      launch.manage = Boolean(result.body.manage);
+      launch.agents = result.body.agents || [];
+    } else if (result) {
+      launch.configured = false;
+    }
+    launcherSync();
+    return Boolean(result && result.ok);
+  }
+
+  function lastAgent() {
+    try { return localStorage.getItem(LAST_KEY) || ""; } catch { return ""; }
+  }
+
+  function pickAgent(agent) {
+    try { localStorage.setItem(LAST_KEY, agent.name); } catch { /* private mode */ }
+    closeMenu(false);
+    openTerminal(agent, "cli");
+  }
+
+  async function onLauncher(event) {
+    const from = event.currentTarget;
+    if (launch.menu) { closeMenu(true); return; }
+    if (term.win) {
+      applyWindow();
+      focusTerminal();
+      return;
+    }
+    await launcherLoad();
+    if (!launcherVisible()) return;
+    const connected = launch.agents.filter((agent) => agent.connected);
+    if (launch.agents.length === 1 && connected.length === 1) pickAgent(connected[0]);
+    else openMenu(from);
+  }
+
+  function openMenu(from) {
+    closeMenu(false);
+    const menu = el("div", "term-menu");
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", "Open the terminal of");
+    menu.append(el("div", "term-menu-head", "Open a terminal"));
+    const last = lastAgent();
+    const agents = launch.agents.filter((agent) => agent.connected)
+      .sort((a, b) => (b.name === last) - (a.name === last));
+    if (!agents.length) menu.append(el("p", "muted small-text term-menu-empty", "No built-in agent is connected."));
+    for (const agent of agents) {
+      const item = el("button", "term-menu-item");
+      item.type = "button";
+      item.setAttribute("role", "menuitem");
+      const image = el("img", "term-avatar");
+      image.src = `/admin/avatars/${encodeURIComponent(agent.avatar || "orbit")}.svg`;
+      image.alt = "";
+      const text = el("span", "term-menu-text");
+      text.append(el("strong", "", agent.name),
+        el("span", agent.signed_in ? "ok" : "warn", agent.signed_in ? "signed in" : "not signed in"));
+      item.append(image, text);
+      if (agent.name === last) item.append(el("span", "muted small-text", "last"));
+      item.addEventListener("click", () => pickAgent(agent));
+      menu.append(item);
+    }
+    menu.addEventListener("keydown", (event) => {
+      const items = [...menu.querySelectorAll(".term-menu-item")];
+      const at = items.indexOf(document.activeElement);
+      if (event.key === "Escape") { event.preventDefault(); closeMenu(true); }
+      else if (event.key === "ArrowDown" && items.length) { event.preventDefault(); items[(at + 1) % items.length].focus(); }
+      else if (event.key === "ArrowUp" && items.length) { event.preventDefault(); items[(at - 1 + items.length) % items.length].focus(); }
+      else if (event.key === "Tab") closeMenu(false);
+    });
+    document.body.append(menu);
+    launch.menu = menu;
+    launch.from = from;
+    from.setAttribute("aria-expanded", "true");
+    // Below the icon, or above it when there is no room below.
+    const anchor = from.getBoundingClientRect();
+    const box = menu.getBoundingClientRect();
+    const left = Math.max(8, Math.min(anchor.right - box.width, window.innerWidth - box.width - 8));
+    let top = anchor.bottom + 6;
+    if (top + box.height > window.innerHeight - 8) top = Math.max(8, anchor.top - 6 - box.height);
+    menu.style.setProperty("left", left + "px");
+    menu.style.setProperty("top", top + "px");
+    const first = menu.querySelector(".term-menu-item");
+    if (!first) menu.tabIndex = -1;
+    (first || menu).focus();
+  }
+
+  function closeMenu(refocus) {
+    if (!launch.menu) return;
+    launch.menu.remove();
+    launch.menu = null;
+    if (launch.from) {
+      launch.from.setAttribute("aria-expanded", "false");
+      if (refocus) launch.from.focus();
+    }
+    launch.from = null;
+  }
+
+  for (const node of launchers) {
+    node.setAttribute("aria-haspopup", "menu");
+    node.setAttribute("aria-expanded", "false");
+    node.addEventListener("click", onLauncher);
+  }
+  document.addEventListener("pointerdown", (event) => {
+    if (!launch.menu || launch.menu.contains(event.target) || launchers.some((node) => node.contains(event.target))) return;
+    closeMenu(false);
+  });
+  window.addEventListener("resize", () => closeMenu(false));
+  /* The icons follow the session: signing in or out shows or hides #app,
+     and the Agents button shows only with the agents permission. */
+  {
+    const watch = new MutationObserver(() => { launcherLoad(); });
+    for (const id of ["app", "agents-toggle"]) {
+      const node = $(id);
+      if (node) watch.observe(node, { attributes: true, attributeFilter: ["hidden"] });
+    }
+    launcherLoad();
+  }
 
   /* ---------- Task runner ---------- */
 

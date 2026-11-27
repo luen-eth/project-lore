@@ -106,6 +106,9 @@
     <div class="feed-head">
       <h2>Live activity</h2>
       <span id="feed-count" class="muted small-text"></span>
+      <button id="terminal-launch" class="ghost term-launch" type="button" title="Open a built-in agent's terminal" aria-label="Open a built-in agent's terminal" hidden>
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M7 9.5l3 2.5-3 2.5M12.5 15H17"/></svg>
+      </button>
     </div>
     <ol id="feed-list" class="feed-list"></ol>
     <p id="feed-empty" class="muted small-text feed-empty" hidden>Nothing yet. Actions appear here the moment an agent searches or writes.</p>
@@ -606,6 +609,9 @@
   </div>
   <button id="labels-toggle" class="ghost small labels-toggle" type="button" aria-pressed="true">Hide labels</button>
   <button id="feed-hide" class="ghost small feed-hide" type="button" aria-pressed="true" aria-controls="feed">Hide activity</button>
+  <button id="terminal-launch-float" class="ghost small term-launch term-launch-float" type="button" title="Open a built-in agent's terminal" aria-label="Open a built-in agent's terminal" hidden>
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M7 9.5l3 2.5-3 2.5M12.5 15H17"/></svg>
+  </button>
 </div>
 
 <script src="/admin/app.js"></script>

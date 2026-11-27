@@ -73,45 +73,120 @@
 .task-targets summary { cursor: pointer; padding: 2px 0 6px; }
 .task-targets[open] { display: grid; gap: 6px; }
 
-/* Terminal: the buttons on a card and the overlay holding its frame. */
+/* Terminal: the buttons on a card. */
 .builtin-terminal { align-items: center; }
 .builtin-more { font-size: 12px; color: var(--muted); }
 .builtin-more summary { cursor: pointer; padding: 4px 6px; border-radius: 8px; }
 .builtin-more summary:hover { color: var(--text); }
 .builtin-more[open] summary { color: var(--text); }
 .builtin-more-body { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 4px 0 0 6px; }
-.terminal-overlay {
-  position: fixed; inset: 0; z-index: 50; display: grid; padding: 28px;
-  background: rgba(2, 4, 10, 0.72); backdrop-filter: blur(4px);
-}
-.terminal-frame {
-  display: block; width: 100%; height: 100%; min-height: 0;
-  border: 1px solid var(--line); border-radius: var(--radius); background: #05080f;
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.65);
-}
-html.terminal-open, html.terminal-open body { overflow: hidden; }
 
-/* Docked: in the Live activity column on wide screens. The column runs from
-   68px below the top to 16px above the bottom (see .feed in admin.css);
-   Live activity keeps its top half, the terminal takes the bottom half, or
-   the whole column when Live activity is hidden. Nothing else moves, so the
-   graph keeps its size. It stays above the panels (z-index 6) that open
-   over the column, the Agents panel it is opened from among them. */
-@media (min-width: 1181px) {
-  .terminal-overlay.docked {
-    inset: auto 16px 16px auto; top: calc((100vh - 84px) / 2 + 74px);
-    width: var(--feed); padding: 0; z-index: 7;
-    background: none; backdrop-filter: none;
-  }
-  #app.feed-hidden ~ .terminal-overlay.docked { top: 68px; }
-  html.terminal-docked #app:not(.feed-hidden) .feed { bottom: calc((100vh - 84px) / 2 + 22px); }
-  .terminal-overlay.docked .terminal-frame { box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45); }
+/* The terminal window: floats over the page (above the panels, z-index 6,
+   the Agents panel it can be opened from among them), moved by its bar and
+   resized by its edges and corner grip. builtin.js sets its place and size
+   through the CSSOM and keeps it inside the page. */
+.term-win {
+  position: fixed; left: 0; top: 0; width: 640px; height: 400px; z-index: 7;
+  display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  border: 1px solid transparent; border-radius: var(--radius); overflow: hidden;
+  background:
+    linear-gradient(var(--panel-solid), var(--panel-solid)) padding-box,
+    linear-gradient(140deg, rgba(111, 182, 255, 0.42), rgba(199, 155, 255, 0.14) 38%, rgba(255, 255, 255, 0.05) 70%) border-box;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.6);
 }
+.term-bar {
+  display: flex; align-items: center; gap: 10px; flex: none;
+  padding: 7px 8px 7px 12px; border-bottom: 1px solid var(--line);
+  cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none;
+}
+.term-win.moving .term-bar { cursor: grabbing; }
+.term-win.maximised .term-bar, .term-win.narrow .term-bar { cursor: default; }
+.term-avatar { width: 24px; height: 24px; flex: none; }
+.term-title { display: flex; flex-direction: column; min-width: 0; flex: 1; line-height: 1.25; }
+.term-title strong { font-weight: 620; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.term-title .muted { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The state as a dot; its words are in the tooltip and read out. */
+.term-state {
+  flex: none; width: 9px; height: 9px; border-radius: 50%; overflow: hidden;
+  background: currentColor; color: var(--muted); font-size: 0;
+}
+.term-state.open { color: var(--ok); }
+.term-state.connecting { color: var(--warn); }
+.term-state.closed { color: var(--danger); }
+.term-buttons { display: flex; gap: 6px; flex: none; }
+.term-body { position: relative; flex: 1; min-height: 0; background: #05080f; }
+.terminal-frame { display: block; width: 100%; height: 100%; border: 0; background: #05080f; }
+/* Over the frame while moving or resizing, so the pointer stays here. */
+.term-shield { position: absolute; inset: 0; display: none; }
+.term-win.moving .term-shield { display: block; }
+.term-win.moving .terminal-frame { pointer-events: none; }
+.term-win.moving { user-select: none; -webkit-user-select: none; }
+
+.term-edge { position: absolute; z-index: 2; touch-action: none; }
+.term-edge-n, .term-edge-s { left: 10px; right: 10px; height: 8px; cursor: ns-resize; }
+.term-edge-n { top: -3px; }
+.term-edge-s { bottom: -3px; }
+.term-edge-e, .term-edge-w { top: 10px; bottom: 10px; width: 8px; cursor: ew-resize; }
+.term-edge-e { right: -3px; }
+.term-edge-w { left: -3px; }
+.term-edge-ne, .term-edge-nw, .term-edge-se, .term-edge-sw { width: 14px; height: 14px; }
+.term-edge-ne { top: -3px; right: -3px; cursor: nesw-resize; }
+.term-edge-nw { top: -3px; left: -3px; cursor: nwse-resize; }
+.term-edge-se { bottom: -3px; right: -3px; cursor: nwse-resize; }
+.term-edge-sw { bottom: -3px; left: -3px; cursor: nesw-resize; }
+/* The visible grip in the bottom-right corner. */
+.term-grip {
+  position: absolute; right: 2px; bottom: 2px; z-index: 3; width: 16px; height: 16px;
+  cursor: nwse-resize; touch-action: none; opacity: 0.75;
+  background:
+    linear-gradient(135deg, transparent 0 55%, rgba(148, 170, 220, 0.6) 55% 62%, transparent 62% 72%,
+      rgba(148, 170, 220, 0.6) 72% 79%, transparent 79%);
+}
+.term-grip:hover { opacity: 1; }
+/* Maximised: nothing to drag. Narrow: only the top edge, for the height. */
+.term-win.maximised .term-edge, .term-win.maximised .term-grip { display: none; }
+.term-win.narrow .term-edge:not(.term-edge-n), .term-win.narrow .term-grip { display: none; }
+.term-win.narrow { border-radius: var(--radius) var(--radius) 0 0; }
+.term-win.narrow .term-edge-n { top: 0; height: 12px; }
+.term-win.narrow.maximised { border-radius: 0; }
+
+/* The launcher icons and the menu of agents. */
+.term-launch {
+  display: inline-grid; place-items: center; padding: 4px; min-width: 30px; min-height: 30px;
+  border-radius: 9px; color: var(--muted);
+}
+.term-launch:hover, .term-launch.active { color: var(--accent); }
+.term-launch[hidden] { display: none; }
+.feed-head h2 { margin-right: auto; }
+.feed-head .term-launch { align-self: center; margin-left: 8px; }
+/* Beside "Hide activity", where it also shows when Live activity is hidden;
+   below 1181px (no column to hide) it takes that button's place. */
+.term-launch-float { position: fixed; left: calc(var(--side) + 36px); bottom: 112px; z-index: 1; }
+@media (max-width: 1180px) { .term-launch-float { bottom: 78px; } }
+.term-menu {
+  position: fixed; z-index: 11; min-width: 220px; max-width: calc(100vw - 16px);
+  display: grid; gap: 2px; padding: 6px; border-radius: 12px;
+  border: 1px solid var(--line); background: var(--panel-solid);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+}
+.term-menu:focus { outline: none; }
+.term-menu-head { padding: 4px 8px 6px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+.term-menu-empty { margin: 0; padding: 4px 8px 6px; }
+.term-menu-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 7px 8px; border: 0; border-radius: 8px; background: transparent;
+}
+.term-menu-item:hover, .term-menu-item:focus-visible { background: rgba(255, 255, 255, 0.07); }
+.term-menu-text { display: flex; flex-direction: column; min-width: 0; flex: 1; line-height: 1.25; }
+.term-menu-text strong { font-weight: 600; font-size: 13px; }
+.term-menu-text .ok { color: var(--ok); font-size: 11px; }
+.term-menu-text .warn { color: var(--warn); font-size: 11px; }
 
 @media (max-width: 760px) {
   .builtin-row { grid-template-columns: minmax(0, 1fr); }
   .builtin-code { font-size: 18px; }
-  /* A full-screen sheet on phones. */
-  .terminal-overlay { padding: 0; background: #05080f; }
-  .terminal-frame { border: 0; border-radius: 0; box-shadow: none; }
+  .term-launch-float { left: 12px; bottom: calc(var(--tab-h) + 56px); }
+  #app button.term-launch { min-height: 40px; min-width: 40px; }
+  .term-bar { padding: 6px 6px 6px 10px; gap: 8px; }
+  .term-title .muted { display: none; }
 }
