@@ -707,7 +707,7 @@ function toGraph(brain, colors, counts, agents) {
   }
   for (const agent of agents) {
     nodes.push({
-      key: "a:" + agent.name, kind: "agent", color: agentColor(agent.name), label: agent.name,
+      key: "a:" + agent.name, kind: "agent", color: agentColor(agent.name), label: displayName(agent.name), name: agent.name,
       radius: 5.5, phase: Math.random(), online: agent.seconds_since_seen !== null && agent.seconds_since_seen < 300,
     });
     for (const project of wroteIn.get(agent.name) || []) {
@@ -1187,7 +1187,7 @@ function renderSessions() {
     const open = session.status === "open";
     const item = el("li", open ? "session" : "session closed");
     const avatar = avatarNode(session.agent || "unknown", "small");
-    const name = el("span", "name", session.agent || "unknown agent");
+    const name = el("span", "name", session.agent ? displayName(session.agent) : "unknown agent");
     const when = el("span", "count", relative(secondsSince(session.last_seen_at)));
     const sub = el("span", "sub");
     sub.textContent = `${session.project} · ${session.title}`;
@@ -1314,7 +1314,9 @@ function addToFeed(activity, live) {
 
   const avatar = avatarNode(activity.agent, "small");
   const line = el("div", "line");
-  line.append(el("span", "who", activity.agent), el("span", "verb", tool.verb),
+  const who = el("span", "who", displayName(activity.agent));
+  if (who.textContent !== activity.agent) who.title = activity.agent;
+  line.append(who, el("span", "verb", tool.verb),
     el("span", "when", relative(secondsSince(activity.at))));
   item.append(avatar, line);
   if (activity.summary) item.append(el("div", "what", activity.summary));
@@ -1385,6 +1387,14 @@ function toggleFilter(type, value) {
   applyFocus();
 }
 
+/* The name the page shows for an agent: the display name its owner gave
+   it, or its technical name, which stays its identity (filters, links,
+   the API). */
+function displayName(name) {
+  const agent = name && state.agents.find((a) => a.name === name);
+  return (agent && agent.display_name) || name || "";
+}
+
 function renderAgents(flash) {
   const list = $("agents");
   list.replaceChildren();
@@ -1413,7 +1423,8 @@ function renderAgents(flash) {
     const item = el("li", isFilter("agent", agent.name) ? "active" : "");
     if (flash === agent.name) item.classList.add("flash");
     item.title = [agent.client, `${agent.requests} requests`, `${agent.entries} entries written`].filter(Boolean).join(" · ");
-    item.append(avatar, el("span", "name", agent.name),
+    item.title = (agent.display_name ? agent.name + " · " : "") + item.title;
+    item.append(avatar, el("span", "name", displayName(agent.name)),
       el("span", "count", seen === null ? "—" : relative(seen)), el("span", "sub", sub));
     clickable(item, () => toggleFilter("agent", agent.name));
     list.append(item);
@@ -2039,7 +2050,7 @@ function renderBoard() {
     datalist.append(option);
   }
   const agents = boardAgents();
-  fillSelect($("task-assignee"), [["", "anyone"], ...agents.map((a) => [a, a])]);
+  fillSelect($("task-assignee"), [["", "anyone"], ...agents.map((a) => [a, displayName(a)])]);
   fillSelect($("message-to"), [["", "everyone"], ...agents.map((a) => [a, a])]);
 
   if (!board.data) {
@@ -2086,11 +2097,11 @@ function taskItem(task, admin) {
   const head = el("div", "board-item-head");
   head.append(el("span", "pill " + task.status, task.status),
     el("span", "board-title", task.title), el("span", "board-id", "#" + task.id));
-  const meta = [task.project, `added by ${task.created_by}`];
-  if (task.assignee) meta.push(`for ${task.assignee}`);
-  if (task.claimed_by && task.status !== "open") meta.push(`claimed by ${task.claimed_by}`);
+  const meta = [task.project, `added by ${displayName(task.created_by)}`];
+  if (task.assignee) meta.push(`for ${displayName(task.assignee)}`);
+  if (task.claimed_by && task.status !== "open") meta.push(`claimed by ${displayName(task.claimed_by)}`);
   if (task.done_by) {
-    meta.push(`done by ${task.done_by}` + (task.done_commit ? ` at ${task.done_commit.slice(0, 10)}` : ""));
+    meta.push(`done by ${displayName(task.done_by)}` + (task.done_commit ? ` at ${task.done_commit.slice(0, 10)}` : ""));
   }
   meta.push(ago(task.updated_at));
   const metaLine = el("div", "board-meta", meta.join(" · "));
@@ -3637,7 +3648,9 @@ function statRow(box, label, value) {
 function agentCard(agent, manage) {
   const item = el("li", "board-item agent-card" + (agent.disabled ? " disabled" : ""));
   const head = el("div", "board-item-head agent-head");
-  head.append(avatarNode(agent.name, "large", agent.avatar), el("span", "board-title", agent.name));
+  const title = el("span", "board-title agent-title", agent.display_name || agent.name);
+  if (agent.display_name) title.append(el("small", "agent-tech", agent.name));
+  head.append(avatarNode(agent.name, "large", agent.avatar), title);
   head.append(el("span", "pill " + (agent.kind === "oauth" ? "oauth" : "token"), agent.kind === "oauth" ? "OAuth" : agent.kind === "builtin" ? "built-in" : "env token"));
   if (agent.disabled) head.append(el("span", "pill cancelled", "disabled"));
   item.append(head);
@@ -3685,7 +3698,7 @@ function agentCard(agent, manage) {
     node.addEventListener("click", onClick);
     actions.append(node);
   };
-  button("Avatar and note", "", () => { agentsPanel.editing = agent.name; renderAgentsPanel(); });
+  button("Name, avatar and note", "", () => { agentsPanel.editing = agent.name; renderAgentsPanel(); });
   button("Service levels", "", () => {
     closeAgentsPanel();
     $("integrations-toggle").click();
@@ -3726,6 +3739,14 @@ function agentEditor(agent) {
     }
   };
   draw();
+  const display = el("input");
+  display.type = "text";
+  display.maxLength = 40;
+  display.value = agent.display_name || "";
+  display.placeholder = agent.name;
+  display.spellcheck = false;
+  const displayField = el("label", "board-field");
+  displayField.append(el("span", "", `Display name (shown on this page; ${agent.name} stays its name everywhere else)`), display);
   const note = el("input");
   note.type = "text";
   note.maxLength = 300;
@@ -3743,11 +3764,11 @@ function agentEditor(agent) {
   const save = el("button", "ghost small", "Save");
   save.type = "submit";
   actions.append(reset, cancel, save);
-  form.append(picker, noteField, actions);
+  form.append(displayField, picker, noteField, actions);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     save.disabled = true;
-    const ok = await changeAgent(agent, { avatar: picked, note: note.value });
+    const ok = await changeAgent(agent, { avatar: picked, note: note.value, display_name: display.value });
     save.disabled = false;
     if (ok) {
       agentsPanel.editing = null;
@@ -3823,16 +3844,16 @@ graph.onHover = (node, x, y) => {
   if (node.kind === "hub") {
     tip.append(el("div", "", node.label), el("div", "sub", `${node.members} memories`));
   } else if (node.kind === "agent") {
-    const agent = state.agents.find((a) => a.name === node.label);
-    const last = state.lastAction.get(node.label);
+    const agent = state.agents.find((a) => a.name === node.name);
+    const last = state.lastAction.get(node.name);
     const tool = last ? (TOOLS[last.tool] || { verb: last.tool }).verb : null;
-    tip.append(el("div", "", node.label),
+    tip.append(el("div", "", node.label === node.name ? node.name : `${node.label} (${node.name})`),
       el("div", "sub", agent ? `${agent.entries} entries written · ${agent.requests} requests` : "agent"));
     if (last) tip.append(el("div", "sub", `last: ${tool}${last.summary ? " · " + last.summary : ""}`));
   } else {
     tip.append(el("div", "", node.data.title),
       el("div", "sub", `${KIND_LABEL[node.data.kind] || node.data.kind} · ${node.data.project}` +
-        (node.data.agent ? ` · ${node.data.agent}` : "")));
+        (node.data.agent ? ` · ${displayName(node.data.agent)}` : "")));
   }
   tip.hidden = false;
   const box = tip.getBoundingClientRect();
@@ -3844,7 +3865,7 @@ graph.onSelect = (node) => {
   if (state.decorative) return;
   if (!node) { closeDetail(); return; }
   if (node.kind === "hub") { toggleFilter("project", node.label); return; }
-  if (node.kind === "agent") { toggleFilter("agent", node.label); return; }
+  if (node.kind === "agent") { toggleFilter("agent", node.name); return; }
   openDetail(node);
 };
 
@@ -3900,7 +3921,7 @@ async function openDetail(node) {
   badge.style.color = node.color;
   box.append(badge, el("h3", "", entry.title));
   const meta = [`#${entry.id}`, entry.project, shortDate(entry.created_at)];
-  if (entry.agent) meta.push(`by ${entry.agent}`);
+  if (entry.agent) meta.push(`by ${displayName(entry.agent)}`);
   if (entry.updated_at) meta.push(`amended ${shortDate(entry.updated_at)}`);
   box.append(el("div", "meta", meta.join(" · ")), el("p", "body", entry.body));
 

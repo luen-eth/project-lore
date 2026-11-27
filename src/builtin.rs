@@ -2207,6 +2207,104 @@ esac
         cookie.split(';').next().unwrap().to_string()
     }
 
+    /// The owner gives a built-in agent a display name with the `agents`
+    /// permission; it is checked, shown by the page's APIs, and the
+    /// technical name stays the identity everywhere.
+    #[tokio::test]
+    async fn a_built_in_agent_gets_a_display_name_and_keeps_its_name() {
+        let pair = listen().await;
+        let base = admin_server(&pair).await;
+        pair.db
+            .add_user(&crate::db::NewUser {
+                username: "writer".into(),
+                email: None,
+                password_hash: crate::users::hash_password("writer-password").unwrap(),
+                permissions: crate::users::Perms::parse(&["write"]).unwrap(),
+                created_by: "admin".into(),
+            })
+            .unwrap();
+        let http = reqwest::Client::new();
+        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let writer = sign_in(&http, &base, "writer", "writer-password").await;
+        let put = |cookie: &str, name: &str| {
+            http.put(format!("{base}/admin/api/agents/claude-builtin"))
+                .header(header::COOKIE, cookie.to_string())
+                .json(&serde_json::json!({ "display_name": name }))
+        };
+        assert_eq!(put(&writer, "Claude").send().await.unwrap().status(), 403);
+        for bad in [
+            "two\nlines",
+            &"x".repeat(41),
+            "codex-builtin",
+            "DEEPSEEK-BUILTIN",
+        ] {
+            assert_eq!(
+                put(&admin, bad).send().await.unwrap().status(),
+                400,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            put(&admin, "  Claude  ").send().await.unwrap().status(),
+            200
+        );
+        let builtin: serde_json::Value = http
+            .get(format!("{base}/admin/api/builtin"))
+            .header(header::COOKIE, &admin)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let claude = builtin["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["display_name"] == "Claude")
+            .expect("the display name is shown");
+        assert_eq!(claude["name"], "claude-builtin");
+        let agents: serde_json::Value = http
+            .get(format!("{base}/admin/api/agents"))
+            .header(header::COOKIE, &writer)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(agents["agents"].as_array().unwrap().iter().any(|agent| {
+            agent["name"] == "claude-builtin" && agent["display_name"] == "Claude"
+        }));
+        // The identity: the hub, the built-in row, the registry row.
+        assert!(
+            pair.hub
+                .agents()
+                .iter()
+                .any(|name| name == "claude-builtin")
+        );
+        assert!(pair.db.builtin_agent("claude-builtin").unwrap().is_some());
+        assert!(pair.db.registry_agent("Claude").unwrap().is_none());
+        assert_eq!(
+            pair.db
+                .registry_agent("claude-builtin")
+                .unwrap()
+                .unwrap()
+                .kind,
+            "builtin"
+        );
+        // Empty clears it.
+        assert_eq!(put(&admin, "").send().await.unwrap().status(), 200);
+        assert_eq!(
+            pair.db
+                .registry_agent("claude-builtin")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
+    }
+
     #[tokio::test]
     async fn the_page_signs_an_agent_in_and_the_token_goes_only_to_its_volume() {
         let pair = listen().await;

@@ -57,6 +57,12 @@
     return node;
   }
 
+  /* The name the page shows: the owner's display name, else the
+     technical one (which every request and record keeps using). */
+  function shown(agent) {
+    return (agent && (agent.display_name || agent.name)) || "";
+  }
+
   function status(text, tone) {
     const node = $("builtin-status");
     node.textContent = text || "";
@@ -153,7 +159,9 @@
     const image = el("img", "builtin-avatar");
     image.src = `/admin/avatars/${encodeURIComponent(agent.avatar)}.svg`;
     image.alt = "";
-    head.append(image, el("span", "board-title", agent.name));
+    const title = el("span", "board-title", shown(agent));
+    if (agent.display_name) title.append(el("small", "agent-tech", agent.name));
+    head.append(image, title);
     const kind = (KIND_LABEL[agent.kind] || "unknown CLI") + (agent.kind === "opencode" && agent.provider ? ` · ${agent.provider}` : "");
     head.append(pill(kind, "token"));
     head.append(agent.connected ? pill("connected", "open") : pill("not connected", "closed"));
@@ -730,7 +738,7 @@
   function openTerminal(agent, mode) {
     closeTerminal(true);
     readWindow();
-    const label = `${mode === "shell" ? "Shell" : "Terminal"} of ${agent.name}`;
+    const label = `${mode === "shell" ? "Shell" : "Terminal"} of ${shown(agent)}`;
     const win = el("section", "term-win");
     win.setAttribute("role", "dialog");
     win.setAttribute("aria-label", label);
@@ -745,8 +753,9 @@
       bar.append(image);
     }
     const title = el("div", "term-title");
-    title.append(el("strong", "", agent.name),
-      el("span", "muted", mode === "shell" ? "Shell as the agent user" : "The CLI's own interface"));
+    const what = mode === "shell" ? "Shell as the agent user" : "The CLI's own interface";
+    title.append(el("strong", "", shown(agent)),
+      el("span", "muted", agent.display_name ? `${agent.name} · ${what}` : what));
     const stateNode = el("span", "term-state connecting", "Connecting…");
     stateNode.setAttribute("role", "status");
     stateNode.setAttribute("aria-live", "polite");
@@ -914,9 +923,10 @@
       image.src = `/admin/avatars/${encodeURIComponent(agent.avatar || "orbit")}.svg`;
       image.alt = "";
       const text = el("span", "term-menu-text");
-      text.append(el("strong", "", agent.name),
+      text.append(el("strong", "", shown(agent)),
         el("span", agent.signed_in ? "ok" : "warn", agent.signed_in ? "signed in" : "not signed in"));
       item.append(image, text);
+      if (agent.display_name) item.title = agent.name;
       if (agent.name === last) item.append(el("span", "muted small-text", "last"));
       item.addEventListener("click", () => pickAgent(agent));
       menu.append(item);

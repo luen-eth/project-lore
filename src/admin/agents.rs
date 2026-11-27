@@ -338,12 +338,16 @@ pub(super) struct AgentForm {
     avatar: Option<String>,
     #[serde(default)]
     note: Option<String>,
+    /// The name the page shows; empty clears it.
+    #[serde(default)]
+    display_name: Option<String>,
     #[serde(default)]
     disabled: Option<bool>,
 }
 
-/// Changes an agent's avatar, note, or whether it is disabled. Disabling
-/// closes its open sessions; its tokens are refused from then on.
+/// Changes an agent's avatar, note, display name, or whether it is
+/// disabled. Disabling closes its open sessions; its tokens are refused
+/// from then on. The technical name never changes.
 pub(super) async fn update_agent(
     State(admin): State<Arc<Admin>>,
     Extension(me): Extension<SignedIn>,
@@ -375,11 +379,25 @@ pub(super) async fn update_agent(
             "the note must be at most {NOTE_MAX_CHARS} characters"
         ));
     }
+    let display_name = match form
+        .display_name
+        .as_deref()
+        .map(crate::db::clean_display_name)
+    {
+        None => None,
+        Some(Ok(cleaned)) => Some(cleaned),
+        Some(Err(why)) => return bad_request(&why),
+    };
     let state = admin.clone();
     let result =
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
             if !known_agent(&state, &name)? {
                 return Ok(None);
+            }
+            if let Some(display) = &display_name {
+                state
+                    .db
+                    .set_agent_display_name(&name, display.as_deref(), &me.username)?;
             }
             if avatar.is_some() || note.is_some() {
                 state.db.set_agent_details(

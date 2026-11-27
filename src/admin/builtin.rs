@@ -568,11 +568,12 @@ fn agent_view(
         .db
         .builtin_agent(name)?
         .ok_or_else(|| anyhow::anyhow!("the built-in agent {name} has no row"))?;
-    let avatar = admin
-        .db
-        .registry_agent(name)?
+    let registry = admin.db.registry_agent(name)?;
+    let avatar = registry
+        .as_ref()
         .map(|agent| avatars::effective(name, &agent.avatar).to_string())
         .unwrap_or_else(|| avatars::default_for(name).to_string());
+    let display_name = registry.and_then(|agent| agent.display_name);
     let kind = kind_of(hub, name, &stored.kind);
     let link = hub.link(name);
     let provider = link
@@ -603,6 +604,8 @@ fn agent_view(
         .unwrap_or_default();
     Ok(json!({
         "name": stored.name,
+        // What the page shows; `name` stays the identity.
+        "display_name": display_name,
         "kind": kind.map(Kind::id),
         "provider": provider,
         "avatar": avatar,

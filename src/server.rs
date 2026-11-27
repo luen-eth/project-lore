@@ -2556,7 +2556,11 @@ impl Lore {
                 "busy" => format!("busy with {}", agent.detail),
                 _ => format!("off: {}", agent.detail),
             };
-            out.push_str(&format!("- {}{kind} · {model} · {state}\n", agent.name));
+            let shown = match &agent.display_name {
+                Some(display) => format!("{} ({display})", agent.name),
+                None => agent.name.clone(),
+            };
+            out.push_str(&format!("- {shown}{kind} · {model} · {state}\n"));
         }
         out.push_str(&format!(
             "\nHow to use them:\n\

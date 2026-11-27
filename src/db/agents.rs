@@ -115,6 +115,27 @@ pub struct OAuthClient {
     pub redirect_uris: Vec<String>,
 }
 
+/// Longest display name, in characters.
+pub const DISPLAY_NAME_MAX_CHARS: usize = 40;
+
+/// A display name as the owner typed it: trimmed, 1 to 40 characters, no
+/// control characters (newlines included). Empty clears it (`None`).
+pub fn clean_display_name(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("a display name is one line without control characters".into());
+    }
+    if trimmed.chars().count() > DISPLAY_NAME_MAX_CHARS {
+        return Err(format!(
+            "a display name is at most {DISPLAY_NAME_MAX_CHARS} characters"
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// One registry row.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RegistryAgent {
@@ -122,6 +143,9 @@ pub struct RegistryAgent {
     pub kind: String,
     pub avatar: String,
     pub note: String,
+    /// The name the page shows instead of `name`, when the owner set one.
+    /// `name` stays the agent's identity everywhere.
+    pub display_name: Option<String>,
     pub disabled: bool,
     pub created_at: String,
     pub created_by: String,
@@ -264,6 +288,7 @@ pub struct AgentRecord {
     pub avatar: String,
     pub avatar_chosen: bool,
     pub note: String,
+    pub display_name: Option<String>,
     pub disabled: bool,
     pub registered_at: Option<String>,
     pub registered_by: String,
@@ -322,7 +347,7 @@ impl Db {
     pub fn oauth_agents(&self) -> Result<Vec<RegistryAgent>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT name, kind, avatar, note, disabled, created_at, created_by
+            "SELECT name, kind, avatar, note, disabled, created_at, created_by, display_name
              FROM agent_registry WHERE kind = 'oauth' ORDER BY name",
         )?;
         let rows = stmt.query_map([], registry_from_row)?;
@@ -348,6 +373,49 @@ impl Db {
             "UPDATE agent_registry SET avatar = COALESCE(?2, avatar), note = COALESCE(?3, note)
              WHERE name = ?1",
             params![name, avatar, note],
+        )?;
+        get_registry_agent(&conn, name)?.context("agent vanished after update")
+    }
+
+    /// Sets (or with `None` clears) the name the page shows for an agent;
+    /// `display` must already be checked (`clean_display_name`). Refuses a
+    /// display name that is another agent's technical name. Gives an agent
+    /// without a row a `token` row, like `set_agent_details`.
+    pub fn set_agent_display_name(
+        &self,
+        name: &str,
+        display: Option<&str>,
+        by: &str,
+    ) -> Result<RegistryAgent> {
+        let conn = self.lock();
+        if let Some(display) = display {
+            let lowered = display.to_lowercase();
+            if lowered != name {
+                for (table, column) in AGENT_HISTORY
+                    .iter()
+                    .copied()
+                    .chain([("agent_registry", "name")])
+                {
+                    let taken: bool = conn.query_row(
+                        &format!("SELECT COUNT(*) > 0 FROM {table} WHERE lower({column}) = ?1"),
+                        params![lowered],
+                        |row| row.get(0),
+                    )?;
+                    if taken {
+                        anyhow::bail!(
+                            "\"{display}\" is another agent's name; pick a display name that is not"
+                        );
+                    }
+                }
+            }
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO agent_registry (name, kind, created_by) VALUES (?1, 'token', ?2)",
+            params![name, by],
+        )?;
+        conn.execute(
+            "UPDATE agent_registry SET display_name = ?2 WHERE name = ?1",
+            params![name, display],
         )?;
         get_registry_agent(&conn, name)?.context("agent vanished after update")
     }
@@ -802,6 +870,7 @@ impl Db {
             avatar: avatars::default_for(name).to_string(),
             avatar_chosen: false,
             note: String::new(),
+            display_name: None,
             disabled: false,
             registered_at: None,
             registered_by: String::new(),
@@ -817,7 +886,7 @@ impl Db {
         }
         {
             let mut stmt = conn.prepare(
-                "SELECT name, kind, avatar, note, disabled, created_at, created_by
+                "SELECT name, kind, avatar, note, disabled, created_at, created_by, display_name
                  FROM agent_registry",
             )?;
             for row in stmt.query_map([], registry_from_row)? {
@@ -829,6 +898,7 @@ impl Db {
                 record.avatar = avatars::effective(&row.name, &row.avatar).to_string();
                 record.avatar_chosen = avatars::is_known(&row.avatar);
                 record.note = row.note;
+                record.display_name = row.display_name;
                 record.disabled = row.disabled;
                 record.registered_at = Some(row.created_at);
                 record.registered_by = row.created_by;
@@ -1001,7 +1071,7 @@ fn revoke_grant(conn: &Connection, grant_id: i64) -> Result<()> {
 fn get_registry_agent(conn: &Connection, name: &str) -> Result<Option<RegistryAgent>> {
     Ok(conn
         .query_row(
-            "SELECT name, kind, avatar, note, disabled, created_at, created_by
+            "SELECT name, kind, avatar, note, disabled, created_at, created_by, display_name
              FROM agent_registry WHERE name = ?1",
             params![name],
             registry_from_row,
@@ -1018,6 +1088,7 @@ fn registry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegistryAgent>
         disabled: row.get(4)?,
         created_at: row.get(5)?,
         created_by: row.get(6)?,
+        display_name: row.get(7)?,
     })
 }
 
@@ -1037,6 +1108,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("lore.db");
         (Db::open(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn a_display_name_is_one_short_line_and_empty_clears_it() {
+        assert_eq!(clean_display_name("  Claude  "), Ok(Some("Claude".into())));
+        assert_eq!(clean_display_name("   "), Ok(None));
+        assert_eq!(clean_display_name(""), Ok(None));
+        assert!(clean_display_name("two\nlines").is_err());
+        assert!(clean_display_name("tab\there").is_err());
+        assert!(clean_display_name("bell\u{7}").is_err());
+        assert_eq!(
+            clean_display_name(&"é".repeat(40)),
+            Ok(Some("é".repeat(40)))
+        );
+        assert!(clean_display_name(&"x".repeat(41)).is_err());
+    }
+
+    #[test]
+    fn a_display_name_never_takes_another_agent_s_name_and_never_renames() {
+        let (db, _) = temp_db("display");
+        db.register_token_agents(&["claude-builtin".into(), "codex".into()])
+            .unwrap();
+        let row = db
+            .set_agent_display_name("claude-builtin", Some("Claude <b>"), "admin")
+            .unwrap();
+        assert_eq!(row.name, "claude-builtin");
+        assert_eq!(row.display_name.as_deref(), Some("Claude <b>"));
+        // Another agent's technical name, in any case, is refused; its own
+        // is allowed.
+        assert!(
+            db.set_agent_display_name("claude-builtin", Some("Codex"), "admin")
+                .is_err()
+        );
+        assert!(
+            db.set_agent_display_name("claude-builtin", Some("Claude-Builtin"), "admin")
+                .is_ok()
+        );
+        let records = db.agent_records(&[]).unwrap();
+        let record = records.iter().find(|r| r.name == "claude-builtin").unwrap();
+        assert_eq!(record.display_name.as_deref(), Some("Claude-Builtin"));
+        assert!(records.iter().all(|r| r.name != "Claude-Builtin"));
+        let summary = db.agents(&[]).unwrap();
+        assert_eq!(
+            summary
+                .iter()
+                .find(|a| a.name == "claude-builtin")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Claude-Builtin")
+        );
+        // Cleared: the technical name shows again.
+        let row = db
+            .set_agent_display_name("claude-builtin", None, "admin")
+            .unwrap();
+        assert_eq!(row.display_name, None);
+    }
+
+    /// Schema 9 adds a nullable column and nothing else: a database of
+    /// schema 8 with rows keeps every row, gets the column (NULL), and a
+    /// second start changes nothing.
+    #[test]
+    fn schema_nine_adds_the_display_name_to_a_schema_eight_database() {
+        let (db, path) = temp_db("schema9");
+        db.register_token_agents(&["alpha".into(), "beta".into()])
+            .unwrap();
+        db.set_agent_details("alpha", Some("nova"), Some("a note"), "admin")
+            .unwrap();
+        {
+            let conn = db.lock();
+            conn.execute_batch(
+                "ALTER TABLE agent_registry DROP COLUMN display_name;
+                 UPDATE meta SET value = '8' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        }
+        drop(db);
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            let conn = db.lock();
+            let version: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(version, crate::db::SCHEMA_VERSION.to_string());
+            assert_eq!(crate::db::SCHEMA_VERSION, 9);
+            let rows: Vec<(String, String, String, Option<String>)> = conn
+                .prepare(
+                    "SELECT name, avatar, note, display_name FROM agent_registry ORDER BY name",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("alpha".into(), "nova".into(), "a note".into(), None),
+                    ("beta".into(), "".into(), "".into(), None),
+                ]
+            );
+        }
     }
 
     fn client(db: &Db, id: &str) {

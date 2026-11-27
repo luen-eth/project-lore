@@ -229,6 +229,9 @@ pub enum AskOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assistant {
     pub name: String,
+    /// The name the owner shows for it on the admin page, if any; `name`
+    /// is how it is addressed.
+    pub display_name: Option<String>,
     pub kind: String,
     pub model: String,
     /// `idle`, `busy` or `off`.
@@ -2144,8 +2147,13 @@ impl TaskRunner {
                 }
                 Some(why) => ("off", why),
             };
+            let display_name = self
+                .db
+                .registry_agent(&agent.name)?
+                .and_then(|row| row.display_name);
             out.push(Assistant {
                 name: agent.name.clone(),
+                display_name,
                 kind: self
                     .hub
                     .link(&agent.name)

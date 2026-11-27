@@ -333,8 +333,9 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// 7: run hardening (`tasks.author`, `touches`, `auto_seen`;
 /// `sessions.token_agent`; `builtin_agents.read_other_services`;
 /// `agent_runs.output_bytes`). 8: run confirmation and provenance
-/// (`agent_run_refs`, `run_writes`; `agent_runs.base_head`).
-pub const SCHEMA_VERSION: i64 = 8;
+/// (`agent_run_refs`, `run_writes`; `agent_runs.base_head`). 9: an
+/// agent's display name (`agent_registry.display_name`, nullable).
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Columns every database lore ever created has in `entries`: a full
 /// backup without them is not a lore database.
@@ -416,6 +417,10 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // Run confirmation (schema 8): the default branch's head lore read
     // itself before the run started.
     ("agent_runs", "base_head", "TEXT NOT NULL DEFAULT ''"),
+    // Display names (schema 9): what the page shows for an agent, which
+    // the owner may change; NULL shows the technical name, which stays the
+    // agent's identity everywhere.
+    ("agent_registry", "display_name", "TEXT"),
 ];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1319,6 +1324,8 @@ pub struct AgentSummary {
     pub entries: i64,
     /// The avatar id the page shows for the agent.
     pub avatar: String,
+    /// The name the page shows, when the owner gave one.
+    pub display_name: Option<String>,
 }
 
 /// An entry as drawn in the admin graph (no body).
@@ -4303,6 +4310,7 @@ impl Db {
                     seconds_since_seen: row.get(5)?,
                     entries: 0,
                     avatar: String::new(),
+                    display_name: None,
                 })
             })?;
             for row in rows {
@@ -4313,6 +4321,13 @@ impl Db {
         // connected can have its service levels lowered.
         let avatars: HashMap<String, String> = {
             let mut stmt = conn.prepare("SELECT name, avatar FROM agent_registry")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let display_names: HashMap<String, String> = {
+            let mut stmt = conn.prepare(
+                "SELECT name, display_name FROM agent_registry WHERE display_name IS NOT NULL",
+            )?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -4332,6 +4347,7 @@ impl Db {
                     requests: 0,
                     entries: 0,
                     avatar: String::new(),
+                    display_name: None,
                 });
             }
         }
@@ -4339,6 +4355,7 @@ impl Db {
             agent.entries = written.get(&agent.name).copied().unwrap_or(0);
             let chosen = avatars.get(&agent.name).map(String::as_str).unwrap_or("");
             agent.avatar = crate::avatars::effective(&agent.name, chosen).to_string();
+            agent.display_name = display_names.get(&agent.name).cloned();
         }
         agents.sort_by_key(|a| (a.seconds_since_seen.unwrap_or(i64::MAX), a.name.clone()));
         Ok(agents)

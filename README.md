@@ -685,12 +685,27 @@ and when it was last used); and what it did: memories logged in total and by kin
 sessions (total and open), tool calls in the last 24 hours, 7 days and 30 days
 (counted from the activity feed, which keeps its newest 2000 actions), service calls
 by provider and outcome (from the operations log), tasks completed, files saved,
-first and last seen. From the card the avatar and the note are changed, the agent is
+first and last seen. From the card (**Name, avatar and note**) the display name, the
+avatar and the note are changed, the agent is
 disabled or enabled (disabling refuses its tokens and closes its open sessions), an
 OAuth agent's authorization is revoked (it has to authorize again) or deleted
 entirely (what it wrote stays), and **Service levels** opens its row in the
 Integrations panel. Every signed-in user still sees the read-only Connected models
 list.
+
+**Display names.** An agent's technical name (`claude-builtin`, `codex`, an OAuth
+agent's name) is its identity: it is in `LORE_TOKENS` and `LORE_RUNNER_TOKENS`, in
+sessions, entries, tasks, the operations log, commit authorship and the runner link,
+and it never changes. Every agent, built-in or not, may also get a **display name**
+(1 to 40 characters, one line, no control characters; empty clears it), set with the
+`agents` permission and kept in `agent_registry.display_name` (schema 9). The admin
+page shows it wherever a person reads an agent's name: the agent cards (with the
+technical name small beneath), Connected models, the graph's agent bubbles, Live
+activity, the board, the built-in agents' cards, the terminal window and the terminal
+icon's menu, with the technical name in a tooltip where it is not shown. It may not
+be another agent's technical name (in any case), so the logs stay unambiguous. Agents
+keep addressing each other by technical name: `assistants` lists a built-in agent as
+`claude-builtin (Claude)`.
 
 Every agent has one of ten built-in avatars (`orbit`, `comet`, `nova`, `prism`,
 `wave`, `ember`, `lattice`, `crescent`, `pulsar`, `hexa`), served from the binary at
@@ -756,7 +771,7 @@ can read everything the viewer reads.
 | `restore` | import and restore JSON backups. Restoring a **full database** needs every permission, not just this one |
 | `settings` | edit the profile and the rules |
 | `integrations` | store, test and remove service credentials, set the per-agent service levels and the kill switch |
-| `agents` | manage agents (avatar, note, disable, revoke, delete an authorization) and approve new ones on the OAuth consent page; sign the built-in agents in and out and set their model, switches, daily cap and active hours. Approving gives the agent the shared memory, the board and the files; service access only when the approver also holds `integrations` (see *Without a token*) |
+| `agents` | manage agents (display name, avatar, note, disable, revoke, delete an authorization) and approve new ones on the OAuth consent page; sign the built-in agents in and out and set their model, switches, daily cap and active hours. Approving gives the agent the shared memory, the board and the files; service access only when the approver also holds `integrations` (see *Without a token*) |
 | `users` | add, change and delete users, within the limits below |
 
 A user can be edited (e-mail, permissions, disabled, a new password) or deleted;
