@@ -216,6 +216,17 @@ const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/admin/avatars/{file}", Access::Public),
     ("GET", "/admin/api/session", Access::Public),
     ("POST", "/admin/api/login", Access::Public),
+    // The second step of a sign-in (needs the lore_pending cookie a right
+    // password gives) and passwordless passkey sign-in.
+    (
+        "POST",
+        "/admin/api/login/second-factor/passkey-options",
+        Access::Public,
+    ),
+    ("POST", "/admin/api/login/second-factor", Access::Public),
+    ("POST", "/admin/api/login/cancel", Access::Public),
+    ("POST", "/admin/api/login/passkey/options", Access::Public),
+    ("POST", "/admin/api/login/passkey", Access::Public),
     ("POST", "/admin/api/logout", Access::Public),
     ("GET", "/admin/api/brain", Access::SignedIn),
     ("GET", "/admin/api/pulse", Access::SignedIn),
@@ -451,6 +462,15 @@ pub struct Admin {
     /// lore's own secrets, redacted from the Test button's answer too.
     guard: ops::Guard,
     sessions: Mutex<HashMap<String, AdminSession>>,
+    /// Sign-ins whose password was right and that wait for a second
+    /// factor, by the `lore_pending` cookie.
+    pending: Mutex<HashMap<String, security::PendingSignIn>>,
+    /// WebAuthn challenges handed out and not yet answered.
+    ceremonies: Mutex<HashMap<String, security::Ceremony>>,
+    /// Failed second-factor attempts per account, from any address.
+    second_factor_failures: RateLimiter,
+    /// Passwordless passkey options per address.
+    passkey_options: RateLimiter,
     logins: RateLimiter,
     /// Argon2 verifications running at once, at most `ARGON_PERMITS`: each
     /// takes 19 MiB and a core, so a flood of sign-ins is answered 429
@@ -524,6 +544,12 @@ impl Admin {
             vault,
             guard,
             sessions: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            ceremonies: Mutex::new(HashMap::new()),
+            // Ten wrong codes lock an account's second step for fifteen
+            // minutes, whatever address they come from.
+            second_factor_failures: RateLimiter::new(10, Duration::from_secs(15 * 60)),
+            passkey_options: RateLimiter::new(30, Duration::from_secs(10 * 60)),
             // Five wrong attempts lock the address out for fifteen minutes.
             logins: RateLimiter::new(5, Duration::from_secs(15 * 60)),
             argon: Arc::new(tokio::sync::Semaphore::new(ARGON_PERMITS)),
@@ -613,6 +639,21 @@ impl Admin {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn pending_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, security::PendingSignIn>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn ceremony_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, security::Ceremony>> {
+        self.ceremonies.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Forgets every pending sign-in and WebAuthn challenge, after a full
+    /// restore replaced the credentials they were made for.
+    fn clear_sign_in_state(&self) {
+        self.pending_map().clear();
+        self.ceremony_map().clear();
+    }
+
     /// Who the session a request carries belongs to, if it is live.
     fn signed_in(&self, headers: &HeaderMap) -> Option<SignedIn> {
         let token = cookie(headers, COOKIE)?;
@@ -625,6 +666,12 @@ impl Admin {
     /// `keep` (the session making the change), whose permissions are
     /// brought up to date.
     fn end_sessions_of_account(&self, account: &str, keep: Option<&str>, perms: Option<Perms>) {
+        self.pending_map()
+            .retain(|_, pending| pending.account != account);
+        self.ceremony_map().retain(|_, ceremony| {
+            ceremony.account.as_deref() != Some(account)
+                || keep.is_some_and(|keep| ceremony.bound_to == keep)
+        });
         let mut sessions = self.sessions();
         sessions
             .retain(|token, session| session.account != account || Some(token.as_str()) == keep);
@@ -749,6 +796,27 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
         )
         .route("/admin/api/session", get(session))
         .route("/admin/api/login", post(login))
+        .route(
+            "/admin/api/login/second-factor/passkey-options",
+            post(security::second_factor_passkey_options)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/login/second-factor",
+            post(security::second_factor).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/login/cancel",
+            post(security::cancel_pending).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/login/passkey/options",
+            post(security::passkey_options).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
+        .route(
+            "/admin/api/login/passkey",
+            post(security::passkey_sign_in).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
         .route("/admin/api/logout", post(logout))
         // Reading: any signed-in user.
         .route("/admin/api/brain", get(brain))
@@ -1013,7 +1081,9 @@ async fn session(State(admin): State<Arc<Admin>>, headers: HeaderMap) -> Json<se
                 .map(|session| (session.break_glass, session.methods.clone()))
         })
         .unwrap_or_default();
+    let pending = security::pending_summary(&admin, &headers);
     Json(json!({
+        "second_factor_pending": pending,
         "break_glass": break_glass,
         "methods": methods,
         "fresh_for": admin.fresh_for(&headers),
@@ -1313,9 +1383,54 @@ async fn login(
             &ip,
             "",
         );
-        return finish_sign_in(&admin, &ip, user, vec!["password-env-break-glass"], true).await;
+        return finish_sign_in(
+            &admin,
+            &ip,
+            user,
+            vec!["password-env-break-glass"],
+            true,
+            SignInExtras::default(),
+        )
+        .await;
     }
-    finish_sign_in(&admin, &ip, user, vec!["password"], false).await
+    // A second factor, when the account has one: the session waits for it.
+    let rp = admin.relying_party(&headers);
+    let state = admin.clone();
+    let account = user.account();
+    let factors = tokio::task::spawn_blocking(move || {
+        security::second_factors(&state, &account, rp.as_ref())
+    })
+    .await;
+    match factors {
+        Ok(Ok(factors)) if factors.any => security::start_pending(&admin, &ip, user, factors),
+        Ok(Ok(_)) => {
+            finish_sign_in(
+                &admin,
+                &ip,
+                user,
+                vec!["password"],
+                false,
+                SignInExtras::default(),
+            )
+            .await
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "reading the second factors failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "the second-factor task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// What a completed sign-in answers beyond the session: fields to add to
+/// the body and cookies to clear.
+#[derive(Default)]
+struct SignInExtras {
+    body: Option<(&'static str, serde_json::Value)>,
+    clear_cookies: Vec<&'static str>,
 }
 
 /// Notes a sign-in or credential event in the sign-in log; a failure to
@@ -1337,6 +1452,7 @@ async fn finish_sign_in(
     user: SignedIn,
     methods: Vec<&'static str>,
     break_glass: bool,
+    extras: SignInExtras,
 ) -> Response {
     let token = match random_token() {
         Ok(token) => token,
@@ -1378,7 +1494,7 @@ async fn finish_sign_in(
         ip,
         &detail,
     );
-    let body = json!({
+    let mut body = json!({
         "ok": true,
         "role": user.role(),
         "username": user.username,
@@ -1386,8 +1502,22 @@ async fn finish_sign_in(
         "stored": user.user_id.is_some(),
         "break_glass": break_glass,
     });
+    if let Some((key, value)) = extras.body {
+        body[key] = value;
+    }
     tracing::info!(%ip, user = %user.username, methods = %detail, "signed in to the admin view");
-    ([(header::SET_COOKIE, session_cookie(&token))], Json(body)).into_response()
+    let mut response = ([(header::SET_COOKIE, session_cookie(&token))], Json(body)).into_response();
+    for name in extras.clear_cookies {
+        if let Ok(value) = HeaderValue::from_str(&expired_cookie(name)) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+    response
+}
+
+/// A cookie of the admin path, removed.
+fn expired_cookie(name: &str) -> String {
+    format!("{name}=; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age=0")
 }
 
 /// Inserts the session for a checked sign-in, with the password-only
@@ -2014,6 +2144,7 @@ fn restore_prepared(
             tracing::error!(%error, snapshot = %snapshot, "a full restore failed after the database was replaced");
             // The sessions follow what the database now holds.
             keep_sessions_of_existing_users(admin);
+            admin.clear_sign_in_state();
             db::Refusal {
                 check: "after-load",
                 message: format!(
@@ -2039,6 +2170,9 @@ fn restore_prepared(
         }
     });
     keep_sessions_of_existing_users(admin);
+    // Pending sign-ins and challenges were made for the replaced
+    // credentials.
+    admin.clear_sign_in_state();
     let entries = counts
         .iter()
         .find(|(table, _)| table == "entries")
@@ -7875,5 +8009,553 @@ mod tests {
             .auth_events(Some(&db::user_account(user.id)), 10)
             .unwrap();
         assert_eq!(events[0].event, "password.set_by_other");
+    }
+    /// The value of a cookie a response sets.
+    fn cookie_of(response: &reqwest::Response, name: &str) -> Option<String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| value.strip_prefix(&format!("{name}=")))
+            .and_then(|rest| rest.split(';').next())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Gives an account an authenticator app; returns its key.
+    fn give_totp(admin: &Admin, account: &str) -> Vec<u8> {
+        let secret = crate::totp::new_secret().unwrap();
+        let (nonce, sealed) = admin
+            .vault
+            .as_ref()
+            .unwrap()
+            .encrypt("totp", account, &secret);
+        admin.db.set_totp(account, &nonce, &sealed, 0).unwrap();
+        crate::totp::decode_secret(&secret).unwrap()
+    }
+
+    fn code_now(key: &[u8]) -> String {
+        crate::totp::hotp(key, crate::totp::now() / crate::totp::PERIOD, 6)
+    }
+
+    /// Gives an account a passkey for the test server's address.
+    fn give_passkey(admin: &Admin, account: &str) -> crate::webauthn::soft::Authenticator {
+        let mut device = crate::webauthn::soft::Authenticator::es256();
+        device.user_handle = Some(admin.db.webauthn_user_handle(account).unwrap());
+        admin
+            .db
+            .add_credential(&db::NewCredential {
+                account: account.into(),
+                credential_id: device.credential_id.clone(),
+                rp_id: "127.0.0.1".into(),
+                public_key: device.cose_key(),
+                alg: crate::webauthn::ALG_ES256,
+                sign_count: 0,
+                uv_initialized: true,
+                backup_eligible: false,
+                backup_state: false,
+                discoverable: Some(true),
+                transports: vec!["internal".into()],
+                aaguid: vec![0; 16],
+                attestation_fmt: "none".into(),
+                name: "test key".into(),
+            })
+            .unwrap();
+        device
+    }
+
+    async fn post_with(
+        base: &str,
+        path: &str,
+        cookies: &str,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{base}{path}"))
+            .header(header::COOKIE, cookies)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Signs in with a password and returns the pending cookie.
+    async fn pending_for(base: &str, username: &str, password: &str) -> String {
+        let response = login(base, json!({ "username": username, "password": password })).await;
+        assert_eq!(response.status(), 200);
+        let pending = cookie_of(&response, "lore_pending").expect("a pending sign-in");
+        assert!(session_token_of(&response).is_none());
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["second_factor"]["username"], username);
+        format!("lore_pending={pending}")
+    }
+
+    fn challenge_of(options: &serde_json::Value) -> Vec<u8> {
+        crate::webauthn::b64url_decode(options["publicKey"]["challenge"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_authenticator_app_is_asked_for_after_the_password() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "unused");
+        let account = db::user_account(user.id);
+        let key = give_totp(&admin, &account);
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        let session: serde_json::Value = reqwest::Client::new()
+            .get(format!("{base}/admin/api/session"))
+            .header(header::COOKIE, &pending)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(session["authenticated"], false);
+        assert_eq!(session["second_factor_pending"]["methods"], json!(["totp"]));
+        // A method the account does not have is refused outright.
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "recovery", "code": "x" }),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        // Five wrong codes end the pending sign-in.
+        for attempt in 1..=5 {
+            let response = post_with(
+                &base,
+                "/admin/api/login/second-factor",
+                &pending,
+                json!({ "method": "totp", "code": "000000" }),
+            )
+            .await;
+            assert_eq!(response.status(), 401);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(
+                body["restart"].as_bool().unwrap_or(false),
+                attempt == 5,
+                "{attempt}"
+            );
+        }
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["restart"], true);
+        // Again, with the right code.
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        let code = code_now(&key);
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": code }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        assert!(has_session(&admin, &token));
+        assert_eq!(admin.sessions()[&token].methods, ["password", "totp"]);
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value.to_str().unwrap().starts_with("lore_pending=;"))
+        );
+        // The same code cannot sign in twice.
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": code }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+        let events: Vec<String> = admin
+            .db
+            .auth_events(Some(&account), 50)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event)
+            .collect();
+        assert!(events.contains(&"signin.pending".to_string()));
+        assert!(events.contains(&"signin.fail.second_factor".to_string()));
+        // Cancelling drops the pending sign-in.
+        let response = post_with(&base, "/admin/api/login/cancel", &pending, json!({})).await;
+        assert_eq!(response.status(), 200);
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn wrong_codes_lock_the_account_from_every_address() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "unused");
+        let key = give_totp(&admin, &db::user_account(user.id));
+        // Two pending sign-ins, five wrong codes each: the account's limit.
+        for _ in 0..2 {
+            let pending = pending_for(&base, "luis", "a-long-password").await;
+            for _ in 0..5 {
+                post_with(
+                    &base,
+                    "/admin/api/login/second-factor",
+                    &pending,
+                    json!({ "method": "totp", "code": "000000" }),
+                )
+                .await;
+            }
+        }
+        // A third sign-in (the password limit is per address and the
+        // password was right) meets the account limit even with the right
+        // code.
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 429);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn a_recovery_code_signs_in_once() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "unused");
+        let account = db::user_account(user.id);
+        give_totp(&admin, &account);
+        let (codes, hashes) = crate::totp::new_recovery_codes(&account).unwrap();
+        admin.db.replace_recovery_codes(&account, &hashes).unwrap();
+        // Another account's code is no code here.
+        let (other, _) = crate::totp::new_recovery_codes("admin").unwrap();
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "recovery", "code": other[0] }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "recovery", "code": codes[3].to_uppercase().replace('-', " ") }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["recovery_left"], 9);
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "recovery", "code": codes[3] }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn a_passkey_serves_as_the_second_step() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "unused");
+        let account = db::user_account(user.id);
+        let mut device = give_passkey(&admin, &account);
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        let options: serde_json::Value = post_with(
+            &base,
+            "/admin/api/login/second-factor/passkey-options",
+            &pending,
+            json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(options["publicKey"]["userVerification"], "preferred");
+        assert_eq!(options["publicKey"]["rpId"], "127.0.0.1");
+        assert_eq!(
+            options["publicKey"]["allowCredentials"][0]["id"],
+            crate::webauthn::b64url_encode(&device.credential_id)
+        );
+        // User presence alone is enough for a second step.
+        let answer = device.assert(
+            &challenge_of(&options),
+            &base,
+            "127.0.0.1",
+            crate::webauthn::soft::Flags::UP,
+        );
+        // Another pending sign-in cannot use this challenge.
+        let other = pending_for(&base, "luis", "a-long-password").await;
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &other,
+            json!({ "method": "passkey", "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+        // And a challenge is single use: it went with that attempt.
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "passkey", "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+        let options: serde_json::Value = post_with(
+            &base,
+            "/admin/api/login/second-factor/passkey-options",
+            &pending,
+            json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let answer = device.assert(
+            &challenge_of(&options),
+            &base,
+            "127.0.0.1",
+            crate::webauthn::soft::Flags::UP,
+        );
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "passkey", "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        assert_eq!(admin.sessions()[&token].methods, ["password", "passkey"]);
+        assert!(
+            admin.db.credentials(&account).unwrap()[0]
+                .last_used_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_passkey_alone_signs_in_with_user_verification() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &["write"], "unused");
+        let account = db::user_account(user.id);
+        let mut device = give_passkey(&admin, &account);
+        let options_for = || async {
+            let response =
+                post_with(&base, "/admin/api/login/passkey/options", "", json!({})).await;
+            assert_eq!(response.status(), 200);
+            let binding = cookie_of(&response, "lore_webauthn").unwrap();
+            let options: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(options["publicKey"]["userVerification"], "required");
+            assert_eq!(options["publicKey"]["allowCredentials"], json!([]));
+            (format!("lore_webauthn={binding}"), options)
+        };
+        // Without user verification: refused.
+        let (binding, options) = options_for().await;
+        let answer = device.assert(
+            &challenge_of(&options),
+            &base,
+            "127.0.0.1",
+            crate::webauthn::soft::Flags::UP,
+        );
+        let response = post_with(
+            &base,
+            "/admin/api/login/passkey",
+            &binding,
+            json!({ "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"], security::PASSKEY_REFUSED);
+        // Bound to the browser that asked: another cookie cannot finish it.
+        let (_, options) = options_for().await;
+        let answer = device.assert(
+            &challenge_of(&options),
+            &base,
+            "127.0.0.1",
+            crate::webauthn::soft::Flags::UP_UV,
+        );
+        let response = post_with(
+            &base,
+            "/admin/api/login/passkey",
+            "lore_webauthn=someone-else",
+            json!({ "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+        // With user verification: signed in, as the stored user.
+        let (binding, options) = options_for().await;
+        let answer = device.assert(
+            &challenge_of(&options),
+            &base,
+            "127.0.0.1",
+            crate::webauthn::soft::Flags::UP_UV,
+        );
+        let response = post_with(
+            &base,
+            "/admin/api/login/passkey",
+            &binding,
+            json!({ "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["username"], "luis");
+        assert_eq!(admin.sessions()[&token].methods, ["passkey-uv"]);
+        // The same answer again: the challenge is gone.
+        let response = post_with(
+            &base,
+            "/admin/api/login/passkey",
+            &binding,
+            json!({ "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+        // A disabled user is told so.
+        admin
+            .db
+            .update_user(
+                user.id,
+                &UserPatch {
+                    disabled: Some(true),
+                    ..UserPatch::default()
+                },
+            )
+            .unwrap();
+        let (binding, options) = options_for().await;
+        let answer = device.assert(
+            &challenge_of(&options),
+            &base,
+            "127.0.0.1",
+            crate::webauthn::soft::Flags::UP_UV,
+        );
+        let response = post_with(
+            &base,
+            "/admin/api/login/passkey",
+            &binding,
+            json!({ "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn a_user_changed_between_the_steps_is_refused() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "unused");
+        let account = db::user_account(user.id);
+        let key = give_totp(&admin, &account);
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        admin
+            .db
+            .update_user(
+                user.id,
+                &UserPatch {
+                    disabled: Some(true),
+                    ..UserPatch::default()
+                },
+            )
+            .unwrap();
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        // An administrator resetting the user ends the pending sign-in too.
+        admin
+            .db
+            .update_user(
+                user.id,
+                &UserPatch {
+                    disabled: Some(false),
+                    ..UserPatch::default()
+                },
+            )
+            .unwrap();
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        admin.end_sessions_of(user.id, None, None);
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_app_still_asks_for_the_second_step() {
+        // The secret was stored under another vault key: sign-in fails
+        // closed, offering nothing it can check.
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "unused");
+        let account = db::user_account(user.id);
+        let other = VaultKey::from_env_value(&"cd".repeat(32)).unwrap().unwrap();
+        let (nonce, sealed) = other.encrypt("totp", &account, &crate::totp::new_secret().unwrap());
+        admin.db.set_totp(&account, &nonce, &sealed, 0).unwrap();
+        let response = login(
+            &base,
+            json!({ "username": "luis", "password": "a-long-password" }),
+        )
+        .await;
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["second_factor"]["methods"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn every_write_route_refuses_a_cross_site_request() {
+        let (base, _admin) = serve().await;
+        let http = reqwest::Client::new();
+        for (method, path, _) in ROUTES.iter().chain(builtin::ROUTES) {
+            if *method == "GET" {
+                continue;
+            }
+            let url = format!(
+                "{base}{}",
+                path.replace("{id}", "1")
+                    .replace("{name}", "x")
+                    .replace("{provider}", "github")
+                    .replace("{file}", "x")
+            );
+            let response = http
+                .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), url)
+                .header(header::COOKIE, format!("{COOKIE}=admin-token"))
+                .header("sec-fetch-site", "cross-site")
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 403, "{method} {path}");
+        }
     }
 }

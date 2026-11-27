@@ -1417,6 +1417,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_consent_page_sign_in_asks_for_the_second_factor() {
+        let server = serve().await;
+        // Admin has a passkey and recovery codes: a second step.
+        server
+            .db
+            .add_credential(&db::NewCredential {
+                account: "admin".into(),
+                credential_id: vec![4; 32],
+                rp_id: "127.0.0.1".into(),
+                public_key: vec![0xa0],
+                alg: -7,
+                sign_count: 0,
+                uv_initialized: false,
+                backup_eligible: false,
+                backup_state: false,
+                discoverable: None,
+                transports: vec![],
+                aaguid: vec![0; 16],
+                attestation_fmt: "none".into(),
+                name: "key".into(),
+            })
+            .unwrap();
+        let (codes, hashes) = totp::new_recovery_codes("admin").unwrap();
+        server.db.replace_recovery_codes("admin", &hashes).unwrap();
+        let client_id = register(&server).await;
+        let (verifier, challenge) = pkce();
+        let id = authorize(&server, &client_id, &challenge).await;
+        // The password alone gives no session, only the second step.
+        let response = server
+            .http
+            .post(format!("{}/admin/api/login", server.base))
+            .json(&json!({ "username": "admin", "password": ADMIN_PASSWORD }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let pending = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(pending.starts_with("lore_pending="), "{pending}");
+        let pending = pending.split(';').next().unwrap().to_string();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(
+            body["second_factor"]["methods"],
+            json!(["passkey", "recovery"])
+        );
+        let (status, _) = consent(&server, &pending, &id).await;
+        assert_eq!(status, 401);
+        // The recovery code finishes the sign-in; the consent works.
+        let response = server
+            .http
+            .post(format!("{}/admin/api/login/second-factor", server.base))
+            .header(header::COOKIE, &pending)
+            .json(&json!({ "method": "recovery", "code": codes[0] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let session = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .find(|value| value.starts_with("lore_session="))
+            .unwrap();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["recovery_left"], 9);
+        let (status, request) = consent(&server, &session, &id).await;
+        assert_eq!(status, 200, "{request}");
+        let (status, approved) = approve(
+            &server,
+            &session,
+            &id,
+            json!({ "csrf": request["csrf"], "mode": "new", "name": "two-step", "avatar": "comet" }),
+        )
+        .await;
+        assert_eq!(status, 200, "{approved}");
+        let query = query_of(approved["redirect"].as_str().unwrap());
+        let (status, tokens) = exchange(&server, &client_id, &verifier, &query["code"]).await;
+        assert_eq!(status, 200, "{tokens}");
+        let access = tokens["access_token"].as_str().unwrap();
+        assert_eq!(tools_list(&server, access).await.status(), 200);
+        // Agent tokens never meet the second step.
+        assert_eq!(tools_list(&server, ENV_TOKEN).await.status(), 200);
+    }
+
+    #[tokio::test]
     async fn codes_are_single_use_bound_and_short_lived() {
         let server = serve().await;
         // Wrong verifier: refused, and the code is used up.
