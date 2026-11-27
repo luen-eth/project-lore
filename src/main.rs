@@ -176,9 +176,11 @@ async fn run() -> Result<()> {
         Err(error) => tracing::warn!(%error, "checking the project aliases failed"),
     }
     let status_lang = env_or("LORE_TOOL_STATUS_LANG", "tr");
-    let Some(status_lang) = toolui::Lang::parse(&status_lang) else {
-        bail!("LORE_TOOL_STATUS_LANG must be tr, en or off");
-    };
+    // A display setting must never keep lore from starting.
+    let status_lang = toolui::Lang::parse(&status_lang).unwrap_or_else(|| {
+        tracing::warn!(value = %status_lang, "LORE_TOOL_STATUS_LANG must be tr, en or off; using tr");
+        toolui::Lang::parse("tr").expect("tr is a known language")
+    });
     toolui::set_lang(status_lang);
     let semantic = flag("LORE_EMBEDDINGS", true);
     let embedder = if semantic {

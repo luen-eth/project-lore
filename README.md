@@ -2677,7 +2677,7 @@ only ask less, never more, than before.
 | `LORE_EMBEDDING_MODEL` | `bge-m3` | `bge-m3`, `e5-large`, `e5-base` or `e5-small`. Changing it re-embeds every entry. |
 | `LORE_EMBEDDINGS` | `on` | `off` gives keyword-only search with no model download. |
 | `LORE_MIN_SIMILARITY` | per model | Similarity below which a meaning-only match is dropped. |
-| `LORE_TOOL_STATUS_LANG` | `tr` | Language of the status texts ChatGPT shows while a tool runs (see *Connecting a chat web app*): `tr`, `en` or `off`. Anything else refuses to start. Read at start-up. |
+| `LORE_TOOL_STATUS_LANG` | `tr` | Language of the status texts ChatGPT shows while a tool runs (see *Connecting a chat web app*): `tr`, `en` or `off`. Anything else logs a warning and uses `tr`. Read at start-up. |
 | `LORE_SESSION_IDLE_HOURS` | `12` | Hours without activity after which an open session is closed. Whole number between 1 and 720. |
 | `LORE_ALLOWED_HOSTS` | any | Hostnames accepted in the `Host` header. |
 | `LORE_TRUST_PROXY` | `on` in Docker | Read the client address from `X-Forwarded-For`. Turn off if the port is exposed directly. |
