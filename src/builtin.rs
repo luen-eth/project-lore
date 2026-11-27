@@ -1379,6 +1379,27 @@ impl Hub {
         let generation = self.next_id();
         {
             let mut inner = self.inner();
+            // A replaced link takes its terminals with it: their PTYs died
+            // with the old runner session, and their tokens must not
+            // outlive it. Their pages hear why.
+            if inner.links.contains_key(&agent) {
+                let gone: Vec<String> = inner
+                    .terminals
+                    .iter()
+                    .filter(|(_, terminal)| terminal.agent == agent)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in gone {
+                    if let Some(terminal) = inner.terminals.remove(&id) {
+                        let _ = terminal.tx.try_send(TerminalEvent::Exit {
+                            code: None,
+                            message: Some(
+                                "the agent's runner reconnected; open the terminal again".into(),
+                            ),
+                        });
+                    }
+                }
+            }
             inner.links.insert(
                 agent.clone(),
                 Link {
@@ -2120,6 +2141,58 @@ esac
                 .await,
             Err(HubError::NotConnected)
         ));
+    }
+
+    /// A runner that dials again while its old link still sits in the hub
+    /// (dead, not yet noticed) replaces it, and the old link's terminals go
+    /// with it: their pages hear why and their tokens stop working.
+    #[tokio::test]
+    async fn a_replaced_link_closes_its_terminals_and_their_tokens() {
+        use crate::auth::{Authenticated, McpAuth, Refused};
+        let pair = listen().await;
+        let token = new_terminal_token().unwrap();
+        let (page_tx, mut page_rx) = mpsc::channel(8);
+        {
+            let (dead_tx, dead_rx) = mpsc::channel(1);
+            drop(dead_rx);
+            let mut inner = pair.hub.inner();
+            inner.links.insert(
+                "claude-builtin".into(),
+                Link {
+                    generation: 0,
+                    tx: dead_tx,
+                    kind: Kind::Claude,
+                    provider: "anthropic".into(),
+                    address: Some("127.0.0.1".parse().unwrap()),
+                },
+            );
+            inner.terminals.insert(
+                "t-old".into(),
+                Terminal {
+                    agent: "claude-builtin".into(),
+                    tx: page_tx,
+                    token_hash: Some(crate::oauth::token_hash(&token)),
+                },
+            );
+        }
+        let mut auth = McpAuth::new(Vec::new(), pair.db.clone(), false);
+        auth.terminals = Some(pair.hub.clone());
+        let local: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, Some(local)).await,
+            Ok(Authenticated::Terminal("claude-builtin".into()))
+        );
+        start(config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET));
+        let exit = tokio::time::timeout(WAIT, page_rx.recv()).await.unwrap();
+        assert!(
+            matches!(&exit, Some(TerminalEvent::Exit { message: Some(why), .. }) if why.contains("reconnected")),
+            "{exit:?}"
+        );
+        assert_eq!(pair.hub.terminal_count(), 0);
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, Some(local)).await,
+            Err(Refused::Invalid)
+        );
     }
 
     #[tokio::test]
