@@ -187,6 +187,15 @@ pub struct CliHome {
     /// opencode's directory on the exec-capable mount (`Fresh::exec_tmp`),
     /// deleted with the home.
     exec_tmp: Option<PathBuf>,
+    /// A terminal's MCP configuration: a runner-owned directory beside the
+    /// home (root 0755, files 0644), never inside it, because the runner
+    /// has no CAP_DAC_OVERRIDE and cannot write into a home it handed
+    /// over. Deleted with the home.
+    side: Option<PathBuf>,
+    /// The home's Claude settings name the API key through `apiKeyHelper`
+    /// (a terminal with the API key): the CLI then gets the key in
+    /// `LORE_CLAUDE_API_KEY` instead of `ANTHROPIC_API_KEY`.
+    key_helper: bool,
     /// The driver's set of paths in use, which the janitor leaves alone;
     /// this home leaves it when dropped.
     live: Option<Live>,
@@ -268,11 +277,19 @@ impl Drop for CliHome {
         {
             tracing::warn!(path = %exec_tmp.display(), %error, "a CLI's exec temporary directory could not be deleted");
         }
+        if let Some(side) = &self.side
+            && let Err(error) = sandbox::remove_tree(side)
+        {
+            tracing::warn!(path = %side.display(), %error, "a terminal's configuration could not be deleted");
+        }
         if let Some(live) = &self.live {
             let mut live = live.lock().unwrap_or_else(|e| e.into_inner());
             live.remove(&self.path);
             if let Some(exec_tmp) = &self.exec_tmp {
                 live.remove(exec_tmp);
+            }
+            if let Some(side) = &self.side {
+                live.remove(side);
             }
         }
     }
@@ -315,6 +332,18 @@ pub struct Driver {
     /// Claude: the owner's order and fallback, what was refused lately and
     /// the last start (in memory only; a restart forgets it).
     claude: std::sync::Mutex<ClaudeMemory>,
+}
+
+/// What a fresh home is for: what must be in it is written before it is
+/// handed to the agent user (the runner has no CAP_DAC_OVERRIDE, so it
+/// cannot write into the home afterwards).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HomePurpose {
+    /// A run, a question, a check, a sign-in.
+    #[default]
+    Plain,
+    /// A terminal: of the CLI's interface (`cli`) or a shell.
+    Terminal { cli: bool },
 }
 
 /// What the runner remembers about Claude's credentials.
@@ -455,7 +484,7 @@ impl Driver {
         if self.kind() != Kind::Claude || auth == ClaudeAuth::None {
             return;
         }
-        let Ok(home) = self.home_with(Some((auth, None))) else {
+        let Ok(home) = self.home_with(Some((auth, None)), HomePurpose::Plain) else {
             return;
         };
         let output = self
@@ -777,6 +806,8 @@ impl Driver {
             fresh: false,
             claude: None,
             exec_tmp: None,
+            side: None,
+            key_helper: false,
             live: None,
         };
         self.write_cli_config(&home, false)
@@ -854,18 +885,32 @@ impl Driver {
     /// known-good configuration and copies of the stored credentials,
     /// owned by the agent user.
     pub fn home(&self) -> Result<CliHome> {
+        self.home_for(HomePurpose::Plain)
+    }
+
+    /// `home`, for a purpose that needs something in it (a terminal).
+    pub fn home_for(&self, purpose: HomePurpose) -> Result<CliHome> {
         // Claude's credential for this start, decided once.
-        self.home_with((self.kind() == Kind::Claude).then(|| self.claude_choice()))
+        self.home_with(
+            (self.kind() == Kind::Claude).then(|| self.claude_choice()),
+            purpose,
+        )
     }
 
     /// `home`, with the Claude credential given (a confirming check).
-    fn home_with(&self, claude: Option<(ClaudeAuth, Option<String>)>) -> Result<CliHome> {
+    fn home_with(
+        &self,
+        claude: Option<(ClaudeAuth, Option<String>)>,
+        purpose: HomePurpose,
+    ) -> Result<CliHome> {
         let Isolation::Fresh(fresh) = &self.isolation else {
             return Ok(CliHome {
                 claude,
                 path: self.settings.home.clone(),
                 fresh: false,
                 exec_tmp: None,
+                side: None,
+                key_helper: false,
                 live: None,
             });
         };
@@ -875,16 +920,52 @@ impl Driver {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(path.clone());
-        let home = CliHome {
+        let cli_terminal = purpose == HomePurpose::Terminal { cli: true };
+        // A terminal's MCP configuration goes beside the home, in the
+        // runner-owned homes directory, never inside the home.
+        let side = cli_terminal.then(|| fresh.homes.join(sandbox::random_name("m-")));
+        if let Some(side) = &side {
+            self.live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(side.clone());
+        }
+        let mut home = CliHome {
             claude,
             path,
             fresh: true,
             exec_tmp: None,
+            side,
+            key_helper: false,
             live: Some(self.live.clone()),
         };
         sandbox::make_dir(home.path(), 0o700)?;
         sandbox::make_dir(&home.tmp(), 0o700)?;
+        if let Some(side) = &home.side {
+            sandbox::make_dir(side, 0o755)?;
+        }
         self.write_cli_config(&home, true)?;
+        // A terminal with Claude's API key: Claude's interface would ask
+        // before it uses ANTHROPIC_API_KEY from the environment (and
+        // suggest No); the owner chose the key on the card, so the home
+        // names it through Claude Code's documented `apiKeyHelper` setting,
+        // which reads it from the CLI's environment (never from disk).
+        // Written now, before the home is handed over.
+        if cli_terminal && self.kind() == Kind::Claude && home.claude_auth() == ClaudeAuth::ApiKey {
+            let path = home.claude_dir().join("settings.json");
+            let mut settings: serde_json::Value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(object) = settings.as_object_mut() {
+                object.insert(
+                    "apiKeyHelper".into(),
+                    format!("printenv {CLAUDE_KEY_HELPER_VAR}").into(),
+                );
+            }
+            write_private(&path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
+            home.key_helper = true;
+        }
         match self.kind() {
             Kind::Codex => {
                 if let Some(bytes) = sandbox::read_regular(&self.codex_auth(), MAX_CREDENTIAL_FILE)
@@ -1095,8 +1176,20 @@ impl Driver {
         let mut extra_env: Vec<(String, String)> = Vec::new();
         let token = match (mode, mcp) {
             (TerminalMode::Cli, Some(mcp)) => {
-                let conf = home.path().join(".lore-mcp");
-                sandbox::make_dir(&conf, 0o755)?;
+                // Beside the home (fresh homes), where the runner may
+                // write; in the one shared home of a runner started by hand,
+                // inside it (same user, nothing handed over).
+                let conf = match &home.side {
+                    Some(side) => side.clone(),
+                    None if !home.is_fresh() => {
+                        let conf = home.path().join(".lore-mcp");
+                        sandbox::make_dir(&conf, 0o755)?;
+                        conf
+                    }
+                    None => bail!(
+                        "this terminal's home was made without room for its MCP configuration"
+                    ),
+                };
                 let (mcp_args, env) =
                     super::runs::mcp_arguments(self.kind(), &mcp.url, &conf, false)?;
                 if self.user().is_some() {
@@ -1136,28 +1229,15 @@ impl Driver {
         if mode == TerminalMode::Cli {
             self.note_claude_start(home);
         }
+        // The settings in the home (written before it was handed over)
+        // name the key through `apiKeyHelper`; it goes in their variable.
         if mode == TerminalMode::Cli
-            && self.kind() == Kind::Claude
-            && home.is_fresh()
-            && home.claude_auth() == ClaudeAuth::ApiKey
+            && home.key_helper
             && let Some((_, key)) = self
                 .stored_vars()
                 .into_iter()
                 .find(|(name, _)| name == CLAUDE_KEY_VAR)
         {
-            let path = home.claude_dir().join("settings.json");
-            let mut settings: serde_json::Value = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| serde_json::from_str(&text).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
-            if let Some(object) = settings.as_object_mut() {
-                object.insert(
-                    "apiKeyHelper".into(),
-                    format!("printenv {CLAUDE_KEY_HELPER_VAR}").into(),
-                );
-            }
-            write_private(&path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
-            sandbox::hand_over(&path, self.user())?;
             command
                 .env_remove(CLAUDE_KEY_VAR)
                 .env(CLAUDE_KEY_HELPER_VAR, key);
@@ -1509,6 +1589,10 @@ impl Driver {
         let Some((auth, reason)) = home.claude.clone() else {
             return;
         };
+        // Nothing stored: nothing to say about which credential it used.
+        if auth == ClaudeAuth::None {
+            return;
+        }
         let at = add_days_iso(0);
         let mut line = format!("the last start used the {} ({at})", auth.label());
         if let Some(reason) = reason {
@@ -2928,6 +3012,12 @@ esac
             Some(key.expose())
         );
         assert!(!run.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        drop(home);
+        // A terminal's home is made for it: the settings are written before
+        // it is handed over.
+        let home = driver
+            .home_for(HomePurpose::Terminal { cli: true })
+            .unwrap();
         let terminal = envs(
             &driver
                 .terminal_command(TerminalMode::Cli, None, None, Path::new("/bin/sh"), &home)
@@ -3132,6 +3222,139 @@ esac
             .confirm_claude_refusal(ClaudeAuth::Subscription)
             .await;
         assert_eq!(driver.claude_auth(), ClaudeAuth::ApiKey);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Root without CAP_DAC_OVERRIDE (as in the agent container) and a
+    /// separate agent user: a terminal's home is prepared without writing
+    /// into the home after it was handed over: the MCP configuration lands
+    /// beside it, readable by the agent user, and Claude's apiKeyHelper
+    /// settings are in it before the hand-over. Runs' homes work too.
+    #[test]
+    #[ignore = "needs root: see the README, Development"]
+    fn a_terminal_home_is_prepared_as_root_without_dac_override() {
+        use rustix::thread::{CapabilitySet, capabilities, set_capabilities};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        assert!(
+            sandbox::can_switch_user(),
+            "needs root: see the README, Development"
+        );
+        let dir = temp("no-dac");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711)).unwrap();
+        let user = sandbox::AgentUser {
+            uid: 64_125,
+            gid: 64_125,
+        };
+        for kind in [Kind::Claude, Kind::Codex, Kind::Opencode] {
+            let base = dir.join(format!("{kind:?}"));
+            std::fs::create_dir_all(&base).unwrap();
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o711)).unwrap();
+            let exec = base.join("exec");
+            let driver = Driver::with_isolation(
+                Settings {
+                    kind,
+                    provider: crate::runner::default_provider(kind).into(),
+                    home: base.join("runner-home"),
+                    program: PathBuf::from("/bin/true"),
+                },
+                Isolation::Fresh(Fresh {
+                    exec_tmp: Some(exec.clone()),
+                    state: base.join("state"),
+                    homes: base.join("work/.homes"),
+                    user: Some(user),
+                }),
+            );
+            driver.prepare().unwrap();
+            if kind == Kind::Claude {
+                driver
+                    .store_var(CLAUDE_KEY_VAR, "sk-ant-api03-test-key-0123456789abcdef")
+                    .unwrap(); // lore:allow-secret (fake test value)
+            }
+            let mcp = TerminalMcp {
+                url: "http://lore:8081/mcp".into(),
+                token: Secret::new(format!("lore_term_{}", "cd".repeat(32))),
+            };
+            let before = capabilities(None).unwrap();
+            let mut without = before;
+            without.effective -= CapabilitySet::DAC_OVERRIDE
+                | CapabilitySet::DAC_READ_SEARCH
+                | CapabilitySet::FOWNER;
+            set_capabilities(None, without).unwrap();
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut home = driver
+                    .home_for(HomePurpose::Terminal { cli: true })
+                    .unwrap();
+                driver.give_exec_tmp(&mut home).unwrap();
+                let command = driver
+                    .terminal_command(
+                        TerminalMode::Cli,
+                        None,
+                        Some(&mcp),
+                        Path::new("/bin/sh"),
+                        &home,
+                    )
+                    .unwrap();
+                let side = home
+                    .side
+                    .clone()
+                    .expect("a terminal gets its configuration beside the home");
+                assert!(!side.starts_with(home.path()));
+                let files: Vec<PathBuf> = std::fs::read_dir(&side)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.path())
+                    .collect();
+                if kind != Kind::Codex {
+                    assert!(!files.is_empty(), "{kind:?}");
+                }
+                for file in &files {
+                    let meta = std::fs::metadata(file).unwrap();
+                    assert_eq!(meta.mode() & 0o777, 0o644, "{}", file.display());
+                    assert_eq!(meta.uid(), 0);
+                }
+                assert_eq!(std::fs::metadata(&side).unwrap().mode() & 0o777, 0o755);
+                assert_eq!(std::fs::metadata(home.path()).unwrap().uid(), user.uid);
+                // Looking inside the agent's home needs the capability back
+                // (the test's own reading, not the runner's).
+                set_capabilities(None, before).unwrap();
+                if kind == Kind::Claude {
+                    let settings = home.claude_dir().join("settings.json");
+                    assert_eq!(std::fs::metadata(&settings).unwrap().uid(), user.uid);
+                    assert!(
+                        std::fs::read_to_string(&settings)
+                            .unwrap()
+                            .contains("apiKeyHelper")
+                    );
+                    assert!(
+                        command
+                            .as_std()
+                            .get_envs()
+                            .any(|(k, _)| k == "LORE_CLAUDE_API_KEY")
+                    );
+                }
+                set_capabilities(None, without).unwrap();
+                drop(home);
+                assert!(!side.exists(), "removed with the home");
+                // A run's home and a shell's.
+                let plain = driver.home().unwrap();
+                assert!(plain.side.is_none());
+                drop(plain);
+                let shell = driver
+                    .home_for(HomePurpose::Terminal { cli: false })
+                    .unwrap();
+                driver
+                    .terminal_command(
+                        TerminalMode::Shell,
+                        None,
+                        Some(&mcp),
+                        Path::new("/bin/sh"),
+                        &shell,
+                    )
+                    .unwrap();
+            }));
+            set_capabilities(None, before).unwrap();
+            checked.unwrap();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

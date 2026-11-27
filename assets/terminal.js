@@ -92,16 +92,24 @@
         term.focus();
       } else if (message.type === "exit") {
         const code = message.code === null || message.code === undefined ? "" : ` (exit ${message.code})`;
-        setState("closed", `Ended${code}${message.message ? ": " + message.message : ""}`);
+        const text = `Ended${code}${message.message ? ": " + message.message : ""}`;
+        setState("closed", text);
+        // Said in the terminal too, not only in the state dot's tooltip.
+        if (message.message) term.write(`\r\n\x1b[31m${text.replace(/[\x00-\x1f]/g, " ")}\x1b[0m\r\n`);
       } else if (message.type === "error") {
-        setState("closed", message.message || "The terminal could not be opened");
+        const text = message.message || "The terminal could not be opened";
+        setState("closed", text);
+        term.write(`\r\n\x1b[31m${text.replace(/[\x00-\x1f]/g, " ")}\x1b[0m\r\n`);
       }
     });
     ws.addEventListener("close", () => {
       if (ws !== socket) return;
       // Refused before it opened: signed out, no `agents` permission, or
       // another origin. The server says which only to a fetch, not here.
-      if (state === "connecting") setState("closed", "Disconnected: sign in again, or check the agents permission");
+      if (state === "connecting") {
+        setState("closed", "Disconnected: sign in again, or check the agents permission");
+        term.write("\r\n\x1b[31mDisconnected: sign in again, or check the agents permission\x1b[0m\r\n");
+      }
       else if (state !== "closed") setState("closed", "Disconnected");
     });
   }

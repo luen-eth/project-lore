@@ -45,3 +45,8 @@ rustix = { version = "1", features = ["pty", "termios", "process"] }
 opt-level = 3
 lto = "thin"
 strip = true
+
+[dev-dependencies]
+# The root-only test that prepares a terminal's home without
+# CAP_DAC_OVERRIDE drops that capability in its own thread.
+rustix = { version = "1", features = ["pty", "termios", "process", "thread"] }

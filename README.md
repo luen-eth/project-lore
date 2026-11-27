@@ -1132,7 +1132,10 @@ is working on. Helping other agents on request comes in a later part.
   for a plain docker host). The agents get `cpus` (`LORE_AGENT_CPUS`, 2),
   `mem_limit` (`LORE_AGENT_MEMORY`, 4g), `pids_limit` 512, `init: true` (docker-init
   reaps what the CLI leaves), `no-new-privileges`, every capability dropped except
-  the four the runner needs (next section), a read-only root file system with tmpfs
+  the four the runner needs (next section; with no `CAP_DAC_OVERRIDE` the runner cannot
+  write into a home it handed to the agent user, so everything a home needs is written
+  before the hand-over, and a terminal's MCP configuration lives beside the home, in
+  the runner-owned `/work/.homes`), a read-only root file system with tmpfs
   for `/tmp` (`noexec`) and `/work` (`LORE_AGENT_WORK_SIZE`, 2g, counted against the
   memory limit, `noexec` unless `LORE_AGENT_WORK_EXEC=exec`), their own state
   volume, no access to lore's data volume and none of lore's `.env`: each gets only
@@ -2618,6 +2621,13 @@ that nothing in `target/` ends up owned by root:
 cargo test --no-run          # prints the test binary, target/debug/deps/lore-<hash>
 doas target/debug/deps/lore-<hash> --ignored kill_all --skip fork_bomb
 ```
+
+One of them, `a_terminal_home_is_prepared_as_root_without_dac_override`, prepares
+terminal and run homes for a separate agent uid after dropping `CAP_DAC_OVERRIDE`,
+`CAP_DAC_READ_SEARCH` and `CAP_FOWNER` from its own thread, as the agent container
+has none of them: a write into a home after its hand-over fails it with "Permission
+denied" (run it with `doas target/debug/deps/lore-<hash> --ignored
+a_terminal_home_is_prepared`).
 
 Run with `--ignored` but without root, they fail with "needs root"
 instead of skipping. The fork-bomb test (`kill_all_ends_a_fork_bomb_that_holds_every_pid`)

@@ -113,6 +113,11 @@
 .term-state.open { color: var(--ok); }
 .term-state.connecting { color: var(--warn); }
 .term-state.closed { color: var(--danger); }
+/* Closed: the reason in words beside the dot, not only in its tooltip. */
+.term-state.closed {
+  width: auto; height: auto; max-width: 45%; border-radius: 0; background: none;
+  font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .term-buttons { display: flex; gap: 6px; flex: none; }
 .term-body { position: relative; flex: 1; min-height: 0; background: #05080f; }
 .terminal-frame { display: block; width: 100%; height: 100%; border: 0; background: #05080f; }

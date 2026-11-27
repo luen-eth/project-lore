@@ -251,23 +251,27 @@ impl Terminals {
                 if first {
                     driver.sweep().await;
                 }
-                driver.home().and_then(|mut home| {
-                    // Only the CLI's interactive interface needs the exec
-                    // mount (opencode's renderer); a shell never gets it.
-                    if mode == TerminalMode::Cli {
-                        driver.give_exec_tmp(&mut home)?;
-                    }
-                    let (child, master) = spawn(
-                        &driver,
-                        mode,
-                        model.as_deref(),
-                        mcp.as_ref(),
-                        &shell,
-                        size(cols, rows),
-                        &home,
-                    )?;
-                    Ok((child, master, home))
-                })
+                driver
+                    .home_for(super::drivers::HomePurpose::Terminal {
+                        cli: mode == TerminalMode::Cli,
+                    })
+                    .and_then(|mut home| {
+                        // Only the CLI's interactive interface needs the exec
+                        // mount (opencode's renderer); a shell never gets it.
+                        if mode == TerminalMode::Cli {
+                            driver.give_exec_tmp(&mut home)?;
+                        }
+                        let (child, master) = spawn(
+                            &driver,
+                            mode,
+                            model.as_deref(),
+                            mcp.as_ref(),
+                            &shell,
+                            size(cols, rows),
+                            &home,
+                        )?;
+                        Ok((child, master, home))
+                    })
             };
             let (child, master, home) = match spawned {
                 Ok(spawned) => spawned,
@@ -279,6 +283,12 @@ impl Terminals {
                     occupancy.close_terminal();
                     let message = driver.redact(&format!("{error:#}"));
                     tracing::warn!(%term_id, %message, "a terminal could not be opened");
+                    // The page shows the cause in words; the container's
+                    // paths tell the owner nothing and stay in the log.
+                    let message = format!(
+                        "the terminal could not be opened: {}",
+                        without_paths(&message)
+                    );
                     let _ = out
                         .send(FromRunner::TerminalExit {
                             term_id,
@@ -314,6 +324,25 @@ impl Drop for Terminals {
         // its session.
         self.open().clear();
     }
+}
+
+/// A message with every absolute path replaced by "a path".
+fn without_paths(text: &str) -> String {
+    text.split(' ')
+        .map(|word| {
+            if word.starts_with('/') {
+                let tail: String = word
+                    .chars()
+                    .rev()
+                    .take_while(|c| matches!(c, ':' | ',' | ')'))
+                    .collect();
+                format!("a path{}", tail.chars().rev().collect::<String>())
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn size(cols: u16, rows: u16) -> Winsize {
