@@ -1044,6 +1044,21 @@ function bootDone(loaded) {
 
 $("boot-retry").addEventListener("click", () => location.reload());
 
+/* A failure after the first data was drawn: a notice with Retry, which
+   loads again without the full-page loader. */
+function loadNotice(text) {
+  $("load-notice-text").textContent = text;
+  $("load-notice").hidden = false;
+}
+$("load-notice-retry").addEventListener("click", async () => {
+  $("load-notice").hidden = true;
+  try {
+    await refresh(false);
+  } catch (_) {
+    loadNotice("It could not be loaded again. Check the connection.");
+  }
+});
+
 async function enter(session) {
   applySession(session || {});
   $("login").hidden = true;
@@ -1052,14 +1067,21 @@ async function enter(session) {
   graph.chrome = true;
   state.decorative = false;
   bootStart();
+  let failed = false;
   try {
     await refresh(true);
-  } catch (error) {
-    // Signed out meanwhile: the sign-in shows instead.
-    if (!$("login").hidden) return;
+  } catch (_) {
+    failed = true;
+  }
+  // Signed out meanwhile: the sign-in shows instead.
+  if (!$("login").hidden) return;
+  if (failed && !boot.loaded) {
     bootFail("The memories could not be loaded. Check the connection and try again.");
     return;
   }
+  // Once the first data is drawn the page runs on, whatever failed after
+  // it: the stream and the timers start, and the failure shows as a notice.
+  if (failed) loadNotice("Part of the page could not be loaded.");
   bootDone(true);
   connectStream();
   loadWorking();
@@ -1233,7 +1255,18 @@ async function loadSessions() {
     ]);
     state.sessions = [...open, ...closed];
     renderSessions();
-  } catch (_) { /* signed out or offline; the next refresh retries */ }
+    if ($("load-notice-text").dataset.what === "sessions") $("load-notice").hidden = true;
+  } catch (error) {
+    // Signed out: the sign-in shows. Otherwise say so (the next refresh
+    // retries too).
+    if (error && error.message === "signed out") return;
+    $("load-notice-text").dataset.what = "sessions";
+    loadNotice("The sessions could not be loaded.");
+    const list = $("sessions");
+    if (list.querySelector(".skeleton")) {
+      list.replaceChildren(el("li", "none", "Not loaded yet."));
+    }
+  }
 }
 
 function renderSessions() {

@@ -1125,6 +1125,14 @@ a.button-link:hover { background: rgba(255, 255, 255, 0.11); }
 .boot.failed .boot-mark span, .boot.failed .boot-mark i { animation: none; opacity: 0.35; }
 .boot.failed .boot-text { display: none; }
 
+.load-notice {
+  position: fixed; left: 50%; top: 72px; transform: translateX(-50%); z-index: 9;
+  display: flex; align-items: center; gap: 12px; max-width: calc(100vw - 32px);
+  padding: 8px 10px 8px 14px; border-radius: 12px; font-size: 13px;
+  border: 1px solid rgba(255, 122, 144, 0.4); background: var(--panel-solid);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.load-notice[hidden] { display: none; }
 .skeleton { pointer-events: none; }
 .list li.skeleton, .feed-list li.skeleton {
   display: block; height: 34px; margin: 4px 0; border-radius: 10px; border: 0;
