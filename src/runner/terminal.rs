@@ -251,7 +251,12 @@ impl Terminals {
                 if first {
                     driver.sweep().await;
                 }
-                driver.home().and_then(|home| {
+                driver.home().and_then(|mut home| {
+                    // Only the CLI's interactive interface needs the exec
+                    // mount (opencode's renderer); a shell never gets it.
+                    if mode == TerminalMode::Cli {
+                        driver.give_exec_tmp(&mut home)?;
+                    }
                     let (child, master) = spawn(
                         &driver,
                         mode,

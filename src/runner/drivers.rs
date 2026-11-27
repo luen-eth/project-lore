@@ -680,33 +680,18 @@ impl Driver {
         };
         sandbox::make_dir(&fresh.homes, 0o711)?;
         let path = fresh.homes.join(sandbox::random_name("h-"));
-        let exec_tmp = match (&fresh.exec_tmp, self.kind()) {
-            (Some(root), Kind::Opencode) => Some(root.join(sandbox::random_name("x-"))),
-            _ => None,
-        };
-        {
-            let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-            live.insert(path.clone());
-            if let Some(exec_tmp) = &exec_tmp {
-                live.insert(exec_tmp.clone());
-            }
-        }
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.clone());
         let home = CliHome {
             path,
             fresh: true,
-            exec_tmp,
+            exec_tmp: None,
             live: Some(self.live.clone()),
         };
         sandbox::make_dir(home.path(), 0o700)?;
         sandbox::make_dir(&home.tmp(), 0o700)?;
-        if let Some(exec_tmp) = &home.exec_tmp {
-            // A new name under the mount (the agent user cannot write the
-            // mount itself, 0711), made like the home and handed over the
-            // same way, without following links.
-            sandbox::make_dir(exec_tmp, 0o700)?;
-            sandbox::hand_over(exec_tmp, fresh.user)
-                .with_context(|| format!("handing {} to the agent user", exec_tmp.display()))?;
-        }
         self.write_cli_config(&home, true)?;
         match self.kind() {
             Kind::Codex => {
@@ -727,6 +712,38 @@ impl Driver {
         sandbox::hand_over(home.path(), fresh.user)
             .with_context(|| format!("handing {} to the agent user", home.path().display()))?;
         Ok(home)
+    }
+
+    /// Gives a fresh home of an opencode agent its directory on the exec
+    /// mount (`Fresh::exec_tmp`), for the CLI's interactive interface in a
+    /// terminal only: Bun maps its renderer library from there. Runs, the
+    /// sign-in check and the model list keep everything on the noexec
+    /// mounts. Nothing for another CLI, a shared home or without the mount.
+    pub fn give_exec_tmp(&self, home: &mut CliHome) -> Result<()> {
+        let Isolation::Fresh(fresh) = &self.isolation else {
+            return Ok(());
+        };
+        let (Some(root), Kind::Opencode, true) = (&fresh.exec_tmp, self.kind(), home.fresh) else {
+            return Ok(());
+        };
+        if home.exec_tmp.is_some() {
+            return Ok(());
+        }
+        let exec_tmp = root.join(sandbox::random_name("x-"));
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(exec_tmp.clone());
+        // Set before it exists, so dropping the home removes whatever part
+        // of it was made.
+        home.exec_tmp = Some(exec_tmp.clone());
+        // A new name under the mount (the agent user cannot write the mount
+        // itself, 0711), made like the home and handed over the same way,
+        // without following links.
+        sandbox::make_dir(&exec_tmp, 0o700)?;
+        sandbox::hand_over(&exec_tmp, fresh.user)
+            .with_context(|| format!("handing {} to the agent user", exec_tmp.display()))?;
+        Ok(())
     }
 
     /// Takes a credential a sign-in made (or the CLI renewed) in a fresh
@@ -2154,7 +2171,7 @@ mod tests {
     /// library (BUN_TMPDIR only; TMPDIR stays in the noexec home), deleted
     /// with the home and swept by the janitor; the other CLIs never do.
     #[test]
-    fn only_opencode_gets_an_exec_temporary_directory_and_it_goes_with_the_home() {
+    fn only_opencode_s_terminal_gets_an_exec_temporary_directory_and_it_goes_with_the_home() {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp("exec-tmp");
         let exec_root = dir.join("exec");
@@ -2180,8 +2197,16 @@ mod tests {
         std::fs::create_dir_all(exec_root.join("x-old")).unwrap();
         let opencode = make(Kind::Opencode);
         assert!(!exec_root.join("x-old").exists());
-        let home = opencode.home().unwrap();
-        let exec = home.exec_tmp.clone().expect("opencode gets one");
+        // A run's (or a check's) home gets none.
+        let plain = opencode.home().unwrap();
+        assert!(plain.exec_tmp.is_none());
+        let command = opencode.run_command(Path::new("/bin/true"), &[], &dir, &plain);
+        assert!(command.as_std().get_envs().all(|(k, _)| k != "BUN_TMPDIR"));
+        drop(plain);
+        // A terminal's home does.
+        let mut home = opencode.home().unwrap();
+        opencode.give_exec_tmp(&mut home).unwrap();
+        let exec = home.exec_tmp.clone().expect("opencode's terminal gets one");
         assert!(exec.starts_with(&exec_root));
         assert_eq!(
             std::fs::metadata(&exec).unwrap().permissions().mode() & 0o777,
@@ -2209,7 +2234,8 @@ mod tests {
         assert!(!exec.exists());
         for kind in [Kind::Claude, Kind::Codex] {
             let driver = make(kind);
-            let home = driver.home().unwrap();
+            let mut home = driver.home().unwrap();
+            driver.give_exec_tmp(&mut home).unwrap();
             assert!(home.exec_tmp.is_none());
             let command = driver.run_command(Path::new("/bin/true"), &[], &dir, &home);
             assert!(command.as_std().get_envs().all(|(k, _)| k != "BUN_TMPDIR"));
