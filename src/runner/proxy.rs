@@ -15,6 +15,12 @@
 //! - `LORE_PROXY_ALLOW`: comma-separated host names; `.example.com`
 //!   allows every name under example.com. Default [`DEFAULT_ALLOW`].
 //! - `LORE_PROXY_PORTS`: comma-separated ports; default `443`.
+//! - `LORE_PROXY_ALLOW_<NAME>`: `<subnet> <hosts>`, an allowlist of its
+//!   own for the clients in one subnet (an agent's network), hosts comma
+//!   separated like `LORE_PROXY_ALLOW`. With any such entry, a client is
+//!   allowed only its own subnet's hosts, and a client in none of the
+//!   subnets is refused; without one, `LORE_PROXY_ALLOW` is every
+//!   client's.
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -72,11 +78,24 @@ impl Default for Limits {
     }
 }
 
+/// One agent network's own allowlist.
+#[derive(Debug, Clone)]
+pub struct SourceNet {
+    /// What the log calls it (`claude`, from `LORE_PROXY_ALLOW_CLAUDE`).
+    pub name: String,
+    pub subnet: crate::auth::Cidr,
+    pub allow: Vec<String>,
+}
+
 /// What the proxy lets through.
 #[derive(Debug, Clone)]
 pub struct Policy {
-    /// Exact names, and `.suffix` entries.
+    /// Exact names, and `.suffix` entries: every client's when `networks`
+    /// is empty.
     pub allow: Vec<String>,
+    /// Per-network allowlists; when there is any, a client gets only its
+    /// own network's, and one in no network nothing.
+    pub networks: Vec<SourceNet>,
     pub ports: Vec<u16>,
     /// Only for the tests: let a name resolve to a local address.
     pub allow_private: bool,
@@ -84,11 +103,7 @@ pub struct Policy {
 
 impl Policy {
     pub fn parse(allow: &str, ports: &str) -> Result<Self> {
-        let allow: Vec<String> = allow
-            .split(',')
-            .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
-            .filter(|host| !host.is_empty())
-            .collect();
+        let allow = host_list(allow);
         let ports = ports
             .split(',')
             .map(str::trim)
@@ -100,29 +115,74 @@ impl Policy {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             allow,
+            networks: Vec::new(),
             ports,
             allow_private: false,
         })
     }
 
-    /// Whether a host name (not an address) is on the allowlist.
-    pub fn allows(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        if host.is_empty()
-            || host.parse::<IpAddr>().is_ok()
-            || !host
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
-        {
-            return false;
-        }
-        self.allow
-            .iter()
-            .any(|entry| match entry.strip_prefix('.') {
-                Some(suffix) => host.ends_with(&format!(".{suffix}")),
-                None => *entry == host,
-            })
+    /// Adds one network's allowlist, `<subnet> <hosts>` (the value of
+    /// `LORE_PROXY_ALLOW_<NAME>`).
+    pub fn add_network(&mut self, name: &str, value: &str) -> Result<()> {
+        let value = value.trim();
+        let (subnet, hosts) = value.split_once(char::is_whitespace).unwrap_or((value, ""));
+        let Some(subnet) = crate::auth::Cidr::parse(subnet) else {
+            anyhow::bail!(
+                "LORE_PROXY_ALLOW_{}: \"{subnet}\" is not a subnet; write `<subnet> <hosts>`",
+                name.to_ascii_uppercase()
+            );
+        };
+        self.networks.push(SourceNet {
+            name: name.to_ascii_lowercase(),
+            subnet,
+            allow: host_list(hosts),
+        });
+        Ok(())
     }
+
+    /// The allowlist a client gets, and the name the log uses for it:
+    /// its network's, the global one without per-network lists, or none
+    /// (a client in no listed network).
+    pub fn for_client(&self, ip: IpAddr) -> Option<(&str, &[String])> {
+        if self.networks.is_empty() {
+            return Some(("any", &self.allow));
+        }
+        self.networks
+            .iter()
+            .find(|net| net.subnet.contains(ip))
+            .map(|net| (net.name.as_str(), net.allow.as_slice()))
+    }
+
+    /// Whether a host name (not an address) is on the global allowlist.
+    #[cfg(test)]
+    pub fn allows(&self, host: &str) -> bool {
+        allowed(&self.allow, host)
+    }
+}
+
+/// Comma-separated host names, normalised.
+fn host_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+        .collect()
+}
+
+/// Whether a host name (not an address) is on `allow`.
+fn allowed(allow: &[String], host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty()
+        || host.parse::<IpAddr>().is_ok()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+    {
+        return false;
+    }
+    allow.iter().any(|entry| match entry.strip_prefix('.') {
+        Some(suffix) => host.ends_with(&format!(".{suffix}")),
+        None => *entry == host,
+    })
 }
 
 /// Whether an address is on the public internet.
@@ -173,10 +233,23 @@ pub async fn main_from_env() -> Result<()> {
     let bind: SocketAddr = var("LORE_PROXY_BIND", "0.0.0.0:3128")
         .parse()
         .context("LORE_PROXY_BIND must be an address like 0.0.0.0:3128")?;
-    let policy = Policy::parse(
+    let mut policy = Policy::parse(
         &var("LORE_PROXY_ALLOW", DEFAULT_ALLOW),
         &var("LORE_PROXY_PORTS", "443"),
     )?;
+    let mut networks: Vec<(String, String)> = std::env::vars()
+        .filter_map(|(name, value)| {
+            let suffix = name.strip_prefix("LORE_PROXY_ALLOW_")?;
+            (!suffix.is_empty() && !value.trim().is_empty()).then(|| (suffix.to_string(), value))
+        })
+        .collect();
+    networks.sort();
+    for (name, value) in &networks {
+        policy.add_network(name, value)?;
+        let net = policy.networks.last().expect("just added");
+        tracing::info!(network = %net.name, subnet = %value.split_whitespace().next().unwrap_or(""),
+            allow = %net.allow.join(","), "egress proxy network");
+    }
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
@@ -241,7 +314,10 @@ pub async fn serve_with(listener: TcpListener, policy: Policy, limits: Limits) {
         };
         let policy = policy.clone();
         tokio::spawn(async move {
-            let ended = tokio::time::timeout(limits.lifetime, tunnel(client, &policy, limits.idle));
+            let ended = tokio::time::timeout(
+                limits.lifetime,
+                tunnel(client, &policy, peer.ip(), limits.idle),
+            );
             match ended.await {
                 Ok(Err(error)) => tracing::debug!(%peer, %error, "a tunnel ended"),
                 Err(_) => tracing::info!(%peer, "a tunnel reached its lifetime and was closed"),
@@ -263,7 +339,12 @@ async fn answer(client: &mut TcpStream, status: &str) -> Result<()> {
     Ok(())
 }
 
-async fn tunnel(mut client: TcpStream, policy: &Policy, idle: Duration) -> Result<()> {
+async fn tunnel(
+    mut client: TcpStream,
+    policy: &Policy,
+    peer: IpAddr,
+    idle: Duration,
+) -> Result<()> {
     let mut head = Vec::new();
     let mut buffer = [0u8; 1024];
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -291,8 +372,14 @@ async fn tunnel(mut client: TcpStream, policy: &Policy, idle: Duration) -> Resul
         return Ok(());
     };
     let port: u16 = port.parse().unwrap_or(0);
-    if !policy.ports.contains(&port) || !policy.allows(host) {
-        tracing::info!(%host, port, "the egress proxy refused a host that is not allowed");
+    let Some((network, allow)) = policy.for_client(peer) else {
+        tracing::info!(%host, port, %peer, network = "none",
+            "the egress proxy refused a client in no agent network");
+        answer(&mut client, "403 Forbidden").await?;
+        return Ok(());
+    };
+    if !policy.ports.contains(&port) || !allowed(allow, host) {
+        tracing::info!(%host, port, %network, "the egress proxy refused a host that is not allowed");
         answer(&mut client, "403 Forbidden").await?;
         return Ok(());
     }
@@ -329,7 +416,7 @@ async fn tunnel(mut client: TcpStream, policy: &Policy, idle: Duration) -> Resul
     };
     // At debug level (`RUST_LOG=lore=debug` on the proxy): which allowed
     // host each tunnel went to, to see that an agent reaches its provider.
-    tracing::debug!(%host, port, "the egress proxy opened a tunnel");
+    tracing::debug!(%host, port, %network, "the egress proxy opened a tunnel");
     client
         .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
         .await?;
@@ -401,6 +488,78 @@ mod tests {
             assert!(default.allows(host), "{host}");
         }
         assert!(!default.allows("github.com"));
+    }
+
+    /// Per-network allowlists: a client gets its own network's hosts only;
+    /// with any network listed, a client in none is refused; without
+    /// one, every client gets the global list.
+    #[test]
+    fn each_agent_network_gets_its_own_allowlist() {
+        let global = Policy::parse(DEFAULT_ALLOW, "443").unwrap();
+        let anywhere: IpAddr = "10.9.9.9".parse().unwrap();
+        let (name, list) = global.for_client(anywhere).unwrap();
+        assert_eq!(name, "any");
+        assert!(allowed(list, "opencode.ai"));
+        let mut policy = Policy::parse(DEFAULT_ALLOW, "443").unwrap();
+        policy
+            .add_network(
+                "CLAUDE",
+                "172.31.250.0/28 api.anthropic.com,claude.ai,console.anthropic.com,platform.claude.com",
+            )
+            .unwrap();
+        policy
+            .add_network(
+                "OPENCODE",
+                " 10.250.42.48/28\tapi.deepseek.com, opencode.ai,api.anthropic.com,api.openai.com ",
+            )
+            .unwrap();
+        let claude: IpAddr = "172.31.250.9".parse().unwrap();
+        let opencode: IpAddr = "10.250.42.57".parse().unwrap();
+        let (name, list) = policy.for_client(claude).unwrap();
+        assert_eq!(name, "claude");
+        assert!(allowed(list, "claude.ai") && allowed(list, "api.anthropic.com"));
+        assert!(!allowed(list, "opencode.ai") && !allowed(list, "api.deepseek.com"));
+        let (name, list) = policy.for_client(opencode).unwrap();
+        assert_eq!(name, "opencode");
+        assert!(allowed(list, "opencode.ai") && allowed(list, "api.openai.com"));
+        assert!(!allowed(list, "claude.ai") && !allowed(list, "chatgpt.com"));
+        // Outside every listed network: nothing, not the global list.
+        assert!(policy.for_client(anywhere).is_none());
+        assert!(
+            policy
+                .for_client("172.31.250.16".parse().unwrap())
+                .is_none()
+        );
+        // An IPv4-mapped IPv6 peer is its IPv4 address.
+        assert_eq!(
+            policy
+                .for_client("::ffff:172.31.250.9".parse().unwrap())
+                .unwrap()
+                .0,
+            "claude"
+        );
+        assert!(
+            policy
+                .add_network("X", "not-a-subnet api.openai.com")
+                .is_err()
+        );
+        assert!(policy.add_network("X", "").is_err());
+    }
+
+    /// Over a real connection: a client outside the listed networks is
+    /// refused a host the global list allows.
+    #[tokio::test]
+    async fn a_client_in_no_listed_network_is_refused() {
+        let mut policy = Policy::parse("api.anthropic.com", "443").unwrap();
+        policy
+            .add_network("OTHER", "10.11.12.0/24 api.anthropic.com")
+            .unwrap();
+        let proxy = start(policy).await;
+        assert!(
+            ask(proxy, "CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n")
+                .await
+                .starts_with("HTTP/1.1 403")
+        );
     }
 
     #[test]

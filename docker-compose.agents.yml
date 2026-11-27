@@ -101,6 +101,14 @@ services:
     command: ["proxy"]
     environment:
       LORE_PROXY_ALLOW: ${LORE_PROXY_ALLOW:-}
+      # Each agent network's own allowlist, `<subnet> <hosts>`: a client
+      # gets only its own network's hosts, and a client in none of these
+      # subnets is refused (LORE_PROXY_ALLOW then applies to nobody). The
+      # host lists can be replaced with LORE_PROXY_HOSTS_<AGENT>.
+      LORE_PROXY_ALLOW_CLAUDE: ${LORE_AGENT_SUBNET_CLAUDE:-172.31.250.0/28} ${LORE_PROXY_HOSTS_CLAUDE:-api.anthropic.com,claude.ai,console.anthropic.com,platform.claude.com}
+      LORE_PROXY_ALLOW_CODEX: ${LORE_AGENT_SUBNET_CODEX:-172.31.250.16/28} ${LORE_PROXY_HOSTS_CODEX:-api.openai.com,auth.openai.com,chatgpt.com}
+      LORE_PROXY_ALLOW_DEEPSEEK: ${LORE_AGENT_SUBNET_DEEPSEEK:-172.31.250.32/28} ${LORE_PROXY_HOSTS_DEEPSEEK:-api.deepseek.com,opencode.ai,api.anthropic.com,api.openai.com}
+      LORE_PROXY_ALLOW_OPENCODE: ${LORE_AGENT_SUBNET_OPENCODE:-172.31.250.48/28} ${LORE_PROXY_HOSTS_OPENCODE:-api.deepseek.com,opencode.ai,api.anthropic.com,api.openai.com}
     healthcheck:
       disable: true
     read_only: true

@@ -1457,12 +1457,26 @@ to any private, loopback, link-local, shared or otherwise non-public address, so
 allowlist cannot be bent toward the host or the LAN; plain HTTP and IP literals are
 refused. One agent cannot hold the proxy for the others: at most 64 tunnels are open
 from one container (256 in all), and a tunnel closes after 15 minutes without a byte
-passing, or after 3 hours whatever passes. The default allowlist is what each CLI
-needs:
-`api.anthropic.com`, `claude.ai`, `console.anthropic.com`, `platform.claude.com`
-(Claude Code and its sign-in), `api.openai.com`, `auth.openai.com`, `chatgpt.com`
-(Codex with an API key or the ChatGPT sign-in), and for the opencode agents the API
-hosts of their four providers as opencode's built-in catalogue (2.3.2) names them:
+passing, or after 3 hours whatever passes. **Each agent network has an allowlist of
+its own**: the proxy looks at the address a tunnel comes from, finds the agent
+network (subnet) it belongs to, and allows only that network's hosts, so one agent
+cannot use another's hosts. The lists, set in `docker-compose.agents.yml` on the
+`egress` service as `LORE_PROXY_ALLOW_<AGENT>: <subnet> <hosts>` (the subnet is the
+same `LORE_AGENT_SUBNET_<AGENT>` the network uses; the hosts can be replaced with
+`LORE_PROXY_HOSTS_<AGENT>`, comma separated):
+
+| Network | Hosts |
+|---|---|
+| Claude | `api.anthropic.com`, `claude.ai`, `console.anthropic.com`, `platform.claude.com` (Claude Code and its sign-in) |
+| Codex | `api.openai.com`, `auth.openai.com`, `chatgpt.com` (an API key or the ChatGPT sign-in) |
+| DeepSeek, OpenCode | `api.deepseek.com`, `opencode.ai`, `api.anthropic.com`, `api.openai.com` (opencode's four providers; no sign-in hosts) |
+
+A tunnel from an address in none of these subnets is refused, and every refusal is
+logged with the host and the network's name (`network=claude`, or `none`). With no
+`LORE_PROXY_ALLOW_*` entry at all (an older compose file, or a proxy run by hand),
+`LORE_PROXY_ALLOW` (default: all of the hosts above) applies to every client, as
+before; with entries, it applies to nobody. The opencode hosts are the API hosts of
+the four providers as opencode's built-in catalogue (2.3.2) names them:
 `api.deepseek.com` (DeepSeek), `opencode.ai` (OpenCode Go, at
 `https://opencode.ai/inference/go/…`), `api.anthropic.com` (Anthropic) and
 `api.openai.com` (OpenAI). No catalogue host is allowed: the runner sets
@@ -1472,8 +1486,8 @@ uses `models.dev`, which earlier versions of this list allowed). `opencode.ai` i
 also where opencode's own free provider (`opencode`) is served; the proxy cannot
 tell the two apart, which is why the runner turns that provider off in opencode's
 configuration (*Signing in*, opencode agents). graphify needs no network at run
-time. Set `LORE_PROXY_ALLOW` (comma separated; `.example.com` allows every name under
-it) to change it. The agents get `HTTPS_PROXY`/`HTTP_PROXY=http://egress:3128` and
+time. Host lists are comma separated; `.example.com` allows every name under it. The
+agents get `HTTPS_PROXY`/`HTTP_PROXY=http://egress:3128` and
 `NO_PROXY=lore`. opencode 2.3.2 was seen to go through the proxy to all four of its
 providers (agents on an internal network, fake keys: each provider answered with its
 own authentication error, and the proxy opened tunnels to `api.deepseek.com`,
@@ -2511,7 +2525,9 @@ has no channel to push that notification.
 | `LORE_RUNNER_BIND` | `0.0.0.0:8081`; compose: lore's address on each agent network | Where lore listens for the built-in agents' runners (only with `LORE_RUNNER_TOKENS`): one address, or several, comma separated. Internal networks only: never publish this port. Must use another port than `LORE_BIND`. |
 | `LORE_AGENT_SUBNET_*`, `LORE_AGENT_RANGE_*`, `LORE_AGENT_IP_*` (`CLAUDE`, `CODEX`, `DEEPSEEK`, `OPENCODE`) | `172.31.250.0/28`, `.8/29`, `.2`; `.16/28`, `.24/29`, `.18`; `.32/28`, `.40/29`, `.34`; `.48/28`, `.56/29`, `.50` | `docker-compose.agents.yml` only: each agent network's subnet, the range everything but lore gets addresses from, and lore's fixed address (the runner listener binds there). Check for overlaps first (*Network*). |
 | `LORE_SIGN_IN_HOSTS_CLAUDE`, `LORE_SIGN_IN_HOSTS_CODEX` | the CLIs' documented hosts | The hosts a sign-in link may point to (comma separated); replaces the built-in list, for when a CLI moves its sign-in. |
-| `LORE_PROXY_ALLOW` | the providers' hosts | The egress proxy's allowlist (compose service `egress`): host names, comma separated; `.example.com` allows every name under it. See *Network*. |
+| `LORE_PROXY_ALLOW` | the providers' hosts | The egress proxy's allowlist for every client, used only when no `LORE_PROXY_ALLOW_*` entry is set: host names, comma separated; `.example.com` allows every name under it. See *Network*. |
+| `LORE_PROXY_ALLOW_<NAME>` | compose: one per agent network | `<subnet> <hosts>`: the allowlist of the clients in that subnet. With any such entry, a client gets only its own subnet's hosts and a client in none is refused. |
+| `LORE_PROXY_HOSTS_CLAUDE`, `_CODEX`, `_DEEPSEEK`, `_OPENCODE` | the hosts in *Network* | compose: replaces that agent network's host list in its `LORE_PROXY_ALLOW_<NAME>`. |
 | `LORE_PROXY_BIND`, `LORE_PROXY_PORTS` | `0.0.0.0:3128`, `443` | Where the egress proxy listens, and the ports it tunnels to. |
 | `LORE_AGENT_WORK_SIZE`, `LORE_AGENT_WORK_EXEC` | `2g`, `noexec` | Size of each agent's `/work` tmpfs; `exec` lets the agents run programs they build in a checkout. |
 | `LORE_RUNNER_EXEC_TMP` | compose: `/run/lore-exec` for the opencode agents only | The runner's exec-capable temporary mount: each terminal of an opencode agent's interface gets a directory there for `BUN_TMPDIR` (Bun's native library); runs and checks do not. Unset: none, and opencode's interface cannot start on a `noexec` `/work`. Never point it at the state volume. |

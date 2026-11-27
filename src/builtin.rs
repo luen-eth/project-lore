@@ -3313,6 +3313,13 @@ esac
             assert!(compose.contains(&format!(
                 "LORE_RUNNER_TOKEN: ${{LORE_RUNNER_TOKEN_{upper}:-}}"
             )));
+            // The egress proxy's list for this network, from the same subnet.
+            assert!(
+                compose.contains(&format!(
+                    "LORE_PROXY_ALLOW_{upper}: ${{LORE_AGENT_SUBNET_{upper}:-172.31.250.{base}/28}} ${{LORE_PROXY_HOSTS_{upper}:-"
+                )),
+                "{upper}'s egress list"
+            );
             assert!(
                 compose.contains(&format!("  {service}:\n    <<: *agent\n")),
                 "{service}"
