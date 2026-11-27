@@ -5786,9 +5786,27 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), 404, "{missing}");
         }
-        // Other pages are still never cached.
-        let response = client.get(format!("{base}/admin")).send().await.unwrap();
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        // Other pages are still never cached, nor are the scripts and
+        // styles that change with a deploy (the terminal's protocol among
+        // them): a reload always gets the deployed ones.
+        for page in [
+            "/admin",
+            "/admin/app.js",
+            "/admin/app.css",
+            "/admin/builtin.js",
+            "/admin/builtin.css",
+            "/admin/terminal",
+            "/admin/terminal.js",
+            "/admin/terminal.css",
+        ] {
+            let response = client.get(format!("{base}{page}")).send().await.unwrap();
+            assert_eq!(response.status(), 200, "{page}");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-store",
+                "{page}"
+            );
+        }
 
         let call = |method: reqwest::Method, path: &str, token: &str| {
             client

@@ -400,10 +400,28 @@ async fn terminal(
 
 /// Sends one small JSON frame to the page.
 async fn tell(socket: &mut WebSocket, value: serde_json::Value) -> bool {
-    socket
-        .send(WsMessage::text(value.to_string()))
-        .await
-        .is_ok()
+    send_within(socket, WsMessage::text(value.to_string())).await
+}
+
+/// How long one write to a terminal window may take: a window that does
+/// not read (a stalled tab, a dead connection) is let go after it.
+const SEND_WAIT: Duration = Duration::from_secs(10);
+
+/// Sends one frame to the page, or gives up after `SEND_WAIT`.
+async fn send_within(socket: &mut WebSocket, message: WsMessage) -> bool {
+    matches!(
+        tokio::time::timeout(SEND_WAIT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// What a window is told before the session reaches its maximum age.
+fn ends_soon_frame(hub: &Hub, at: i64) -> serde_json::Value {
+    json!({
+        "type": "ends_soon",
+        "at": at,
+        "max_hours": hub.terminal_max_hours(),
+    })
 }
 
 /// Largest binary frame of a replay.
@@ -478,7 +496,7 @@ async fn relay(
                 json!({ "type": "ended", "at": ended.at, "message": ended.message }),
             )
             .await;
-            let _ = socket.send(WsMessage::Close(None)).await;
+            send_within(&mut socket, WsMessage::Close(None)).await;
             return;
         }
         Err(error) => {
@@ -497,6 +515,8 @@ async fn relay(
         started,
         replay,
         started_at,
+        ends_at,
+        ends_soon,
         opened_by,
         taken_from,
     } = attached;
@@ -504,7 +524,12 @@ async fn relay(
     let mut live = if started {
         tell(
             &mut socket,
-            json!({ "type": "opened", "since": started_at, "opened_by": opened_by }),
+            json!({
+                "type": "opened",
+                "since": started_at,
+                "ends_at": ends_at,
+                "opened_by": opened_by,
+            }),
         )
         .await
     } else {
@@ -515,6 +540,7 @@ async fn relay(
             json!({
                 "type": "attached",
                 "since": started_at,
+                "ends_at": ends_at,
                 "opened_by": opened_by,
                 "taken_from": taken_from,
             }),
@@ -524,14 +550,15 @@ async fn relay(
             if !sent {
                 break;
             }
-            sent = socket
-                .send(WsMessage::Binary(piece.to_vec().into()))
-                .await
-                .is_ok();
+            sent = send_within(&mut socket, WsMessage::Binary(piece.to_vec().into())).await;
         }
         drop(replay);
         sent && tell(&mut socket, json!({ "type": "replayed" })).await
     };
+    // Attached in the last minutes before the maximum age: said at once.
+    if live && ends_soon {
+        live = tell(&mut socket, ends_soon_frame(&hub, ends_at)).await;
+    }
     if live && !started {
         let redraw = hub.clone();
         let id = term_id.clone();
@@ -571,10 +598,13 @@ async fn relay(
                             cols,
                             rows,
                         },
-                        Ok(PageFrame::Alive) => {
-                            hub.terminal_alive(&term_id, viewer);
-                            continue;
-                        }
+                        // Someone looks. Passed on as an empty input too: a
+                        // runner built before lore kept the idle limit counts
+                        // it as input, this one types nothing.
+                        Ok(PageFrame::Alive) => ToRunner::TerminalInput {
+                            term_id: term_id.clone(),
+                            data: String::new(),
+                        },
                         Ok(PageFrame::Hide) => break,
                         Ok(PageFrame::End | PageFrame::Close) => {
                             // The end comes back as the session's exit.
@@ -596,7 +626,7 @@ async fn relay(
             }
             event = events.recv() => match event {
                 Some(TerminalEvent::Output(bytes)) => {
-                    if socket.send(WsMessage::Binary(bytes.into())).await.is_err() {
+                    if !send_within(&mut socket, WsMessage::Binary(bytes.into())).await {
                         break;
                     }
                 }
@@ -610,6 +640,11 @@ async fn relay(
                     .await;
                     settled = true;
                     live = false;
+                }
+                Some(TerminalEvent::EndsSoon { at }) => {
+                    if !tell(&mut socket, ends_soon_frame(&hub, at)).await {
+                        break;
+                    }
                 }
                 Some(TerminalEvent::TakenOver { by }) => {
                     tell(&mut socket, json!({ "type": "taken", "by": by })).await;
@@ -652,7 +687,7 @@ async fn relay(
         }
     }
     hub.terminal_detach(&term_id, viewer, left);
-    let _ = socket.send(WsMessage::Close(None)).await;
+    send_within(&mut socket, WsMessage::Close(None)).await;
     tracing::info!(%agent, %term_id, "a terminal window closed");
 }
 

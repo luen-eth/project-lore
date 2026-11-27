@@ -765,12 +765,24 @@
     term.action.hidden = !action;
     if (action) term.action.textContent = action;
     term.end.hidden = name !== "open";
-    if (name !== "open") closeConfirm();
+    if (name !== "open") { closeConfirm(); showNotice(""); }
     // A session started or ended: the cards and the menu say so.
     if (previous !== name && (name === "open" || name === "ended")) {
       if (!panel.hidden) load();
       launcherLoad();
     }
+  }
+
+  /* What the session says ahead of its end (its maximum age), under the
+     bar; an empty text removes it. */
+  function showNotice(text) {
+    if (!term.win) return;
+    const old = term.win.querySelector(".term-notice");
+    if (old) old.remove();
+    if (!text) return;
+    const strip = el("p", "term-notice", String(text));
+    strip.setAttribute("role", "status");
+    term.bar.after(strip);
   }
 
   /* End session asks first, in the window's own bar. */
@@ -967,6 +979,7 @@
     const data = event.data || {};
     if (data.type === "lore-terminal-close") closeTerminal(true);
     else if (data.type === "lore-terminal-state" || data.type === "lore-terminal-ready") setTerminalState(data.state, data.text, data.action);
+    else if (data.type === "lore-terminal-notice") showNotice(data.text);
   });
 
   /* ---------- Terminal launcher ---------- */

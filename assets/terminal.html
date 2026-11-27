@@ -22,6 +22,12 @@
     <button id="end" class="ghost" type="button" hidden title="Ends the program and everything started in it">End session</button>
   </div>
 </header>
+<div id="confirm" class="confirm" role="alertdialog" aria-label="End the session?" hidden>
+  <span>End this session? The program and everything started in it stop.</span>
+  <button id="confirm-end" class="ghost danger" type="button">End session</button>
+  <button id="confirm-keep" class="ghost" type="button">Keep it running</button>
+</div>
+<p id="notice" class="notice" role="status" hidden></p>
 <main id="screen" class="screen" aria-label="Terminal"></main>
 <script src="/admin/vendor/xterm-6.0.0/xterm.js"></script>
 <script src="/admin/vendor/addon-fit-0.11.0/addon-fit.js"></script>

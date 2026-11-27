@@ -26,8 +26,6 @@
 
   /* The page shown says someone is looking, so the session is not idle. */
   const ALIVE_EVERY = 60 * 1000;
-  /* How long End session waits for a second click. */
-  const CONFIRM_FOR = 4000;
 
   $("name").textContent = agent || "Terminal";
   $("what").textContent = mode === "shell" ? "Shell as the agent user" : "The CLI's own interface";
@@ -63,6 +61,11 @@
   const embedded = window.parent !== window;
   let resizing = false;
   let told = null;
+  /* From `attached` until xterm.js has parsed the replay: the recent
+     screen may hold questions the program once asked the terminal (its
+     attributes, the cursor position), which xterm.js answers through
+     onData; those answers must not be typed into the live program. */
+  let replaying = false;
   const encoder = new TextEncoder();
 
   /* What the one action button does in each state. */
@@ -87,6 +90,10 @@
     $("action").hidden = !action;
     if (action) $("action").textContent = action[0];
     $("end").hidden = name !== "open";
+    if (name !== "open") {
+      closeConfirm(false);
+      $("notice").hidden = true;
+    }
     $("screen").classList.toggle("ended", name !== "open" && name !== "connecting");
     tellParent({ type: "lore-terminal-state", state: name, text, action: action ? action[0] : "" });
   }
@@ -106,6 +113,7 @@
       socket = null;
       old.close();
     }
+    replaying = false;
     setState("connecting", fresh ? "Starting a new session…" : "Connecting…");
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${scheme}//${location.host}/admin/api/builtin/${encodeURIComponent(agent)}/terminal`);
@@ -131,13 +139,20 @@
       } else if (message.type === "attached") {
         // The recent screen follows; the program then draws its screen
         // again for this window's size.
+        replaying = true;
         term.reset();
         const from = message.taken_from ? ` (taken from ${message.taken_from}'s window)` : "";
         setState("open", `Resumed · running since ${clock(message.since)}${from}`);
         catchUpSize();
       } else if (message.type === "replayed") {
-        term.scrollToBottom();
-        term.focus();
+        // term.write is asynchronous: this runs once everything written
+        // before it, the whole replay, has been parsed.
+        term.write("", () => {
+          if (ws !== socket) return;
+          replaying = false;
+          term.scrollToBottom();
+          term.focus();
+        });
       } else if (message.type === "exit" || message.type === "ended") {
         const code = message.code === null || message.code === undefined ? "" : ` (exit ${message.code})`;
         const at = message.at ? ` at ${clock(message.at)}` : "";
@@ -145,6 +160,15 @@
         setState("ended", text);
         say(text);
         if (message.type === "ended") say("Press New session to start another.", 90);
+      } else if (message.type === "ends_soon") {
+        // The maximum age is near: said in the terminal and to the page
+        // around it, which keeps it beside the state.
+        const text = `This session ends at ${clock(message.at)} (maximum ${message.max_hours} hours);`
+          + " End it, or keep working and open a new one after";
+        say(text, 33);
+        $("notice").textContent = text;
+        $("notice").hidden = false;
+        tellParent({ type: "lore-terminal-notice", text });
       } else if (message.type === "taken") {
         const text = `Opened in another window${message.by ? " (" + message.by + ")" : ""}; the session goes on there`;
         setState("taken", text);
@@ -174,9 +198,9 @@
     });
   }
 
-  term.onData((data) => { if (state === "open") send(encoder.encode(data)); });
+  term.onData((data) => { if (state === "open" && !replaying) send(encoder.encode(data)); });
   term.onBinary((data) => {
-    if (state !== "open") return;
+    if (state !== "open" || replaying) return;
     const bytes = new Uint8Array(data.length);
     for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 0xff;
     send(bytes);
@@ -218,24 +242,24 @@
     send(JSON.stringify({ type: "end" }));
   }
 
-  /* On the page of its own, End session asks for a second click. */
-  let confirming = 0;
-  $("end").addEventListener("click", () => {
-    if (!confirming) {
-      $("end").textContent = "Click again to end";
-      $("end").classList.add("danger");
-      confirming = setTimeout(resetEnd, CONFIRM_FOR);
-      return;
-    }
-    resetEnd();
-    end();
-  });
-  function resetEnd() {
-    clearTimeout(confirming);
-    confirming = 0;
-    $("end").textContent = "End session";
-    $("end").classList.remove("danger");
+  /* On the page of its own, End session asks first, with the focus on
+     "Keep it running", so a key pressed by habit does not end it. */
+  function askEnd() {
+    if (state !== "open") return;
+    $("confirm").hidden = false;
+    $("confirm-keep").focus();
   }
+  function closeConfirm(refocus) {
+    if ($("confirm").hidden) return;
+    $("confirm").hidden = true;
+    if (refocus) term.focus();
+  }
+  $("end").addEventListener("click", askEnd);
+  $("confirm-end").addEventListener("click", () => { closeConfirm(false); end(); });
+  $("confirm-keep").addEventListener("click", () => closeConfirm(true));
+  $("confirm").addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { event.preventDefault(); closeConfirm(true); }
+  });
 
   /* In the admin page the window around the frame draws the bar (the
      agent, the state, the action, Expand, Hide, End session) and moves and
@@ -270,7 +294,11 @@
         if (told !== `${term.cols}x${term.rows}`) sendSize(term.cols, term.rows);
       }
     } else if (data.type === "lore-terminal-command") {
-      if (data.command === "hide") { hide(); tellParent({ type: "lore-terminal-close" }); }
+      // "close" and "reconnect" are what an admin page loaded before
+      // terminal sessions sends: its Close only hides now (the card then
+      // offers Resume), which never ends a session by surprise.
+      if (data.command === "hide" || data.command === "close") { hide(); tellParent({ type: "lore-terminal-close" }); }
+      else if (data.command === "reconnect") $("action").click();
       else if (data.command === "end") end();
       else if (data.command === "action") $("action").click();
       else if (data.command === "focus") term.focus();

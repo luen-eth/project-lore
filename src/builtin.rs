@@ -87,6 +87,16 @@ const TERMINAL_BACKLOG: usize = 1024;
 /// (`LORE_TERMINAL_IDLE_MINUTES`).
 pub const TERMINAL_IDLE: Duration = Duration::from_secs(30 * 60);
 
+/// A terminal session ends after this long whatever happens in it
+/// (`LORE_TERMINAL_MAX_HOURS`): a program that keeps drawing, or a tab
+/// left open, does not hold the container, its sign-in and its token
+/// forever.
+pub const TERMINAL_MAX_AGE: Duration = Duration::from_secs(12 * 3600);
+
+/// The window showing a session says this long before its maximum age
+/// when it will end.
+const TERMINAL_AGE_WARNING: Duration = Duration::from_secs(10 * 60);
+
 /// How often lore looks at every terminal session: the idle limit, and
 /// whether the user who opened it may still have it.
 const TERMINAL_WATCH: Duration = Duration::from_secs(30);
@@ -576,6 +586,10 @@ pub struct ModelList {
 #[derive(Debug, PartialEq, Eq)]
 pub enum TerminalEvent {
     Output(Vec<u8>),
+    /// The session reaches its maximum age at this unix time.
+    EndsSoon {
+        at: i64,
+    },
     /// The session ended.
     Exit {
         code: Option<i32>,
@@ -618,6 +632,10 @@ struct Terminal {
     opener: Opener,
     /// Unix seconds.
     started_at: i64,
+    /// For the maximum age.
+    started: Instant,
+    /// The window showing it was told when it ends.
+    warned: bool,
     last_output_at: i64,
     /// The last output, or the last moment someone looked: the idle limit
     /// counts from here.
@@ -625,6 +643,13 @@ struct Terminal {
     /// The recent screen, in memory only.
     replay: replay::Replay,
     viewer: Option<Viewer>,
+}
+
+impl Terminal {
+    /// When the session reaches the maximum age, in unix seconds.
+    fn ends_at(&self, max_age: Duration) -> i64 {
+        self.started_at + max_age.as_secs() as i64
+    }
 }
 
 /// How a session ended, kept (in memory) until a new one of the same kind
@@ -673,6 +698,10 @@ pub struct Attached {
     /// For a session that was running: its recent screen.
     pub replay: Vec<u8>,
     pub started_at: i64,
+    /// When it reaches the maximum age (unix seconds), and whether that
+    /// is close enough to say so now.
+    pub ends_at: i64,
+    pub ends_soon: bool,
     pub opened_by: String,
     /// The window it was taken from, by user name.
     pub taken_from: Option<String>,
@@ -711,6 +740,14 @@ pub fn clock(unix: i64) -> String {
     format!("{:02}:{:02} UTC", minute / 60, minute % 60)
 }
 
+fn hours(duration: Duration) -> String {
+    match duration.as_secs() / 3600 {
+        0 => minutes(duration),
+        1 => "1 hour".into(),
+        hours => format!("{hours} hours"),
+    }
+}
+
 fn minutes(duration: Duration) -> String {
     let minutes = duration.as_secs() / 60;
     match minutes {
@@ -720,25 +757,53 @@ fn minutes(duration: Duration) -> String {
     }
 }
 
-/// Why the user who opened a session may no longer have it, or `None`.
-fn opener_gone(db: &Db, opener: &Opener) -> Option<String> {
+/// What the opener check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Verdict {
+    Allowed,
+    /// Why the user may no longer have the session.
+    Gone(String),
+    /// The database could not be asked.
+    Unknown,
+}
+
+/// Opener checks in a row that could not reach the database before the
+/// sessions they could not check end (about 90 seconds).
+const OPENER_CHECK_FAILURES: u32 = 3;
+
+/// Whether the user who opened a session may still have it: the same user
+/// (by id and by the name recorded at open, so a restored database with
+/// another user at that id does not count), not disabled, with `agents`.
+fn opener_gone(db: &Db, opener: &Opener) -> Verdict {
     let Some(id) = opener.user_id else {
-        return (opener.username != crate::users::ADMIN_USER)
-            .then(|| format!("{} is not a user who may open a terminal", opener.username));
+        return if opener.username == crate::users::ADMIN_USER {
+            Verdict::Allowed
+        } else {
+            Verdict::Gone(format!(
+                "{} is not a user who may open a terminal",
+                opener.username
+            ))
+        };
     };
     match db.user(id) {
-        Ok(None) => Some(format!("{}, who opened it, was deleted", opener.username)),
-        Ok(Some(user)) if user.disabled => {
-            Some(format!("{}, who opened it, was disabled", opener.username))
-        }
-        Ok(Some(user)) if !user.perms().contains(crate::users::Perm::Agents) => Some(format!(
-            "{}, who opened it, no longer has the agents permission",
+        Ok(None) => Verdict::Gone(format!("{}, who opened it, was deleted", opener.username)),
+        Ok(Some(user)) if user.username != opener.username => Verdict::Gone(format!(
+            "{}, who opened it, is no longer that account (the database changed)",
             opener.username
         )),
-        Ok(Some(_)) => None,
+        Ok(Some(user)) if user.disabled => {
+            Verdict::Gone(format!("{}, who opened it, was disabled", opener.username))
+        }
+        Ok(Some(user)) if !user.perms().contains(crate::users::Perm::Agents) => {
+            Verdict::Gone(format!(
+                "{}, who opened it, no longer has the agents permission",
+                opener.username
+            ))
+        }
+        Ok(Some(_)) => Verdict::Allowed,
         Err(error) => {
-            tracing::warn!(%error, "checking who opened a terminal failed; checked again later");
-            None
+            tracing::warn!(%error, "checking who opened a terminal failed; checked again shortly");
+            Verdict::Unknown
         }
     }
 }
@@ -837,6 +902,13 @@ pub struct Hub {
     terminal_idle: Duration,
     /// How often the sessions are looked at.
     terminal_watch: Duration,
+    /// A session ends after this long, whatever happens in it.
+    terminal_max_age: Duration,
+    /// Opener checks in a row that could not reach the database.
+    opener_failures: std::sync::atomic::AtomicU32,
+    /// Makes the next look at the sessions panic, for a test.
+    #[cfg(test)]
+    watch_panics: AtomicBool,
     /// Set once the watch over the sessions runs.
     watching: AtomicBool,
     /// Where the activity feed's notes are published (the admin page's).
@@ -868,6 +940,10 @@ impl Hub {
             mcp_url: None,
             terminal_idle: TERMINAL_IDLE,
             terminal_watch: TERMINAL_WATCH,
+            terminal_max_age: TERMINAL_MAX_AGE,
+            opener_failures: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            watch_panics: AtomicBool::new(false),
             watching: AtomicBool::new(false),
             events: OnceLock::new(),
         }
@@ -877,6 +953,18 @@ impl Hub {
     pub fn with_terminal_idle(mut self, idle: Duration) -> Self {
         self.terminal_idle = idle;
         self
+    }
+
+    /// The maximum age of a terminal session.
+    pub fn with_terminal_max_age(mut self, max_age: Duration) -> Self {
+        self.terminal_max_age = max_age;
+        self
+    }
+
+    /// The maximum age of a terminal session, in whole hours (at least 1
+    /// as the page says it).
+    pub fn terminal_max_hours(&self) -> u64 {
+        (self.terminal_max_age.as_secs() / 3600).max(1)
     }
 
     /// A shorter look at the sessions, for the tests.
@@ -1075,27 +1163,87 @@ impl Hub {
         let hub = Arc::downgrade(self);
         let every = self.terminal_watch;
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(every);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            tick.tick().await;
+            /// Lets the next attach start the watch again, however this
+            /// one ends.
+            struct Stopped(std::sync::Weak<Hub>);
+            impl Drop for Stopped {
+                fn drop(&mut self) {
+                    if let Some(hub) = self.0.upgrade() {
+                        hub.watching.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+            let _stopped = Stopped(hub.clone());
             loop {
-                tick.tick().await;
-                let Some(hub) = hub.upgrade() else {
-                    return;
-                };
-                hub.check_terminals().await;
+                let weak = hub.clone();
+                let run = tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(every);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        let Some(hub) = weak.upgrade() else {
+                            return;
+                        };
+                        hub.check_terminals().await;
+                    }
+                });
+                match run.await {
+                    // The hub went.
+                    Ok(()) => return,
+                    Err(error) if error.is_panic() => {
+                        tracing::error!(
+                            "the watch over the terminal sessions (idle limit, maximum age, \
+                             opener check) panicked; starting it again"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        if hub.upgrade().is_none() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
             }
         });
     }
 
-    /// One look at every session: the idle limit, then the openers.
+    /// One look at every session: the maximum age and its warning, the
+    /// idle limit, a keep-alive for older runners, then the openers.
     async fn check_terminals(&self) {
+        #[cfg(test)]
+        if self.watch_panics.swap(false, Ordering::SeqCst) {
+            panic!("a panic the tests asked for");
+        }
         let now = Instant::now();
         let mut idle = Vec::new();
+        let mut old = Vec::new();
         let mut openers = Vec::new();
+        let mut keep_alive = Vec::new();
         {
             let mut inner = self.inner();
+            let links: HashMap<String, mpsc::Sender<ToRunner>> = inner
+                .links
+                .iter()
+                .map(|(agent, link)| (agent.clone(), link.tx.clone()))
+                .collect();
             for (id, terminal) in inner.terminals.iter_mut() {
+                let age = now.duration_since(terminal.started);
+                if age >= self.terminal_max_age {
+                    old.push(id.clone());
+                    continue;
+                }
+                if !terminal.warned
+                    && age + TERMINAL_AGE_WARNING >= self.terminal_max_age
+                    && let Some(viewer) = &terminal.viewer
+                    && viewer
+                        .tx
+                        .try_send(TerminalEvent::EndsSoon {
+                            at: terminal.ends_at(self.terminal_max_age),
+                        })
+                        .is_ok()
+                {
+                    terminal.warned = true;
+                }
                 let looking = terminal
                     .viewer
                     .as_ref()
@@ -1104,9 +1252,33 @@ impl Hub {
                     terminal.quiet_since = now;
                 } else if now.duration_since(terminal.quiet_since) >= self.terminal_idle {
                     idle.push(id.clone());
+                    continue;
                 }
                 openers.push((id.clone(), terminal.opener.clone()));
+                // A runner built before lore kept the idle limit closes a
+                // terminal after 15 minutes without input; an empty input
+                // counts as input there and types nothing (in this runner
+                // as in that one), so a session lore keeps stays.
+                if let Some(link) = links.get(&terminal.agent) {
+                    keep_alive.push((link.clone(), id.clone()));
+                }
             }
+        }
+        for (link, term_id) in keep_alive {
+            let _ = link.try_send(ToRunner::TerminalInput {
+                term_id,
+                data: String::new(),
+            });
+        }
+        for id in old {
+            self.end_terminal(
+                &id,
+                None,
+                format!(
+                    "it reached the maximum age of a terminal session, {}",
+                    hours(self.terminal_max_age)
+                ),
+            );
         }
         for id in idle {
             self.end_terminal(
@@ -1122,23 +1294,52 @@ impl Hub {
             return;
         }
         let db = self.db.clone();
-        let gone = tokio::task::spawn_blocking(move || {
-            let mut checked: HashMap<(String, Option<i64>), Option<String>> = HashMap::new();
+        let verdicts = tokio::task::spawn_blocking(move || {
+            let mut checked: HashMap<(String, Option<i64>), Verdict> = HashMap::new();
             openers
                 .into_iter()
-                .filter_map(|(id, opener)| {
-                    checked
+                .map(|(id, opener)| {
+                    let verdict = checked
                         .entry((opener.username.clone(), opener.user_id))
                         .or_insert_with(|| opener_gone(&db, &opener))
-                        .clone()
-                        .map(|why| (id, why))
+                        .clone();
+                    (id, verdict)
                 })
                 .collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
-        for (id, why) in gone {
-            self.end_terminal(&id, None, why);
+        let failed = verdicts
+            .iter()
+            .any(|(_, verdict)| matches!(verdict, Verdict::Unknown));
+        let failures = if failed {
+            self.opener_failures.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            self.opener_failures.store(0, Ordering::SeqCst);
+            0
+        };
+        for (id, verdict) in verdicts {
+            match verdict {
+                Verdict::Allowed => {}
+                Verdict::Gone(why) => {
+                    self.end_terminal(&id, None, why);
+                }
+                Verdict::Unknown if failures >= OPENER_CHECK_FAILURES => {
+                    tracing::error!(
+                        term_id = %id,
+                        failures,
+                        "lore could not check who opened a terminal session; ending it"
+                    );
+                    self.end_terminal(
+                        &id,
+                        None,
+                        "lore could not check, several times in a row, that the user who opened \
+                         it may still have it (a database error)"
+                            .into(),
+                    );
+                }
+                Verdict::Unknown => {}
+            }
         }
     }
 
@@ -1188,6 +1389,8 @@ impl Hub {
                     previous.user
                 });
                 terminal.quiet_since = now;
+                let ends_soon = now.duration_since(terminal.started) + TERMINAL_AGE_WARNING
+                    >= self.terminal_max_age;
                 let attached = Attached {
                     term_id: id.clone(),
                     viewer: viewer_id,
@@ -1195,6 +1398,8 @@ impl Hub {
                     started: false,
                     replay: terminal.replay.snapshot(),
                     started_at: terminal.started_at,
+                    ends_at: terminal.ends_at(self.terminal_max_age),
+                    ends_soon,
                     opened_by: terminal.opener.username.clone(),
                     taken_from,
                 };
@@ -1255,6 +1460,8 @@ impl Hub {
                         .map(|(_, token)| crate::oauth::token_hash(token)),
                     opener: opener.clone(),
                     started_at,
+                    started: now,
+                    warned: false,
                     last_output_at: started_at,
                     quiet_since: now,
                     replay: replay::Replay::default(),
@@ -1290,6 +1497,8 @@ impl Hub {
             started: true,
             replay: Vec::new(),
             started_at,
+            ends_at: started_at + self.terminal_max_age.as_secs() as i64,
+            ends_soon: false,
             opened_by: opener.username,
             taken_from: None,
         })
@@ -1334,11 +1543,6 @@ impl Hub {
     ) -> Result<(), HubError> {
         let link = self.viewer_link(term_id, viewer, true)?;
         link.send(command).await.map_err(|_| HubError::Closed)
-    }
-
-    /// The page showing a session says it is shown.
-    pub fn terminal_alive(&self, term_id: &str, viewer: u64) {
-        let _ = self.viewer_link(term_id, viewer, true);
     }
 
     /// Makes a program draw its whole screen again for a page that just
@@ -2891,6 +3095,8 @@ esac
                     token_hash: Some(crate::oauth::token_hash(&token)),
                     opener: owner(),
                     started_at: unix_now(),
+                    started: Instant::now(),
+                    warned: false,
                     last_output_at: unix_now(),
                     quiet_since: Instant::now(),
                     replay: replay::Replay::default(),
@@ -3817,7 +4023,7 @@ esac
     }
 
     async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-        for _ in 0..400 {
+        for _ in 0..1200 {
             if done() {
                 return;
             }
@@ -4018,7 +4224,7 @@ esac
     }
 
     /// A fake CLI that prints its lore token, then a line every 200 ms
-    /// for 1.6 s, then waits for input.
+    /// for 4 s, then waits for input.
     fn chatty_cli(pair: &Pair) -> std::path::PathBuf {
         let program = pair.dir.join("claude-chatty");
         std::fs::write(
@@ -4026,7 +4232,7 @@ esac
             "#!/bin/sh\ncase \"$1\" in --version) echo \"2.1.328 (Claude Code)\"; exit 0;; \
              auth) echo \"Not logged in\"; exit 1;; esac\n\
              echo \"tok:${LORE_AGENT_TOKEN:-none}:\"\n\
-             for i in 1 2 3 4 5 6 7 8; do sleep 0.2; echo \"out-$i\"; done\n\
+             i=0; while [ $i -lt 20 ]; do sleep 0.2; i=$((i+1)); echo \"out-$i\"; done\n\
              echo ready; read line\n",
         )
         .unwrap();
@@ -4050,7 +4256,9 @@ esac
         use crate::auth::{Authenticated, McpAuth, Refused};
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::Message as Ws;
-        let pair = listen_tuned(Some(Duration::from_millis(800))).await;
+        // Margins wide enough for a loaded machine: output every 0.2 s
+        // for 4 s against a limit of 1.5 s.
+        let pair = listen_tuned(Some(Duration::from_millis(1500))).await;
         let base = admin_server(&pair).await;
         let mut config = config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET);
         config.settings.program = chatty_cli(&pair);
@@ -4075,7 +4283,7 @@ esac
         let token = token_in(&text);
         drop(socket);
         // Detached and printing: it lives, and so does its token.
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
         assert_eq!(pair.hub.terminal_count(), 1);
         assert_eq!(
             auth.authenticate_terminal(&token, true, Some(runner)).await,
@@ -4131,7 +4339,7 @@ esac
             .unwrap();
         let mut text = String::new();
         page_read(&mut socket, &mut text, "ready", &[]).await;
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        tokio::time::sleep(Duration::from_millis(3000)).await;
         assert_eq!(pair.hub.terminal_count(), 1);
         // Hidden or closed: the limit counts again.
         socket.send(Ws::text(r#"{"type":"hide"}"#)).await.unwrap();
@@ -4259,6 +4467,228 @@ esac
         );
     }
 
+    /// A link for `agent` that the test holds the other end of, as if its
+    /// runner were connected from 127.0.0.1.
+    fn fake_link(hub: &Hub, agent: &str) -> mpsc::Receiver<ToRunner> {
+        let (tx, rx) = mpsc::channel(256);
+        hub.inner().links.insert(
+            agent.into(),
+            Link {
+                generation: 0,
+                tx,
+                kind: Kind::Claude,
+                provider: "anthropic".into(),
+                address: Some("127.0.0.1".parse().unwrap()),
+            },
+        );
+        rx
+    }
+
+    /// A session as `terminal_attach` would make it, shown in no window.
+    fn fake_session(hub: &Hub, term_id: &str, agent: &str, opener: Opener) {
+        hub.inner().terminals.insert(
+            term_id.into(),
+            Terminal {
+                agent: agent.into(),
+                mode: TerminalMode::Cli,
+                token_hash: None,
+                opener,
+                started_at: unix_now(),
+                started: Instant::now(),
+                warned: false,
+                last_output_at: unix_now(),
+                quiet_since: Instant::now(),
+                replay: replay::Replay::default(),
+                viewer: None,
+            },
+        );
+    }
+
+    /// Waits for the first message the fake runner gets that `pick`
+    /// takes.
+    async fn runner_gets<T>(
+        rx: &mut mpsc::Receiver<ToRunner>,
+        mut pick: impl FnMut(&ToRunner) -> Option<T>,
+    ) -> T {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let message = rx.recv().await.expect("the link closed");
+                if let Some(found) = pick(&message) {
+                    return found;
+                }
+            }
+        })
+        .await
+        .expect("the runner never got it")
+    }
+
+    /// A runner built before lore kept the idle limit closes a terminal
+    /// after 15 minutes without input. lore keeps it from doing that to a
+    /// session it keeps: the window's keep-alive goes on as an empty input,
+    /// and the watch sends one for every session, shown or not. (This
+    /// runner types nothing for an empty input:
+    /// `runner::terminal::tests::a_terminal_without_input_stays_open`.)
+    #[tokio::test]
+    async fn sessions_are_kept_alive_in_an_older_runner() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as Ws;
+        let pair = listen_tuned(Some(Duration::from_secs(3600))).await;
+        let mut runner = fake_link(&pair.hub, "claude-builtin");
+        let base = admin_server(&pair).await;
+        let http = reqwest::Client::new();
+        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let mut socket = terminal_socket(&base, Some(&admin), Some(&base))
+            .await
+            .unwrap();
+        socket
+            .send(Ws::text(open_frame("shell", 80, 24, false)))
+            .await
+            .unwrap();
+        let term_id = runner_gets(&mut runner, |message| match message {
+            ToRunner::TerminalOpen { term_id, .. } => Some(term_id.clone()),
+            _ => None,
+        })
+        .await;
+        page_read(&mut socket, &mut String::new(), "", &["opened"]).await;
+        // The window says it is shown: an empty input reaches the runner.
+        socket.send(Ws::text(r#"{"type":"alive"}"#)).await.unwrap();
+        let empty = |message: &ToRunner| match message {
+            ToRunner::TerminalInput { term_id: id, data } if *id == term_id && data.is_empty() => {
+                Some(())
+            }
+            _ => None,
+        };
+        runner_gets(&mut runner, empty).await;
+        // No window: the watch sends them.
+        drop(socket);
+        wait_for("the window to go", || {
+            pair.hub.terminal_sessions("claude-builtin")[0]
+                .viewer
+                .is_none()
+        })
+        .await;
+        while runner.try_recv().is_ok() {}
+        runner_gets(&mut runner, empty).await;
+        runner_gets(&mut runner, empty).await;
+        assert_eq!(pair.hub.terminal_count(), 1);
+    }
+
+    /// A session ends at its maximum age, whatever happens in it; the
+    /// window showing it hears when, ahead, and why, at the end. Its token
+    /// goes with it.
+    #[tokio::test]
+    async fn a_session_ends_at_its_maximum_age() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as Ws;
+        let pair = listen().await;
+        let hub = Hub::new(
+            pair.db.clone(),
+            parse_runner_tokens(&format!("claude-builtin:{CLAUDE_SECRET}")).unwrap(),
+        )
+        .with_terminal_max_age(Duration::from_secs(3))
+        .with_terminal_watch(Duration::from_millis(100));
+        let hub = Arc::new(hub);
+        let pair = Pair {
+            hub,
+            db: pair.db.clone(),
+            url: pair.url.clone(),
+            dir: pair.dir.clone(),
+        };
+        let mut runner = fake_link(&pair.hub, "claude-builtin");
+        let base = admin_server(&pair).await;
+        let http = reqwest::Client::new();
+        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let mut socket = terminal_socket(&base, Some(&admin), Some(&base))
+            .await
+            .unwrap();
+        socket
+            .send(Ws::text(open_frame("shell", 80, 24, false)))
+            .await
+            .unwrap();
+        let opened = page_read(&mut socket, &mut String::new(), "", &["opened"])
+            .await
+            .unwrap();
+        let since = opened["since"].as_i64().unwrap();
+        assert_eq!(opened["ends_at"].as_i64(), Some(since + 3));
+        // Within ten minutes of the end (here at once): the window is told.
+        let soon = page_read(&mut socket, &mut String::new(), "", &["ends_soon"])
+            .await
+            .unwrap();
+        assert_eq!(soon["at"].as_i64(), Some(since + 3));
+        // Kept busy and shown, it still ends at its age.
+        for _ in 0..10 {
+            socket.send(Ws::text(r#"{"type":"alive"}"#)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let exit = page_read(&mut socket, &mut String::new(), "", &["exit"])
+            .await
+            .unwrap();
+        assert!(
+            exit["message"]
+                .as_str()
+                .unwrap()
+                .contains("maximum age of a terminal session"),
+            "{exit}"
+        );
+        assert_eq!(pair.hub.terminal_count(), 0);
+        runner_gets(&mut runner, |message| {
+            matches!(message, ToRunner::TerminalClose { .. }).then_some(())
+        })
+        .await;
+    }
+
+    /// The watch is started again when it panics; and the opener check
+    /// fails closed: sessions it cannot check three times in a row end.
+    #[tokio::test]
+    async fn the_watch_survives_a_panic_and_the_opener_check_fails_closed() {
+        let pair = listen().await;
+        let hub = Arc::new(
+            Hub::new(
+                pair.db.clone(),
+                parse_runner_tokens(&format!("claude-builtin:{CLAUDE_SECRET}")).unwrap(),
+            )
+            .with_terminal_watch(Duration::from_millis(100)),
+        );
+        let _runner = fake_link(&hub, "claude-builtin");
+        let keeper = pair
+            .db
+            .add_user(&crate::db::NewUser {
+                username: "keeper".into(),
+                email: None,
+                password_hash: "x".into(),
+                permissions: crate::users::Perms::parse(&["agents"]).unwrap(),
+                created_by: "admin".into(),
+            })
+            .unwrap();
+        fake_session(
+            &hub,
+            "t-kept",
+            "claude-builtin",
+            Opener {
+                username: "keeper".into(),
+                user_id: Some(keeper.id),
+            },
+        );
+        hub.watch_panics.store(true, Ordering::SeqCst);
+        hub.watch_terminals();
+        // The first look panics; the watch runs again and keeps it.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert!(!hub.watch_panics.load(Ordering::SeqCst));
+        assert!(hub.watching.load(Ordering::SeqCst));
+        assert_eq!(hub.terminal_count(), 1);
+        // The database cannot be asked: after three looks it ends.
+        pair.db.execute_for_test("DROP TABLE users");
+        wait_for("the opener check to fail closed", || {
+            hub.terminal_count() == 0
+        })
+        .await;
+        assert!(
+            hub.terminal_ended("claude-builtin")[0]
+                .message
+                .contains("could not check")
+        );
+    }
+
     /// Deleted, disabled, without `agents`, or not a user at all: the
     /// opener check says why; the built-in admin always may.
     #[test]
@@ -4279,24 +4709,35 @@ esac
             username: user.username.clone(),
             user_id: Some(user.id),
         };
-        assert_eq!(opener_gone(&db, &owner()), None);
+        let why = |verdict: Verdict| match verdict {
+            Verdict::Gone(why) => why,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(opener_gone(&db, &owner()), Verdict::Allowed);
+        why(opener_gone(
+            &db,
+            &Opener {
+                username: "viewer".into(),
+                user_id: None,
+            },
+        ));
+        let keeper = add("keeper", &["agents"]);
+        assert_eq!(opener_gone(&db, &opener(&keeper)), Verdict::Allowed);
+        // Another user at the same id (a restored database): not the
+        // one who opened it.
         assert!(
-            opener_gone(
+            why(opener_gone(
                 &db,
                 &Opener {
-                    username: "viewer".into(),
-                    user_id: None
-                }
-            )
-            .is_some()
+                    username: "someone-else".into(),
+                    user_id: Some(keeper.id),
+                },
+            ))
+            .contains("no longer that account")
         );
-        let keeper = add("keeper", &["agents"]);
-        assert_eq!(opener_gone(&db, &opener(&keeper)), None);
         let writer = add("writer", &["write"]);
         assert!(
-            opener_gone(&db, &opener(&writer))
-                .unwrap()
-                .contains("no longer has the agents permission")
+            why(opener_gone(&db, &opener(&writer))).contains("no longer has the agents permission")
         );
         let disabled = add("sleeper", &["agents"]);
         db.update_user(
@@ -4307,18 +4748,13 @@ esac
             },
         )
         .unwrap();
-        assert!(
-            opener_gone(&db, &opener(&disabled))
-                .unwrap()
-                .contains("was disabled")
-        );
+        assert!(why(opener_gone(&db, &opener(&disabled))).contains("was disabled"));
         let gone = add("leaver", &["agents"]);
         db.delete_user(gone.id).unwrap();
-        assert!(
-            opener_gone(&db, &opener(&gone))
-                .unwrap()
-                .contains("was deleted")
-        );
+        assert!(why(opener_gone(&db, &opener(&gone))).contains("was deleted"));
+        // The database cannot be asked: not known, not allowed.
+        db.execute_for_test("DROP TABLE users");
+        assert_eq!(opener_gone(&db, &opener(&keeper)), Verdict::Unknown);
     }
 
     #[test]
