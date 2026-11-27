@@ -1422,13 +1422,26 @@ its own.
 both: with the subscription (setup token or claude.ai sign-in) it gets no
 `ANTHROPIC_API_KEY`; with the API key it gets no `CLAUDE_CODE_OAUTH_TOKEN` and its
 fresh home no claude.ai credentials. When only one is stored, that one is used for
-runs, questions (`ask`), checks and terminals; when both are stored, the subscription
-is used and the card says that an API key is stored too. Choosing the order ("Use
-first: subscription / API key") and a fallback to the other credential are not there
-yet: they need two more settings columns in `builtin_agents` (a schema change).
+runs, questions (`ask`), checks and terminals. When both are stored, the card's **Use
+first** (*subscription*, the default, or *API key*) decides. The checkbox **If the
+first one cannot be used, fall back to the other** (off by default) makes a start use
+the other credential while the first is known unusable: a setup token past its
+recorded end, or a credential Claude Code refused as invalid (its
+`authentication_failed` error) at a start in the last hour. **Falling back from the
+subscription to the API key starts per-token billing without you watching.** A usage
+limit is not detected (its signal could not be established without real
+credentials), so it is not a reason to fall back. Nothing switches inside a running
+process; the first credential is tried again after an hour, or at once when you press
+**Check**. The card's status text says which credential the last start used and why,
+a run's log says it in its first line, and the activity feed notes it per run (the
+kind of credential, never the value). What lore remembers about refusals is kept in
+the runner's memory and forgotten when it restarts.
 **Sign out** removes every stored Claude credential, the API key included; there is
-no removal of one credential alone (no other card has one either). In a terminal
-with the API key, Claude Code asks once whether to use the key from the environment.
+no removal of one credential alone (no other card has one either). In a terminal the
+API key reaches Claude Code through its documented `apiKeyHelper` setting
+(`printenv LORE_CLAUDE_API_KEY`, written into the terminal's fresh home; the key itself
+is only in the CLI's environment), so the interface does not ask whether to use a key
+it found in the environment.
 
 **Billing with an API key.** With an API key, runs, questions and terminal sessions
 are billed per token to the Anthropic API account instead of drawing on a
@@ -1535,8 +1548,14 @@ into such calls. What still holds: the kill switch, the per-agent levels (set th
 built-in agent's levels on the Integrations panel to what you would let it do
 unattended), the leak scan for public repositories, `LORE_DOKPLOY_PROTECTED`, the
 redaction and the operations log. The interactive CLIs ask before each tool call by
-default; do not switch that off in a terminal. There is no separate service cap for
-terminals yet (it would need one more column in `builtin_agents`).
+default; do not switch that off in a terminal. On each built-in agent's card,
+**Services in the terminal** caps what its terminals' CLI may do through lore: *same as
+the agent* (the default: its own levels), *read only* (only `GET` calls, `mail` and the
+read repository tools; `repo_commit` and every other method are refused) or *off* (every
+`github`, `github_org`, `git_server`, `cloudflare`, `dokploy`, `mail` and `repo_*` call
+is refused, with a message naming the setting). It applies to calls made with a
+terminal token only; runs keep their task's scope, and the agent's own levels still
+apply under the cap.
 
 On the board a terminal's CLI is a caller of its own, neither a run nor an ordinary
 agent: it may add tasks, to-dos and notes, log entries, and claim open tasks; it

@@ -473,6 +473,10 @@ fn handle(command: ToRunner, driver: &Arc<Driver>, out: &mpsc::Sender<FromRunner
     tokio::spawn(async move {
         let answer = match command {
             ToRunner::Welcome { .. } | ToRunner::Refused { .. } => return,
+            ToRunner::ClaudeCredentials { priority, fallback } => {
+                driver.set_claude_prefs(&priority, fallback);
+                return;
+            }
             ToRunner::Ping { id } => FromRunner::Pong { id },
             ToRunner::Status { id } => driver.status(Some(id)).await,
             ToRunner::ListModels { id } => {

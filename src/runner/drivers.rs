@@ -117,6 +117,8 @@ pub struct Output {
 const CLAUDE_TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 /// An Anthropic API key for Claude Code (billed per token).
 const CLAUDE_KEY_VAR: &str = "ANTHROPIC_API_KEY";
+/// Where a terminal's Claude finds the key through `apiKeyHelper`.
+const CLAUDE_KEY_HELPER_VAR: &str = "LORE_CLAUDE_API_KEY";
 
 /// Which credential a Claude Code process gets: never both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +300,38 @@ pub struct Driver {
     /// Leftover entries the janitor removed, and when it last did.
     cleaned: std::sync::atomic::AtomicU64,
     cleaned_at: std::sync::Mutex<Option<String>>,
+    /// Claude: the owner's order and fallback, what was refused lately and
+    /// the last start (in memory only; a restart forgets it).
+    claude: std::sync::Mutex<ClaudeMemory>,
+}
+
+/// What the runner remembers about Claude's credentials.
+#[derive(Debug, Default)]
+struct ClaudeMemory {
+    /// The API key first (else the subscription), when both are stored.
+    key_first: bool,
+    /// Fall back to the other credential when the first cannot be used.
+    fallback: bool,
+    /// When the CLI last refused each credential as invalid
+    /// (`authentication_failed`): the subscription, the API key.
+    refused: [Option<std::time::SystemTime>; 2],
+    /// The credential of the last start and the line the card shows.
+    last: Option<(ClaudeAuth, String)>,
+}
+
+/// How long a refused credential is passed over before it is tried again
+/// (or until the owner presses Check).
+const CLAUDE_RETRY: Duration = Duration::from_secs(60 * 60);
+
+impl ClaudeAuth {
+    /// What the card and the run's log call it; never the credential.
+    pub fn label(self) -> &'static str {
+        match self {
+            ClaudeAuth::Subscription => "subscription",
+            ClaudeAuth::ApiKey => "API key",
+            ClaudeAuth::None => "no credential",
+        }
+    }
 }
 
 /// Largest stored credential file (`auth.json`, `.credentials.json`)
@@ -369,7 +403,36 @@ impl Driver {
             live: Arc::default(),
             cleaned: std::sync::atomic::AtomicU64::new(0),
             cleaned_at: std::sync::Mutex::new(None),
+            claude: std::sync::Mutex::new(ClaudeMemory::default()),
         }
+    }
+
+    fn claude_memory(&self) -> std::sync::MutexGuard<'_, ClaudeMemory> {
+        self.claude.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The owner's order of Claude's credentials and the fallback switch,
+    /// as lore sends them.
+    pub fn set_claude_prefs(&self, priority: &str, fallback: bool) {
+        let mut memory = self.claude_memory();
+        memory.key_first = priority == "api_key";
+        memory.fallback = fallback;
+    }
+
+    /// The CLI refused this credential as invalid: with the fallback on,
+    /// the next starts use the other one for a while.
+    pub fn claude_refused(&self, auth: ClaudeAuth) {
+        let index = match auth {
+            ClaudeAuth::Subscription => 0,
+            ClaudeAuth::ApiKey => 1,
+            ClaudeAuth::None => return,
+        };
+        self.claude_memory().refused[index] = Some(std::time::SystemTime::now());
+    }
+
+    /// The credential the last start used, if any.
+    pub fn claude_last(&self) -> Option<ClaudeAuth> {
+        self.claude_memory().last.as_ref().map(|(auth, _)| *auth)
     }
 
     /// Marks a path under `/work` as in use until the answer is dropped.
@@ -995,6 +1058,37 @@ impl Driver {
         if let Some(token) = token {
             command.env("LORE_AGENT_TOKEN", token);
         }
+        // Claude's interface asks before it uses ANTHROPIC_API_KEY from the
+        // environment (and suggests No). The owner chose the key on the
+        // card, so a terminal's fresh home names it through Claude Code's
+        // documented `apiKeyHelper` setting instead, which reads it from
+        // the CLI's environment: the key is still never on disk.
+        if mode == TerminalMode::Cli
+            && self.kind() == Kind::Claude
+            && home.is_fresh()
+            && self.claude_last() == Some(ClaudeAuth::ApiKey)
+            && let Some((_, key)) = self
+                .stored_vars()
+                .into_iter()
+                .find(|(name, _)| name == CLAUDE_KEY_VAR)
+        {
+            let path = home.claude_dir().join("settings.json");
+            let mut settings: serde_json::Value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(object) = settings.as_object_mut() {
+                object.insert(
+                    "apiKeyHelper".into(),
+                    format!("printenv {CLAUDE_KEY_HELPER_VAR}").into(),
+                );
+            }
+            write_private(&path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
+            sandbox::hand_over(&path, self.user())?;
+            command
+                .env_remove(CLAUDE_KEY_VAR)
+                .env(CLAUDE_KEY_HELPER_VAR, key);
+        }
         Ok(command)
     }
 
@@ -1069,7 +1163,12 @@ impl Driver {
         }
         // Claude Code gets one credential: the subscription's or the API
         // key, never both (see `choose_claude_auth`).
-        let skip: &[&str] = match (self.kind(), self.claude_auth()) {
+        let claude = (self.kind() == Kind::Claude).then(|| {
+            let (auth, reason) = self.claude_choice();
+            self.note_claude_start(auth, reason);
+            auth
+        });
+        let skip: &[&str] = match (self.kind(), claude.unwrap_or(ClaudeAuth::None)) {
             (Kind::Claude, ClaudeAuth::ApiKey) => &[CLAUDE_TOKEN_VAR],
             (Kind::Claude, _) => &[CLAUDE_KEY_VAR],
             _ => &[],
@@ -1247,24 +1346,113 @@ impl Driver {
         (subscription, has(CLAUDE_KEY_VAR))
     }
 
-    /// The credential Claude Code starts with now: the subscription first
-    /// (the owner's choice of order and a fallback are not stored yet),
-    /// the API key when it is the only one.
-    pub fn claude_auth(&self) -> ClaudeAuth {
+    /// The credential Claude Code starts with now, and why when it is not
+    /// the owner's first choice (see `choose_claude_auth`). Known unusable:
+    /// a setup token past its recorded end, or a credential the CLI refused
+    /// as invalid within the last hour. A usage limit is not detected.
+    pub fn claude_choice(&self) -> (ClaudeAuth, Option<String>) {
         let (subscription, key) = self.claude_stored();
-        let state = |stored| CredentialState {
-            stored,
-            unusable: false,
+        let now = std::time::SystemTime::now();
+        let memory = self.claude_memory();
+        let refused_at = |index: usize| {
+            memory.refused[index]
+                .filter(|at| now.duration_since(*at).is_ok_and(|age| age < CLAUDE_RETRY))
         };
-        choose_claude_auth(
-            state(subscription),
-            state(key),
-            ClaudeAuth::Subscription,
-            false,
-        )
+        // The setup token's recorded end (only when it is the stored
+        // subscription; a claude.ai sign-in has no end lore knows).
+        let token_ends = self
+            .stored_vars()
+            .iter()
+            .any(|(name, _)| name == CLAUDE_TOKEN_VAR)
+            .then(|| self.sign_in_meta())
+            .flatten()
+            .and_then(|meta| {
+                meta.get("ends")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|ends| ends.as_str() < add_days_iso(0).as_str());
+        let why_not = |index: usize| -> Option<String> {
+            let name = if index == 0 {
+                "the subscription"
+            } else {
+                "the API key"
+            };
+            if let Some(at) = refused_at(index) {
+                let at = iso_from_unix(
+                    at.duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                );
+                return Some(format!("{name} was refused as invalid at {at}"));
+            }
+            if index == 0
+                && let Some(ends) = &token_ends
+            {
+                return Some(format!(
+                    "{name}'s setup token ended on {}",
+                    &ends[..ends.len().min(10)]
+                ));
+            }
+            None
+        };
+        let state = |stored: bool, index: usize| CredentialState {
+            stored,
+            unusable: stored && why_not(index).is_some(),
+        };
+        let priority = if memory.key_first {
+            ClaudeAuth::ApiKey
+        } else {
+            ClaudeAuth::Subscription
+        };
+        let auth = choose_claude_auth(
+            state(subscription, 0),
+            state(key, 1),
+            priority,
+            memory.fallback,
+        );
+        let reason = match (auth, priority) {
+            (ClaudeAuth::None, _) => None,
+            (chosen, first) if chosen == first => None,
+            (_, first) => {
+                let (first_stored, index) = if first == ClaudeAuth::Subscription {
+                    (subscription, 0)
+                } else {
+                    (key, 1)
+                };
+                if !first_stored {
+                    Some(format!("only the {} is stored", auth.label()))
+                } else {
+                    why_not(index).map(|why| format!("{why}, and falling back is on"))
+                }
+            }
+        };
+        (auth, reason)
+    }
+
+    /// The credential Claude Code starts with now.
+    pub fn claude_auth(&self) -> ClaudeAuth {
+        self.claude_choice().0
+    }
+
+    /// Notes which credential a start used and why, for the card.
+    fn note_claude_start(&self, auth: ClaudeAuth, reason: Option<String>) {
+        let at = add_days_iso(0);
+        let mut line = format!("the last start used the {} ({at})", auth.label());
+        if let Some(reason) = reason {
+            line.push_str(&format!(" because {reason}"));
+        }
+        self.claude_memory().last = Some((auth, line));
     }
 
     async fn claude_status(&self) -> (bool, Option<String>, Option<String>, String) {
+        // Check tries the first credential again.
+        self.claude_memory().refused = [None, None];
+        let last = self
+            .claude_memory()
+            .last
+            .as_ref()
+            .map(|(_, line)| line.clone());
         let (subscription, key) = self.claude_stored();
         let auth = self.claude_auth();
         let stored = auth == ClaudeAuth::Subscription
@@ -1288,13 +1476,16 @@ impl Driver {
         .any(|phrase| lower.contains(phrase));
         let signed_in = success && !refused;
         let meta = self.sign_in_meta();
-        let both = if subscription && key {
-            " (an API key is stored too; the subscription is used)"
-        } else {
-            ""
+        let both = match (subscription && key, auth) {
+            (true, ClaudeAuth::ApiKey) => {
+                " (a subscription sign-in is stored too; the API key is used)".to_string()
+            }
+            (true, _) => " (an API key is stored too; the subscription is used)".to_string(),
+            _ => String::new(),
         };
+        let last = last.map(|line| format!("; {line}")).unwrap_or_default();
         let (method, ends) = if auth == ClaudeAuth::ApiKey {
-            (Some("API key".to_string()), None)
+            (Some(format!("API key{both}")), None)
         } else if stored {
             let ends = meta
                 .as_ref()
@@ -1305,6 +1496,12 @@ impl Driver {
             (Some(format!("claude.ai sign-in{both}")), find_date(&text))
         } else {
             (None, None)
+        };
+        // The card shows the last start's credential with the CLI's text.
+        let text = if last.is_empty() {
+            text
+        } else {
+            format!("{}\n{}", text.trim_end(), last.trim_start_matches("; "))
         };
         (signed_in, method, ends, text)
     }
@@ -2666,10 +2863,19 @@ esac
                 .terminal_command(TerminalMode::Cli, None, None, Path::new("/bin/sh"), &home)
                 .unwrap(),
         );
+        // A terminal gets it through `apiKeyHelper` (no prompt), not in
+        // ANTHROPIC_API_KEY, and the settings file names only the variable.
+        assert!(!terminal.contains_key("ANTHROPIC_API_KEY"));
         assert_eq!(
-            terminal.get("ANTHROPIC_API_KEY").map(String::as_str),
+            terminal.get("LORE_CLAUDE_API_KEY").map(String::as_str),
             Some(key.expose())
         );
+        let settings = std::fs::read_to_string(home.claude_dir().join("settings.json")).unwrap();
+        assert!(
+            settings.contains("printenv LORE_CLAUDE_API_KEY"),
+            "{settings}"
+        );
+        assert!(!settings.contains(key.expose()));
         assert!(!terminal.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
         drop(home);
         // The claude.ai sign-in stays out of the home while the key is used.
@@ -2730,6 +2936,64 @@ esac
         driver.logout().await.unwrap();
         assert_eq!(driver.claude_auth(), ClaudeAuth::None);
         assert!(!driver.secrets().iter().any(|secret| secret == key.expose()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The owner's order and the fallback in the driver: the key first
+    /// when asked; with the fallback, the other credential while the first
+    /// was refused as invalid or its setup token ended, with the reason
+    /// noted for the card; Check tries the first again.
+    #[tokio::test]
+    async fn claude_follows_the_owner_s_order_and_falls_back_only_when_asked() {
+        let dir = temp("claude-order");
+        let driver = fresh(&dir, Kind::Claude, "#!/bin/sh\necho \"Logged in\"\n");
+        let token = Secret::new("sk-ant-oat01-a-pasted-setup-token-0000"); // lore:allow-secret (fake test value)
+        let key = Secret::new("sk-ant-api03-test-key-0123456789abcdef"); // lore:allow-secret (fake test value)
+        driver
+            .set_credential(CredentialKind::SetupToken, &token)
+            .await
+            .unwrap();
+        driver
+            .set_credential(CredentialKind::ApiKey, &key)
+            .await
+            .unwrap();
+        assert_eq!(driver.claude_choice(), (ClaudeAuth::Subscription, None));
+        driver.set_claude_prefs("api_key", false);
+        assert_eq!(driver.claude_choice(), (ClaudeAuth::ApiKey, None));
+        // Refused, without the fallback: still the first.
+        driver.claude_refused(ClaudeAuth::ApiKey);
+        assert_eq!(driver.claude_auth(), ClaudeAuth::ApiKey);
+        // With it: the other one, and why.
+        driver.set_claude_prefs("api_key", true);
+        let (auth, why) = driver.claude_choice();
+        assert_eq!(auth, ClaudeAuth::Subscription);
+        assert!(why.unwrap().contains("the API key was refused as invalid"));
+        // A start notes it; Check tries the first again.
+        let home = driver.home().unwrap();
+        let _ = driver.run_command(Path::new("/bin/true"), &[], &dir, &home);
+        assert_eq!(driver.claude_last(), Some(ClaudeAuth::Subscription));
+        drop(home);
+        let FromRunner::Status { detail, .. } = driver.status(None).await else {
+            panic!()
+        };
+        assert!(
+            detail.contains("the last start used the subscription"),
+            "{detail}"
+        );
+        assert_eq!(driver.claude_auth(), ClaudeAuth::ApiKey);
+        // An ended setup token: with the subscription first and the
+        // fallback on, the key.
+        driver.set_claude_prefs("subscription", true);
+        write_private(
+            &dir.join("state/sign-in.json"),
+            br#"{"method":"setup-token","saved":"2020-01-01T00:00:00Z","ends":"2021-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let (auth, why) = driver.claude_choice();
+        assert_eq!(auth, ClaudeAuth::ApiKey);
+        assert!(why.unwrap().contains("setup token ended on 2021-01-01"));
+        driver.set_claude_prefs("subscription", false);
+        assert_eq!(driver.claude_auth(), ClaudeAuth::Subscription);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

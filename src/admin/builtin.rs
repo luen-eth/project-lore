@@ -625,6 +625,11 @@ fn agent_view(
         // What the CLI said may name the account (an e-mail address).
         "status_detail": if manage { Some(&stored.status_detail) } else { None },
         "read_other_services": stored.read_other_services,
+        // NULL in the database: what the agent may; the subscription
+        // first; no fallback.
+        "terminal_services": stored.terminal_services.as_deref().unwrap_or("same"),
+        "claude_priority": stored.claude_priority.as_deref().unwrap_or("subscription"),
+        "claude_fallback": stored.claude_fallback.unwrap_or(false),
         "second_runner": if manage { hub.intrusion(name) } else { None },
         "status_at": stored.status_at,
         "updated_at": stored.updated_at,
@@ -687,6 +692,14 @@ struct SettingsForm {
     active_hours: Option<String>,
     #[serde(default)]
     read_other_services: Option<bool>,
+    /// `same`, `read` or `off`.
+    #[serde(default)]
+    terminal_services: Option<String>,
+    /// Claude: `subscription` or `api_key`.
+    #[serde(default)]
+    claude_priority: Option<String>,
+    #[serde(default)]
+    claude_fallback: Option<bool>,
 }
 
 /// A model name: an alias or an id, no spaces, not starting with `-` (it
@@ -764,6 +777,20 @@ async fn update(
     let state = admin.clone();
     let (who, agent) = (me.username.clone(), name.clone());
     let read_other_services = form.read_other_services;
+    let terminal_services = match form.terminal_services.as_deref().map(str::trim) {
+        None => None,
+        Some("same") => Some(None),
+        Some(value @ ("read" | "off")) => Some(Some(value.to_string())),
+        Some(_) => return bad_request("the terminal's services are same, read or off"),
+    };
+    let claude_priority = match form.claude_priority.as_deref().map(str::trim) {
+        None => None,
+        Some("subscription") => Some(None),
+        Some("api_key") => Some(Some("api_key".to_string())),
+        Some(_) => return bad_request("Claude's first credential is subscription or api_key"),
+    };
+    let claude_fallback = form.claude_fallback;
+    let prefs_hub = hub.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let before = state.db.builtin_agent(&agent)?;
         let mut after = state.db.update_builtin_settings(&agent, &settings, &who)?;
@@ -772,6 +799,31 @@ async fn update(
         {
             state.db.set_builtin_read_other_services(&agent, on, &who)?;
             after.read_other_services = on;
+        }
+        if let Some(services) = terminal_services
+            && services != after.terminal_services
+        {
+            state
+                .db
+                .set_builtin_terminal_services(&agent, services.as_deref(), &who)?;
+            after.terminal_services = services;
+        }
+        if claude_priority.is_some() || claude_fallback.is_some() {
+            let priority = claude_priority.unwrap_or_else(|| after.claude_priority.clone());
+            let fallback = claude_fallback.unwrap_or(after.claude_fallback.unwrap_or(false));
+            if priority != after.claude_priority
+                || fallback != after.claude_fallback.unwrap_or(false)
+            {
+                state.db.set_builtin_claude_credentials(
+                    &agent,
+                    priority.as_deref(),
+                    fallback,
+                    &who,
+                )?;
+                after.claude_priority = priority;
+                after.claude_fallback = fallback.then_some(true);
+                prefs_hub.send_claude_prefs(&agent);
+            }
         }
         if before.as_ref() != Some(&after) {
             let mut changes = Vec::new();
@@ -806,6 +858,37 @@ async fn update(
                             "may read other services during runs"
                         } else {
                             "reads only its task's services during runs"
+                        }
+                        .to_string(),
+                    );
+                }
+                if before.terminal_services != after.terminal_services {
+                    changes.push(format!(
+                        "services in the terminal: {}",
+                        match after.terminal_services.as_deref() {
+                            Some("read") => "read only",
+                            Some("off") => "off",
+                            _ => "same as the agent",
+                        }
+                    ));
+                }
+                if before.claude_priority != after.claude_priority {
+                    changes.push(format!(
+                        "uses first: {}",
+                        if after.claude_priority.is_some() {
+                            "API key"
+                        } else {
+                            "subscription"
+                        }
+                    ));
+                }
+                if before.claude_fallback.unwrap_or(false) != after.claude_fallback.unwrap_or(false)
+                {
+                    changes.push(
+                        if after.claude_fallback.unwrap_or(false) {
+                            "falls back to the other credential"
+                        } else {
+                            "does not fall back"
                         }
                         .to_string(),
                     );

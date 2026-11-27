@@ -138,12 +138,21 @@ pub struct BuiltinAgent {
     /// (schema 7, off by default): a board run then also reads the services
     /// its task's author may read, beyond the task's own targets.
     pub read_other_services: bool,
+    /// What a terminal's CLI may do with the services (schema 9): `None`
+    /// what the agent may, `read`, or `off`.
+    pub terminal_services: Option<String>,
+    /// Claude: the credential used first when both are stored (schema 9):
+    /// `None` the subscription, or `api_key`.
+    pub claude_priority: Option<String>,
+    /// Claude: fall back to the other credential when the first cannot be
+    /// used (schema 9); `None` is off.
+    pub claude_fallback: Option<bool>,
 }
 
 const BUILTIN_COLUMNS: &str = "name, kind, provider, model, enabled, available, daily_cap, \
      active_hours, connected, connected_at, last_seen_at, runner_version, cli_version, \
      signed_in, login_method, login_ends, status_detail, status_at, updated_at, updated_by, \
-     read_other_services";
+     read_other_services, terminal_services, claude_priority, claude_fallback";
 
 impl BuiltinAgent {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -169,6 +178,9 @@ impl BuiltinAgent {
             updated_at: row.get(18)?,
             updated_by: row.get(19)?,
             read_other_services: row.get(20)?,
+            terminal_services: row.get(21)?,
+            claude_priority: row.get(22)?,
+            claude_fallback: row.get(23)?,
         })
     }
 }
@@ -295,6 +307,53 @@ impl Db {
                  updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), updated_by = ?3
              WHERE name = ?1",
             params![name, on, by],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("there is no built-in agent by that name");
+        }
+        Ok(())
+    }
+
+    /// What a terminal's CLI may do with the services: `None` (what the
+    /// agent may), `read` or `off`.
+    pub fn set_builtin_terminal_services(
+        &self,
+        name: &str,
+        services: Option<&str>,
+        by: &str,
+    ) -> Result<()> {
+        if services.is_some_and(|value| !matches!(value, "read" | "off")) {
+            anyhow::bail!("the terminal's services are `same`, `read` or `off`");
+        }
+        let changed = self.lock().execute(
+            "UPDATE builtin_agents SET terminal_services = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), updated_by = ?3
+             WHERE name = ?1",
+            params![name, services, by],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("there is no built-in agent by that name");
+        }
+        Ok(())
+    }
+
+    /// Claude's credentials: which comes first (`None` the subscription,
+    /// or `api_key`) and whether to fall back to the other.
+    pub fn set_builtin_claude_credentials(
+        &self,
+        name: &str,
+        priority: Option<&str>,
+        fallback: bool,
+        by: &str,
+    ) -> Result<()> {
+        if priority.is_some_and(|value| value != "api_key") {
+            anyhow::bail!("the first credential is `subscription` or `api_key`");
+        }
+        let changed = self.lock().execute(
+            "UPDATE builtin_agents SET claude_priority = ?2, claude_fallback = ?3,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), updated_by = ?4
+             WHERE name = ?1",
+            params![name, priority, fallback.then_some(true), by],
         )?;
         if changed == 0 {
             anyhow::bail!("there is no built-in agent by that name");

@@ -4249,6 +4249,19 @@ impl ServerHandler for Lore {
                     .into(),
             );
         }
+        // A built-in agent's terminal: the owner's cap on what its CLI may
+        // do with the services ("Services in the terminal" on the card).
+        if let Some(parts) = context.extensions.get::<Parts>()
+            && from_terminal(parts)
+            && let Some(reason) = self
+                .terminal_service_refusal(parts, &request.name, request.arguments.as_ref())
+                .await
+        {
+            return Ok(
+                rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(reason)])
+                    .into(),
+            );
+        }
         // The board and file reads a run makes start with the reminder too
         // (`recall`, `recent` and `get` add it themselves).
         let remind = scope.is_some() && RUN_REMINDED_TOOLS.contains(&request.name.as_ref());
@@ -4260,6 +4273,75 @@ impl ServerHandler for Lore {
                 .insert(0, rmcp::model::ContentBlock::text(RUN_READ_REMINDER));
         }
         Ok(response)
+    }
+}
+
+/// The tools that reach a service with a stored credential, and whether
+/// a call writes: a provider call writes unless its method is GET; of the
+/// repository tools only `repo_commit` writes; `mail` only reads.
+const SERVICE_TOOLS: &[&str] = &[
+    "github",
+    "github_org",
+    "git_server",
+    "cloudflare",
+    "dokploy",
+    "mail",
+    "repo_tree",
+    "repo_read",
+    "repo_search",
+    "repo_commit",
+];
+
+fn service_call_writes(
+    tool: &str,
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    match tool {
+        "mail" | "repo_tree" | "repo_read" | "repo_search" => false,
+        "repo_commit" => true,
+        _ => !args
+            .and_then(|args| args.get("method"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("GET")
+            .trim()
+            .eq_ignore_ascii_case("GET"),
+    }
+}
+
+impl Lore {
+    /// Why a terminal's CLI may not make this service call: the owner set
+    /// the agent's "Services in the terminal" to `off`, or to `read` and
+    /// the call writes. `None` for anything else (the agent's own levels
+    /// and every other gate still apply).
+    async fn terminal_service_refusal(
+        &self,
+        parts: &Parts,
+        tool: &str,
+        args: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<String> {
+        if !SERVICE_TOOLS.contains(&tool) {
+            return None;
+        }
+        let agent = agent_of(parts);
+        let db = self.db.clone();
+        let name = agent.clone();
+        // Unreadable settings refuse the call rather than lift the cap.
+        let cap = match blocking(move || db.builtin_agent(&name).map_err(internal)).await {
+            Ok(stored) => stored.and_then(|stored| stored.terminal_services),
+            Err(_) => Some("off".to_string()),
+        };
+        match cap.as_deref() {
+            Some("off") => Some(format!(
+                "`{tool}` is off in {agent}'s terminal: the owner set \"Services in the terminal\" \
+                 to off on the agent's card (Agents panel)"
+            )),
+            Some("read") if service_call_writes(tool, args) => Some(format!(
+                "{agent}'s terminal may only read services: the owner set \"Services in the \
+                 terminal\" to read only on the agent's card (Agents panel), so `{tool}` may not \
+                 write"
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -6987,6 +7069,76 @@ mod tests {
         assert_eq!(
             world.db.task_author(id).unwrap(),
             format!("terminal:{BUILTIN}")
+        );
+    }
+
+    /// "Services in the terminal": `same` lets the agent's own levels
+    /// decide, `read` refuses writes, `off` refuses every service call,
+    /// and only for a terminal's token.
+    #[tokio::test]
+    async fn the_terminal_s_services_are_capped_by_the_owner_s_setting() {
+        let (lore, world) = helping("terminal-services", |_| {}).await;
+        let Extension(mut parts) = as_agent(Some(BUILTIN));
+        parts.extensions.insert(TerminalCaller);
+        let read = json!({"method": "GET", "path": "/user"});
+        let write = json!({"method": "POST", "path": "/user/repos"});
+        let ask = |tool: &'static str, args: serde_json::Value| {
+            let lore = lore.clone();
+            let parts = parts.clone();
+            async move {
+                lore.terminal_service_refusal(&parts, tool, args.as_object())
+                    .await
+            }
+        };
+        // Same as the agent (NULL): nothing refused here.
+        assert_eq!(ask("github", read.clone()).await, None);
+        assert_eq!(ask("github", write.clone()).await, None);
+        world
+            .db
+            .set_builtin_terminal_services(BUILTIN, Some("read"), "admin")
+            .unwrap();
+        assert_eq!(ask("github", read.clone()).await, None);
+        assert_eq!(ask("repo_read", json!({})).await, None);
+        assert!(
+            ask("github", write.clone())
+                .await
+                .unwrap()
+                .contains("may only read")
+        );
+        assert!(
+            ask("repo_commit", json!({}))
+                .await
+                .unwrap()
+                .contains("may only read")
+        );
+        world
+            .db
+            .set_builtin_terminal_services(BUILTIN, Some("off"), "admin")
+            .unwrap();
+        for (tool, args) in [
+            ("dokploy", read.clone()),
+            ("cloudflare", write.clone()),
+            ("mail", json!({})),
+        ] {
+            let refused = ask(tool, args).await.unwrap();
+            assert!(
+                refused.contains("Services in the terminal") && refused.contains("Agents panel"),
+                "{refused}"
+            );
+        }
+        // Lore's own tools are not service calls.
+        assert_eq!(ask("recall", json!({})).await, None);
+        // Back to the default.
+        world
+            .db
+            .set_builtin_terminal_services(BUILTIN, None, "admin")
+            .unwrap();
+        assert_eq!(ask("cloudflare", write).await, None);
+        assert!(
+            world
+                .db
+                .set_builtin_terminal_services(BUILTIN, Some("full"), "admin")
+                .is_err()
         );
     }
 

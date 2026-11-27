@@ -1249,6 +1249,9 @@ mod tests {
             let conn = db.lock();
             conn.execute_batch(
                 "ALTER TABLE agent_registry DROP COLUMN display_name;
+                 ALTER TABLE builtin_agents DROP COLUMN terminal_services;
+                 ALTER TABLE builtin_agents DROP COLUMN claude_priority;
+                 ALTER TABLE builtin_agents DROP COLUMN claude_fallback;
                  UPDATE meta SET value = '8' WHERE key = 'schema_version';",
             )
             .unwrap();
@@ -1282,6 +1285,16 @@ mod tests {
                     ("beta".into(), "".into(), "".into(), None),
                 ]
             );
+            let columns: Vec<String> = conn
+                .prepare("SELECT name FROM pragma_table_info('builtin_agents')")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            for column in ["terminal_services", "claude_priority", "claude_fallback"] {
+                assert!(columns.iter().any(|c| c == column), "{column}");
+            }
         }
     }
 

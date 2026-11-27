@@ -727,6 +727,10 @@ impl Run {
         stop: &mut watch::Receiver<Option<String>>,
         base: Option<String>,
     ) -> Result<Ended> {
+        // The credential Claude Code was started with (its kind only).
+        let credential = (self.driver.kind() == Kind::Claude)
+            .then(|| self.driver.claude_last())
+            .flatten();
         let mut child = command.spawn().context("starting the CLI")?;
         let session = child.id().and_then(|pid| Pid::from_raw(pid as i32));
         self.flush().await;
@@ -736,9 +740,19 @@ impl Run {
                 run_id: self.spec.run_id.clone(),
                 session_id: None,
                 base,
+                credential: credential.map(|auth| auth.label().to_string()),
             })
             .await;
-        self.say("lore", "the CLI started").await;
+        match credential {
+            Some(auth) => {
+                self.say(
+                    "lore",
+                    &format!("the CLI started (Claude with the {})", auth.label()),
+                )
+                .await
+            }
+            None => self.say("lore", "the CLI started").await,
+        }
         let (lines_tx, mut lines_rx) = mpsc::channel::<(bool, String)>(256);
         for (is_err, pipe) in [
             (
@@ -805,10 +819,14 @@ impl Run {
                                 run_id: self.spec.run_id.clone(),
                                 session_id: Some(self.redact(&session_id)),
                                 base: None,
+                                credential: None,
                             }).await;
                         }
                         if let Some(answer) = parsed.answer {
                             self.answer = Some(answer);
+                        }
+                        if parsed.auth_failed && let Some(auth) = credential {
+                            self.driver.claude_refused(auth);
                         }
                         for (stream, text) in parsed.lines {
                             self.say(&stream, &text).await;
@@ -1254,6 +1272,9 @@ pub struct Parsed {
     /// The CLI's message to the user, when this line holds one: the last
     /// one is a conversation's answer.
     pub answer: Option<String>,
+    /// Claude Code refused its credential as invalid
+    /// (`"error": "authentication_failed"` on the message).
+    pub auth_failed: bool,
 }
 
 impl Parsed {
@@ -1335,6 +1356,7 @@ fn parse_claude(event: &Value) -> Parsed {
             }
         }
         "assistant" => {
+            parsed.auth_failed = event["error"] == "authentication_failed";
             for block in event["message"]["content"].as_array().into_iter().flatten() {
                 match block["type"].as_str().unwrap_or_default() {
                     "text" => {

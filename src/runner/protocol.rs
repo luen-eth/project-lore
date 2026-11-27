@@ -289,6 +289,10 @@ pub enum ToRunner {
     },
     /// Close a terminal: its whole session is killed.
     TerminalClose { term_id: String },
+    /// Claude's credentials: which comes first when both are stored
+    /// (`subscription` or `api_key`) and whether to fall back to the other.
+    /// Sent after the welcome and whenever the owner changes them.
+    ClaudeCredentials { priority: String, fallback: bool },
 }
 
 /// The resources an agent container uses, as the runner reads them.
@@ -422,6 +426,10 @@ pub enum FromRunner {
         /// made, so lore can tell later whether the run moved it.
         #[serde(default)]
         base: Option<String>,
+        /// Which kind of credential the CLI was started with (`API key`,
+        /// `subscription`), never the credential itself.
+        #[serde(default)]
+        credential: Option<String>,
     },
     /// Part 6b: one line of a run's output, parsed from the CLI's JSON
     /// stream (`text`, `tool`, `result`, `error` or `raw`).
@@ -633,6 +641,7 @@ mod tests {
                 run_id: "r1".into(),
                 session_id: None,
                 base: Some("abc".into()),
+                credential: Some("API key".into()),
             },
             FromRunner::RunOutput {
                 run_id: "r1".into(),

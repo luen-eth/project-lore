@@ -1246,9 +1246,46 @@ impl TaskRunner {
                 match message {
                     // The base the runner reports is not used: lore read the
                     // head itself before the run started.
-                    FromRunner::RunStarted { session_id, .. } => {
+                    FromRunner::RunStarted {
+                        session_id,
+                        credential,
+                        ..
+                    } => {
                         let (db, id) = (self.db.clone(), run_id.clone());
                         blocking(move || db.run_running(&id, session_id.as_deref())).await?;
+                        // Which kind of credential it runs with (never the
+                        // credential), for the activity feed.
+                        if let Some(credential) = credential {
+                            let credential: String = credential
+                                .chars()
+                                .filter(|c| c.is_ascii_alphanumeric() || *c == ' ')
+                                .take(40)
+                                .collect();
+                            let project = self
+                                .state()
+                                .active
+                                .get(&agent)
+                                .map(|active| active.project.clone())
+                                .unwrap_or_default();
+                            let (db, events, who) =
+                                (self.db.clone(), self.events.clone(), agent.clone());
+                            let summary = format!("run {run_id} signed in with the {credential}");
+                            let recorded = blocking(move || {
+                                db.record_activity(
+                                    &who,
+                                    "builtin",
+                                    &project,
+                                    None,
+                                    None,
+                                    &[],
+                                    &summary,
+                                )
+                            })
+                            .await;
+                            if let Ok(activity) = recorded {
+                                events.publish(activity);
+                            }
+                        }
                         self.events.publish_run(json!({
                             "type": "status", "run_id": run_id, "agent": agent, "status": "running",
                         }));

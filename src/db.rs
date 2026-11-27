@@ -356,7 +356,11 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// `sessions.token_agent`; `builtin_agents.read_other_services`;
 /// `agent_runs.output_bytes`). 8: run confirmation and provenance
 /// (`agent_run_refs`, `run_writes`; `agent_runs.base_head`). 9: an
-/// agent's display name (`agent_registry.display_name`, nullable).
+/// agent's display name (`agent_registry.display_name`), and per built-in
+/// agent the services of its terminals and the order and fallback of
+/// Claude's credentials (`builtin_agents.terminal_services`,
+/// `claude_priority`, `claude_fallback`); all nullable, NULL being the
+/// behaviour before them.
 pub const SCHEMA_VERSION: i64 = 9;
 
 /// Columns every database lore ever created has in `entries`: a full
@@ -443,6 +447,13 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // the owner may change; NULL shows the technical name, which stays the
     // agent's identity everywhere.
     ("agent_registry", "display_name", "TEXT"),
+    // Built-in agents (schema 9): what a terminal's CLI may do with the
+    // services (NULL: what the agent may; `read`; `off`), and which Claude
+    // credential comes first (NULL: the subscription; `api_key`) and
+    // whether to fall back to the other (NULL or 0: no).
+    ("builtin_agents", "terminal_services", "TEXT"),
+    ("builtin_agents", "claude_priority", "TEXT"),
+    ("builtin_agents", "claude_fallback", "INTEGER"),
 ];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

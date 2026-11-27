@@ -680,6 +680,31 @@ impl Hub {
         }
     }
 
+    /// The message that tells a Claude runner the owner's order and
+    /// fallback of its credentials (NULL: the subscription first, no
+    /// fallback).
+    fn claude_prefs(&self, agent: &str) -> Option<ToRunner> {
+        let stored = self.db.builtin_agent(agent).ok().flatten()?;
+        Some(ToRunner::ClaudeCredentials {
+            priority: stored
+                .claude_priority
+                .unwrap_or_else(|| "subscription".into()),
+            fallback: stored.claude_fallback.unwrap_or(false),
+        })
+    }
+
+    /// Sends the agent's runner its Claude credential choice again, after
+    /// the owner changed it.
+    pub fn send_claude_prefs(&self, agent: &str) {
+        let Some(prefs) = self.claude_prefs(agent) else {
+            return;
+        };
+        let link = self.inner().links.get(agent).map(|link| link.tx.clone());
+        if let Some(link) = link {
+            let _ = link.try_send(prefs);
+        }
+    }
+
     /// Gives the terminals' CLIs lore's MCP server at `url` (lore's
     /// internal address, `LORE_RUNNER_LORE_URL` + `/mcp`).
     pub fn with_mcp_url(mut self, url: String) -> Self {
@@ -1404,12 +1429,19 @@ impl Hub {
                 agent.clone(),
                 Link {
                     generation,
-                    tx,
+                    tx: tx.clone(),
                     kind,
                     provider: provider.clone(),
                     address: address.parse().ok().map(plain_ip),
                 },
             );
+            // The owner's choice of Claude's credentials, before anything
+            // else the runner hears.
+            if kind == Kind::Claude
+                && let Some(prefs) = self.claude_prefs(&agent)
+            {
+                let _ = tx.try_send(prefs);
+            }
         }
         if let Err(error) = self.db.builtin_connected(
             &agent,
@@ -2375,6 +2407,118 @@ esac
                 .unwrap()
                 .display_name,
             None
+        );
+    }
+
+    /// The terminal's services and Claude's credential order are set on
+    /// the card with the `agents` permission only, validated, stored as
+    /// NULL for the defaults, and the order reaches the runner.
+    #[tokio::test]
+    async fn the_terminal_and_credential_settings_need_the_agents_permission() {
+        let pair = listen().await;
+        let base = admin_server(&pair).await;
+        pair.db
+            .add_user(&crate::db::NewUser {
+                username: "writer".into(),
+                email: None,
+                password_hash: crate::users::hash_password("writer-password").unwrap(),
+                permissions: crate::users::Perms::parse(&["write"]).unwrap(),
+                created_by: "admin".into(),
+            })
+            .unwrap();
+        let http = reqwest::Client::new();
+        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let writer = sign_in(&http, &base, "writer", "writer-password").await;
+        let put = |cookie: &str, body: serde_json::Value| {
+            http.put(format!("{base}/admin/api/builtin/claude-builtin"))
+                .header(header::COOKIE, cookie.to_string())
+                .json(&body)
+        };
+        let row = || pair.db.builtin_agent("claude-builtin").unwrap().unwrap();
+        assert_eq!(
+            put(&writer, serde_json::json!({"terminal_services": "off"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        assert_eq!(row().terminal_services, None);
+        assert_eq!(
+            put(&admin, serde_json::json!({"terminal_services": "full"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        assert_eq!(
+            put(&admin, serde_json::json!({"claude_priority": "both"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        assert_eq!(
+            put(&admin, serde_json::json!({"terminal_services": "read"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(row().terminal_services.as_deref(), Some("read"));
+        assert_eq!(
+            put(
+                &admin,
+                serde_json::json!({"claude_priority": "api_key", "claude_fallback": true})
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            200
+        );
+        assert_eq!(
+            (row().claude_priority.as_deref(), row().claude_fallback),
+            (Some("api_key"), Some(true))
+        );
+        let shown: serde_json::Value = http
+            .get(format!("{base}/admin/api/builtin"))
+            .header(header::COOKIE, &admin)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let claude = shown["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "claude-builtin")
+            .unwrap();
+        assert_eq!(
+            (
+                claude["terminal_services"].as_str(),
+                claude["claude_priority"].as_str()
+            ),
+            (Some("read"), Some("api_key"))
+        );
+        assert_eq!(claude["claude_fallback"], true);
+        // Back to the defaults: NULL again.
+        put(&admin, serde_json::json!({"terminal_services": "same", "claude_priority": "subscription", "claude_fallback": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                row().terminal_services,
+                row().claude_priority,
+                row().claude_fallback
+            ),
+            (None, None, None)
         );
     }
 
