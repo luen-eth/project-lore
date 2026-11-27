@@ -2194,7 +2194,16 @@ impl TaskRunner {
                     .link(&agent.name)
                     .map(|(kind, _)| kind.id().to_string())
                     .unwrap_or_else(|| agent.kind.clone()),
-                model: agent.model.clone(),
+                // An opencode agent without a chosen model starts with the
+                // default its runner reported (never opencode's own).
+                model: if agent.model.is_empty() {
+                    self.hub
+                        .keys(&agent.name)
+                        .and_then(|keys| keys.default_model)
+                        .unwrap_or_default()
+                } else {
+                    agent.model.clone()
+                },
                 state: state.into(),
                 detail,
             });

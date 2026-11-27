@@ -4,7 +4,7 @@
 #
 # The built-in coding agents live in docker-compose.agents.yml, a complete
 # file of its own that takes lore from this one (`extends`) and adds the
-# egress proxy, the three agents, their networks and lore's attachments to
+# egress proxy, the four agents, their networks and lore's attachments to
 # them. Nothing of the agents (no network, no fixed subnet, no runner
 # listener) exists unless that file is used:
 #

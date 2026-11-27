@@ -1474,14 +1474,18 @@ tell the two apart, which is why the runner turns that provider off in opencode'
 configuration (*Signing in*, opencode agents). graphify needs no network at run
 time. Set `LORE_PROXY_ALLOW` (comma separated; `.example.com` allows every name under
 it) to change it. The agents get `HTTPS_PROXY`/`HTTP_PROXY=http://egress:3128` and
-`NO_PROXY=lore`. Claude Code documents `HTTPS_PROXY`; Codex (a Rust HTTP client)
-and opencode (its JavaScript runtime) are expected to honour the same standard
-variables, but that any of the three reaches its provider through the proxy was not
-verified here (it needs a real sign-in). If one does not, `Check` and the first run
-fail with a connection error, and the proxy's log shows nothing for it; the
-fallback is to give that agent a non-internal network as well, losing the egress
-restriction for it. Anything else a CLI tries (telemetry, a web fetch to
-an arbitrary site) is refused and logged by the proxy with the host name only.
+`NO_PROXY=lore`. opencode 2.3.2 was seen to go through the proxy to all four of its
+providers (agents on an internal network, fake keys: each provider answered with its
+own authentication error, and the proxy opened tunnels to `api.deepseek.com`,
+`opencode.ai`, `api.anthropic.com` and `api.openai.com`); Claude Code reached
+`api.anthropic.com` the same way. Codex is expected to honour the same variables but
+was not checked here. If a CLI does not, `Check` and the first run fail with a
+connection error, and the proxy's log shows nothing for it; the fallback is to give
+that agent a non-internal network as well, losing the egress restriction for it.
+Anything else a CLI tries (telemetry, a web fetch to an arbitrary site; Claude Code's
+interface asks `raw.githubusercontent.com` at start) is refused and logged by the
+proxy with the host name only. Allowed tunnels are logged at debug level
+(`RUST_LOG=info,lore::runner::proxy=debug` on `egress`), with the host name only.
 
 Unverified: whether Docker's embedded DNS answers names outside the stack for a
 container on an internal network depends on the Docker version; the agents do not

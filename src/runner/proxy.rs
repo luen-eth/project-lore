@@ -327,6 +327,9 @@ async fn tunnel(mut client: TcpStream, policy: &Policy, idle: Duration) -> Resul
         answer(&mut client, "502 Bad Gateway").await?;
         return Ok(());
     };
+    // At debug level (`RUST_LOG=lore=debug` on the proxy): which allowed
+    // host each tunnel went to, to see that an agent reaches its provider.
+    tracing::debug!(%host, port, "the egress proxy opened a tunnel");
     client
         .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
         .await?;
