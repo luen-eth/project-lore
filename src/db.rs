@@ -1783,15 +1783,48 @@ impl Db {
     }
 
     /// Moves everything in the write-ahead log into the database file and
-    /// empties the log: what a clean close does, for a process that is
-    /// about to exit.
-    pub fn checkpoint(&self) -> Result<()> {
-        let conn = self.lock();
-        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-        if busy != 0 {
-            anyhow::bail!("the database was busy; the checkpoint was not complete");
-        }
-        Ok(())
+    /// empties the log, what a clean close does, for a process that is
+    /// about to exit; without ever waiting long. The connection is waited
+    /// for at most `patience` (a backup download or a restore holds it for
+    /// a whole copy), and the checkpoint itself never waits on another
+    /// process's lock: when a reader is in the way it copies what it can
+    /// (`PASSIVE`) and says so. Either way the log is crash-safe: what is
+    /// not checkpointed now is replayed at the next start.
+    pub fn checkpoint_within(&self, patience: std::time::Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + patience;
+        let conn = loop {
+            match self.conn.try_lock() {
+                Ok(conn) => break conn,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "the database connection stayed busy (a backup or a restore in \
+                             progress?); not checkpointed"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        };
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        let attempt = (|| -> Result<()> {
+            let busy: i64 =
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            if busy == 0 {
+                return Ok(());
+            }
+            let (_, log, done): (i64, i64, i64) =
+                conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            anyhow::bail!(
+                "another process is reading the database; {done} of {log} log pages were \
+                 checkpointed"
+            )
+        })();
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        attempt
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {

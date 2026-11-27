@@ -51,7 +51,7 @@ fn main() -> Result<()> {
     let result = runtime.block_on(run());
     // Blocking work still going (a database call, a file being written)
     // gets a moment; nothing keeps the process up longer than that.
-    runtime.shutdown_timeout(Duration::from_secs(1));
+    runtime.shutdown_timeout(shutdown::RUNTIME);
     result
 }
 
@@ -409,16 +409,35 @@ async fn run() -> Result<()> {
             Ok(())
         }
     };
+    // Detached work that records what upstream accepted (a push's refs)
+    // gets a moment to finish.
+    if tokio::time::timeout(shutdown::WORK, shutdown::work_done())
+        .await
+        .is_err()
+    {
+        tracing::warn!("a push's record was still being written at shutdown");
+    }
     // A clean close: everything in the write-ahead log goes into the
     // database file, and the log is emptied.
+    // Bounded: lore never waits on it past shutdown::CHECKPOINT; the log
+    // is crash-safe, so a checkpoint that cannot happen now happens at the
+    // next start.
     let checkpoint = {
         let db = db.clone();
-        tokio::task::spawn_blocking(move || db.checkpoint()).await
+        let patience = shutdown::CHECKPOINT.saturating_sub(Duration::from_millis(500));
+        tokio::time::timeout(
+            shutdown::CHECKPOINT,
+            tokio::task::spawn_blocking(move || db.checkpoint_within(patience)),
+        )
+        .await
     };
     match checkpoint {
-        Ok(Ok(())) => tracing::info!("database checkpointed; stopped"),
-        Ok(Err(error)) => tracing::warn!(%error, "the database could not be checkpointed"),
-        Err(error) => tracing::warn!(%error, "the database could not be checkpointed"),
+        Ok(Ok(Ok(()))) => tracing::info!("database checkpointed; stopped"),
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%error, "the database was not fully checkpointed; stopped")
+        }
+        Ok(Err(error)) => tracing::warn!(%error, "the database could not be checkpointed; stopped"),
+        Err(_) => tracing::warn!("the checkpoint took too long; stopped without it"),
     }
     result
 }

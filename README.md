@@ -2073,16 +2073,35 @@ At least one of `LORE_TOKENS` and `LORE_TOKEN` is required, and every secret mus
 
 On `SIGTERM` (`docker stop`, a redeploy) or `Ctrl-C` lore stops accepting connections
 on every listener (the public one and the runner listener), ends the admin pages' live
-event streams, gives requests still in flight 3 seconds, closes whatever is still
-open after that (a runner's link, a client that keeps a connection open), writes the
-database's write-ahead log back into the database file (`lore.db-wal` is left empty)
-and exits with code 0, normally within a fraction of a second and at most about 4
-seconds after the signal. Docker's default of 10 seconds before it kills the
-container is therefore enough, and no `stop_grace_period` is needed in the compose
-files. Before this, an open admin page kept lore from ever finishing its shutdown:
-Docker killed it after 10 seconds (exit code 137) and the write-ahead log was left
-for the next start to replay. A runner whose link drops on shutdown reconnects when
-lore is back, and a run that was going is marked interrupted, as after any restart.
+event streams, and starts no new run (the task runner claims nothing more). Requests
+still in flight get 3 seconds; whatever is still open after that (a runner's link, a
+client that keeps a connection open, a backup download) is closed. The record of a
+push GitHub has accepted gets up to one more second to be written. Then lore writes
+the database's write-ahead log back into the database file and exits with code 0.
+That last step never waits long either: it waits at most 1.5 seconds for the
+database connection (a backup or a restore holds it for a whole copy) and never
+waits on another process's lock (with a reader such as an open `sqlite3` shell it
+copies what it can and says so in the log). What it leaves in the log is replayed
+at the next start. Blocking work still running gets one more second.
+
+So lore normally exits within a fraction of a second, and at most about 7 seconds
+after the signal (3 + 1 + 2 + 1). Docker's default of 10 seconds before it kills the
+container is enough, and no `stop_grace_period` is needed in the compose files.
+Measured locally: 0.01 s with another process reading the database, 5.5 s when the
+signal came while an 8 GB database was being copied for a backup download.
+
+A second `SIGTERM` or `Ctrl-C` once the shutdown has started ends lore at once (exit
+code 130). Nothing it interrupts damages the database: SQLite's log is crash-safe,
+and a full restore cut off while it copies the backup in has not committed anything
+(the live database stays as it was; the restore can be run again). A restore cut off
+after the copy, before lore's schema changes ran, leaves the backup in place, and the
+next start runs them. A backup download cut off leaves a temporary file in the data
+directory, which the next start removes.
+
+Before this, an open admin page kept lore from ever finishing its shutdown: Docker
+killed it after 10 seconds (exit code 137) and the write-ahead log was left for the
+next start to replay. A runner whose link drops on shutdown reconnects when lore is
+back, and a run that was going is marked interrupted, as after any restart.
 
 ### Memory use
 

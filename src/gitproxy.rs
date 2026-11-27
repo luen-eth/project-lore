@@ -1057,7 +1057,11 @@ impl ReportReader {
 /// report cannot be read.
 fn recording_body(response: reqwest::Response, pushed: RunPushed, db: Db, run_id: String) -> Body {
     let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(8);
+    // Lore's shutdown waits (briefly) for the record of a push upstream
+    // has accepted.
+    let work = crate::shutdown::Work::start();
     tokio::spawn(async move {
+        let _work = work;
         let mut reader = ReportReader::new(pushed.side_band);
         let mut stream = response.bytes_stream();
         let mut client_gone = false;

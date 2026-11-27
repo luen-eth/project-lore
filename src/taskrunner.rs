@@ -446,6 +446,10 @@ impl TaskRunner {
 
     /// One look at the runs and the board.
     pub async fn tick(&self) -> Result<()> {
+        // Nothing new is claimed or started once lore is shutting down.
+        if crate::shutdown::is_stopping() {
+            return Ok(());
+        }
         self.enforce_limits().await?;
         let agents = self.agents().await?;
         // Tasks other agents handed over go first, to their own agent,
@@ -982,6 +986,9 @@ impl TaskRunner {
     /// the lock: a task someone else claimed meanwhile is left alone), and
     /// tells the runner. The run id, or `None` when the task was taken.
     async fn launch(&self, agent: &BuiltinAgent, launch: Launch) -> Result<Option<String>> {
+        if crate::shutdown::is_stopping() {
+            anyhow::bail!("lore is shutting down; no run is started");
+        }
         // The agent's slot is taken here, under the lock and before any
         // await: a second start for the same agent is refused (and its task
         // left untouched, to be tried again later).
