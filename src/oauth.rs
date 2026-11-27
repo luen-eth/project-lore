@@ -401,6 +401,13 @@ fn split_host(host: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The host name of `host[:port]`, lowercase, without the port (and
+/// without brackets for an IPv6 literal).
+pub fn host_name(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    split_host(&host).0.to_string()
+}
+
 fn is_loopback_host(name: &str) -> bool {
     let name = name.trim_start_matches('[').trim_end_matches(']');
     name == "localhost"

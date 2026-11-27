@@ -18,6 +18,7 @@ use std::convert::Infallible;
 mod agents;
 mod builtin;
 mod notes;
+mod security;
 
 use axum::{
     Extension, Json, Router,
@@ -125,6 +126,15 @@ impl SignedIn {
         }
     }
 
+    /// The account key the sign-in tables use: `user:<id>` for a stored
+    /// user, the name for a built-in one.
+    fn account(&self) -> String {
+        match self.user_id {
+            Some(id) => db::user_account(id),
+            None => self.username.clone(),
+        }
+    }
+
     /// The role older pages read: `admin` with every permission, else
     /// `viewer`.
     fn role(&self) -> &'static str {
@@ -139,7 +149,42 @@ impl SignedIn {
 struct AdminSession {
     expires: Instant,
     user: SignedIn,
+    /// The account key of `user`.
+    account: String,
+    /// The last full sign-in or re-authentication: sensitive changes need
+    /// it to be recent (`FRESH_FOR`).
+    authenticated_at: Instant,
+    /// How the session was signed in, e.g. `["password", "totp"]`.
+    methods: Vec<&'static str>,
+    /// Signed in with the environment admin password under
+    /// `LORE_ADMIN_BREAK_GLASS`, without a second factor.
+    break_glass: bool,
 }
+
+impl AdminSession {
+    fn new(user: SignedIn, methods: Vec<&'static str>, break_glass: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            expires: now + SESSION_TTL,
+            account: user.account(),
+            user,
+            authenticated_at: now,
+            methods,
+            break_glass,
+        }
+    }
+
+    /// Seconds the last authentication stays fresh; 0 when it is not.
+    fn fresh_for(&self) -> u64 {
+        FRESH_FOR
+            .saturating_sub(self.authenticated_at.elapsed())
+            .as_secs()
+    }
+}
+
+/// How long a sign-in or re-authentication counts as fresh: the routes in
+/// `FRESH_ROUTES` (and `Admin::require_fresh`) need one this recent.
+const FRESH_FOR: Duration = Duration::from_secs(10 * 60);
 
 /// Who may reach a route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +234,7 @@ const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/admin/api/agents", Access::SignedIn),
     ("GET", "/admin/api/projects/aliases", Access::SignedIn),
     ("PUT", "/admin/api/password", Access::SignedIn),
+    ("DELETE", "/admin/api/password", Access::SignedIn),
     // The consent page: anyone signed in sees the request (and is told
     // when they lack `agents`) and may deny it; approving needs `agents`.
     ("GET", "/admin/api/oauth/requests/{id}", Access::SignedIn),
@@ -315,7 +361,44 @@ const ROUTES: &[(&str, &str, Access)] = &[
         "/admin/api/users/{id}",
         Access::Needs(Perm::Users),
     ),
+    // Setting the viewer's password needs `users`; admin's, being admin
+    // (the handler checks).
+    (
+        "PUT",
+        "/admin/api/builtin-users/{name}/password",
+        Access::SignedIn,
+    ),
 ];
+
+/// Routes that also need a fresh authentication (`FRESH_FOR`): a session
+/// left open must not silently change how its account signs in. The guard
+/// answers `403 {"reauth": true}` otherwise. `PUT /admin/api/users/{id}`
+/// needs one only when it sets a password; its handler checks.
+const FRESH_ROUTES: &[(&str, &str)] = &[
+    ("DELETE", "/admin/api/password"),
+    ("PUT", "/admin/api/builtin-users/{name}/password"),
+    ("POST", "/admin/api/restore/full"),
+];
+
+/// Whether a passkey relying-party id may be used on `host`: equal to it,
+/// or a parent domain of it.
+pub(crate) fn rp_id_fits(rp_id: &str, host: &str) -> bool {
+    host == rp_id || host.ends_with(&format!(".{rp_id}"))
+}
+
+/// Where passkeys of a request are bound: the relying-party id and the
+/// exact origin the browser must report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RelyingParty {
+    id: String,
+    origin: String,
+}
+
+fn needs_fresh(method: &axum::http::Method, pattern: &str) -> bool {
+    FRESH_ROUTES
+        .iter()
+        .any(|(m, path)| *m == method.as_str() && *path == pattern)
+}
 
 /// Who may reach a route, or `None` when the table does not list it.
 fn access(method: &axum::http::Method, pattern: &str) -> Option<Access> {
@@ -330,6 +413,21 @@ fn access(method: &axum::http::Method, pattern: &str) -> Option<Access> {
         .chain(builtin::ROUTES)
         .find(|(m, path, _)| *m == method && *path == pattern)
         .map(|(_, _, access)| *access)
+}
+
+/// Sign-in options beyond the passwords, from the environment.
+#[derive(Clone, Debug, Default)]
+pub struct SignInOptions {
+    /// `LORE_ALLOWED_HOSTS`: the host names passkeys may be bound to.
+    pub allowed_hosts: Vec<String>,
+    /// `LORE_WEBAUTHN_RP_ID`: a parent domain passkeys are bound to.
+    pub rp_id: Option<String>,
+    /// `LORE_ADMIN_BREAK_GLASS`: the environment admin password signs in
+    /// without a second factor, even after a password was set on the page.
+    pub break_glass: bool,
+    /// `LORE_TOTP_ISSUER`: the name authenticator apps show.
+    #[allow(dead_code, reason = "the authenticator app arrives in a later commit")]
+    pub totp_issuer: Option<String>,
 }
 
 pub struct Admin {
@@ -375,6 +473,7 @@ pub struct Admin {
     /// How often an open terminal's session and permission are checked
     /// again.
     terminal_recheck: Duration,
+    sign_in: SignInOptions,
 }
 
 /// How often lore checks that the page holding an open terminal is still
@@ -438,7 +537,31 @@ impl Admin {
             builtin: None,
             task_runner: None,
             terminal_recheck: TERMINAL_RECHECK,
+            sign_in: SignInOptions::default(),
         }
+    }
+
+    /// The relying party of a request: its public origin (a host in
+    /// `LORE_ALLOWED_HOSTS` when that is set) and, as id, its host name or
+    /// `LORE_WEBAUTHN_RP_ID` when that fits the host. `None` when passkeys
+    /// cannot work at this address.
+    fn relying_party(&self, headers: &HeaderMap) -> Option<RelyingParty> {
+        let origin =
+            crate::oauth::public_origin(headers, self.trust_proxy, &self.sign_in.allowed_hosts)?;
+        let host = origin.split_once("://").map(|(_, host)| host)?;
+        let name = crate::oauth::host_name(host);
+        let id = match &self.sign_in.rp_id {
+            Some(rp_id) if rp_id_fits(rp_id, &name) => rp_id.clone(),
+            Some(_) => return None,
+            None => name,
+        };
+        Some(RelyingParty { id, origin })
+    }
+
+    /// Sets the sign-in options read from the environment.
+    pub fn with_sign_in(mut self, options: SignInOptions) -> Self {
+        self.sign_in = options;
+        self
     }
 
     /// A shorter terminal re-check, for the tests.
@@ -498,18 +621,61 @@ impl Admin {
         sessions.get(&token).map(|session| session.user.clone())
     }
 
-    /// Ends every session of a stored user except `keep` (the session
-    /// making the change), whose permissions are brought up to date.
-    fn end_sessions_of(&self, user_id: i64, keep: Option<&str>, perms: Option<Perms>) {
+    /// Ends every session of an account (stored or built-in) except
+    /// `keep` (the session making the change), whose permissions are
+    /// brought up to date.
+    fn end_sessions_of_account(&self, account: &str, keep: Option<&str>, perms: Option<Perms>) {
         let mut sessions = self.sessions();
-        sessions.retain(|token, session| {
-            session.user.user_id != Some(user_id) || Some(token.as_str()) == keep
-        });
+        sessions
+            .retain(|token, session| session.account != account || Some(token.as_str()) == keep);
         if let (Some(keep), Some(perms)) = (keep, perms)
             && let Some(session) = sessions.get_mut(keep)
-            && session.user.user_id == Some(user_id)
+            && session.account == account
         {
             session.user.perms = perms;
+        }
+    }
+
+    /// Ends every session of a stored user except `keep`.
+    fn end_sessions_of(&self, user_id: i64, keep: Option<&str>, perms: Option<Perms>) {
+        self.end_sessions_of_account(&db::user_account(user_id), keep, perms);
+    }
+
+    /// Moves a live session to a new token, so a token seen before a
+    /// security change stops working. `reauthenticated` also makes it
+    /// fresh. `None` when `old` is not a live session.
+    fn rotate_session(&self, old: &str, reauthenticated: bool) -> Option<String> {
+        let token = random_token().ok()?;
+        let mut sessions = self.sessions();
+        sessions.retain(|_, session| session.expires > Instant::now());
+        let mut session = sessions.remove(old)?;
+        if reauthenticated {
+            session.authenticated_at = Instant::now();
+        }
+        sessions.insert(token.clone(), session);
+        Some(token)
+    }
+
+    /// Seconds the session a request carries stays fresh; 0 when it is not
+    /// fresh or not signed in.
+    fn fresh_for(&self, headers: &HeaderMap) -> u64 {
+        let Some(token) = cookie(headers, COOKIE) else {
+            return 0;
+        };
+        let mut sessions = self.sessions();
+        sessions.retain(|_, session| session.expires > Instant::now());
+        sessions.get(&token).map_or(0, AdminSession::fresh_for)
+    }
+
+    /// The re-authentication check, reusable by any handler that needs a
+    /// recent sign-in (security changes, a full restore, later wallet
+    /// approvals): `Err` with `403 {"reauth": true}` when the session's
+    /// last authentication is older than `FRESH_FOR`.
+    pub(crate) fn require_fresh(&self, headers: &HeaderMap) -> Result<(), NeedsReauth> {
+        if self.fresh_for(headers) > 0 {
+            Ok(())
+        } else {
+            Err(NeedsReauth)
         }
     }
 
@@ -618,7 +784,13 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
         .route("/admin/api/integrations", get(integrations))
         .route(
             "/admin/api/password",
-            put(change_own_password).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+            put(security::change_own_password)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
+                .delete(security::restore_env_password),
+        )
+        .route(
+            "/admin/api/builtin-users/{name}/password",
+            put(security::set_builtin_password).layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
         )
         // Backups carry the whole store.
         .route("/admin/api/export", get(export))
@@ -793,6 +965,11 @@ async fn guard(State(admin): State<Arc<Admin>>, mut request: Request, next: Next
              permissions and tokens, so it is as much as being the administrator",
         );
     }
+    if needs_fresh(request.method(), &pattern)
+        && let Err(refusal) = admin.require_fresh(request.headers())
+    {
+        return refusal.into_response();
+    }
     request.extensions_mut().insert(user);
     next.run(request).await
 }
@@ -801,12 +978,46 @@ fn forbidden(message: &str) -> Response {
     (StatusCode::FORBIDDEN, Json(json!({ "error": message }))).into_response()
 }
 
+/// A change needed a fresh authentication and the session has none: the
+/// page asks the user to confirm it is them, then retries.
+pub(crate) struct NeedsReauth;
+
+impl IntoResponse for NeedsReauth {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Confirm it is you first.", "reauth": true })),
+        )
+            .into_response()
+    }
+}
+
+/// The session cookie for `token`.
+fn session_cookie(token: &str) -> String {
+    format!(
+        "{COOKIE}={token}; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age={}",
+        SESSION_TTL.as_secs()
+    )
+}
+
 /// Tells the page whether it is signed in, as whom, with which
 /// permissions, and which reCAPTCHA key to load. `role` stays for pages
 /// cached before permissions existed.
 async fn session(State(admin): State<Arc<Admin>>, headers: HeaderMap) -> Json<serde_json::Value> {
     let user = admin.signed_in(&headers);
+    let (break_glass, methods) = cookie(&headers, COOKIE)
+        .and_then(|token| {
+            admin
+                .sessions()
+                .get(&token)
+                .map(|session| (session.break_glass, session.methods.clone()))
+        })
+        .unwrap_or_default();
     Json(json!({
+        "break_glass": break_glass,
+        "methods": methods,
+        "fresh_for": admin.fresh_for(&headers),
+        "passkey_sign_in": admin.relying_party(&headers).is_some(),
         "authenticated": user.is_some(),
         "build": build_id(),
         "role": user.as_ref().map(SignedIn::role),
@@ -839,7 +1050,13 @@ impl std::fmt::Debug for LoginForm {
 
 /// How a sign-in attempt went.
 enum LoginOutcome {
-    Ok(SignedIn),
+    /// The password was right. `break_glass` when it was the environment
+    /// admin password under `LORE_ADMIN_BREAK_GLASS`: that sign-in needs no
+    /// second factor.
+    Ok {
+        user: SignedIn,
+        break_glass: bool,
+    },
     Wrong,
     /// The password was right, but the user is disabled.
     Disabled,
@@ -847,30 +1064,14 @@ enum LoginOutcome {
     Busy,
 }
 
-/// Checks a user name and password. Built-in passwords are compared in
-/// constant time; stored users are verified against their Argon2id hash,
-/// and an unknown name against a dummy hash, so it takes as long.
+/// Checks a user name and password. Built-in users are checked against
+/// their page password (Argon2id) when one was set, else against the
+/// environment password in constant time; stored users against their
+/// Argon2id hash, and an unknown name against a dummy hash, so it takes as
+/// long.
 async fn check_login(admin: &Arc<Admin>, username: &str, password: String) -> LoginOutcome {
-    let presented = password.as_bytes();
-    let is_admin = || bool::from(presented.ct_eq(admin.password.as_bytes()));
-    let is_viewer = || {
-        admin
-            .viewer_password
-            .as_ref()
-            .is_some_and(|viewer| bool::from(presented.ct_eq(viewer.as_bytes())))
-    };
     match username {
-        "" => {
-            // Check both passwords every time so timing does not tell them apart.
-            match (is_admin(), is_viewer()) {
-                (true, _) => LoginOutcome::Ok(SignedIn::builtin_admin()),
-                (false, true) => LoginOutcome::Ok(SignedIn::builtin_viewer()),
-                (false, false) => LoginOutcome::Wrong,
-            }
-        }
-        ADMIN_USER if is_admin() => LoginOutcome::Ok(SignedIn::builtin_admin()),
-        VIEWER_USER if is_viewer() => LoginOutcome::Ok(SignedIn::builtin_viewer()),
-        ADMIN_USER | VIEWER_USER => LoginOutcome::Wrong,
+        "" | ADMIN_USER | VIEWER_USER => check_builtin_login(admin, username, password).await,
         name => {
             // The slot moves into the blocking task, so it is held until
             // the hash is checked even when the request goes away.
@@ -892,25 +1093,164 @@ async fn check_login(admin: &Arc<Admin>, username: &str, password: String) -> Lo
                     return Ok(LoginOutcome::Disabled);
                 }
                 state.db.touch_user_login(login.user.id)?;
-                Ok(LoginOutcome::Ok(SignedIn {
-                    perms: login.user.perms(),
-                    username: login.user.username,
-                    user_id: Some(login.user.id),
-                }))
+                Ok(LoginOutcome::Ok {
+                    user: SignedIn {
+                        perms: login.user.perms(),
+                        username: login.user.username,
+                        user_id: Some(login.user.id),
+                    },
+                    break_glass: false,
+                })
             })
             .await;
-            match checked {
-                Ok(Ok(outcome)) => outcome,
-                Ok(Err(error)) => {
-                    tracing::error!(%error, "checking a sign-in failed");
-                    LoginOutcome::Wrong
-                }
-                Err(error) => {
-                    tracing::error!(%error, "the sign-in task failed");
-                    LoginOutcome::Wrong
+            flatten_login(checked)
+        }
+    }
+}
+
+fn flatten_login(
+    checked: Result<anyhow::Result<LoginOutcome>, tokio::task::JoinError>,
+) -> LoginOutcome {
+    match checked {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "checking a sign-in failed");
+            LoginOutcome::Wrong
+        }
+        Err(error) => {
+            tracing::error!(%error, "the sign-in task failed");
+            LoginOutcome::Wrong
+        }
+    }
+}
+
+/// Whether a password signs in as one built-in user, and whether only
+/// through break-glass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuiltinMatch {
+    No,
+    Yes,
+    BreakGlass,
+}
+
+/// Checks the built-in users: `admin`, `viewer`, or (empty name) admin,
+/// then viewer, both checked every time so timing does not tell them
+/// apart. A page password replaces the environment one, except that under
+/// `LORE_ADMIN_BREAK_GLASS` the environment admin password still signs in.
+async fn check_builtin_login(admin: &Arc<Admin>, username: &str, password: String) -> LoginOutcome {
+    let try_admin = username.is_empty() || username == ADMIN_USER;
+    let try_viewer =
+        (username.is_empty() || username == VIEWER_USER) && admin.viewer_password.is_some();
+    let state = admin.clone();
+    let pages = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(Option<String>, Option<String>)> {
+            Ok((
+                state
+                    .db
+                    .builtin_password(ADMIN_USER)?
+                    .map(|row| row.password_hash),
+                state
+                    .db
+                    .builtin_password(VIEWER_USER)?
+                    .map(|row| row.password_hash),
+            ))
+        },
+    )
+    .await;
+    let (admin_page, viewer_page) = match pages {
+        Ok(Ok(pages)) => pages,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "reading the built-in passwords failed");
+            return LoginOutcome::Wrong;
+        }
+        Err(error) => {
+            tracing::error!(%error, "the sign-in task failed");
+            return LoginOutcome::Wrong;
+        }
+    };
+    let admin_page = admin_page.filter(|_| try_admin);
+    let viewer_page = viewer_page.filter(|_| try_viewer);
+    let needs_argon = admin_page.is_some() || viewer_page.is_some();
+    let (env_admin, env_viewer, break_glass_on) = (
+        admin.password.clone(),
+        admin.viewer_password.clone(),
+        admin.sign_in.break_glass,
+    );
+    let decide = move |password: &str| -> (BuiltinMatch, BuiltinMatch) {
+        let presented = password.as_bytes();
+        let env_is_admin = bool::from(presented.ct_eq(env_admin.as_bytes()));
+        let admin_match = match &admin_page {
+            Some(hash) => {
+                let page = users::verify_password(password, hash);
+                if page {
+                    BuiltinMatch::Yes
+                } else if env_is_admin && break_glass_on {
+                    BuiltinMatch::BreakGlass
+                } else {
+                    BuiltinMatch::No
                 }
             }
+            None if env_is_admin && break_glass_on => BuiltinMatch::BreakGlass,
+            None if env_is_admin => BuiltinMatch::Yes,
+            None => BuiltinMatch::No,
+        };
+        let viewer_match = match (&viewer_page, &env_viewer) {
+            (Some(hash), _) => {
+                if users::verify_password(password, hash) {
+                    BuiltinMatch::Yes
+                } else {
+                    BuiltinMatch::No
+                }
+            }
+            (None, Some(env)) if bool::from(presented.ct_eq(env.as_bytes())) => BuiltinMatch::Yes,
+            _ => BuiltinMatch::No,
+        };
+        (
+            if try_admin {
+                admin_match
+            } else {
+                BuiltinMatch::No
+            },
+            if try_viewer {
+                viewer_match
+            } else {
+                BuiltinMatch::No
+            },
+        )
+    };
+    let (admin_match, viewer_match) = if needs_argon {
+        let Ok(permit) = admin.argon.clone().try_acquire_owned() else {
+            return LoginOutcome::Busy;
+        };
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            decide(&password)
+        })
+        .await
+        {
+            Ok(matches) => matches,
+            Err(error) => {
+                tracing::error!(%error, "the sign-in task failed");
+                return LoginOutcome::Wrong;
+            }
         }
+    } else {
+        decide(&password)
+    };
+    match (admin_match, viewer_match) {
+        (BuiltinMatch::Yes, _) => LoginOutcome::Ok {
+            user: SignedIn::builtin_admin(),
+            break_glass: false,
+        },
+        (BuiltinMatch::BreakGlass, _) => LoginOutcome::Ok {
+            user: SignedIn::builtin_admin(),
+            break_glass: true,
+        },
+        (BuiltinMatch::No, BuiltinMatch::Yes) => LoginOutcome::Ok {
+            user: SignedIn::builtin_viewer(),
+            break_glass: false,
+        },
+        _ => LoginOutcome::Wrong,
     }
 }
 
@@ -939,14 +1279,17 @@ async fn login(
     }
 
     let username = form.username.trim().to_lowercase();
-    let user = match check_login(&admin, &username, form.password).await {
-        LoginOutcome::Ok(user) => user,
+    let (user, break_glass) = match check_login(&admin, &username, form.password).await {
+        LoginOutcome::Ok { user, break_glass } => (user, break_glass),
         LoginOutcome::Busy => {
             tracing::warn!(%ip, "sign-in refused: every password check slot is busy");
             return too_many_requests(2);
         }
         LoginOutcome::Wrong => {
             tracing::warn!(%ip, "admin login with a wrong user name or password");
+            // The typed name is not stored: it may be a password typed
+            // into the wrong field.
+            auth_event(&admin, "", "", "signin.fail.password", &ip, "");
             tokio::time::sleep(Duration::from_millis(400)).await;
             let message = if username.is_empty() {
                 "Wrong password."
@@ -960,7 +1303,41 @@ async fn login(
             return forbidden("This user is disabled.");
         }
     };
+    if break_glass {
+        tracing::warn!(%ip, "admin signed in with the environment password under LORE_ADMIN_BREAK_GLASS");
+        auth_event(
+            &admin,
+            ADMIN_USER,
+            ADMIN_USER,
+            "signin.break_glass",
+            &ip,
+            "",
+        );
+        return finish_sign_in(&admin, &ip, user, vec!["password-env-break-glass"], true).await;
+    }
+    finish_sign_in(&admin, &ip, user, vec!["password"], false).await
+}
 
+/// Notes a sign-in or credential event in the sign-in log; a failure to
+/// write it is logged, never shown.
+fn auth_event(admin: &Admin, account: &str, actor: &str, event: &str, ip: &str, detail: &str) {
+    if let Err(error) = admin
+        .db
+        .record_auth_event(account, actor, event, ip, detail)
+    {
+        tracing::warn!(%error, event, "writing the sign-in log failed");
+    }
+}
+
+/// Starts the session of a completed sign-in, whichever way it went, and
+/// answers like a successful `/login`: a new token, the session cookie.
+async fn finish_sign_in(
+    admin: &Arc<Admin>,
+    ip: &str,
+    user: SignedIn,
+    methods: Vec<&'static str>,
+    break_glass: bool,
+) -> Response {
     let token = match random_token() {
         Ok(token) => token,
         Err(error) => {
@@ -972,8 +1349,11 @@ async fn login(
     // password was checked: the session gets the state as it is now.
     let state = admin.clone();
     let session_token = token.clone();
-    let started =
-        tokio::task::spawn_blocking(move || start_session(&state, &session_token, user)).await;
+    let detail = methods.join("+");
+    let started = tokio::task::spawn_blocking(move || {
+        start_session_with(&state, &session_token, user, methods, break_glass)
+    })
+    .await;
     let user = match started {
         Ok(Ok(Some(user))) => user,
         Ok(Ok(None)) => {
@@ -989,47 +1369,63 @@ async fn login(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    admin.logins.reset(&ip);
+    admin.logins.reset(ip);
+    auth_event(
+        admin,
+        &user.account(),
+        &user.username,
+        "signin.ok",
+        ip,
+        &detail,
+    );
     let body = json!({
         "ok": true,
         "role": user.role(),
         "username": user.username,
         "permissions": user.perms.ids(),
         "stored": user.user_id.is_some(),
+        "break_glass": break_glass,
     });
-    tracing::info!(%ip, user = %user.username, "signed in to the admin view");
-    let cookie = format!(
-        "{COOKIE}={token}; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age={}",
-        SESSION_TTL.as_secs()
-    );
-    ([(header::SET_COOKIE, cookie)], Json(body)).into_response()
+    tracing::info!(%ip, user = %user.username, methods = %detail, "signed in to the admin view");
+    ([(header::SET_COOKIE, session_cookie(&token))], Json(body)).into_response()
+}
+
+/// Inserts the session for a checked sign-in, with the password-only
+/// method; the tests use it.
+#[cfg(test)]
+fn start_session(admin: &Admin, token: &str, user: SignedIn) -> anyhow::Result<Option<SignedIn>> {
+    start_session_with(admin, token, user, vec!["password"], false)
 }
 
 /// Inserts the session for a checked sign-in. A stored user is read again
 /// under the sessions lock: a change made while the password was being
 /// checked (disabled, deleted, other permissions) either shows here or
 /// ends this session right after, because `end_sessions_of` needs the same
-/// lock. `None` when the user is gone or disabled.
-fn start_session(
+/// lock. A built-in user still needs its environment variable. `None` when
+/// the user is gone or disabled.
+fn start_session_with(
     admin: &Admin,
     token: &str,
     mut user: SignedIn,
+    methods: Vec<&'static str>,
+    break_glass: bool,
 ) -> anyhow::Result<Option<SignedIn>> {
     let mut sessions = admin.sessions();
-    if let Some(id) = user.user_id {
-        match admin.db.user(id)? {
+    match user.user_id {
+        Some(id) => match admin.db.user(id)? {
             Some(now) if !now.disabled && now.username == user.username => {
                 user.perms = now.perms();
             }
             _ => return Ok(None),
+        },
+        None if user.username == VIEWER_USER && admin.viewer_password.is_none() => {
+            return Ok(None);
         }
+        None => {}
     }
     sessions.insert(
         token.to_string(),
-        AdminSession {
-            expires: Instant::now() + SESSION_TTL,
-            user: user.clone(),
-        },
+        AdminSession::new(user.clone(), methods, break_glass),
     );
     Ok(Some(user))
 }
@@ -1174,6 +1570,7 @@ enum UserChange<T> {
     Done(T),
     Missing,
     Forbidden(String),
+    Invalid(String),
 }
 
 /// Permission ids for an activity note.
@@ -1205,11 +1602,13 @@ struct UserForm {
 async fn update_user(
     State(admin): State<Arc<Admin>>,
     Extension(me): Extension<SignedIn>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(form): Json<UserForm>,
 ) -> Response {
     let myself = me.user_id == Some(id);
+    let ip = client_ip(&headers, Some(peer), admin.trust_proxy);
     let mut patch = UserPatch::default();
     if let Some(email) = &form.email {
         match users::normalize_email(email) {
@@ -1240,66 +1639,106 @@ async fn update_user(
     }
     patch.disabled = form.disabled;
     let password = form.password.filter(|password| !password.is_empty());
-    if let Some(password) = &password
-        && let Err(message) = users::check_password(password)
-    {
-        return bad_request(&message);
+    if let Some(password) = &password {
+        if let Err(message) = users::check_password(password) {
+            return bad_request(&message);
+        }
+        // Setting a password changes how the account signs in.
+        if let Err(refusal) = admin.require_fresh(&headers) {
+            return refusal.into_response();
+        }
     }
     let keep = cookie(&headers, COOKIE);
     let state = admin.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<UserChange<db::User>> {
-        let Some(before) = state.db.user(id)? else {
-            return Ok(UserChange::Missing);
-        };
-        if let Err(message) = may_manage(&me, &before) {
-            return Ok(UserChange::Forbidden(message));
-        }
-        if let Some(password) = &password {
-            patch.password_hash = Some(users::hash_password(password)?);
-        }
-        let Some(after) = state.db.update_user(id, &patch)? else {
-            return Ok(UserChange::Missing);
-        };
-        let mut changes = Vec::new();
-        if before.email != after.email {
-            changes.push("e-mail".to_string());
-        }
-        let perms_changed = before.permissions != after.permissions;
-        if perms_changed {
-            changes.push(format!("permissions ({})", describe_perms(after.perms())));
-        }
-        if before.disabled != after.disabled {
-            changes.push(
-                if after.disabled {
-                    "disabled"
-                } else {
-                    "enabled"
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<UserChange<(db::User, Option<String>)>> {
+            let Some(before) = state.db.user(id)? else {
+                return Ok(UserChange::Missing);
+            };
+            if let Err(message) = may_manage(&me, &before) {
+                return Ok(UserChange::Forbidden(message));
+            }
+            if let Some(password) = &password {
+                if let Err(message) = users::check_new_password(
+                    &before.username,
+                    before.email.as_deref(),
+                    password,
+                    false,
+                ) {
+                    return Ok(UserChange::Invalid(message));
                 }
-                .to_string(),
-            );
-        }
-        if password.is_some() {
-            changes.push("password".to_string());
-        }
-        if password.is_some() || perms_changed || after.disabled {
-            state.end_sessions_of(id, keep.as_deref(), Some(after.perms()));
-        }
-        if !changes.is_empty() {
-            let summary = format!(
-                "{} changed the user {}: {}",
-                me.username,
-                after.username,
-                changes.join(", ")
-            );
-            note_activity(&state, "users", &summary);
-        }
-        Ok(UserChange::Done(after))
-    })
+                patch.password_hash = Some(users::hash_password(password)?);
+            }
+            let Some(after) = state.db.update_user(id, &patch)? else {
+                return Ok(UserChange::Missing);
+            };
+            let mut changes = Vec::new();
+            if before.email != after.email {
+                changes.push("e-mail".to_string());
+            }
+            let perms_changed = before.permissions != after.permissions;
+            if perms_changed {
+                changes.push(format!("permissions ({})", describe_perms(after.perms())));
+            }
+            if before.disabled != after.disabled {
+                changes.push(
+                    if after.disabled {
+                        "disabled"
+                    } else {
+                        "enabled"
+                    }
+                    .to_string(),
+                );
+            }
+            if password.is_some() {
+                changes.push("password".to_string());
+            }
+            let mut rotated = None;
+            if password.is_some() || perms_changed || after.disabled {
+                // The caller's own session stays, with the new permissions;
+                // everyone else's ends. A new password of one's own also moves
+                // it to a new token.
+                let keep = keep.as_deref().filter(|_| myself);
+                state.end_sessions_of(id, keep, Some(after.perms()));
+                if let Some(keep) = keep.filter(|_| password.is_some()) {
+                    rotated = state.rotate_session(keep, false);
+                }
+            }
+            if password.is_some() {
+                auth_event(
+                    &state,
+                    &db::user_account(id),
+                    &me.username,
+                    if myself {
+                        "password.changed"
+                    } else {
+                        "password.set_by_other"
+                    },
+                    &ip,
+                    "",
+                );
+            }
+            if !changes.is_empty() {
+                let summary = format!(
+                    "{} changed the user {}: {}",
+                    me.username,
+                    after.username,
+                    changes.join(", ")
+                );
+                note_activity(&state, "users", &summary);
+            }
+            Ok(UserChange::Done((after, rotated)))
+        },
+    )
     .await;
     match result {
-        Ok(Ok(UserChange::Done(user))) => Json(user).into_response(),
+        Ok(Ok(UserChange::Done((user, Some(token))))) => {
+            ([(header::SET_COOKIE, session_cookie(&token))], Json(user)).into_response()
+        }
+        Ok(Ok(UserChange::Done((user, None)))) => Json(user).into_response(),
         Ok(Ok(UserChange::Missing)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Ok(UserChange::Forbidden(message))) => forbidden(&message),
+        Ok(Ok(UserChange::Invalid(message))) => bad_request(&message),
         Ok(Err(error)) => bad_request(&error.to_string()),
         Err(error) => {
             tracing::error!(%error, "changing a user failed");
@@ -1338,85 +1777,10 @@ async fn delete_user(
         Ok(Ok(UserChange::Done(()))) => Json(json!({ "ok": true })).into_response(),
         Ok(Ok(UserChange::Missing)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Ok(UserChange::Forbidden(message))) => forbidden(&message),
+        Ok(Ok(UserChange::Invalid(message))) => bad_request(&message),
         Ok(Err(error)) => bad_request(&error.to_string()),
         Err(error) => {
             tracing::error!(%error, "deleting a user failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct PasswordForm {
-    #[serde(default)]
-    current: String,
-    #[serde(default)]
-    password: String,
-}
-
-impl std::fmt::Debug for PasswordForm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PasswordForm { [redacted] }")
-    }
-}
-
-/// A stored user changes their own password; the current one is required.
-/// Their other sessions end; this one stays.
-async fn change_own_password(
-    State(admin): State<Arc<Admin>>,
-    Extension(me): Extension<SignedIn>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(form): Json<PasswordForm>,
-) -> Response {
-    let Some(id) = me.user_id else {
-        return bad_request(
-            "the built-in users' passwords are set in the server environment, not here",
-        );
-    };
-    let ip = client_ip(&headers, Some(peer), admin.trust_proxy);
-    if let Err(message) = users::check_password(&form.password) {
-        return bad_request(&message);
-    }
-    // Like a sign-in: the attempt counts before the current password is
-    // checked, and the check needs a free Argon2 slot.
-    if let Some(retry_after) = admin.logins.hit(&ip) {
-        return too_many_requests(retry_after);
-    }
-    let Ok(permit) = admin.argon.clone().try_acquire_owned() else {
-        return too_many_requests(2);
-    };
-    let keep = cookie(&headers, COOKIE);
-    let state = admin.clone();
-    let result =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Result<(), &'static str>> {
-            let _permit = permit;
-            let Some(hash) = state.db.user_password_hash(id)? else {
-                return Ok(Err("your user no longer exists"));
-            };
-            if !users::verify_password(&form.current, &hash) {
-                return Ok(Err("the current password is wrong"));
-            }
-            let patch = UserPatch {
-                password_hash: Some(users::hash_password(&form.password)?),
-                ..UserPatch::default()
-            };
-            state.db.update_user(id, &patch)?;
-            state.end_sessions_of(id, keep.as_deref(), None);
-            let summary = format!("{} changed their password", me.username);
-            note_activity(&state, "users", &summary);
-            Ok(Ok(()))
-        })
-        .await;
-    match result {
-        Ok(Ok(Ok(()))) => {
-            admin.logins.reset(&ip);
-            Json(json!({ "ok": true })).into_response()
-        }
-        Ok(Ok(Err(message))) => bad_request(message),
-        Ok(Err(error)) => bad_request(&error.to_string()),
-        Err(error) => {
-            tracing::error!(%error, "changing a password failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -3869,6 +4233,15 @@ mod tests {
         vault: Option<VaultKey>,
         extra: Router<Arc<Admin>>,
     ) -> (String, Arc<Admin>) {
+        serve_custom(vault, extra, SignInOptions::default()).await
+    }
+
+    /// Like `serve_router`, with sign-in options.
+    async fn serve_custom(
+        vault: Option<VaultKey>,
+        extra: Router<Arc<Admin>>,
+        options: SignInOptions,
+    ) -> (String, Arc<Admin>) {
         // A counter keeps every server, even two in one test, on its own
         // database.
         static SERVERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -3879,21 +4252,24 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let db = Db::open(&dir.join("lore.db")).unwrap();
-        let admin = Arc::new(Admin::new(
-            db,
-            "admin-password".into(),
-            Some("viewer-password".into()),
-            None,
-            false,
-            vec!["claude".into()],
-            None,
-            0.8,
-            Events::new(),
-            Embedder::disabled(),
-            12,
-            vault,
-            ops::Guard::default(),
-        ));
+        let admin = Arc::new(
+            Admin::new(
+                db,
+                "admin-password".into(),
+                Some("viewer-password".into()),
+                None,
+                false,
+                vec!["claude".into()],
+                None,
+                0.8,
+                Events::new(),
+                Embedder::disabled(),
+                12,
+                vault,
+                ops::Guard::default(),
+            )
+            .with_sign_in(options),
+        );
         sign_in(&admin, "admin-token", SignedIn::builtin_admin());
         sign_in(&admin, "viewer-token", SignedIn::builtin_viewer());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3912,13 +4288,9 @@ mod tests {
 
     /// Puts a live session for `user` under `token`.
     fn sign_in(admin: &Admin, token: &str, user: SignedIn) {
-        admin.sessions().insert(
-            token.into(),
-            AdminSession {
-                expires: Instant::now() + Duration::from_secs(600),
-                user,
-            },
-        );
+        let mut session = AdminSession::new(user, vec!["password"], false);
+        session.expires = Instant::now() + Duration::from_secs(600);
+        admin.sessions().insert(token.into(), session);
     }
 
     async fn serve() -> (String, Arc<Admin>) {
@@ -5648,6 +6020,29 @@ mod tests {
         admin.sessions().contains_key(token)
     }
 
+    /// The session token a response sets, if it sets one.
+    fn session_token_of(response: &reqwest::Response) -> Option<String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| value.strip_prefix(&format!("{COOKIE}=")))
+            .and_then(|rest| rest.split(';').next())
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Makes a session look as if its sign-in was longer ago than the
+    /// fresh window.
+    fn make_stale(admin: &Admin, token: &str) {
+        if let Some(session) = admin.sessions().get_mut(token) {
+            session.authenticated_at = Instant::now()
+                .checked_sub(FRESH_FOR + Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+        }
+    }
+
     async fn login(base: &str, body: serde_json::Value) -> reqwest::Response {
         reqwest::Client::new()
             .post(format!("{base}/admin/api/login"))
@@ -6434,7 +6829,7 @@ mod tests {
         );
         // What boss holds he may grant, and weaker users he may change.
         let response = call(reqwest::Method::PUT, ann_path.clone(), "boss-token")
-            .json(&json!({ "permissions": ["users"], "password": "ann-new-password" }))
+            .json(&json!({ "permissions": ["users"], "password": "fresh-new-password" }))
             .send()
             .await
             .unwrap();
@@ -6968,15 +7363,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), 400);
-        // The built-in users' passwords live in the environment.
+        // A built-in user's new password needs twelve characters.
         let response = change(
             "admin-token",
-            json!({ "current": "admin-password", "password": "new-password-1" }),
+            json!({ "current": "admin-password", "password": "eleven-char" }),
         )
         .send()
         .await
         .unwrap();
         assert_eq!(response.status(), 400);
+        // Not containing the user name, and not the same as before.
+        for password in ["my-luis-password", "a-long-password"] {
+            let response = change(
+                "luis-token",
+                json!({ "current": "a-long-password", "password": password }),
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), 400, "{password}");
+        }
         let response = change(
             "luis-token",
             json!({ "current": "a-long-password", "password": "new-password-1" }),
@@ -6985,7 +7391,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), 200);
-        assert!(has_session(&admin, "luis-token"));
+        // This session moved to a new token; the others ended.
+        let rotated = session_token_of(&response).unwrap();
+        assert!(!has_session(&admin, "luis-token"));
+        assert!(has_session(&admin, &rotated));
         assert!(!has_session(&admin, "luis-other"));
         assert_eq!(
             login(
@@ -7113,5 +7522,358 @@ mod tests {
                 .flatten()
                 .all(|item| { !item.file_name().to_string_lossy().starts_with(".lore-tmp-") })
         );
+    }
+    async fn put_json(
+        base: &str,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .put(format!("{base}{path}"))
+            .header(header::COOKIE, format!("{COOKIE}={token}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn send_as(
+        method: reqwest::Method,
+        base: &str,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .request(method, format!("{base}{path}"))
+            .header(header::COOKIE, format!("{COOKIE}={token}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_built_in_admin_changes_its_password_on_the_page_and_back() {
+        let (base, admin) = serve().await;
+        sign_in(&admin, "admin-other", SignedIn::builtin_admin());
+        let response = put_json(
+            &base,
+            "/admin/api/password",
+            "admin-token",
+            json!({ "current": "admin-password", "password": "page-password-1" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let rotated = session_token_of(&response).unwrap();
+        assert!(!has_session(&admin, "admin-token"));
+        assert!(!has_session(&admin, "admin-other"));
+        // The viewer stays signed in: another account.
+        assert!(has_session(&admin, "viewer-token"));
+        // The environment password no longer signs in; the page one does.
+        let env = login(
+            &base,
+            json!({ "username": "admin", "password": "admin-password" }),
+        )
+        .await;
+        assert_eq!(env.status(), 401);
+        let empty = login(&base, json!({ "password": "admin-password" })).await;
+        assert_eq!(empty.status(), 401);
+        let page = login(
+            &base,
+            json!({ "username": "admin", "password": "page-password-1" }),
+        )
+        .await;
+        assert_eq!(page.status(), 200);
+        let page = login(&base, json!({ "password": "page-password-1" })).await;
+        assert_eq!(page.status(), 200);
+        let session: serde_json::Value = reqwest::Client::new()
+            .get(format!("{base}/admin/api/session"))
+            .header(header::COOKIE, format!("{COOKIE}={rotated}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(session["username"], "admin");
+        assert!(session["fresh_for"].as_u64().unwrap() > 0);
+
+        // Going back to the environment password needs a fresh sign-in.
+        make_stale(&admin, &rotated);
+        let stale = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            "/admin/api/password",
+            &rotated,
+            json!({}),
+        )
+        .await;
+        assert_eq!(stale.status(), 403);
+        let body: serde_json::Value = stale.json().await.unwrap();
+        assert_eq!(body["reauth"], true);
+        sign_in(&admin, "admin-fresh", SignedIn::builtin_admin());
+        let back = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            "/admin/api/password",
+            "admin-fresh",
+            json!({}),
+        )
+        .await;
+        assert_eq!(back.status(), 200);
+        assert!(session_token_of(&back).is_some());
+        assert!(!has_session(&admin, &rotated));
+        let env = login(
+            &base,
+            json!({ "username": "admin", "password": "admin-password" }),
+        )
+        .await;
+        assert_eq!(env.status(), 200);
+        let events = admin.db.auth_events(Some("admin"), 50).unwrap();
+        let names: Vec<&str> = events.iter().map(|event| event.event.as_str()).collect();
+        assert!(names.contains(&"password.changed") && names.contains(&"password.env_restored"));
+        // A stored user has no environment password to go back to.
+        stored_user(&admin, "luis", &[], "luis-token");
+        let refused = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            "/admin/api/password",
+            "luis-token",
+            json!({}),
+        )
+        .await;
+        assert_eq!(refused.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn the_built_in_passwords_never_overlap() {
+        let (base, admin) = serve().await;
+        // The viewer cannot take admin's password, environment or page.
+        let response = put_json(
+            &base,
+            "/admin/api/password",
+            "viewer-token",
+            json!({ "current": "viewer-password", "password": "admin-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        admin
+            .db
+            .set_builtin_password(
+                ADMIN_USER,
+                &users::hash_password("admin-page-pass").unwrap(),
+                "admin",
+            )
+            .unwrap();
+        let response = put_json(
+            &base,
+            "/admin/api/password",
+            "viewer-token",
+            json!({ "current": "viewer-password", "password": "admin-page-pass" }),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        // Nor admin the viewer's.
+        let response = put_json(
+            &base,
+            "/admin/api/builtin-users/admin/password",
+            "admin-token",
+            json!({ "password": "viewer-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn who_may_set_a_built_in_password() {
+        let (base, admin) = serve().await;
+        stored_user(&admin, "boss", &Perm::ALL.map(Perm::id), "boss-token");
+        stored_user(&admin, "clerk", &["write"], "clerk-token");
+        // Admin's password: only admin itself, even for a user holding
+        // every permission.
+        let response = put_json(
+            &base,
+            "/admin/api/builtin-users/admin/password",
+            "boss-token",
+            json!({ "password": "taken-over-pass" }),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("LORE_ADMIN_BREAK_GLASS")
+        );
+        // The viewer's: needs users.
+        let response = put_json(
+            &base,
+            "/admin/api/builtin-users/viewer/password",
+            "clerk-token",
+            json!({ "password": "fresh-watch-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        let response = put_json(
+            &base,
+            "/admin/api/builtin-users/nobody/password",
+            "boss-token",
+            json!({ "password": "fresh-watch-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 404);
+        // Fresh only.
+        make_stale(&admin, "boss-token");
+        let response = put_json(
+            &base,
+            "/admin/api/builtin-users/viewer/password",
+            "boss-token",
+            json!({ "password": "fresh-watch-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        let response = put_json(
+            &base,
+            "/admin/api/builtin-users/viewer/password",
+            "admin-token",
+            json!({ "password": "fresh-watch-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        // The viewer's sessions end; admin's do not.
+        assert!(!has_session(&admin, "viewer-token"));
+        assert!(has_session(&admin, "admin-token"));
+        let old = login(
+            &base,
+            json!({ "username": "viewer", "password": "viewer-password" }),
+        )
+        .await;
+        assert_eq!(old.status(), 401);
+        let new = login(
+            &base,
+            json!({ "username": "viewer", "password": "fresh-watch-password" }),
+        )
+        .await;
+        assert_eq!(new.status(), 200);
+        let events = admin.db.auth_events(Some("viewer"), 10).unwrap();
+        assert_eq!(events[0].event, "signin.ok");
+        assert_eq!(events[1].event, "password.set_by_other");
+        assert_eq!(events[1].actor, "admin");
+    }
+
+    #[tokio::test]
+    async fn break_glass_lets_the_environment_admin_password_in() {
+        let options = SignInOptions {
+            break_glass: true,
+            ..SignInOptions::default()
+        };
+        let (base, admin) = serve_custom(Some(test_vault_key()), Router::new(), options).await;
+        admin
+            .db
+            .set_builtin_password(
+                ADMIN_USER,
+                &users::hash_password("admin-page-pass").unwrap(),
+                "admin",
+            )
+            .unwrap();
+        let response = login(
+            &base,
+            json!({ "username": "admin", "password": "admin-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["break_glass"], true);
+        let session: serde_json::Value = reqwest::Client::new()
+            .get(format!("{base}/admin/api/session"))
+            .header(header::COOKIE, format!("{COOKIE}={token}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(session["break_glass"], true);
+        let events = admin.db.auth_events(Some("admin"), 10).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "signin.break_glass")
+        );
+        // The page password still works, without the banner.
+        let response = login(
+            &base,
+            json!({ "username": "admin", "password": "admin-page-pass" }),
+        )
+        .await;
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["break_glass"], false);
+        // Break-glass is admin's only: the viewer keeps its rules.
+        admin
+            .db
+            .set_builtin_password(
+                VIEWER_USER,
+                &users::hash_password("viewer-page-pass").unwrap(),
+                "admin",
+            )
+            .unwrap();
+        let viewer = login(
+            &base,
+            json!({ "username": "viewer", "password": "viewer-password" }),
+        )
+        .await;
+        assert_eq!(viewer.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn setting_another_users_password_needs_a_fresh_sign_in_and_the_rules() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "luis-token");
+        make_stale(&admin, "admin-token");
+        let path = format!("/admin/api/users/{}", user.id);
+        let response = put_json(
+            &base,
+            &path,
+            "admin-token",
+            json!({ "password": "another-password-1" }),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        // Other changes need no fresh sign-in.
+        let response = put_json(
+            &base,
+            &path,
+            "admin-token",
+            json!({ "email": "l@example.com" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        sign_in(&admin, "admin-fresh", SignedIn::builtin_admin());
+        let response = put_json(
+            &base,
+            &path,
+            "admin-fresh",
+            json!({ "password": "luis-password-1" }),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let response = put_json(
+            &base,
+            &path,
+            "admin-fresh",
+            json!({ "password": "another-password-1" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        assert!(!has_session(&admin, "luis-token"));
+        let events = admin
+            .db
+            .auth_events(Some(&db::user_account(user.id)), 10)
+            .unwrap();
+        assert_eq!(events[0].event, "password.set_by_other");
     }
 }

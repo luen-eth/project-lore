@@ -246,21 +246,25 @@ async fn run() -> Result<()> {
             if recaptcha.is_none() {
                 tracing::warn!("admin view runs without reCAPTCHA (keys not set)");
             }
-            Some(Admin::new(
-                db.clone(),
-                password,
-                viewer_password,
-                recaptcha,
-                trust_proxy,
-                configured_agents,
-                semantic.then(|| model.name()),
-                model.link_similarity(),
-                events.clone(),
-                embedder.clone(),
-                idle_hours,
-                vault.clone(),
-                guard.clone(),
-            ))
+            let sign_in = sign_in_options(&auth.allowed_hosts)?;
+            Some(
+                Admin::new(
+                    db.clone(),
+                    password,
+                    viewer_password,
+                    recaptcha,
+                    trust_proxy,
+                    configured_agents,
+                    semantic.then(|| model.name()),
+                    model.link_similarity(),
+                    events.clone(),
+                    embedder.clone(),
+                    idle_hours,
+                    vault.clone(),
+                    guard.clone(),
+                )
+                .with_sign_in(sign_in),
+            )
         }
         None => {
             tracing::info!(
@@ -787,6 +791,44 @@ fn viewer_password(admin: &str) -> Result<Option<String>> {
         bail!("LORE_VIEWER_PASSWORD must be different from LORE_ADMIN_PASSWORD");
     }
     Ok(Some(password))
+}
+
+/// The sign-in options beyond the passwords: break-glass, the passkey
+/// relying-party id and the authenticator-app issuer.
+fn sign_in_options(allowed_hosts: &[String]) -> Result<admin::SignInOptions> {
+    let break_glass = flag("LORE_ADMIN_BREAK_GLASS", false);
+    if break_glass {
+        tracing::warn!(
+            "LORE_ADMIN_BREAK_GLASS is on: the environment admin password signs in without a \
+             second factor; unset it after recovering"
+        );
+    }
+    let rp_id = env_or("LORE_WEBAUTHN_RP_ID", "").to_ascii_lowercase();
+    let rp_id = (!rp_id.is_empty()).then_some(rp_id);
+    if let Some(rp_id) = &rp_id {
+        if allowed_hosts.is_empty() {
+            tracing::warn!(
+                "LORE_WEBAUTHN_RP_ID is set but LORE_ALLOWED_HOSTS is not: passkeys work only \
+                 on hosts that end in {rp_id}"
+            );
+        }
+        for host in allowed_hosts {
+            let name = oauth::host_name(host);
+            if !admin::rp_id_fits(rp_id, &name) {
+                bail!(
+                    "LORE_WEBAUTHN_RP_ID ({rp_id}) must be the host or a parent domain of every \
+                     LORE_ALLOWED_HOSTS entry; {host} does not end in it"
+                );
+            }
+        }
+    }
+    let totp_issuer = env_or("LORE_TOTP_ISSUER", "");
+    Ok(admin::SignInOptions {
+        allowed_hosts: allowed_hosts.to_vec(),
+        rp_id,
+        break_glass,
+        totp_issuer: (!totp_issuer.is_empty()).then_some(totp_issuer),
+    })
 }
 
 fn recaptcha() -> Result<Option<Recaptcha>> {

@@ -1268,7 +1268,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(version, crate::db::SCHEMA_VERSION.to_string());
-            assert_eq!(crate::db::SCHEMA_VERSION, 9);
+            const { assert!(crate::db::SCHEMA_VERSION >= 9) };
             let rows: Vec<(String, String, String, Option<String>)> = conn
                 .prepare(
                     "SELECT name, avatar, note, display_name FROM agent_registry ORDER BY name",

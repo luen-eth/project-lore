@@ -234,7 +234,10 @@ fn delete_second_factors(conn: &Connection, account: &str) -> Result<()> {
         "DELETE FROM webauthn_credentials WHERE account = ?1",
         params![account],
     )?;
-    conn.execute("DELETE FROM totp_secrets WHERE account = ?1", params![account])?;
+    conn.execute(
+        "DELETE FROM totp_secrets WHERE account = ?1",
+        params![account],
+    )?;
     conn.execute(
         "DELETE FROM recovery_codes WHERE account = ?1",
         params![account],
@@ -403,9 +406,7 @@ impl Db {
             )
             .optional()?;
         match found {
-            Some(credential) if account_exists(&conn, &credential.account)? => {
-                Ok(Some(credential))
-            }
+            Some(credential) if account_exists(&conn, &credential.account)? => Ok(Some(credential)),
             _ => Ok(None),
         }
     }
@@ -423,7 +424,12 @@ impl Db {
     }
 
     /// Renames one of an account's passkeys; `None` when it has no such one.
-    pub fn rename_credential(&self, account: &str, id: i64, name: &str) -> Result<Option<Credential>> {
+    pub fn rename_credential(
+        &self,
+        account: &str,
+        id: i64,
+        name: &str,
+    ) -> Result<Option<Credential>> {
         let conn = self.lock();
         let changed = conn.execute(
             "UPDATE webauthn_credentials SET name = ?3 WHERE account = ?1 AND id = ?2",
@@ -505,7 +511,13 @@ impl Db {
 
     /// Stores a confirmed secret, with the step of the confirming code as
     /// the last one used, so that code cannot sign in.
-    pub fn set_totp(&self, account: &str, nonce: &[u8], secret: &[u8], last_step: i64) -> Result<()> {
+    pub fn set_totp(
+        &self,
+        account: &str,
+        nonce: &[u8],
+        secret: &[u8],
+        last_step: i64,
+    ) -> Result<()> {
         self.lock().execute(
             &format!(
                 "INSERT INTO totp_secrets (account, nonce, secret, last_step, confirmed_at)
@@ -534,7 +546,10 @@ impl Db {
     pub fn delete_totp(&self, account: &str) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        let removed = tx.execute("DELETE FROM totp_secrets WHERE account = ?1", params![account])? > 0;
+        let removed = tx.execute(
+            "DELETE FROM totp_secrets WHERE account = ?1",
+            params![account],
+        )? > 0;
         if removed {
             drop_recovery_without_factor(&tx, account)?;
         }
@@ -767,7 +782,10 @@ mod tests {
         assert_eq!(db.recovery_remaining("admin").unwrap(), (1, 1));
         // The last passkey goes, and the codes with it.
         let id = db.credentials("admin").unwrap()[0].id;
-        assert_eq!(db.delete_credential("admin", id).unwrap().as_deref(), Some("laptop"));
+        assert_eq!(
+            db.delete_credential("admin", id).unwrap().as_deref(),
+            Some("laptop")
+        );
         assert_eq!(db.recovery_remaining("admin").unwrap(), (0, 0));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -804,7 +822,8 @@ mod tests {
     fn rows_of_a_user_deleted_elsewhere_are_ignored() {
         let (dir, db) = temp_db("orphan");
         // As an older binary leaves them: a credential of a user that is gone.
-        db.add_credential(&credential("user:999", &[3; 16])).unwrap();
+        db.add_credential(&credential("user:999", &[3; 16]))
+            .unwrap();
         assert!(db.credential_by_id(&[3; 16]).unwrap().is_none());
         assert!(db.credential_id_taken(&[3; 16]).unwrap());
         let _ = std::fs::remove_dir_all(dir);
@@ -831,7 +850,8 @@ mod tests {
     fn builtin_passwords_are_set_and_cleared() {
         let (dir, db) = temp_db("builtin");
         assert!(db.builtin_password("admin").unwrap().is_none());
-        db.set_builtin_password("admin", "$argon2id$x", "admin").unwrap();
+        db.set_builtin_password("admin", "$argon2id$x", "admin")
+            .unwrap();
         assert_eq!(
             db.builtin_password("admin").unwrap().unwrap().password_hash,
             "$argon2id$x"
@@ -895,7 +915,8 @@ mod tests {
         let mut new = credential("admin", &[0xab; 16]);
         new.public_key = b"public-key-bytes".to_vec();
         db.add_credential(&new).unwrap();
-        db.set_totp("admin", &[9; 24], b"totp-ciphertext", 5).unwrap();
+        db.set_totp("admin", &[9; 24], b"totp-ciphertext", 5)
+            .unwrap();
         db.replace_recovery_codes("admin", &["recovery-hash-1".into()])
             .unwrap();
         db.record_auth_event("admin", "admin", "signin.ok", "10.1.2.3", "password")

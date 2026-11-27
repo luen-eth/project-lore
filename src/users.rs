@@ -224,6 +224,43 @@ pub fn check_password(password: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Shortest password of the built-in users, as for their environment
+/// variables.
+pub const MIN_BUILTIN_PASSWORD_CHARS: usize = 12;
+
+/// Checks a new password for a user: its length (12 for the built-in
+/// users, 10 for stored ones), and that it does not contain the user name
+/// (names of three or more characters; an equal one always) and is not the
+/// e-mail address or its local part, compared case-insensitively after
+/// trimming. Comparing it with the current password needs the hash and is
+/// left to the caller. The password never appears in the message.
+pub fn check_new_password(
+    username: &str,
+    email: Option<&str>,
+    password: &str,
+    builtin: bool,
+) -> Result<(), String> {
+    check_password(password)?;
+    let count = password.chars().count();
+    if builtin && count < MIN_BUILTIN_PASSWORD_CHARS {
+        return Err(format!(
+            "the password of a built-in user must be at least {MIN_BUILTIN_PASSWORD_CHARS} characters"
+        ));
+    }
+    let typed = password.trim().to_lowercase();
+    let name = username.trim().to_lowercase();
+    if !name.is_empty() && (typed == name || (name.chars().count() >= 3 && typed.contains(&name))) {
+        return Err("the password must not contain the user name".into());
+    }
+    if let Some(email) = email.map(|email| email.trim().to_lowercase()) {
+        let local = email.split('@').next().unwrap_or_default().to_string();
+        if !email.is_empty() && (typed == email || (!local.is_empty() && typed == local)) {
+            return Err("the password must not be the e-mail address or its first part".into());
+        }
+    }
+    Ok(())
+}
+
 /// An Argon2id hash (default parameters) as a PHC string, with a salt from
 /// the OS random number generator. Slow on purpose: call it off the async
 /// executor.
@@ -321,6 +358,48 @@ mod tests {
         assert!(check_password("short").is_err());
         assert!(check_password(&"x".repeat(10)).is_ok());
         assert!(check_password(&"x".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn new_passwords_follow_the_rules() {
+        assert!(check_new_password("luis", None, "a long and fine phrase", false).is_ok());
+        assert!(check_new_password("luis", None, "short", false).is_err());
+        // Ten characters do for a stored user, not for a built-in one.
+        assert!(check_new_password("luis", None, "abcdefghij", false).is_ok());
+        assert!(check_new_password("admin", None, "abcdefghij", true).is_err());
+        assert!(check_new_password("admin", None, "abcdefghijkl", true).is_ok());
+        let error = check_new_password("luis", None, "my-LUIS-password", false).unwrap_err();
+        assert!(!error.contains("LUIS") && error.contains("user name"));
+        assert!(check_new_password("admin", None, "xxadminxxxxxxx", true).is_err());
+        // Two-character names only refuse an equal password.
+        assert!(check_new_password("lu", None, "lululululululu", false).is_ok());
+        assert!(
+            check_new_password(
+                "luis",
+                Some("someone@example.com"),
+                "Someone@Example.com",
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            check_new_password(
+                "x1",
+                Some("longerlocal@example.com"),
+                " LongerLocal ",
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            check_new_password(
+                "x1",
+                Some("me@example.com"),
+                "something else entirely",
+                false
+            )
+            .is_ok()
+        );
     }
 
     #[test]
