@@ -983,7 +983,7 @@ async fn read_line<R: AsyncBufReadExt + Unpin>(
 
 /// `scheme://host[:port]` of the clone URL: the only address git sends
 /// the token to.
-fn lore_origin(clone_url: &str) -> String {
+pub(crate) fn lore_origin(clone_url: &str) -> String {
     let (scheme, rest) = clone_url.split_once("://").unwrap_or(("http", clone_url));
     let host = rest.split('/').next().unwrap_or(rest);
     format!("{scheme}://{host}")
@@ -1694,6 +1694,7 @@ mod tests {
         let mcp = TerminalMcp {
             url: "http://lore:8081/mcp".into(),
             token: Secret::new(format!("lore_term_{}", "ab".repeat(32))),
+            agent: Some("deepseek-builtin".into()),
         };
         for kind in [Kind::Claude, Kind::Codex, Kind::Opencode] {
             let home = dir.join(format!("{kind:?}"));

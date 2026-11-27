@@ -207,6 +207,9 @@ struct GitRequest {
     provider: ops::Provider,
     repo: String,
     endpoint: Endpoint,
+    /// Made with a built-in agent's terminal token: the ops log row and the
+    /// activity note say so.
+    terminal: bool,
 }
 
 /// Splits the path after `/git/` into provider, repository path and
@@ -243,6 +246,7 @@ fn parse(rest: &str, method: &Method) -> Option<GitRequest> {
         provider,
         repo: segments[1..repo_len].join("/"),
         endpoint,
+        terminal: false,
     })
 }
 
@@ -376,7 +380,7 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
     let Some(rest) = parts.uri.path().strip_prefix("/git/") else {
         return not_found();
     };
-    let Some(git) = parse(rest, &parts.method) else {
+    let Some(mut git) = parse(rest, &parts.method) else {
         return not_found();
     };
 
@@ -389,7 +393,24 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
         .extensions
         .get::<crate::auth::InternalListener>()
         .is_some();
-    let (agent, scope) = match state.auth.authenticate_on(&presented, internal).await {
+    // A built-in agent's terminal token (the CLI in a terminal the owner
+    // opened) is checked exactly as `/mcp` checks it: only on the internal
+    // listener, only from the address that agent's runner is connected
+    // from, and only while that terminal's session lives.
+    let found = if crate::builtin::looks_like_terminal_token(&presented) {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0.ip());
+        state
+            .auth
+            .authenticate_terminal(&presented, internal, peer)
+            .await
+    } else {
+        state.auth.authenticate_on(&presented, internal).await
+    };
+    git.terminal = matches!(found, Ok(crate::auth::Authenticated::Terminal(_)));
+    let (agent, scope) = match found {
         Ok(found) => (found.agent().to_string(), found.scope().cloned()),
         Err(Refused::Disabled { agent, env: true }) => {
             return plain(
@@ -423,17 +444,22 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
     }
     {
         let db = state.auth.db.clone();
-        let (agent, client) = (
-            agent.clone(),
-            parts
-                .headers
-                .get(header::USER_AGENT)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("")
+        let mut client = parts
+            .headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect::<String>();
+        // The agents panel tells a terminal's CLI from a run by this.
+        if git.terminal {
+            client = format!("lore terminal · {client}")
                 .chars()
                 .take(120)
-                .collect::<String>(),
-        );
+                .collect();
+        }
+        let agent = agent.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(error) = db.touch_agent(&agent, &client) {
                 tracing::warn!(%error, "recording agent activity failed");
@@ -468,6 +494,33 @@ async fn proxy(State(state): State<Arc<GitProxy>>, request: Request) -> Response
         )
         .await;
         return plain(StatusCode::BAD_REQUEST, &reason);
+    }
+
+    // A terminal's CLI: the owner's cap on what it may do with the
+    // services ("Services in the terminal" on the agent's card). `read`
+    // lets it clone and fetch, `off` refuses everything; the agent's own
+    // levels still apply below.
+    if git.terminal {
+        let db = state.auth.db.clone();
+        let name = agent.clone();
+        let cap = tokio::task::spawn_blocking(move || db.builtin_agent(&name))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let cap = cap.map(|row| row.map(|stored| stored.terminal_services));
+        if let Some(reason) = terminal_refusal(&agent, cap, is_push(git.endpoint, query)) {
+            conclude(
+                &state,
+                &agent,
+                &git,
+                0,
+                "denied",
+                &reason,
+                elapsed_ms(started),
+            )
+            .await;
+            return plain(StatusCode::FORBIDDEN, &reason);
+        }
     }
 
     // A built-in agent's run token pushes only to its task's repository,
@@ -1855,6 +1908,18 @@ fn record(
         .map(|c| if c.is_control() { '?' } else { c })
         .collect();
     let path = format!("git:{repo}:{tag}", tag = git.endpoint.log_tag());
+    // A terminal's request is marked in the row's detail (no new column).
+    let marked;
+    let detail = if git.terminal {
+        marked = if detail.is_empty() {
+            TERMINAL_MARK.to_string()
+        } else {
+            format!("{TERMINAL_MARK} {detail}")
+        };
+        marked.as_str()
+    } else {
+        detail
+    };
     if let Err(error) = db.log_op(
         agent,
         None,
@@ -1875,11 +1940,49 @@ fn record(
         } else {
             "git_push"
         };
-        let summary = format!("{} {}", git.provider.id, repo);
+        let mut summary = format!("{} {}", git.provider.id, repo);
+        if git.terminal {
+            summary.push_str(" (from a lore terminal)");
+        }
         match db.record_activity(agent, tool, "", None, None, &[], &summary) {
             Ok(activity) => events.publish(activity),
             Err(error) => tracing::warn!(%error, "recording activity failed"),
         }
+    }
+}
+
+/// How a request made with a terminal token is marked in the ops log.
+const TERMINAL_MARK: &str = "[lore terminal]";
+
+/// Why a terminal's CLI may not make this git request: the owner set the
+/// agent's "Services in the terminal" to `off`, or to `read` and this is a
+/// push. `cap` is the stored setting: `None` when it cannot be read,
+/// `Some(None)` when the agent has no settings row, `Some(Some(None))` for
+/// `same` (the agent's own levels decide). A missing row, an unreadable
+/// setting or a value lore does not know refuse rather than lift the cap,
+/// as on `/mcp`.
+fn terminal_refusal(
+    agent: &str,
+    cap: Option<Option<Option<String>>>,
+    push: bool,
+) -> Option<String> {
+    match cap {
+        Some(Some(None)) => None,
+        Some(Some(Some(value))) if value == "off" => Some(format!(
+            "git is off in {agent}'s terminal: the owner set \"Services in the terminal\" to off \
+             on the agent's card (Agents panel)"
+        )),
+        Some(Some(Some(value))) if value == "read" => push.then(|| {
+            format!(
+                "{agent}'s terminal may only read services: the owner set \"Services in the \
+                 terminal\" to read only on the agent's card (Agents panel), so `git push` is \
+                 refused; clone and fetch work"
+            )
+        }),
+        _ => Some(format!(
+            "git is refused in {agent}'s terminal: lore cannot read the agent's \"Services in \
+             the terminal\" setting (Agents panel); set it again there"
+        )),
     }
 }
 
@@ -4362,5 +4465,440 @@ mod tests {
         assert!(text.contains("not the shape git writes"), "{text}");
         assert_eq!(log.lock().unwrap().len(), sent, "nothing went upstream");
         assert_eq!(db.ops_log(1).unwrap()[0].outcome, "denied");
+    }
+
+    // ---------- A built-in agent's terminal ----------
+
+    const TERMINAL_AGENT: &str = "deepseek-builtin";
+
+    /// The proxy with built-in agents: a hub that knows the open terminals,
+    /// served on the internal listener and on a public one, both with the
+    /// peer address the terminal check needs. `deepseek-builtin` has full
+    /// access to the personal GitHub account.
+    async fn serve_terminal_proxy(
+        upstream: &str,
+    ) -> (String, String, Db, Arc<crate::builtin::Hub>) {
+        let dir = std::env::temp_dir().join(format!(
+            "lore-gitproxy-terminal-{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            upstream.rsplit(':').next().unwrap_or("")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        let key = key();
+        let (nonce, secret) = key.encrypt("github", "", GITHUB_CREDENTIAL);
+        db.set_vault("github", "", &nonce, &secret, "-ial").unwrap();
+        let tokens = crate::builtin::parse_runner_tokens(&format!(
+            "{TERMINAL_AGENT}:runner-secret-0123456789abcdef0123,\
+             codex-builtin:runner-secret-0123456789abcdef4567"
+        ))
+        .unwrap();
+        let named: Vec<(String, String, &str)> = tokens
+            .iter()
+            .map(|token| {
+                let (kind, avatar) = crate::builtin::kind_and_avatar(&token.agent);
+                (token.agent.clone(), kind.to_string(), avatar)
+            })
+            .collect();
+        db.register_builtin_agents(&named).unwrap();
+        db.set_ops_level(TERMINAL_AGENT, "github", "full").unwrap();
+        db.set_ops_level("codex-builtin", "github", "full").unwrap();
+        let hub = Arc::new(crate::builtin::Hub::new(db.clone(), tokens));
+        let mut auth = McpAuth::new(Vec::new(), db.clone(), false);
+        auth.terminals = Some(hub.clone());
+        let (api, _) = visibility_api().await;
+        let state = Arc::new(GitProxy {
+            auth: Arc::new(auth),
+            vault: Some(key),
+            github_web_base: upstream.to_string(),
+            http: client(),
+            events: Events::new(),
+            guard: ops::Guard::default(),
+            github_api_base: api,
+            max_scanned_push: packscan::LIMITS.max_request,
+        });
+        async fn with_peer(router: Router) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            });
+            base
+        }
+        let internal =
+            with_peer(router(state.clone()).layer(axum::Extension(crate::auth::InternalListener)))
+                .await;
+        let public = with_peer(router(state)).await;
+        (internal, public, db, hub)
+    }
+
+    fn basic_with(token: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("lore:{token}"))
+        )
+    }
+
+    const UPLOAD_REFS: &str = "/git/github/owner/repo.git/info/refs?service=git-upload-pack";
+    const PUSH_REFS: &str = "/git/github/owner/repo.git/info/refs?service=git-receive-pack";
+
+    async fn status_and_text(base: &str, path: &str, token: &str) -> (StatusCode, String) {
+        let method = if path.contains("/info/refs") {
+            Method::GET
+        } else {
+            Method::POST
+        };
+        let response = reqwest::Client::new()
+            .request(method, format!("{base}{path}"))
+            .header(header::AUTHORIZATION, basic_with(token))
+            .send()
+            .await
+            .unwrap();
+        (response.status(), response.text().await.unwrap())
+    }
+
+    /// A terminal's token works on `/git` exactly as on `/mcp`: on the
+    /// internal listener, from its runner's address, while its session
+    /// lives; as Basic (what git sends) or Bearer.
+    #[tokio::test]
+    async fn a_terminal_token_works_on_git_only_from_its_runner_and_while_it_lives() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mock = Mock {
+            log: log.clone(),
+            status: StatusCode::OK,
+            headers: vec![],
+            body: b"001e# service=git-upload-pack\n0000".to_vec(),
+        };
+        let upstream = serve(mock_upstream(&mock)).await;
+        let (internal, public, db, hub) = serve_terminal_proxy(&upstream).await;
+        let here: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let (token, term_id) = hub.open_test_terminal(TERMINAL_AGENT, here);
+
+        let (status, text) = status_and_text(&internal, UPLOAD_REFS, &token).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let seen = last(&log);
+        assert!(
+            seen.headers
+                .iter()
+                .any(|(name, value)| name == "authorization"
+                    && !value.contains(&token)
+                    && value.starts_with("Basic ")),
+            "{seen:?}"
+        );
+        let row = &db.ops_log(1).unwrap()[0];
+        assert_eq!(row.agent, TERMINAL_AGENT);
+        assert_eq!(
+            (row.outcome.as_str(), row.detail.as_str()),
+            ("ok", "[lore terminal]")
+        );
+        assert!(!format!("{row:?}").contains(&token));
+        // Bearer works too.
+        let response = reqwest::Client::new()
+            .get(format!("{internal}{UPLOAD_REFS}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Not on the public listener.
+        let (status, text) = status_and_text(&public, UPLOAD_REFS, &token).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(text, "missing or invalid lore token\n");
+        // Not from another address than the agent's runner link.
+        let elsewhere: std::net::IpAddr = "10.9.8.7".parse().unwrap();
+        let (other, other_term) = hub.open_test_terminal("codex-builtin", elsewhere);
+        let (status, _) = status_and_text(&internal, UPLOAD_REFS, &other).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        hub.end_terminal(&other_term, None, "ended by the test".into());
+        // A changed character: refused.
+        let mut forged = token.clone();
+        forged.pop();
+        forged.push(if token.ends_with('0') { '1' } else { '0' });
+        let (status, _) = status_and_text(&internal, UPLOAD_REFS, &forged).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // A disabled agent: refused.
+        db.set_agent_disabled(TERMINAL_AGENT, true, "admin")
+            .unwrap();
+        let (status, _) = status_and_text(&internal, UPLOAD_REFS, &token).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        db.set_agent_disabled(TERMINAL_AGENT, false, "admin")
+            .unwrap();
+        let (status, _) = status_and_text(&internal, UPLOAD_REFS, &token).await;
+        assert_eq!(status, StatusCode::OK);
+        // The session ends: the token is gone.
+        assert!(hub.end_terminal(&term_id, None, "ended by the test".into()));
+        let (status, text) = status_and_text(&internal, UPLOAD_REFS, &token).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(text, "missing or invalid lore token\n");
+    }
+
+    /// Clone and fetch need read on the account, push needs full, and the
+    /// owner's "Services in the terminal" caps both: `read` refuses the
+    /// push, `off` everything, a value lore does not know everything.
+    #[tokio::test]
+    async fn the_services_cap_and_the_levels_gate_a_terminal_s_git() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mock = Mock {
+            log: log.clone(),
+            status: StatusCode::OK,
+            headers: vec![],
+            body: b"001e# service=git-upload-pack\n0000".to_vec(),
+        };
+        let upstream = serve(mock_upstream(&mock)).await;
+        let (base, _, db, hub) = serve_terminal_proxy(&upstream).await;
+        let here: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let (token, _) = hub.open_test_terminal(TERMINAL_AGENT, here);
+        let upload = "/git/github/owner/repo.git/git-upload-pack";
+        let receive = "/git/github/owner/repo.git/git-receive-pack";
+
+        // `same`: the agent's own levels.
+        for path in [UPLOAD_REFS, PUSH_REFS, upload, receive] {
+            let (status, text) = status_and_text(&base, path, &token).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {text}");
+        }
+        db.set_ops_level(TERMINAL_AGENT, "github", "read").unwrap();
+        let (status, _) = status_and_text(&base, UPLOAD_REFS, &token).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, text) = status_and_text(&base, PUSH_REFS, &token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        db.set_ops_level(TERMINAL_AGENT, "github", "off").unwrap();
+        let (status, _) = status_and_text(&base, UPLOAD_REFS, &token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        db.set_ops_level(TERMINAL_AGENT, "github", "full").unwrap();
+
+        // `read`: clone and fetch, never push.
+        db.set_builtin_terminal_services(TERMINAL_AGENT, Some("read"), "admin")
+            .unwrap();
+        for path in [UPLOAD_REFS, upload] {
+            let (status, text) = status_and_text(&base, path, &token).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {text}");
+        }
+        let sent = log.lock().unwrap().len();
+        for path in [PUSH_REFS, receive] {
+            let (status, text) = status_and_text(&base, path, &token).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert!(
+                text.contains("may only read services")
+                    && text.contains("\"Services in the terminal\"")
+                    && text.contains("`git push` is refused"),
+                "{text}"
+            );
+        }
+        assert_eq!(log.lock().unwrap().len(), sent, "nothing went upstream");
+        let row = &db.ops_log(1).unwrap()[0];
+        assert_eq!(row.outcome, "denied");
+        assert!(row.detail.starts_with("[lore terminal] "), "{}", row.detail);
+
+        // `off`: nothing.
+        db.set_builtin_terminal_services(TERMINAL_AGENT, Some("off"), "admin")
+            .unwrap();
+        for path in [UPLOAD_REFS, upload, PUSH_REFS, receive] {
+            let (status, text) = status_and_text(&base, path, &token).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert!(
+                text.contains("git is off in deepseek-builtin's terminal"),
+                "{text}"
+            );
+        }
+        // A value lore does not know: nothing either.
+        db.execute_for_test(&format!(
+            "UPDATE builtin_agents SET terminal_services = 'whatever' WHERE name = \
+             '{TERMINAL_AGENT}'"
+        ));
+        let (status, text) = status_and_text(&base, UPLOAD_REFS, &token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(text.contains("cannot read"), "{text}");
+        assert_eq!(log.lock().unwrap().len(), sent, "nothing went upstream");
+        // Back to `same`.
+        db.set_builtin_terminal_services(TERMINAL_AGENT, None, "admin")
+            .unwrap();
+        let (status, _) = status_and_text(&base, PUSH_REFS, &token).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Runs git as a terminal's CLI does: no configuration of its own, the
+    /// `GIT_CONFIG_*` settings the runner gives a terminal (identity and
+    /// the credential helper for lore's address), and the token only in
+    /// `LORE_AGENT_TOKEN`.
+    fn terminal_git(
+        dir: &std::path::Path,
+        lore: &str,
+        token: &str,
+        args: &[&str],
+    ) -> std::process::Output {
+        let mcp = crate::runner::protocol::TerminalMcp {
+            url: format!("{lore}/mcp"),
+            token: crate::runner::protocol::Secret::new(token),
+            agent: Some(TERMINAL_AGENT.into()),
+        };
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .envs(crate::runner::drivers::terminal_git_env(&mcp))
+            .env("LORE_AGENT_TOKEN", token)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("git runs")
+    }
+
+    /// A real `git push` from a terminal, with no token in the URL: the
+    /// credential helper answers lore's challenge; the leak scan refuses a
+    /// secret for a public repository; a clean push goes through as the
+    /// agent, marked as from a terminal, and is never recorded for a run
+    /// (not even a live run of the same agent on the same repository), so
+    /// it never credits a task.
+    #[tokio::test]
+    async fn a_terminal_push_is_leak_scanned_and_never_credits_a_task() {
+        if !git_available() {
+            eprintln!("git is not installed; skipped");
+            return;
+        }
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let upstream = serve(receive_pack_upstream(&log)).await;
+        let (base, _, db, hub) = serve_terminal_proxy(&upstream).await;
+        let here: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let (token, _) = hub.open_test_terminal(TERMINAL_AGENT, here);
+        // A live run of the same agent, on the same repository.
+        let run_token = crate::runscope::new_token().unwrap();
+        db.insert_run(&crate::db::NewRun {
+            id: "run-terminal".into(),
+            agent: TERMINAL_AGENT.into(),
+            kind: "task".into(),
+            token_hash: crate::oauth::token_hash(&run_token),
+            token_expires_at: crate::db::unix_now() + 600,
+            scope: serde_json::to_string(&crate::runscope::RunScope {
+                version: crate::runscope::SCOPE_VERSION,
+                run_id: "run-terminal".into(),
+                agent: TERMINAL_AGENT.into(),
+                provider: "github".into(),
+                owner: "owner".into(),
+                repo: "repo".into(),
+                branch: "main".into(),
+                readable: Some(vec!["github".into()]),
+                ..Default::default()
+            })
+            .unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "lore-terminal-push-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        // On the blocking pool: the servers run on this test's thread.
+        let git = |args: &[&str]| {
+            let (dir, base, token) = (dir.clone(), base.clone(), token.clone());
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                    terminal_git(&dir, &base, &token, &args)
+                })
+                .await
+                .unwrap()
+            }
+        };
+        assert!(git(&["init", "-q"]).await.status.success());
+        std::fs::write(
+            dir.join("config/app.py"),
+            format!("GITHUB = '{}'\n", fake_token()),
+        )
+        .unwrap();
+        assert!(git(&["add", "-A"]).await.status.success());
+        let out = git(&["commit", "-q", "-m", "leak"]).await;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The identity the terminal's git commits with.
+        let out = git(&["log", "-1", "--format=%an <%ae>"]).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "deepseek-builtin <deepseek-builtin@users.noreply.lore.invalid>"
+        );
+
+        let out = git(&[
+            "push",
+            &format!("{base}/git/github/owner/public-site.git"),
+            "HEAD:refs/heads/main",
+        ])
+        .await;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("remote: lore refused this push"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains(&token) && !stderr.contains(&fake_token()));
+        assert!(posts(&log).is_empty(), "the push reached the upstream");
+        let row = &db.ops_log(1).unwrap()[0];
+        assert_eq!(row.outcome, "denied");
+        assert_eq!(
+            row.detail,
+            "[lore terminal] leak scan: github-token in `config/app.py`, line 1"
+        );
+
+        // A clean push to the private repository the run works on.
+        assert!(
+            git(&["rm", "-q", "--cached", "config/app.py"])
+                .await
+                .status
+                .success()
+        );
+        std::fs::remove_file(dir.join("config/app.py")).unwrap();
+        std::fs::write(dir.join("README.md"), "# Shop\n").unwrap();
+        assert!(git(&["add", "-A"]).await.status.success());
+        assert!(
+            git(&["commit", "-q", "--amend", "-m", "clean"])
+                .await
+                .status
+                .success()
+        );
+        let out = git(&[
+            "push",
+            &format!("{base}/git/github/owner/repo.git"),
+            "HEAD:refs/heads/main",
+        ])
+        .await;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{stderr}");
+        assert_eq!(posts(&log).len(), 1);
+        let row = &db.ops_log(1).unwrap()[0];
+        assert_eq!(
+            (
+                row.agent.as_str(),
+                row.outcome.as_str(),
+                row.detail.as_str()
+            ),
+            (TERMINAL_AGENT, "ok", "[lore terminal]")
+        );
+        assert!(db.run_refs("run-terminal").unwrap().is_empty());
+        let activity = &db.activity(1).unwrap()[0];
+        assert_eq!(activity.tool, "git_push");
+        assert_eq!(activity.summary, "github owner/repo.git (from a lore terminal)");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

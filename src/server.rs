@@ -3205,13 +3205,28 @@ impl Lore {
                     } else {
                         "<group>/<sub>/<repo>"
                     };
-                    out.push_str(&format!(
-                        "  git clone https://lore:<your lore token>@{host}/git/{route}/{depth}.git\n"
-                    ));
-                    out.push_str(
-                        "  Use your own lore token as the password; never print it. `read` \
-                         lets you clone and fetch, `full` lets you push.\n",
-                    );
+                    if from_terminal(&parts) {
+                        // A terminal's CLI reaches lore at the internal
+                        // address, and its git already answers lore's
+                        // challenge with the terminal's token.
+                        out.push_str(&format!(
+                            "  git clone {}/git/{route}/{depth}.git\n",
+                            terminal_lore_url()
+                        ));
+                        out.push_str(
+                            "  In this terminal git sends your token to lore by itself (a \
+                             credential helper reads $LORE_AGENT_TOKEN); never print it. `read` \
+                             lets you clone and fetch, `full` lets you push.\n",
+                        );
+                    } else {
+                        out.push_str(&format!(
+                            "  git clone https://lore:<your lore token>@{host}/git/{route}/{depth}.git\n"
+                        ));
+                        out.push_str(
+                            "  Use your own lore token as the password; never print it. `read` \
+                             lets you clone and fetch, `full` lets you push.\n",
+                        );
+                    }
                 }
             }
             // The mailbox: its own levels (off or read) and its own
@@ -4681,9 +4696,33 @@ impl Lore {
         };
         format!(
             "Services in this terminal: {what} (the owner's \"Services in the terminal\" setting \
-             for {agent})."
+             for {agent}).\n\n{}",
+            terminal_git_paragraph()
         )
     }
+}
+
+/// lore's address as a terminal's CLI reaches it (`LORE_RUNNER_LORE_URL`,
+/// by default `http://lore:8081`).
+fn terminal_lore_url() -> String {
+    crate::taskrunner::lore_url_from_env().unwrap_or_else(|_| "http://lore:8081".into())
+}
+
+/// What a terminal's CLI is told about working on a repository: in a
+/// clone through lore's git proxy, not file by file.
+fn terminal_git_paragraph() -> String {
+    let lore = terminal_lore_url();
+    format!(
+        "Working on a repository in this terminal: work in a clone, not file by file. \
+         `git clone {lore}/git/<github|github-org>/<owner>/<repo>.git` (`github` for the personal \
+         account, `github-org` for the organization's; `{lore}/git/gitlab/<group>/<repo>.git` for \
+         the GitLab server) into your home or /work; git sends your terminal's token to lore by \
+         itself (a credential helper reads $LORE_AGENT_TOKEN: never print it or put it in a URL or \
+         a file). Commit locally (your identity is set), then `git push` through the same remote. \
+         Cloning needs read on that account, pushing needs full, both within the \"Services in \
+         the terminal\" setting above; lore's leak scan checks pushes to public repositories. Use \
+         repo_read / repo_commit only for a quick read or a single small file."
+    )
 }
 
 /// Runs database work on the blocking pool, where every SQLite call of
@@ -6057,6 +6096,22 @@ mod tests {
         assert!(
             listed.contains("/git/github-org/<owner>/<repo>.git"),
             "{listed}"
+        );
+        // A terminal's CLI is shown the internal address, no token in the
+        // URL: its git answers lore's challenge itself.
+        let Extension(mut terminal) = as_agent(Some("claude"));
+        terminal.extensions.insert(TerminalCaller);
+        let in_terminal = lore
+            .integrations(args(json!({ "session_id": session })), Extension(terminal))
+            .await
+            .unwrap();
+        assert!(
+            in_terminal.contains(&format!(
+                "  git clone {}/git/github/<owner>/<repo>.git\n",
+                terminal_lore_url()
+            )) && in_terminal.contains("credential helper reads $LORE_AGENT_TOKEN")
+                && !in_terminal.contains("<your lore token>"),
+            "{in_terminal}"
         );
         assert_eq!(
             lore.usable_services("claude", "claude").unwrap(),
@@ -7610,6 +7665,41 @@ mod tests {
                 .db
                 .set_builtin_terminal_services(BUILTIN, Some("full"), "admin")
                 .is_err()
+        );
+    }
+
+    /// A terminal's briefing and `integrations` end with what its CLI may
+    /// do with the services and how to work on a repository: in a clone
+    /// through lore's git proxy, not file by file.
+    #[tokio::test]
+    async fn a_terminal_is_told_to_clone_commit_and_push_through_lore() {
+        let (lore, world) = helping("terminal-git-line", |_| {}).await;
+        let Extension(mut parts) = as_agent(Some(BUILTIN));
+        parts.extensions.insert(TerminalCaller);
+        let line = lore.terminal_services_line(&parts).await;
+        let lore_url = terminal_lore_url();
+        assert!(
+            line.starts_with("Services in this terminal: what the agent's own levels allow"),
+            "{line}"
+        );
+        for part in [
+            "work in a clone, not file by file".to_string(),
+            format!("`git clone {lore_url}/git/<github|github-org>/<owner>/<repo>.git`"),
+            "$LORE_AGENT_TOKEN".to_string(),
+            "Commit locally (your identity is set), then `git push` through the same remote"
+                .to_string(),
+            "Use repo_read / repo_commit only for a quick read or a single small file".to_string(),
+        ] {
+            assert!(line.contains(&part), "{part:?} missing from {line}");
+        }
+        world
+            .db
+            .set_builtin_terminal_services(BUILTIN, Some("read"), "admin")
+            .unwrap();
+        let line = lore.terminal_services_line(&parts).await;
+        assert!(
+            line.contains("read only") && line.contains("git clone"),
+            "{line}"
         );
     }
 

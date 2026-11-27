@@ -212,6 +212,10 @@ pub struct RunSpec {
 pub struct TerminalMcp {
     pub url: String,
     pub token: Secret,
+    /// The built-in agent's name, for the identity its git commits carry
+    /// in the terminal. Absent from an older lore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// lore to runner.
@@ -614,6 +618,7 @@ mod tests {
                 mcp: Some(TerminalMcp {
                     url: "http://lore:8081/mcp".into(),
                     token: Secret::new("lore_term_x"),
+                    agent: Some("claude-builtin".into()),
                 }),
             },
             ToRunner::TerminalInput {

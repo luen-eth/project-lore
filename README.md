@@ -622,6 +622,16 @@ instead of prompting for a password. When the stored credential is rejected
 upstream, lore answers 502 with "the stored <provider> credential was refused
 upstream" for the same reason: it is never a lore login failure.
 
+A built-in agent's **terminal** token (`lore_term_…`, the CLI in a terminal the
+owner opened) works here too, on the internal listener only, from that agent's runner
+address and while the session lives, as the agent with its levels under the owner's
+*Services in the terminal* cap (*read only*: clone and fetch, no push; *off*:
+nothing). Inside a terminal plain `git clone http://lore:8081/git/github/<owner>/<repo>.git`
+works without a token in the URL: a credential helper in the CLI's environment answers
+lore's challenge from `$LORE_AGENT_TOKEN` (see *Terminal*). Its requests are marked
+`[lore terminal]` in the operations log and *(from a lore terminal)* in the activity
+feed, and its pushes are never recorded for a run.
+
 A reverse proxy in front of lore must allow large request bodies and long
 responses for `/git/` (lore itself accepts pushes up to 2 GiB and imposes no
 overall timeout — a clone may take minutes), or big pushes and slow clones will
@@ -1833,7 +1843,7 @@ mints a token of its own (`lore_term_` and 64 hex characters), keeps only its ha
 memory, and sends it over the runner link; the runner gives it to the CLI alone, in
 `LORE_AGENT_TOKEN` (the configuration files in the terminal's fresh home name the
 variable, never the value). lore accepts it only on the internal listener's `/mcp`
-(not on the public one, not on `/git`), only from the address that agent's runner is
+and `/git` (never on the public one), only from the address that agent's runner is
 connected from, and only while that terminal's session lives, shown in a window or
 not (a long task keeps its MCP access when the tab is closed): when the session ends
 for any reason (End session, the CLI exiting, the idle limit, the opener check, the
@@ -1864,6 +1874,43 @@ terminal token only; runs keep their task's scope, and the agent's own levels st
 apply under the cap. A terminal of an agent lore has no settings row for, or with a
 value lore does not know, gets no service calls at all. A terminal's `hello` briefing
 and `integrations` end with one line saying what its CLI may do with the services.
+
+**Working on a repository in a terminal: clone, commit, push through lore.** The
+CLI is told (in its `hello` briefing and `integrations`) to work in a clone rather
+than file by file with `repo_read` / `repo_commit`:
+
+```bash
+git clone http://lore:8081/git/github/<owner>/<repo>.git       # or github-org, gitlab
+cd <repo> && … && git commit -am "…" && git push
+```
+
+No token is typed and none is written anywhere: the runner gives the CLI's
+environment (never a file) three `GIT_CONFIG_*` settings: the agent's identity for
+commits (`user.name` = the agent's name, `user.email` =
+`<agent>@users.noreply.lore.invalid`, as a run's git has it) and a credential helper
+for lore's own address only (`credential.http://lore:8081.helper`), an inline shell
+function that, when git asks after lore's 401 challenge, answers user `lore` and the
+password from `$LORE_AGENT_TOKEN`. The helper's text holds the variable's name, not
+the token, and git never offers it to another host. The explicit form
+`git clone http://lore:$LORE_AGENT_TOKEN@lore:8081/git/…` works too (but leaves the
+token in the clone's `.git/config`; prefer the plain URL). Clone into the terminal's
+fresh home or `/work` (both are deleted or emptied with the session; `noexec` does
+not bother git). A **Shell** gets neither the token nor these settings.
+
+On `/git` the terminal token gets exactly the `/mcp` rules above (internal listener,
+the runner link's address, only while the session lives) and acts as the built-in
+agent: clone and fetch need the agent's `read` on the repository's account
+(`github`, `github_org` or `gitlab`), push needs `full`, and **Services in the
+terminal** caps both: *same as the agent* leaves the agent's levels, *read only*
+allows clone and fetch and refuses every push (`git push` fails with a sentence
+naming the setting), *off* refuses every git request. A terminal's push passes every
+check an ordinary agent's push passes (the leak scan for public GitHub
+repositories, the per-agent request budget, the kill switch) and is recorded like
+one: the operations log row's detail starts with `[lore terminal]` and the activity
+line reads *github owner/repo (from a lore terminal)*. It is not a run's push: lore
+records no ref update for any run, so a terminal push never credits a board task
+(and the run-only ref rules, fast-forward only and no deletion, do not apply to it,
+as they do not apply to an ordinary agent).
 
 On the board a terminal's CLI is a caller of its own, neither a run nor an ordinary
 agent: it may add tasks, to-dos and notes, log entries, and claim open tasks; it

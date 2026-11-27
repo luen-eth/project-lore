@@ -741,8 +741,8 @@ impl McpAuth {
 
     /// A terminal token: only on the internal listener, only while its
     /// terminal is open and only from the address the agent's runner is
-    /// connected from; its agent must not be disabled. Not accepted by the
-    /// git proxy, which only knows `authenticate_on`.
+    /// connected from; its agent must not be disabled. Shared by `/mcp`
+    /// and the git proxy.
     pub async fn authenticate_terminal(
         &self,
         presented: &str,

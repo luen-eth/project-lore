@@ -1368,6 +1368,7 @@ impl Driver {
                 }
                 args.extend(mcp_args);
                 extra_env = env;
+                extra_env.extend(terminal_git_env(mcp));
                 Some(mcp.token.expose().to_string())
             }
             _ => None,
@@ -2755,6 +2756,47 @@ pub fn iso_from_unix(seconds: i64) -> String {
     )
 }
 
+/// The git settings of a terminal's CLI, as `GIT_CONFIG_*` variables
+/// (never a file): the agent's identity for commits, as a run's git has
+/// it, and a credential helper for lore's own address only that answers
+/// git's 401 challenge with user `lore` and the terminal's token, read
+/// from `LORE_AGENT_TOKEN` when git asks. The value of the helper holds
+/// the variable's name, never the token; another host never gets it.
+/// So `git clone <lore>/git/github/<owner>/<repo>.git` works as it is.
+pub(crate) fn terminal_git_env(mcp: &TerminalMcp) -> Vec<(String, String)> {
+    let lore = super::runs::lore_origin(&mcp.url);
+    let agent = mcp
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+        .unwrap_or("lore-terminal");
+    let config = [
+        ("user.name".to_string(), agent.to_string()),
+        (
+            "user.email".to_string(),
+            format!("{agent}@users.noreply.lore.invalid"),
+        ),
+        (
+            format!("credential.{lore}.helper"),
+            "!f() { test \"$1\" = get || return 0; echo username=lore; \
+             echo \"password=$LORE_AGENT_TOKEN\"; }; f"
+                .to_string(),
+        ),
+    ];
+    let mut env = vec![("GIT_CONFIG_COUNT".to_string(), config.len().to_string())];
+    for (index, (key, value)) in config.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{index}"), key));
+        env.push((format!("GIT_CONFIG_VALUE_{index}"), value));
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3700,6 +3742,7 @@ esac
         let mcp = TerminalMcp {
             url: "http://lore:8081/mcp".into(),
             token: Secret::new(format!("lore_term_{}", "ab".repeat(32))),
+            agent: Some("deepseek-builtin".into()),
         };
         // `opencode` (the interface): no argument at all; lore's MCP server
         // comes through OPENCODE_CONFIG, the model through the home.
@@ -3846,6 +3889,7 @@ esac
             let mcp = TerminalMcp {
                 url: "http://lore:8081/mcp".into(),
                 token: Secret::new(format!("lore_term_{}", "cd".repeat(32))),
+                agent: Some("deepseek-builtin".into()),
             };
             let before = capabilities(None).unwrap();
             let mut without = before;
@@ -4207,6 +4251,81 @@ esac
         assert!(!settings.contains("hooks"), "{settings}");
         assert!(driver.keep_transcripts("../x", &next).is_ok());
         assert!(!dir.join("state/x").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A terminal's git: the agent's identity, and a credential helper
+    /// that answers lore's address only, from `LORE_AGENT_TOKEN`, with no
+    /// token in any setting.
+    #[test]
+    fn a_terminal_s_git_answers_lore_s_challenge_from_the_environment() {
+        let token = format!("lore_term_{}", "ef".repeat(32));
+        let mcp = TerminalMcp {
+            url: "http://lore:8081/mcp".into(),
+            token: Secret::new(token.clone()),
+            agent: Some("deepseek-builtin".into()),
+        };
+        let env = terminal_git_env(&mcp);
+        assert!(
+            env.iter().all(|(_, value)| !value.contains(&token)),
+            "{env:?}"
+        );
+        assert!(env.contains(&(
+            "GIT_CONFIG_KEY_2".into(),
+            "credential.http://lore:8081.helper".into()
+        )));
+        let Ok(probe) = std::process::Command::new("git").arg("--version").output() else {
+            eprintln!("git is not installed; skipped");
+            return;
+        };
+        assert!(probe.status.success());
+        let dir = std::env::temp_dir().join(format!("lore-terminal-git-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fill = |input: &str| {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(["credential", "fill"])
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("HOME", &dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_ASKPASS", "/bin/false")
+                .env("SSH_ASKPASS", "/bin/false")
+                .env("LORE_AGENT_TOKEN", &token)
+                .envs(env.clone())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let answer = fill("protocol=http\nhost=lore:8081\npath=git/github/o/r.git\n\n");
+        assert!(answer.contains("username=lore\n"), "{answer}");
+        assert!(answer.contains(&format!("password={token}\n")), "{answer}");
+        // Another host never gets it.
+        let other = fill("protocol=https\nhost=github.com\npath=o/r.git\n\n");
+        assert!(!other.contains(&token), "{other}");
+        let identity = std::process::Command::new("git")
+            .args(["config", "--get", "user.email"])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", &dir)
+            .envs(env.clone())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&identity.stdout).trim(),
+            "deepseek-builtin@users.noreply.lore.invalid"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

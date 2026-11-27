@@ -1477,6 +1477,7 @@ impl Hub {
                 mcp: token.map(|(url, token)| protocol::TerminalMcp {
                     url,
                     token: protocol::Secret::new(token),
+                    agent: Some(agent.clone()),
                 }),
             };
             (link, term_id, open, started_at)
@@ -1760,6 +1761,52 @@ impl Hub {
             .find(|terminal| terminal.token_hash.as_deref() == Some(hash.as_str()))?;
         let link = inner.links.get(&terminal.agent)?;
         (link.address == Some(plain_ip(peer))).then(|| terminal.agent.clone())
+    }
+
+    /// For other modules' tests: a CLI terminal of `agent` open with a
+    /// fresh token, as if that agent's runner were connected from
+    /// `address` (a link with nobody behind it). Answers the token and the
+    /// session id, which `end_terminal` ends.
+    #[cfg(test)]
+    pub(crate) fn open_test_terminal(
+        &self,
+        agent: &str,
+        address: std::net::IpAddr,
+    ) -> (String, String) {
+        let token = new_terminal_token().unwrap();
+        let term_id = format!("t{}", self.next_id());
+        let (tx, _) = mpsc::channel(4);
+        let mut inner = self.inner();
+        inner.links.insert(
+            agent.to_string(),
+            Link {
+                generation: 0,
+                tx,
+                kind: Kind::Opencode,
+                provider: "deepseek".into(),
+                address: Some(address),
+            },
+        );
+        inner.terminals.insert(
+            term_id.clone(),
+            Terminal {
+                agent: agent.to_string(),
+                mode: TerminalMode::Cli,
+                token_hash: Some(crate::oauth::token_hash(&token)),
+                opener: Opener {
+                    username: "admin".into(),
+                    user_id: None,
+                },
+                started_at: unix_now(),
+                started: Instant::now(),
+                warned: false,
+                last_output_at: unix_now(),
+                quiet_since: Instant::now(),
+                replay: replay::Replay::default(),
+                viewer: None,
+            },
+        );
+        (token, term_id)
     }
 
     /// Terminal bytes from a runner: kept for the next page that attaches
@@ -3776,8 +3823,8 @@ esac
             Ok(Authenticated::Terminal("codex-builtin".into()))
         );
         // Not on the public listener, not from another address, not
-        // without a known peer, not where only run and OAuth tokens count
-        // (the git proxy), not with a changed character.
+        // without a known peer, not through `authenticate_on` (which knows
+        // env, run and OAuth tokens only), not with a changed character.
         assert_eq!(
             auth.authenticate_terminal(&token, false, Some(runner))
                 .await,
