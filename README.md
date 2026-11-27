@@ -1693,11 +1693,17 @@ when the session ends. lore keeps it rather than the runner because every byte
 already passes through lore and the attach is then one step under one lock (the
 replay and the switch of the window happen together, so nothing is lost or shown
 twice), and the runner, which runs in the agent's container, needs no new state or
-protocol for it. A replay starts at a whole character outside any escape sequence and
-first sets the terminal modes that were on there (the alternate screen, cursor keys
-and visibility, mouse reporting, focus events, bracketed paste), so a full-screen
+protocol for it. A replay starts at a whole character outside any escape sequence (a
+long title or clipboard string is never cut into) and first sets the terminal modes
+that were on there (the alternate screen, cursor keys and visibility, mouse reporting,
+focus events, bracketed paste; with `ESC [` or the 8-bit CSI), so a full-screen
 program replays on the right screen and the keys and the mouse keep working; the
-redraw that follows fixes the rest.
+redraw that follows fixes the rest. The questions a program once asked the terminal
+are left out of it (device attributes, status and cursor position reports, mode and
+setting requests, capability requests, colour and clipboard queries, window reports),
+and the page ignores what its terminal would answer until it has drawn the whole
+replay: a terminal answers such questions by typing, and a stale answer would land in
+the live program's input.
 
 **A session ends only** when:
 - someone presses **End session** in its window;
@@ -1709,11 +1715,21 @@ redraw that follows fixes the rest.
   not said so for two and a half minutes counts as nobody looking;
 - the user who opened it may no longer have it: lore checks every 30 seconds, for
   every session, shown or not, that this user still exists, is not disabled and still
-  has the `agents` permission (the built-in `admin` always may). Deleting or
-  disabling the user, or taking `agents` away, ends the session within 30 seconds;
+  has the `agents` permission (the built-in `admin` always may), by its id and by the
+  user name recorded when it opened the session (a restored database with another
+  user at that id does not count). Deleting or disabling the user, or taking `agents`
+  away, ends the session within 30 seconds; when lore cannot ask its database three
+  times in a row (about 90 seconds), the sessions it could not check end too;
   signing out, a session that expires or is ended by an administrator, or another
   browser closing does **not**: that only detaches the window that was signed in
   with it;
+- it reached the maximum age, `LORE_TERMINAL_MAX_HOURS` on lore, 12 hours by default
+  (1 to 168), whatever happens in it: a program that keeps drawing or a tab left open
+  does not hold the container (no run, no sign-in, no credential change there while a
+  session is open), the agent's *busy* state and the CLI's lore token forever. Ten
+  minutes before, the window showing it says when (*This session ends at 23:10
+  (maximum 12 hours); End it, or keep working and open a new one after*), also when it
+  is opened in those minutes;
 - the agent's runner link is replaced or drops (its container restarted or lost the
   connection), or lore stops: the runner kills its terminals with the link.
 
@@ -1801,7 +1817,24 @@ same cleared environment as every other CLI command (the runner's link secret ne
 reaches it) and `TERM=xterm-256color`. Each runs in a Unix session of its own; ending
 it, or the runner's link dropping, kills that whole session, background jobs
 included. One session per agent and kind (the CLI, the shell), so a runner keeps at
-most two open; the runner itself has no idle limit any more, lore's applies.
+most two open; the runner itself has no idle limit any more, lore's applies. A runner
+from before terminal sessions still closes a terminal after 15 minutes without input:
+so that a rolling deploy which pairs this lore with such a runner keeps its sessions,
+lore passes every window's keep-alive on as an empty input and sends one for every
+session every 30 seconds; this runner types nothing for it. A bad
+`LORE_TERMINAL_IDLE_MINUTES` or `LORE_TERMINAL_MAX_HOURS` is logged as a warning and
+the default used. The page's scripts and styles are served with `no-store`, so a
+reload after a deploy always gets the current ones; an admin page loaded before the
+deploy keeps working, its Close now only hides the window.
+
+**What an ended Shell can leave behind.** Ending a session kills its whole Unix
+session, background jobs included, but a process that left it (`setsid`, a daemon) is
+ended only when the last terminal of that agent ends (every process of the agent
+user then goes). Until then, if the CLI's session runs in the same container, such a
+process runs as the same agent user and could read that CLI's lore token from its
+environment. Ending it at once is not possible without ending the CLI's session too
+(they are the same user), so if you start background services in a Shell, end the
+CLI's session as well when you are done.
 
 The terminal is drawn with [xterm.js](https://github.com/xtermjs/xterm.js) and its
 fit addon, vendored from npm (`@xterm/xterm` 6.0.0 and `@xterm/addon-fit` 0.11.0,
@@ -2487,7 +2520,8 @@ has no channel to push that notification.
 | `LORE_ASK_RESUME_MINUTES` | `60` | How long after its last turn a conversation can be resumed in the CLI's own session. |
 | `LORE_ASK_PER_HOUR` | `6` | Questions one calling agent may ask the built-in agents per hour. |
 | `LORE_DELEGATE_PER_HOUR` | `3` | Tasks one calling agent may delegate to the built-in agents per hour. |
-| `LORE_TERMINAL_IDLE_MINUTES` | `30` | A built-in agent's terminal session that no window shows ends after this many minutes without output (whole number, 1 to 1440); see [Terminal](#terminal). |
+| `LORE_TERMINAL_IDLE_MINUTES` | `30` | A built-in agent's terminal session that no window shows ends after this many minutes without output (whole number, 1 to 1440; another value is a warning and the default); see [Terminal](#terminal). |
+| `LORE_TERMINAL_MAX_HOURS` | `12` | A built-in agent's terminal session ends after this many hours whatever happens in it, with a warning in its window 10 minutes before (whole number, 1 to 168; another value is a warning and the default); see [Terminal](#terminal). |
 | `LORE_RUNNER_LORE_URL` | `http://lore:<port of LORE_RUNNER_BIND>` (8081) | lore as the agents' containers reach it: their clone URL and MCP endpoint. |
 | `LORE_RUNNER_BIND` | `0.0.0.0:8081`; compose: lore's address on each agent network | Where lore listens for the built-in agents' runners (only with `LORE_RUNNER_TOKENS`): one address, or several, comma separated. Internal networks only: never publish this port. Must use another port than `LORE_BIND`. |
 | `LORE_AGENT_SUBNET_*`, `LORE_AGENT_RANGE_*`, `LORE_AGENT_IP_*` (`CLAUDE`, `CODEX`, `DEEPSEEK`) | `172.31.250.0/28`, `.8/29`, `.2`; `.16/28`, `.24/29`, `.18`; `.32/28`, `.40/29`, `.34` | `docker-compose.agents.yml` only: each agent network's subnet, the range everything but lore gets addresses from, and lore's fixed address (the runner listener binds there). Check for overlaps first (*Network*). |
