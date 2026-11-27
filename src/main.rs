@@ -16,6 +16,7 @@ mod packscan;
 mod runner;
 mod runscope;
 mod server;
+mod shutdown;
 mod taskrunner;
 mod users;
 mod vault;
@@ -42,8 +43,19 @@ use crate::{
 
 const MIN_ADMIN_PASSWORD_LEN: usize = 12;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?;
+    let result = runtime.block_on(run());
+    // Blocking work still going (a database call, a file being written)
+    // gets a moment; nothing keeps the process up longer than that.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+async fn run() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         return healthcheck();
     }
@@ -344,9 +356,11 @@ async fn main() -> Result<()> {
         tracing::warn!("{warning}");
     }
     let (app, agents) = app_and_agents(auth, lore, vault, events, admin);
-    if let Some((listeners, router)) = runner_listener {
-        serve_internal(listeners, router, agents);
-    }
+    shutdown::watch_signals();
+    let internal = match runner_listener {
+        Some((listeners, router)) => serve_internal(listeners, router, agents),
+        None => Vec::new(),
+    };
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -367,13 +381,46 @@ async fn main() -> Result<()> {
     }
     use axum::serve::ListenerExt;
     let listener = builtin::PublicListener::new(listener, agent_addresses).tap_io(|_| {});
-    axum::serve(
+    let public = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown())
-    .await?;
-    Ok(())
+    .with_graceful_shutdown(shutdown::stopping());
+    // Every listener stops accepting at the signal and lets the requests in
+    // flight finish; what is still open after the grace period (a client
+    // that keeps a connection open) is closed when the runtime goes.
+    let served = async {
+        let result = public.await;
+        for listener in internal {
+            let _ = listener.await;
+        }
+        result
+    };
+    let result = tokio::select! {
+        result = served => result.map_err(anyhow::Error::from),
+        () = async {
+            shutdown::stopping().await;
+            tokio::time::sleep(shutdown::GRACE).await;
+        } => {
+            tracing::warn!(
+                "connections still open {} seconds after the shutdown signal are closed",
+                shutdown::GRACE.as_secs()
+            );
+            Ok(())
+        }
+    };
+    // A clean close: everything in the write-ahead log goes into the
+    // database file, and the log is emptied.
+    let checkpoint = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || db.checkpoint()).await
+    };
+    match checkpoint {
+        Ok(Ok(())) => tracing::info!("database checkpointed; stopped"),
+        Ok(Err(error)) => tracing::warn!(%error, "the database could not be checkpointed"),
+        Err(error) => tracing::warn!(%error, "the database could not be checkpointed"),
+    }
+    result
 }
 
 /// Targets never logged, whatever `RUST_LOG` says: the IMAP client and its
@@ -545,25 +592,35 @@ fn app_and_agents(
 /// Serves the internal router on every internal listener (one per agent
 /// network): the runners' link, and `/mcp` and `/git` for the runs, marked
 /// `auth::InternalListener` so run tokens work there and nowhere else.
-fn serve_internal(listeners: Vec<tokio::net::TcpListener>, runners: Router, agents: Router) {
+/// Each stops accepting when the shutdown starts; the handles end once it
+/// has.
+fn serve_internal(
+    listeners: Vec<tokio::net::TcpListener>,
+    runners: Router,
+    agents: Router,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let router = runners.merge(
         agents
             .layer(axum::Extension(auth::InternalListener))
             .layer(middleware::from_fn(builtin::strip_forwarded)),
     );
-    for listener in listeners {
-        let router = router.clone();
-        tokio::spawn(async move {
-            if let Err(error) = axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            {
-                tracing::error!(%error, "the runner listener stopped");
-            }
-        });
-    }
+    listeners
+        .into_iter()
+        .map(|listener| {
+            let router = router.clone();
+            tokio::spawn(async move {
+                if let Err(error) = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown::stopping())
+                .await
+                {
+                    tracing::error!(%error, "the runner listener stopped");
+                }
+            })
+        })
+        .collect()
 }
 
 /// `lore healthcheck`: exits 0 when the local server answers `/health`.
@@ -644,22 +701,6 @@ fn recaptcha() -> Result<Option<Recaptcha>> {
         })),
         _ => bail!("set both LORE_RECAPTCHA_SITE_KEY and LORE_RECAPTCHA_SECRET_KEY, or neither"),
     }
-}
-
-async fn shutdown() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    let mut terminate =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = async {
-            match terminate.as_mut() {
-                Some(signal) => { signal.recv().await; }
-                None => std::future::pending::<()>().await,
-            }
-        } => {}
-    }
-    tracing::info!("shutting down");
 }
 
 #[cfg(test)]

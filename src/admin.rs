@@ -1715,7 +1715,9 @@ async fn events(
         let event = Event::default().event("run").json_data(&run).ok()?;
         Some(Ok(event))
     });
-    let stream = activity.merge(runs);
+    // Ends when lore shuts down: an open admin page would otherwise keep
+    // the graceful shutdown waiting for as long as it stays open.
+    let stream = crate::shutdown::until_stopping(activity.merge(runs));
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
 }
 

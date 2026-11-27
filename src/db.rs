@@ -1782,6 +1782,18 @@ impl Db {
         self.lock().execute_batch(sql).unwrap();
     }
 
+    /// Moves everything in the write-ahead log into the database file and
+    /// empties the log: what a clean close does, for a process that is
+    /// about to exit.
+    pub fn checkpoint(&self) -> Result<()> {
+        let conn = self.lock();
+        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if busy != 0 {
+            anyhow::bail!("the database was busy; the checkpoint was not complete");
+        }
+        Ok(())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }

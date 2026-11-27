@@ -2047,6 +2047,21 @@ documentation for adding a remote MCP server.
 At least one of `LORE_TOKENS` and `LORE_TOKEN` is required, and every secret must be
 24 characters or longer.
 
+### Stopping
+
+On `SIGTERM` (`docker stop`, a redeploy) or `Ctrl-C` lore stops accepting connections
+on every listener (the public one and the runner listener), ends the admin pages' live
+event streams, gives requests still in flight 3 seconds, closes whatever is still
+open after that (a runner's link, a client that keeps a connection open), writes the
+database's write-ahead log back into the database file (`lore.db-wal` is left empty)
+and exits with code 0, normally within a fraction of a second and at most about 4
+seconds after the signal. Docker's default of 10 seconds before it kills the
+container is therefore enough, and no `stop_grace_period` is needed in the compose
+files. Before this, an open admin page kept lore from ever finishing its shutdown:
+Docker killed it after 10 seconds (exit code 137) and the write-ahead log was left
+for the next start to replay. A runner whose link drops on shutdown reconnects when
+lore is back, and a run that was going is marked interrupted, as after any restart.
+
 ### Memory use
 
 The default model, BGE-M3, gives the best recall across languages and needs about
