@@ -39,21 +39,39 @@
     <p class="muted">The shared memory of your agents.</p>
     <label class="field">
       <span class="sr-only">Username</span>
-      <input id="username" type="text" placeholder="Username" autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>
+      <input id="username" type="text" placeholder="Username" autocomplete="username webauthn" autocapitalize="none" spellcheck="false" autofocus>
     </label>
     <label class="field">
       <span class="sr-only">Password</span>
       <input id="password" type="password" placeholder="Password" autocomplete="current-password" required>
     </label>
     <button id="login-button" type="submit">Enter</button>
+    <div class="login-or" id="passkey-or" hidden><span>or</span></div>
+    <button id="passkey-button" class="ghost" type="button" hidden>Sign in with a passkey</button>
     <p id="login-error" class="error" role="alert"></p>
     <p id="captcha-note" class="fine" hidden>Protected by reCAPTCHA. Google's
       <a href="https://policies.google.com/privacy" target="_blank" rel="noopener noreferrer">Privacy Policy</a> and
       <a href="https://policies.google.com/terms" target="_blank" rel="noopener noreferrer">Terms of Service</a> apply.</p>
   </form>
+  <form id="second-factor" class="login-card" autocomplete="off" hidden>
+    <div class="mark" aria-hidden="true"><span></span><span></span><span></span></div>
+    <h1>Second step</h1>
+    <p class="muted">Confirm it is you, <b id="sf-user"></b>.</p>
+    <button id="sf-passkey" type="button" hidden>Use a passkey</button>
+    <label class="field" id="sf-code-field" hidden><span class="sr-only">Code from the authenticator app</span>
+      <input id="sf-code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="7" placeholder="6-digit code"></label>
+    <label class="field" id="sf-recovery-field" hidden><span class="sr-only">Recovery code</span>
+      <input id="sf-recovery" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="24" placeholder="xxxx-xxxx-xxxx-xxxx"></label>
+    <button id="sf-submit" type="submit" hidden>Confirm</button>
+    <button id="sf-use-recovery" class="link" type="button" hidden>Use a recovery code instead</button>
+    <button id="sf-cancel" class="ghost" type="button">Cancel</button>
+    <p id="sf-error" class="error" role="alert"></p>
+  </form>
 </section>
 
 <div id="app" class="loading" aria-busy="true" hidden>
+  <p id="signin-notice" class="banner" role="status" hidden></p>
+  <p id="break-glass" class="banner danger" role="alert" hidden>Signed in with the environment admin password under LORE_ADMIN_BREAK_GLASS, without a second step. Fix the password or the second steps under Profile → Security, then unset LORE_ADMIN_BREAK_GLASS and redeploy.</p>
   <div id="load-notice" class="load-notice" role="alert" hidden>
     <span id="load-notice-text"></span>
     <button id="load-notice-retry" class="ghost small" type="button">Retry</button>
@@ -258,22 +276,103 @@
     <h4>Rules the agents must follow</h4>
     <div id="profile-rules" class="profile-rules"></div>
     <button id="profile-add-rule" class="ghost" type="button">Add rule</button>
-    <form id="own-password" class="board-form own-password" autocomplete="off" hidden>
-      <h4>Your password</h4>
-      <input class="sr-only" type="text" id="own-username" autocomplete="username" readonly tabindex="-1" aria-hidden="true">
-      <label class="board-field"><span>Current password</span>
-        <input id="own-current" type="password" autocomplete="current-password" required>
-      </label>
-      <div class="board-form-row even">
-        <label class="board-field"><span>New password (at least 10 characters)</span>
-          <input id="own-new" type="password" autocomplete="new-password" minlength="10" maxlength="256" required>
+    <section id="security" class="security" aria-labelledby="security-title">
+      <h3 id="security-title">Security</h3>
+      <p id="security-status" class="small-text" role="status"></p>
+
+      <h4>Password</h4>
+      <p id="password-source" class="muted small-text"></p>
+      <form id="own-password" class="board-form own-password" autocomplete="off">
+        <input class="sr-only" type="text" id="own-username" autocomplete="username" readonly tabindex="-1" aria-hidden="true">
+        <label class="board-field"><span>Current password</span>
+          <input id="own-current" type="password" autocomplete="current-password" required>
         </label>
-        <label class="board-field"><span>New password again</span>
-          <input id="own-again" type="password" autocomplete="new-password" minlength="10" maxlength="256" required>
+        <div class="board-form-row even">
+          <label class="board-field"><span id="own-new-label">New password (at least 10 characters)</span>
+            <input id="own-new" type="password" autocomplete="new-password" minlength="10" maxlength="256" required>
+          </label>
+          <label class="board-field"><span>New password again</span>
+            <input id="own-again" type="password" autocomplete="new-password" minlength="10" maxlength="256" required>
+          </label>
+        </div>
+        <div class="board-form-actions">
+          <button id="password-env" class="ghost small" type="button" hidden>Use the environment password again</button>
+          <button id="own-submit" class="ghost small" type="submit">Change password</button>
+        </div>
+      </form>
+
+      <h4>Passkeys</h4>
+      <p class="muted small-text">A passkey signs you in without the password (when your device verifies you with a PIN, fingerprint or face), or serves as the second step after it.</p>
+      <ul id="passkey-list" class="passkey-list"></ul>
+      <p id="passkey-unavailable" class="muted small-text" hidden></p>
+      <div id="passkey-add-row" class="board-form-row passkey-add">
+        <label class="board-field"><span class="sr-only">Passkey name</span>
+          <input id="passkey-name" type="text" maxlength="60" placeholder="Name, e.g. MacBook" autocomplete="off">
         </label>
+        <button id="passkey-add" class="ghost small" type="button">Add a passkey</button>
       </div>
+
+      <h4>Authenticator app</h4>
+      <p id="totp-state" class="muted small-text"></p>
       <div class="board-form-actions">
-        <button id="own-submit" class="ghost small" type="submit">Change password</button>
+        <button id="totp-setup" class="ghost small" type="button">Set up</button>
+        <button id="totp-remove" class="ghost small danger" type="button" hidden>Remove</button>
+      </div>
+      <div id="totp-panel" class="totp-panel" hidden>
+        <img id="totp-qr" class="totp-qr" alt="QR code for the authenticator app" width="200" height="200">
+        <p class="small-text">Or type this key:</p>
+        <p class="totp-key"><code id="totp-secret"></code> <button id="totp-copy" class="ghost small" type="button">Copy</button></p>
+        <div class="board-form-row">
+          <label class="board-field"><span>Code from the app</span>
+            <input id="totp-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="6-digit code">
+          </label>
+        </div>
+        <div class="board-form-actions">
+          <button id="totp-cancel" class="ghost small" type="button">Cancel</button>
+          <button id="totp-confirm" class="ghost small" type="button">Confirm</button>
+        </div>
+      </div>
+
+      <h4>Recovery codes</h4>
+      <p id="recovery-state" class="muted small-text"></p>
+      <div class="board-form-actions">
+        <button id="recovery-new" class="ghost small" type="button">Make new codes</button>
+      </div>
+      <div id="recovery-panel" class="recovery-panel" hidden>
+        <p class="small-text">Each code works once, in place of the second step. They are shown only now: save them somewhere safe.</p>
+        <ol id="recovery-list" class="recovery-codes"></ol>
+        <div class="board-form-actions">
+          <button id="recovery-download" class="ghost small" type="button">Download</button>
+          <button id="recovery-done" class="ghost small" type="button">I saved them</button>
+        </div>
+      </div>
+
+      <h4>Recent sign-ins</h4>
+      <table id="security-events" class="security-events">
+        <thead><tr><th scope="col">When</th><th scope="col">What</th><th scope="col">Address</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <form id="reauth" class="board-form reauth" autocomplete="off" hidden>
+      <h4>Confirm it is you</h4>
+      <p class="muted small-text">This change needs a recent sign-in. Confirm with your password (and your second step), or with a passkey.</p>
+      <input class="sr-only" type="text" id="reauth-username" autocomplete="username" readonly tabindex="-1" aria-hidden="true">
+      <label class="board-field" id="reauth-password-field"><span>Password</span>
+        <input id="reauth-password" type="password" autocomplete="current-password">
+      </label>
+      <label class="board-field" id="reauth-code-field" hidden><span>Code from the authenticator app</span>
+        <input id="reauth-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7">
+      </label>
+      <label class="board-field" id="reauth-recovery-field" hidden><span>Recovery code</span>
+        <input id="reauth-recovery" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="24">
+      </label>
+      <button id="reauth-use-recovery" class="link" type="button" hidden>Use a recovery code instead</button>
+      <p id="reauth-error" class="error" role="alert"></p>
+      <div class="board-form-actions">
+        <button id="reauth-cancel" class="ghost small" type="button">Cancel</button>
+        <button id="reauth-passkey" class="ghost small" type="button" hidden>Use a passkey</button>
+        <button id="reauth-submit" class="ghost small" type="submit">Confirm</button>
       </div>
     </form>
   </div>
@@ -720,6 +819,7 @@
   </button>
 </div>
 
+<script src="/admin/signin.js"></script>
 <script src="/admin/app.js"></script>
 <script src="/admin/builtin.js"></script>
 </body>

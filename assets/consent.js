@@ -17,7 +17,7 @@ const REQUEST = (document.querySelector('meta[name="lore-request"]') || {}).cont
 const state = { siteKey: null, data: null, csrf: "", avatar: "" };
 
 function show(id) {
-  for (const section of ["consent-loading", "consent-login", "consent-card", "consent-message"]) {
+  for (const section of ["consent-loading", "consent-login", "second-factor", "consent-card", "consent-message"]) {
     $(section).hidden = section !== id;
   }
 }
@@ -70,6 +70,9 @@ $("consent-login").addEventListener("submit", async (event) => {
     });
     if (response.ok) {
       $("password").value = "";
+      const body = await response.json().catch(() => ({}));
+      // The password was right; the account has a second step.
+      if (body.second_factor) { showSecondFactor(body.second_factor); return; }
       await loadRequest();
     } else if (response.status === 429) {
       const wait = Number(response.headers.get("Retry-After")) || 60;
@@ -80,6 +83,36 @@ $("consent-login").addEventListener("submit", async (event) => {
     }
   } catch (problem) {
     error.textContent = problem.message || "Sign-in failed.";
+  } finally {
+    button.disabled = false;
+  }
+});
+
+/* The second step and passkey sign-in: the same as on the admin page. */
+const secondStep = window.loreSignIn.secondFactorCard({
+  onDone: () => loadRequest(),
+  onRestart: (text) => {
+    showLogin();
+    $("login-error").textContent = text || "";
+  },
+});
+
+function showSecondFactor(info) {
+  show("second-factor");
+  secondStep.show(info);
+}
+
+$("passkey-button").addEventListener("click", async () => {
+  const button = $("passkey-button"), error = $("login-error");
+  button.disabled = true; error.textContent = "";
+  try {
+    const { response, body } = await window.loreSignIn.passkeySignIn();
+    if (response.ok) { await loadRequest(); return; }
+    error.textContent = response.status === 429
+      ? window.loreSignIn.tooMany(response)
+      : (body.error || "The passkey sign-in failed.");
+  } catch (_) {
+    error.textContent = "The passkey sign-in failed.";
   } finally {
     button.disabled = false;
   }
@@ -272,7 +305,12 @@ $("message-deny").addEventListener("click", deny);
     const session = await (await fetch("/admin/api/session", { credentials: "same-origin" })).json();
     state.siteKey = session.recaptcha_site_key;
     loadRecaptcha(state.siteKey);
-    if (session.authenticated) await loadRequest(); else showLogin();
+    const passkeys = window.loreSignIn.available() && !!session.passkey_sign_in;
+    $("passkey-button").hidden = !passkeys;
+    $("passkey-or").hidden = !passkeys;
+    if (session.authenticated) await loadRequest();
+    else if (session.second_factor_pending) showSecondFactor(session.second_factor_pending);
+    else showLogin();
   } catch (_) {
     message("Lore cannot be reached", "Check the connection and reload this page.");
   }

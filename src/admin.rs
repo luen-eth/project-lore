@@ -86,6 +86,9 @@ const PAGE: &str = include_str!("../assets/admin.html");
 const SCRIPT: &str = include_str!("../assets/admin.js");
 const STYLE: &str = include_str!("../assets/admin.css");
 const CONSENT_SCRIPT: &str = include_str!("../assets/consent.js");
+/// Passkeys and the second step of a sign-in, shared by the admin and the
+/// consent page.
+const SIGNIN_SCRIPT: &str = include_str!("../assets/signin.js");
 const CONSENT_STYLE: &str = include_str!("../assets/consent.css");
 
 /// The page's Content Security Policy; the OAuth consent page uses it too.
@@ -216,6 +219,7 @@ const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/admin/icon.svg", Access::Public),
     ("GET", "/admin/backdrop.jpg", Access::Public),
     ("GET", "/admin/consent.js", Access::Public),
+    ("GET", "/admin/signin.js", Access::Public),
     ("GET", "/admin/consent.css", Access::Public),
     ("GET", "/admin/avatars/{file}", Access::Public),
     ("GET", "/admin/api/session", Access::Public),
@@ -818,6 +822,10 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
             get(|| async { asset("text/javascript; charset=utf-8", CONSENT_SCRIPT) }),
         )
         .route(
+            "/admin/signin.js",
+            get(|| async { asset("text/javascript; charset=utf-8", SIGNIN_SCRIPT) }),
+        )
+        .route(
             "/admin/consent.css",
             get(|| async { asset("text/css; charset=utf-8", CONSENT_STYLE) }),
         )
@@ -1064,7 +1072,15 @@ fn router_with(admin: Arc<Admin>, extra: Router<Arc<Admin>>) -> Router {
 fn build_id() -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (PAGE, SCRIPT, STYLE, builtin::SCRIPT, builtin::STYLE).hash(&mut hasher);
+    (
+        PAGE,
+        SCRIPT,
+        STYLE,
+        SIGNIN_SCRIPT,
+        builtin::SCRIPT,
+        builtin::STYLE,
+    )
+        .hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -6443,6 +6459,7 @@ mod tests {
         for page in [
             "/admin",
             "/admin/app.js",
+            "/admin/signin.js",
             "/admin/app.css",
             "/admin/builtin.js",
             "/admin/builtin.css",
@@ -9307,5 +9324,40 @@ mod tests {
         let body: serde_json::Value = env.json().await.unwrap();
         assert_eq!(body["ok"], true);
         assert!(target_admin.db.totp("admin").unwrap().is_none());
+    }
+    #[test]
+    fn the_sign_in_pages_have_no_inline_script_or_style() {
+        let consent = include_str!("../assets/consent.html");
+        for (name, page) in [("admin.html", PAGE), ("consent.html", consent)] {
+            assert!(!page.contains(" style="), "{name} has a style attribute");
+            assert!(!page.contains("<style"), "{name} has a style element");
+            for script in page.split("<script").skip(1) {
+                assert!(
+                    script.trim_start().starts_with("src=\"/admin/"),
+                    "{name}: inline script"
+                );
+            }
+            // The second-step card, the same on both pages, and the shared
+            // script before the page's own.
+            for id in [
+                "second-factor",
+                "sf-passkey",
+                "sf-code",
+                "sf-recovery",
+                "sf-cancel",
+                "passkey-button",
+            ] {
+                assert!(page.contains(&format!("id=\"{id}\"")), "{name} lacks #{id}");
+            }
+            let shared = page.find("/admin/signin.js").unwrap();
+            let own = page
+                .find("/admin/app.js")
+                .or_else(|| page.find("/admin/consent.js"))
+                .unwrap();
+            assert!(shared < own, "{name} loads signin.js too late");
+        }
+        for script in [SCRIPT, SIGNIN_SCRIPT, CONSENT_SCRIPT] {
+            assert!(!script.contains("innerHTML") && !script.contains("insertAdjacentHTML"));
+        }
     }
 }

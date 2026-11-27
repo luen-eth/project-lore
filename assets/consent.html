@@ -28,17 +28,34 @@
     <p class="muted">An application wants to connect to lore as an agent. Sign in to decide.</p>
     <label class="field">
       <span class="sr-only">Username</span>
-      <input id="username" type="text" placeholder="Username" autocomplete="username" autocapitalize="none" spellcheck="false">
+      <input id="username" type="text" placeholder="Username" autocomplete="username webauthn" autocapitalize="none" spellcheck="false">
     </label>
     <label class="field">
       <span class="sr-only">Password</span>
       <input id="password" type="password" placeholder="Password" autocomplete="current-password" required>
     </label>
     <button id="login-button" type="submit">Sign in</button>
+    <div class="login-or" id="passkey-or" hidden><span>or</span></div>
+    <button id="passkey-button" class="ghost" type="button" hidden>Sign in with a passkey</button>
     <p id="login-error" class="error" role="alert"></p>
     <p id="captcha-note" class="fine" hidden>Protected by reCAPTCHA. Google's
       <a href="https://policies.google.com/privacy" target="_blank" rel="noopener noreferrer">Privacy Policy</a> and
       <a href="https://policies.google.com/terms" target="_blank" rel="noopener noreferrer">Terms of Service</a> apply.</p>
+  </form>
+
+  <form id="second-factor" class="login-card" autocomplete="off" hidden>
+    <div class="mark" aria-hidden="true"><span></span><span></span><span></span></div>
+    <h1>Second step</h1>
+    <p class="muted">Confirm it is you, <b id="sf-user"></b>.</p>
+    <button id="sf-passkey" type="button" hidden>Use a passkey</button>
+    <label class="field" id="sf-code-field" hidden><span class="sr-only">Code from the authenticator app</span>
+      <input id="sf-code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="7" placeholder="6-digit code"></label>
+    <label class="field" id="sf-recovery-field" hidden><span class="sr-only">Recovery code</span>
+      <input id="sf-recovery" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="24" placeholder="xxxx-xxxx-xxxx-xxxx"></label>
+    <button id="sf-submit" type="submit" hidden>Confirm</button>
+    <button id="sf-use-recovery" class="link" type="button" hidden>Use a recovery code instead</button>
+    <button id="sf-cancel" class="ghost" type="button">Cancel</button>
+    <p id="sf-error" class="error" role="alert"></p>
   </form>
 
   <form id="consent-card" class="login-card consent-card" autocomplete="off" hidden>
@@ -90,6 +107,7 @@
   </section>
 </main>
 
+<script src="/admin/signin.js"></script>
 <script src="/admin/consent.js"></script>
 </body>
 </html>

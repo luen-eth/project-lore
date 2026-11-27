@@ -864,6 +864,9 @@ function showLogin() {
   $("profile").hidden = true;
   $("profile-toggle").setAttribute("aria-expanded", "false");
   resetOwnPassword();
+  secondStep.hide();
+  $("login-form").hidden = false;
+  signinNotice("");
   resetBackup();
   closeUsers();
   resetUsers();
@@ -929,6 +932,8 @@ $("login-form").addEventListener("submit", async (event) => {
     if (response.ok) {
       $("password").value = "";
       const body = await response.json().catch(() => ({}));
+      // The password was right; the account has a second step.
+      if (body.second_factor) { showSecondFactor(body.second_factor); return; }
       await enter(body);
     } else if (response.status === 429) {
       const wait = Number(response.headers.get("Retry-After")) || 60;
@@ -939,6 +944,61 @@ $("login-form").addEventListener("submit", async (event) => {
     }
   } catch (problem) {
     error.textContent = problem.message || "Sign-in failed.";
+  } finally {
+    button.disabled = false;
+  }
+});
+
+/* ---------- Passkeys and the second step of a sign-in ---------- */
+
+const secondStep = window.loreSignIn.secondFactorCard({
+  onDone: (body) => {
+    $("login-form").hidden = false;
+    enter(body);
+    if (typeof body.recovery_left === "number") {
+      signinNotice(body.recovery_left <= 3
+        ? `Signed in with a recovery code. Only ${body.recovery_left} left: make new codes under Profile → Security.`
+        : `Signed in with a recovery code; ${body.recovery_left} left.`);
+    }
+  },
+  onRestart: (message) => {
+    $("login-form").hidden = false;
+    $("login-error").textContent = message || "";
+    $("password").value = "";
+    $("password").focus();
+  },
+});
+
+function showSecondFactor(info) {
+  $("login").hidden = false;
+  $("login-form").hidden = true;
+  $("login-error").textContent = "";
+  secondStep.show(info);
+}
+
+function showPasskeyButton(session) {
+  const on = window.loreSignIn.available() && !!(session && session.passkey_sign_in);
+  $("passkey-button").hidden = !on;
+  $("passkey-or").hidden = !on;
+}
+
+function signinNotice(text) {
+  const node = $("signin-notice");
+  node.textContent = text || "";
+  node.hidden = !text;
+}
+
+$("passkey-button").addEventListener("click", async () => {
+  const button = $("passkey-button"), error = $("login-error");
+  button.disabled = true; error.textContent = "";
+  try {
+    const { response, body } = await window.loreSignIn.passkeySignIn();
+    if (response.ok) { await enter(body); return; }
+    error.textContent = response.status === 429
+      ? window.loreSignIn.tooMany(response)
+      : (body.error || "The passkey sign-in failed.");
+  } catch (_) {
+    error.textContent = "The passkey sign-in failed.";
   } finally {
     button.disabled = false;
   }
@@ -991,9 +1051,14 @@ function applySession(session) {
   // A full database brings its own users and tokens: restoring one is for
   // a user holding every permission, as the server enforces.
   $("full-restore-box").hidden = !ALL_PERMISSIONS.every(can);
-  // Stored users change their own password; built-in ones in the environment.
-  $("own-password").hidden = !state.stored;
+  // Every user changes their own password; the built-in ones need 12
+  // characters, like their environment variables.
+  state.minPassword = state.stored ? 10 : 12;
+  $("own-new-label").textContent = `New password (at least ${state.minPassword} characters)`;
+  for (const id of ["own-new", "own-again"]) $(id).minLength = state.minPassword;
   $("own-username").value = state.username;
+  $("reauth-username").value = state.username;
+  $("break-glass").hidden = !session.break_glass;
   if (!backupMenu) {
     $("backup").hidden = true;
     $("backup-toggle").setAttribute("aria-expanded", "false");
@@ -2051,6 +2116,7 @@ $("profile-toggle").addEventListener("click", () => {
     closeAgentsPanel();
     profileStatus("");
     loadProfile();
+    loadSecurity();
   } else {
     resetOwnPassword();
   }
@@ -3671,11 +3737,358 @@ $("integrations-ci").addEventListener("change", (event) =>
   )
 );
 
-/* ---------- Your password (stored users) ---------- */
+/* ---------- Profile → Security ---------- */
 
-function resetOwnPassword() {
-  for (const id of ["own-current", "own-new", "own-again"]) $(id).value = "";
+const security = { data: null, recovery: [] };
+
+function securityStatus(text, tone) {
+  const node = $("security-status");
+  node.textContent = text;
+  node.className = "small-text" + (tone ? " " + tone : "");
 }
+
+/* Typed secrets and shown codes do not outlive the panel. */
+function resetOwnPassword() {
+  for (const id of ["own-current", "own-new", "own-again", "totp-code", "passkey-name",
+    "reauth-password", "reauth-code", "reauth-recovery"]) $(id).value = "";
+  $("totp-panel").hidden = true;
+  $("totp-secret").textContent = "";
+  $("totp-qr").removeAttribute("src");
+  $("recovery-panel").hidden = true;
+  $("recovery-list").replaceChildren();
+  security.recovery = [];
+  closeReauth(false);
+  securityStatus("");
+}
+
+/* A JSON request that may need a fresh sign-in: on 403 {reauth} the
+   dialog asks the user to confirm, then the request is sent once more.
+   Returns { response, body }. */
+async function sendFresh(path, payload, method) {
+  const options = {
+    method: method || "POST",
+    headers: { "Content-Type": "application/json" },
+    body: payload === undefined ? undefined : JSON.stringify(payload),
+  };
+  let response = await api(path, options);
+  let body = await response.json().catch(() => ({}));
+  if (response.status === 403 && body.reauth) {
+    if (!(await askReauth())) return { response, body };
+    response = await api(path, options);
+    body = await response.json().catch(() => ({}));
+  }
+  return { response, body };
+}
+
+/* The re-authentication dialog: resolves true once confirmed, false when
+   cancelled. */
+let reauthWaiting = null;
+
+async function askReauth() {
+  closeReauth(false);
+  let data = security.data;
+  try {
+    const response = await api("/admin/api/security");
+    if (response.ok) data = security.data = await response.json();
+  } catch (_) { /* the dialog still works with what is known */ }
+  const hasFactor = !!(data && data.second_factor_required);
+  const totp = !!(data && data.totp && data.totp.enabled && data.totp.readable);
+  const recovery = !!(data && data.recovery && data.recovery.left > 0);
+  const passkey = window.loreSignIn.available() &&
+    !!(data && data.passkeys.some((key) => key.usable_here));
+  $("reauth-code-field").hidden = !(hasFactor && totp);
+  $("reauth-recovery-field").hidden = !(hasFactor && recovery && !totp);
+  $("reauth-use-recovery").hidden = !(hasFactor && recovery && totp);
+  $("reauth-passkey").hidden = !passkey;
+  $("reauth-error").textContent = "";
+  if (data && data.break_glass) {
+    $("reauth-code-field").hidden = true;
+    $("reauth-recovery-field").hidden = true;
+    $("reauth-use-recovery").hidden = true;
+  }
+  // The dialog lives in the profile panel; open it if another panel asked.
+  if ($("profile").hidden) $("profile-toggle").click();
+  $("reauth").hidden = false;
+  $("reauth").scrollIntoView({ block: "nearest" });
+  $("reauth-password").focus();
+  return new Promise((resolve) => { reauthWaiting = resolve; });
+}
+
+function closeReauth(confirmed) {
+  $("reauth").hidden = true;
+  for (const id of ["reauth-password", "reauth-code", "reauth-recovery"]) $(id).value = "";
+  if (reauthWaiting) { const done = reauthWaiting; reauthWaiting = null; done(confirmed); }
+}
+
+function reauthAnswer(result) {
+  const { response, body } = result;
+  if (response.ok) { closeReauth(true); return; }
+  $("reauth-error").textContent = response.status === 429
+    ? window.loreSignIn.tooMany(response)
+    : (body.error || "That did not confirm it.");
+}
+
+$("reauth").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = { password: $("reauth-password").value };
+  if (!$("reauth-code-field").hidden) payload.code = $("reauth-code").value;
+  if (!$("reauth-recovery-field").hidden) payload.recovery_code = $("reauth-recovery").value;
+  $("reauth-submit").disabled = true;
+  try {
+    const response = await api("/admin/api/security/reauth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    reauthAnswer({ response, body: await response.json().catch(() => ({})) });
+  } catch (_) {
+    $("reauth-error").textContent = "Lore cannot be reached.";
+  } finally {
+    $("reauth-submit").disabled = false;
+  }
+});
+$("reauth-passkey").addEventListener("click", async () => {
+  $("reauth-error").textContent = "";
+  try { reauthAnswer(await window.loreSignIn.reauthPasskey()); } catch (_) { $("reauth-error").textContent = "The passkey did not work."; }
+});
+$("reauth-use-recovery").addEventListener("click", () => {
+  $("reauth-code-field").hidden = true;
+  $("reauth-recovery-field").hidden = false;
+  $("reauth-use-recovery").hidden = true;
+  $("reauth-recovery").focus();
+});
+$("reauth-cancel").addEventListener("click", () => closeReauth(false));
+
+async function loadSecurity() {
+  try {
+    const response = await api("/admin/api/security");
+    if (!response.ok) throw new Error("failed");
+    security.data = await response.json();
+  } catch (_) {
+    securityStatus("The security settings could not be loaded.", "bad");
+    return;
+  }
+  renderSecurity();
+}
+
+const EVENT_WORDS = {
+  "signin.ok": "Signed in", "signin.pending": "Password right, second step asked",
+  "signin.fail.password": "Wrong password", "signin.fail.second_factor": "Second step refused",
+  "signin.fail.passkey": "Passkey refused", "signin.limited": "Too many attempts",
+  "signin.break_glass": "Signed in with break-glass", "reauth.ok": "Confirmed it was you",
+  "reauth.fail": "Confirmation refused", "password.changed": "Password changed",
+  "password.set_by_other": "Password set by an administrator",
+  "password.env_restored": "Back to the environment password", "passkey.added": "Passkey added",
+  "passkey.renamed": "Passkey renamed", "passkey.removed": "Passkey removed",
+  "passkey.counter_regression": "Passkey refused: its counter went backwards",
+  "totp.enabled": "Authenticator app set up", "totp.removed": "Authenticator app removed",
+  "recovery.generated": "New recovery codes", "recovery.used": "Recovery code used",
+  "second_factors.reset": "Second steps reset",
+};
+
+function renderSecurity() {
+  const data = security.data;
+  if (!data) return;
+  // Password.
+  const source = data.password.source;
+  $("password-source").textContent = source === "environment"
+    ? `Set in the server environment (${data.username === "admin" ? "LORE_ADMIN_PASSWORD" : "LORE_VIEWER_PASSWORD"}).`
+    : source === "page"
+      ? `Set on this page ${ago(data.password.changed_at)}; the environment value no longer signs in.`
+      : "Stored by lore as a hash.";
+  $("password-env").hidden = source !== "page";
+
+  // Passkeys.
+  const list = $("passkey-list");
+  list.replaceChildren();
+  for (const key of data.passkeys) list.append(passkeyRow(key));
+  if (!data.passkeys.length) list.append(el("li", "muted small-text", "No passkey yet."));
+  const usable = window.loreSignIn.available() && data.rp_id;
+  $("passkey-add-row").hidden = !usable;
+  $("passkey-unavailable").hidden = !!usable;
+  $("passkey-unavailable").textContent = !window.loreSignIn.available()
+    ? "This browser does not support passkeys."
+    : "Passkeys need lore to be reached at a known host name (LORE_ALLOWED_HOSTS).";
+
+  // Authenticator app.
+  const totp = data.totp;
+  $("totp-state").textContent = totp.enabled
+    ? (totp.readable
+      ? `Set up ${ago(totp.confirmed_at)}.`
+      : "The authenticator app cannot be checked: LORE_VAULT_KEY changed or is missing. Remove it and set it up again.")
+    : data.vault ? "Not set up." : "Needs LORE_VAULT_KEY on the server; passkeys work without it.";
+  $("totp-setup").hidden = totp.enabled;
+  $("totp-setup").disabled = !data.vault;
+  $("totp-remove").hidden = !totp.enabled;
+
+  // Recovery codes.
+  const recovery = data.recovery;
+  const node = $("recovery-state");
+  node.textContent = recovery ? `${recovery.left} of ${recovery.total} left.` : "None: they come with the first passkey or authenticator app.";
+  node.className = "small-text " + (recovery && recovery.left <= 3 ? "warn" : "muted");
+  $("recovery-new").hidden = !(data.passkeys.length || totp.enabled);
+
+  // Recent sign-ins.
+  const body = $("security-events").querySelector("tbody");
+  body.replaceChildren();
+  for (const event of data.events) {
+    const row = el("tr");
+    const words = EVENT_WORDS[event.event] || event.event;
+    row.append(el("td", "", ago(event.created_at)), el("td", "", event.detail ? `${words} (${event.detail})` : words), el("td", "", event.ip || ""));
+    body.append(row);
+  }
+}
+
+function passkeyRow(key) {
+  const item = el("li", "passkey-row");
+  const head = el("div", "passkey-head");
+  const name = el("b", "", key.name);
+  head.append(name);
+  const badges = el("span", "passkey-badges");
+  if (key.synced) badges.append(el("span", "badge", "synced"));
+  if (key.transports && key.transports.includes("internal")) badges.append(el("span", "badge", "this device"));
+  badges.append(el("span", "badge", key.passwordless === true ? "password-free sign-in"
+    : key.passwordless === false ? "second step only" : "unknown"));
+  if (!key.usable_here) badges.append(el("span", "badge warn", `for ${key.rp_id}`));
+  head.append(badges);
+  item.append(head, el("span", "muted small-text",
+    `added ${ago(key.created_at)}, last used ${key.last_used_at ? ago(key.last_used_at) : "never"}`));
+  const actions = el("div", "board-actions");
+  const rename = el("button", "ghost small", "Rename");
+  rename.type = "button";
+  rename.addEventListener("click", () => {
+    const input = el("input");
+    input.type = "text"; input.maxLength = 60; input.value = key.name;
+    const save = el("button", "ghost small", "Save"); save.type = "button";
+    const cancel = el("button", "ghost small", "Cancel"); cancel.type = "button";
+    name.replaceWith(input);
+    actions.replaceChildren(cancel, save);
+    input.focus();
+    cancel.addEventListener("click", renderSecurity);
+    save.addEventListener("click", async () => {
+      const { response, body } = await sendFresh(`/admin/api/security/passkeys/${key.id}`, { name: input.value }, "PUT");
+      if (!response.ok) { securityStatus(body.error || "The passkey could not be renamed.", "bad"); return; }
+      securityStatus("Renamed.", "ok");
+      loadSecurity();
+    });
+  });
+  const remove = el("button", "ghost small danger", "Remove");
+  remove.type = "button";
+  let armed = null;
+  remove.addEventListener("click", async () => {
+    if (!armed) {
+      remove.textContent = "Remove? Yes";
+      armed = setTimeout(() => { armed = null; remove.textContent = "Remove"; }, 4000);
+      return;
+    }
+    clearTimeout(armed); armed = null;
+    const { response, body } = await sendFresh(`/admin/api/security/passkeys/${key.id}`, undefined, "DELETE");
+    if (!response.ok) { securityStatus(body.error || "The passkey could not be removed.", "bad"); return; }
+    securityStatus("Passkey removed. Your other sessions were signed out.", "ok");
+    loadSecurity();
+  });
+  actions.append(rename, remove);
+  item.append(actions);
+  return item;
+}
+
+function showRecoveryCodes(codes) {
+  security.recovery = codes;
+  const list = $("recovery-list");
+  list.replaceChildren();
+  for (const code of codes) { const item = el("li"); item.append(el("code", "", code)); list.append(item); }
+  $("recovery-panel").hidden = false;
+}
+
+$("passkey-add").addEventListener("click", async () => {
+  const name = $("passkey-name").value.trim();
+  if (!name) { securityStatus("Give the passkey a name first, e.g. the device it is on.", "bad"); return; }
+  $("passkey-add").disabled = true;
+  try {
+    const result = await window.loreSignIn.registerPasskey(name, (path, payload) => sendFresh(path, payload));
+    if (!result.response.ok) { securityStatus(result.body.error || "The passkey could not be added.", "bad"); return; }
+    $("passkey-name").value = "";
+    securityStatus("Passkey added. Your other sessions were signed out.", "ok");
+    if (result.body.recovery_codes) showRecoveryCodes(result.body.recovery_codes);
+    loadSecurity();
+  } catch (_) {
+    securityStatus("The passkey could not be added.", "bad");
+  } finally {
+    $("passkey-add").disabled = false;
+  }
+});
+
+$("totp-setup").addEventListener("click", async () => {
+  const { response, body } = await sendFresh("/admin/api/security/totp/setup", {});
+  if (!response.ok) { securityStatus(body.error || "The setup could not start.", "bad"); return; }
+  $("totp-qr").src = body.qr;
+  $("totp-secret").textContent = body.secret;
+  $("totp-panel").hidden = false;
+  $("totp-code").value = "";
+  $("totp-code").focus();
+  securityStatus("Scan the code with the app, then type the code it shows.", "");
+});
+$("totp-copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("totp-secret").textContent.replace(/\s+/g, ""));
+    securityStatus("Key copied.", "ok");
+  } catch (_) {
+    securityStatus("Copying failed; select the key and copy it by hand.", "bad");
+  }
+});
+$("totp-cancel").addEventListener("click", () => {
+  $("totp-panel").hidden = true;
+  $("totp-secret").textContent = "";
+  $("totp-qr").removeAttribute("src");
+});
+$("totp-confirm").addEventListener("click", async () => {
+  const { response, body } = await sendFresh("/admin/api/security/totp/confirm", { code: $("totp-code").value });
+  if (!response.ok) { securityStatus(body.error || "The code was not accepted.", "bad"); return; }
+  $("totp-panel").hidden = true;
+  $("totp-secret").textContent = "";
+  $("totp-qr").removeAttribute("src");
+  securityStatus("Authenticator app set up. Your other sessions were signed out.", "ok");
+  if (body.recovery_codes) showRecoveryCodes(body.recovery_codes);
+  loadSecurity();
+});
+$("totp-remove").addEventListener("click", async () => {
+  if (!window.confirm("Remove the authenticator app? Without another second step you sign in with the password alone.")) return;
+  const { response, body } = await sendFresh("/admin/api/security/totp", undefined, "DELETE");
+  if (!response.ok) { securityStatus(body.error || "The app could not be removed.", "bad"); return; }
+  securityStatus("Authenticator app removed.", "ok");
+  loadSecurity();
+});
+$("recovery-new").addEventListener("click", async () => {
+  if (!window.confirm("Make new recovery codes? The old codes stop working.")) return;
+  const { response, body } = await sendFresh("/admin/api/security/recovery-codes", {});
+  if (!response.ok) { securityStatus(body.error || "New codes could not be made.", "bad"); return; }
+  showRecoveryCodes(body.codes);
+  securityStatus("New recovery codes made; the old ones no longer work.", "ok");
+  loadSecurity();
+});
+$("recovery-download").addEventListener("click", () => {
+  const text = `project-lore recovery codes for ${state.username}\nEach works once.\n\n${security.recovery.join("\n")}\n`;
+  const link = el("a");
+  link.href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+  link.download = `lore-recovery-codes-${state.username}.txt`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+});
+$("recovery-done").addEventListener("click", () => {
+  $("recovery-panel").hidden = true;
+  $("recovery-list").replaceChildren();
+  security.recovery = [];
+});
+
+$("password-env").addEventListener("click", async () => {
+  if (!window.confirm("Use the environment password again? The password set on this page stops working.")) return;
+  const { response, body } = await sendFresh("/admin/api/password", undefined, "DELETE");
+  if (!response.ok) { profileStatus(body.error || "That did not work.", "bad"); return; }
+  profileStatus("The environment password signs in again. Your other sessions were signed out.", "ok");
+  loadSecurity();
+});
 
 $("own-password").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -3684,8 +4097,9 @@ $("own-password").addEventListener("submit", async (event) => {
     profileStatus("The two new passwords differ.", "bad");
     return;
   }
-  if (password.length < 10) {
-    profileStatus("The new password must be at least 10 characters.", "bad");
+  const minimum = state.minPassword || 10;
+  if (password.length < minimum) {
+    profileStatus(`The new password must be at least ${minimum} characters.`, "bad");
     return;
   }
   $("own-submit").disabled = true;
@@ -3700,8 +4114,9 @@ $("own-password").addEventListener("submit", async (event) => {
       profileStatus(result.error || "The password could not be changed.", "bad");
       return;
     }
-    resetOwnPassword();
+    for (const id of ["own-current", "own-new", "own-again"]) $(id).value = "";
     profileStatus("Password changed. Your other sessions were signed out.", "ok");
+    loadSecurity();
   } catch (_) {
     profileStatus("The password could not be changed.", "bad");
   } finally {
@@ -3811,17 +4226,87 @@ function renderUsers() {
 
   const list = $("user-list");
   list.replaceChildren();
-  for (const builtin of data.builtin) {
-    const item = el("li", "board-item user-item builtin");
-    const head = el("div", "board-item-head");
-    head.append(el("span", "board-title", builtin.username), el("span", "board-id", "built-in"));
-    item.append(head, permissionPills(builtin.permissions),
-      el("p", "board-meta", "Its password is set in the server environment; it cannot be changed here."));
-    list.append(item);
-  }
+  for (const builtin of data.builtin) list.append(builtinItem(builtin));
   for (const user of data.users) list.append(userItem(user));
   $("users-count").textContent =
     `${data.users.length} stored user${data.users.length === 1 ? "" : "s"}, ${data.builtin.length} built-in`;
+}
+
+/* "2FA: passkey ×2, app" or "no second step". */
+function factorBadge(factors) {
+  if (!factors) return el("span", "badge", "no second step");
+  const parts = [];
+  if (factors.passkeys) parts.push(factors.passkeys > 1 ? `passkey ×${factors.passkeys}` : "passkey");
+  if (factors.totp) parts.push("app");
+  if (!parts.length && factors.recovery_left) parts.push("recovery codes");
+  return parts.length ? el("span", "badge", "2FA: " + parts.join(", ")) : el("span", "badge warn", "no second step");
+}
+
+function hasFactors(factors) {
+  return !!factors && (factors.passkeys > 0 || factors.totp || factors.recovery_left > 0);
+}
+
+/* Resets a user's second steps (after a confirmation and, when needed, a
+   fresh sign-in). */
+async function resetFactors(label, path) {
+  const sure = window.confirm(`${label} signs in with the password alone until they set up a passkey or app again; their sessions end.\n\nReset the second steps of ${label}?`);
+  if (!sure) return;
+  const { response, body } = await sendFresh(path, undefined, "DELETE");
+  if (!response.ok) { usersStatus(body.error || "The second steps could not be reset.", "bad"); return; }
+  usersStatus(`Reset the second steps of ${label}.`, "ok");
+  await loadUsers();
+}
+
+function builtinItem(builtin) {
+  const item = el("li", "board-item user-item builtin");
+  const head = el("div", "board-item-head");
+  head.append(el("span", "board-title", builtin.username), factorBadge(builtin.second_factors), el("span", "board-id", "built-in"));
+  item.append(head, permissionPills(builtin.permissions));
+  const variable = builtin.username === "admin" ? "LORE_ADMIN_PASSWORD" : "LORE_VIEWER_PASSWORD";
+  item.append(el("p", "board-meta", builtin.password_source === "page"
+    ? `Its password was set on this page and replaces ${variable}.`
+    : `Its password is ${variable} from the server environment.`));
+  // The viewer: with the users permission. Admin: only admin itself.
+  const mayManage = builtin.username === "viewer"
+    ? can("users")
+    : state.username === "admin" && !state.stored;
+  if (!mayManage) {
+    if (builtin.username === "admin") {
+      item.append(el("p", "board-meta", "Only admin changes its own password and second steps; recovery is LORE_ADMIN_BREAK_GLASS."));
+    }
+    return item;
+  }
+  const form = el("form", "board-form user-editor");
+  form.autocomplete = "off";
+  const password = el("input"); password.type = "password"; password.autocomplete = "new-password"; password.minLength = 12; password.maxLength = 256;
+  const again = el("input"); again.type = "password"; again.autocomplete = "new-password"; again.minLength = 12; again.maxLength = 256;
+  const first = el("label", "board-field"); first.append(el("span", "", "New password (at least 12 characters)"), password);
+  const second = el("label", "board-field"); second.append(el("span", "", "New password again"), again);
+  const row = el("div", "board-form-row even"); row.append(first, second);
+  const actions = el("div", "board-actions");
+  const save = el("button", "ghost small", "Set password"); save.type = "submit";
+  actions.append(save);
+  if (hasFactors(builtin.second_factors)) {
+    const reset = el("button", "ghost small danger", "Reset second steps"); reset.type = "button";
+    reset.addEventListener("click", () => resetFactors(builtin.username, `/admin/api/builtin-users/${builtin.username}/second-factors`));
+    actions.append(reset);
+  }
+  form.append(row, actions);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (password.value !== again.value) { usersStatus("The two passwords differ.", "bad"); return; }
+    save.disabled = true;
+    try {
+      const { response, body } = await sendFresh(`/admin/api/builtin-users/${builtin.username}/password`, { password: password.value }, "PUT");
+      if (!response.ok) { usersStatus(body.error || "The password could not be set.", "bad"); return; }
+      usersStatus(`Set the password of ${builtin.username}; its sessions were signed out.`, "ok");
+      await loadUsers();
+    } finally {
+      save.disabled = false;
+    }
+  });
+  item.append(form);
+  return item;
 }
 
 function userItem(user) {
@@ -3830,6 +4315,7 @@ function userItem(user) {
   head.append(el("span", "board-title", user.username));
   if (user.disabled) head.append(el("span", "pill cancelled", "disabled"));
   if (user.username === state.username && state.stored) head.append(el("span", "pill", "you"));
+  head.append(factorBadge(user.second_factors));
   head.append(el("span", "board-id", "#" + user.id));
   item.append(head);
   const meta = [user.email || "no e-mail",
@@ -3853,6 +4339,12 @@ function userItem(user) {
     edit.addEventListener("click", () => { usersState.editing = user.id; renderUsers(); });
     actions.append(edit);
     const myself = user.username === state.username && state.stored;
+    if (!myself && hasFactors(user.second_factors)) {
+      const reset = el("button", "ghost small", "Reset second steps");
+      reset.type = "button";
+      reset.addEventListener("click", () => resetFactors(user.username, `/admin/api/users/${user.id}/second-factors`));
+      actions.append(reset);
+    }
     if (!myself) {
       const remove = el("button", "ghost small danger", "Delete");
       remove.type = "button";
@@ -3921,12 +4413,8 @@ function userEditor(user) {
     if (password.value) payload.password = password.value;
     save.disabled = true;
     try {
-      const response = await api("/admin/api/users/" + user.id, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const result = await response.json().catch(() => ({}));
+      // Setting a password needs a fresh sign-in; sendFresh asks for it.
+      const { response, body: result } = await sendFresh("/admin/api/users/" + user.id, payload, "PUT");
       if (!response.ok) {
         usersStatus(result.error || "The user could not be saved.", "bad");
         return;
@@ -4594,7 +5082,14 @@ syncTabs();
     state.siteKey = session.recaptcha_site_key;
     state.build = session.build;
     loadRecaptcha(state.siteKey);
-    if (session.authenticated) await enter(session); else showLogin();
+    showPasskeyButton(session);
+    if (session.authenticated) {
+      await enter(session);
+    } else {
+      showLogin();
+      // A right password whose second step was not finished yet.
+      if (session.second_factor_pending) showSecondFactor(session.second_factor_pending);
+    }
   } catch (_) {
     // The session check itself failed: say so where the loader is.
     bootFail("The server cannot be reached. Check the connection and try again.");
