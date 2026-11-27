@@ -4426,10 +4426,10 @@ impl Db {
         drop(conn);
 
         // Every pair's similarity once (the matrix is symmetric), spread
-        // over the machine's cores: this is most of what the page's first
+        // over up to four cores: this is most of what the page's first
         // load waits for (about 1.4 billion multiplications for 1200
         // entries of 1024 dimensions).
-        let similar = similar_pairs(&vectors, min_similarity);
+        let similar = similar_pairs(&vectors, min_similarity)?;
         let mut synapses: Vec<Synapse> = Vec::new();
         let mut seen: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
         for (i, (id, _)) in vectors.iter().enumerate() {
@@ -5803,17 +5803,21 @@ fn decode_vector(blob: &[u8]) -> Vec<f32> {
 /// For each vector, the others at least `min_similarity` alike, by index
 /// and in index order, as one pass over every pair would find them. Each
 /// pair is computed once, on as many threads as the machine offers (at
-/// most 8).
-fn similar_pairs(vectors: &[(i64, Vec<f32>)], min_similarity: f32) -> Vec<Vec<(usize, f32)>> {
+/// most 4). A worker that panics fails the whole answer rather than leave
+/// links out.
+fn similar_pairs(
+    vectors: &[(i64, Vec<f32>)],
+    min_similarity: f32,
+) -> Result<Vec<Vec<(usize, f32)>>> {
     let n = vectors.len();
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .clamp(1, 8)
+        .clamp(1, 4)
         .min(n.max(1));
     // Rows are dealt round-robin, so the long first rows and the short last
     // ones (only j > i is computed) share out evenly.
-    let upper: Vec<Vec<(usize, usize, f32)>> = std::thread::scope(|scope| {
+    let upper: Vec<Vec<(usize, usize, f32)>> = std::thread::scope(|scope| -> Result<_> {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 scope.spawn(move || {
@@ -5832,9 +5836,14 @@ fn similar_pairs(vectors: &[(i64, Vec<f32>)], min_similarity: f32) -> Vec<Vec<(u
             .collect();
         handles
             .into_iter()
-            .map(|handle| handle.join().unwrap_or_default())
+            .map(|handle| {
+                handle.join().map_err(|_| {
+                    tracing::error!("a worker computing the graph's links panicked");
+                    anyhow::anyhow!("computing the graph's links failed")
+                })
+            })
             .collect()
-    });
+    })?;
     let mut rows: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
     for (i, j, similarity) in upper.into_iter().flatten() {
         rows[i].push((j, similarity));
@@ -5843,7 +5852,7 @@ fn similar_pairs(vectors: &[(i64, Vec<f32>)], min_similarity: f32) -> Vec<Vec<(u
     for row in &mut rows {
         row.sort_by_key(|&(j, _)| j);
     }
-    rows
+    Ok(rows)
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -5867,7 +5876,7 @@ mod tests {
             .map(|id| (id * 3, (0..16).map(|_| next()).collect()))
             .collect();
         for min in [-1.0, 0.0, 0.05, 0.2] {
-            let fast = super::similar_pairs(&vectors, min);
+            let fast = super::similar_pairs(&vectors, min).unwrap();
             for (i, (_, a)) in vectors.iter().enumerate() {
                 let plain: Vec<(usize, f32)> = vectors
                     .iter()
