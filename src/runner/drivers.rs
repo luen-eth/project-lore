@@ -115,75 +115,16 @@ pub struct Output {
 
 /// Claude Code's subscription sign-in made with `claude setup-token`.
 const CLAUDE_TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
-/// An Anthropic API key for Claude Code (billed per token).
-const CLAUDE_KEY_VAR: &str = "ANTHROPIC_API_KEY";
-/// Where a terminal's Claude finds the key through `apiKeyHelper`.
-const CLAUDE_KEY_HELPER_VAR: &str = "LORE_CLAUDE_API_KEY";
-
-/// Which credential a Claude Code process gets: never both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaudeAuth {
-    /// The setup token or the claude.ai sign-in; no API key.
-    Subscription,
-    /// The API key; no setup token, no claude.ai credentials.
-    ApiKey,
-    /// Nothing is stored.
-    None,
-}
-
-/// What lore knows about one stored Claude credential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CredentialState {
-    pub stored: bool,
-    /// Known unusable now (missing pieces, expired, or refused at its last
-    /// use), so a fallback may skip it.
-    pub unusable: bool,
-}
-
-/// The credential a Claude Code process starts with: the one first in
-/// `priority` that is stored; with `fallback`, the other one when the
-/// first is known unusable and the other is stored and not. Never a
-/// credential that is not stored. A pure function, so the choice is the
-/// same for runs, questions, checks and terminals.
-pub fn choose_claude_auth(
-    subscription: CredentialState,
-    key: CredentialState,
-    priority: ClaudeAuth,
-    fallback: bool,
-) -> ClaudeAuth {
-    let (first, first_kind, second, second_kind) = match priority {
-        ClaudeAuth::ApiKey => (
-            key,
-            ClaudeAuth::ApiKey,
-            subscription,
-            ClaudeAuth::Subscription,
-        ),
-        _ => (
-            subscription,
-            ClaudeAuth::Subscription,
-            key,
-            ClaudeAuth::ApiKey,
-        ),
-    };
-    match (first.stored, second.stored) {
-        (false, false) => ClaudeAuth::None,
-        (true, false) => first_kind,
-        (false, true) => second_kind,
-        (true, true) if fallback && first.unusable && !second.unusable => second_kind,
-        (true, true) => first_kind,
-    }
-}
+/// An Anthropic API key an earlier runner stored for Claude Code. Claude
+/// Code is signed in with the subscription only: a leftover key is
+/// removed from the volume at start-up and never given to `claude`.
+const CLAUDE_LEFTOVER_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 
 /// The home a CLI command runs in. A fresh one is deleted when dropped;
 /// the shared one stays.
 pub struct CliHome {
     path: PathBuf,
     fresh: bool,
-    /// Claude: the one credential every part of this start uses (the
-    /// home's contents, the environment, a terminal's settings, the log
-    /// line, the refusal bookkeeping), decided once when the home is
-    /// made, and why when it is not the owner's first choice.
-    claude: Option<(ClaudeAuth, Option<String>)>,
     /// opencode's directory on the exec-capable mount (`Fresh::exec_tmp`),
     /// deleted with the home.
     exec_tmp: Option<PathBuf>,
@@ -192,10 +133,6 @@ pub struct CliHome {
     /// has no CAP_DAC_OVERRIDE and cannot write into a home it handed
     /// over. Deleted with the home.
     side: Option<PathBuf>,
-    /// The home's Claude settings name the API key through `apiKeyHelper`
-    /// (a terminal with the API key): the CLI then gets the key in
-    /// `LORE_CLAUDE_API_KEY` instead of `ANTHROPIC_API_KEY`.
-    key_helper: bool,
     /// The driver's set of paths in use, which the janitor leaves alone;
     /// this home leaves it when dropped.
     live: Option<Live>,
@@ -223,13 +160,6 @@ impl Drop for Held {
 impl CliHome {
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// The Claude credential this start uses (`None` for another CLI).
-    pub fn claude_auth(&self) -> ClaudeAuth {
-        self.claude
-            .as_ref()
-            .map_or(ClaudeAuth::None, |(auth, _)| *auth)
     }
 
     pub fn is_fresh(&self) -> bool {
@@ -329,9 +259,6 @@ pub struct Driver {
     /// Leftover entries the janitor removed, and when it last did.
     cleaned: std::sync::atomic::AtomicU64,
     cleaned_at: std::sync::Mutex<Option<String>>,
-    /// Claude: the owner's order and fallback, what was refused lately and
-    /// the last start (in memory only; a restart forgets it).
-    claude: std::sync::Mutex<ClaudeMemory>,
 }
 
 /// What a fresh home is for: what must be in it is written before it is
@@ -344,35 +271,6 @@ pub enum HomePurpose {
     Plain,
     /// A terminal: of the CLI's interface (`cli`) or a shell.
     Terminal { cli: bool },
-}
-
-/// What the runner remembers about Claude's credentials.
-#[derive(Debug, Default)]
-struct ClaudeMemory {
-    /// The API key first (else the subscription), when both are stored.
-    key_first: bool,
-    /// Fall back to the other credential when the first cannot be used.
-    fallback: bool,
-    /// When the CLI last refused each credential as invalid
-    /// (`authentication_failed`): the subscription, the API key.
-    refused: [Option<std::time::SystemTime>; 2],
-    /// The credential of the last start and the line the card shows.
-    last: Option<(ClaudeAuth, String)>,
-}
-
-/// How long a refused credential is passed over before it is tried again
-/// (or until the owner presses Check).
-const CLAUDE_RETRY: Duration = Duration::from_secs(60 * 60);
-
-impl ClaudeAuth {
-    /// What the card and the run's log call it; never the credential.
-    pub fn label(self) -> &'static str {
-        match self {
-            ClaudeAuth::Subscription => "subscription",
-            ClaudeAuth::ApiKey => "API key",
-            ClaudeAuth::None => "no credential",
-        }
-    }
 }
 
 /// Largest stored credential file (`auth.json`, `.credentials.json`)
@@ -444,85 +342,7 @@ impl Driver {
             live: Arc::default(),
             cleaned: std::sync::atomic::AtomicU64::new(0),
             cleaned_at: std::sync::Mutex::new(None),
-            claude: std::sync::Mutex::new(ClaudeMemory::default()),
         }
-    }
-
-    fn claude_memory(&self) -> std::sync::MutexGuard<'_, ClaudeMemory> {
-        self.claude.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// The owner's order of Claude's credentials and the fallback switch,
-    /// as lore sends them.
-    pub fn set_claude_prefs(&self, priority: &str, fallback: bool) {
-        let mut memory = self.claude_memory();
-        memory.key_first = priority == "api_key";
-        memory.fallback = fallback;
-    }
-
-    /// The CLI refused this credential as invalid: with the fallback on,
-    /// the next starts use the other one for a while.
-    pub fn claude_refused(&self, auth: ClaudeAuth) {
-        let index = match auth {
-            ClaudeAuth::Subscription => 0,
-            ClaudeAuth::ApiKey => 1,
-            ClaudeAuth::None => return,
-        };
-        self.claude_memory().refused[index] = Some(std::time::SystemTime::now());
-    }
-
-    /// The owner pressed Check: the first credential is tried again.
-    pub fn clear_claude_refusals(&self) {
-        self.claude_memory().refused = [None, None];
-    }
-
-    /// A run's CLI reported its credential refused as invalid. That counts
-    /// (for the fallback) only when a clean check confirms it: the stored
-    /// credential alone, in a fresh home, no task text, no MCP server, one
-    /// short prompt. Anything else leaves the credential usable.
-    pub async fn confirm_claude_refusal(&self, auth: ClaudeAuth) {
-        if self.kind() != Kind::Claude || auth == ClaudeAuth::None {
-            return;
-        }
-        let Ok(home) = self.home_with(Some((auth, None)), HomePurpose::Plain) else {
-            return;
-        };
-        let output = self
-            .run_in(
-                &home,
-                &[
-                    "-p",
-                    "Reply with the single word OK.",
-                    "--output-format",
-                    "stream-json",
-                    "--verbose",
-                    "--max-turns",
-                    "1",
-                    "--strict-mcp-config",
-                ],
-                None,
-            )
-            .await;
-        let refused = output.is_ok_and(|output| {
-            output.text.lines().any(|line| {
-                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|event| {
-                    event["error"] == "authentication_failed" || event["api_error_status"] == 401
-                })
-            })
-        });
-        if refused {
-            tracing::warn!(
-                credential = auth.label(),
-                "a clean check confirmed Claude's credential is refused"
-            );
-            self.claude_refused(auth);
-        }
-    }
-
-    /// The credential the last start used, if any.
-    #[cfg(test)]
-    pub fn claude_last(&self) -> Option<ClaudeAuth> {
-        self.claude_memory().last.as_ref().map(|(auth, _)| *auth)
     }
 
     /// Marks a path under `/work` as in use until the answer is dropped.
@@ -768,7 +588,7 @@ impl Driver {
     /// write there) is ignored, and nothing else is ever written.
     fn stored_names(&self) -> Vec<String> {
         match self.kind() {
-            Kind::Claude => vec![CLAUDE_TOKEN_VAR.into(), CLAUDE_KEY_VAR.into()],
+            Kind::Claude => vec![CLAUDE_TOKEN_VAR.into()],
             Kind::Codex => Vec::new(),
             Kind::Opencode => vec![self.provider_key_var()],
         }
@@ -778,6 +598,9 @@ impl Driver {
     /// relies on, without touching anything the owner set. With fresh
     /// homes, the homes a previous runner left are deleted.
     pub fn prepare(&self) -> Result<()> {
+        if self.kind() == Kind::Claude {
+            self.remove_leftover_claude_key()?;
+        }
         if let Isolation::Fresh(fresh) = &self.isolation {
             sandbox::make_dir(&fresh.state, 0o700)?;
             sandbox::make_dir(&fresh.homes, 0o711)?;
@@ -804,13 +627,46 @@ impl Driver {
         let home = CliHome {
             path: self.settings.home.clone(),
             fresh: false,
-            claude: None,
             exec_tmp: None,
             side: None,
-            key_helper: false,
             live: None,
         };
         self.write_cli_config(&home, false)
+    }
+
+    /// Claude Code is signed in with the subscription only. An Anthropic
+    /// API key an earlier runner stored in `secrets.env` is taken out of
+    /// the file (the other lines stay) and one line in the log names the
+    /// variable, never its value. Nothing reads such a key any more
+    /// (`stored_names`), so it is unused even before this runs.
+    fn remove_leftover_claude_key(&self) -> Result<()> {
+        let path = self.secrets_file();
+        let Some(bytes) = sandbox::read_regular(&path, MAX_CREDENTIAL_BYTES as u64) else {
+            return Ok(());
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let is_key = |line: &str| {
+            line.split_once('=')
+                .is_some_and(|(name, _)| name.trim() == CLAUDE_LEFTOVER_KEY_VAR)
+        };
+        if !text.lines().any(is_key) {
+            return Ok(());
+        }
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|line| !is_key(line) && !line.trim().is_empty())
+            .collect();
+        if kept.is_empty() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing {}", path.display()))?;
+        } else {
+            write_private(&path, (kept.join("\n") + "\n").as_bytes())?;
+        }
+        tracing::info!(
+            variable = CLAUDE_LEFTOVER_KEY_VAR,
+            "removed a stored Anthropic API key: Claude Code signs in with the subscription only"
+        );
+        Ok(())
     }
 
     /// The CLI settings the runner relies on. In a fresh home every file
@@ -890,27 +746,12 @@ impl Driver {
 
     /// `home`, for a purpose that needs something in it (a terminal).
     pub fn home_for(&self, purpose: HomePurpose) -> Result<CliHome> {
-        // Claude's credential for this start, decided once.
-        self.home_with(
-            (self.kind() == Kind::Claude).then(|| self.claude_choice()),
-            purpose,
-        )
-    }
-
-    /// `home`, with the Claude credential given (a confirming check).
-    fn home_with(
-        &self,
-        claude: Option<(ClaudeAuth, Option<String>)>,
-        purpose: HomePurpose,
-    ) -> Result<CliHome> {
         let Isolation::Fresh(fresh) = &self.isolation else {
             return Ok(CliHome {
-                claude,
                 path: self.settings.home.clone(),
                 fresh: false,
                 exec_tmp: None,
                 side: None,
-                key_helper: false,
                 live: None,
             });
         };
@@ -930,13 +771,11 @@ impl Driver {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(side.clone());
         }
-        let mut home = CliHome {
-            claude,
+        let home = CliHome {
             path,
             fresh: true,
             exec_tmp: None,
             side,
-            key_helper: false,
             live: Some(self.live.clone()),
         };
         sandbox::make_dir(home.path(), 0o700)?;
@@ -945,27 +784,6 @@ impl Driver {
             sandbox::make_dir(side, 0o755)?;
         }
         self.write_cli_config(&home, true)?;
-        // A terminal with Claude's API key: Claude's interface would ask
-        // before it uses ANTHROPIC_API_KEY from the environment (and
-        // suggest No); the owner chose the key on the card, so the home
-        // names it through Claude Code's documented `apiKeyHelper` setting,
-        // which reads it from the CLI's environment (never from disk).
-        // Written now, before the home is handed over.
-        if cli_terminal && self.kind() == Kind::Claude && home.claude_auth() == ClaudeAuth::ApiKey {
-            let path = home.claude_dir().join("settings.json");
-            let mut settings: serde_json::Value = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| serde_json::from_str(&text).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
-            if let Some(object) = settings.as_object_mut() {
-                object.insert(
-                    "apiKeyHelper".into(),
-                    format!("printenv {CLAUDE_KEY_HELPER_VAR}").into(),
-                );
-            }
-            write_private(&path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
-            home.key_helper = true;
-        }
         match self.kind() {
             Kind::Codex => {
                 if let Some(bytes) = sandbox::read_regular(&self.codex_auth(), MAX_CREDENTIAL_FILE)
@@ -973,15 +791,14 @@ impl Driver {
                     write_private(&home.codex_home().join("auth.json"), &bytes)?;
                 }
             }
-            // With the API key the claude.ai sign-in stays out of the home.
-            Kind::Claude if home.claude_auth() != ClaudeAuth::ApiKey => {
+            Kind::Claude => {
                 if let Some(bytes) =
                     sandbox::read_regular(&self.claude_credentials(), MAX_CREDENTIAL_FILE)
                 {
                     write_private(&home.claude_dir().join(".credentials.json"), &bytes)?;
                 }
             }
-            Kind::Claude | Kind::Opencode => {}
+            Kind::Opencode => {}
         }
         sandbox::hand_over(home.path(), fresh.user)
             .with_context(|| format!("handing {} to the agent user", home.path().display()))?;
@@ -1221,27 +1038,6 @@ impl Driver {
         if let Some(token) = token {
             command.env("LORE_AGENT_TOKEN", token);
         }
-        // Claude's interface asks before it uses ANTHROPIC_API_KEY from the
-        // environment (and suggests No). The owner chose the key on the
-        // card, so a terminal's fresh home names it through Claude Code's
-        // documented `apiKeyHelper` setting instead, which reads it from
-        // the CLI's environment: the key is still never on disk.
-        if mode == TerminalMode::Cli {
-            self.note_claude_start(home);
-        }
-        // The settings in the home (written before it was handed over)
-        // name the key through `apiKeyHelper`; it goes in their variable.
-        if mode == TerminalMode::Cli
-            && home.key_helper
-            && let Some((_, key)) = self
-                .stored_vars()
-                .into_iter()
-                .find(|(name, _)| name == CLAUDE_KEY_VAR)
-        {
-            command
-                .env_remove(CLAUDE_KEY_VAR)
-                .env(CLAUDE_KEY_HELPER_VAR, key);
-        }
         Ok(command)
     }
 
@@ -1314,25 +1110,17 @@ impl Driver {
                 command.env(name, value.trim());
             }
         }
-        // Claude Code gets one credential: the subscription's or the API
-        // key, never both (see `choose_claude_auth`).
-        let skip: &[&str] = match (self.kind(), home.claude_auth()) {
-            (Kind::Claude, ClaudeAuth::ApiKey) => &[CLAUDE_TOKEN_VAR],
-            (Kind::Claude, _) => &[CLAUDE_KEY_VAR],
-            _ => &[],
-        };
+        // Only the names this CLI uses: Claude Code never gets
+        // ANTHROPIC_API_KEY (it is signed in with the subscription only).
         for name in self.passthrough_vars() {
             if let Ok(value) = std::env::var(&name)
                 && !value.trim().is_empty()
-                && !skip.contains(&name.as_str())
             {
                 command.env(&name, value.trim());
             }
         }
         for (name, value) in self.stored_vars() {
-            if !skip.contains(&name.as_str()) {
-                command.env(name, value);
-            }
+            command.env(name, value);
         }
         if let Some(user) = self.user() {
             command.uid(user.uid).gid(user.gid);
@@ -1482,138 +1270,11 @@ impl Driver {
         })
     }
 
-    /// The Claude credentials stored now: the subscription (a setup token,
-    /// in the volume or the container's environment, or a claude.ai
-    /// sign-in) and the API key.
-    fn claude_stored(&self) -> (bool, bool) {
-        let vars = self.stored_vars();
-        let has = |name: &str| vars.iter().any(|(stored, _)| stored == name);
-        let token_env = std::env::var(CLAUDE_TOKEN_VAR).is_ok_and(|v| !v.trim().is_empty());
-        let subscription =
-            has(CLAUDE_TOKEN_VAR) || token_env || self.claude_credentials().is_file();
-        (subscription, has(CLAUDE_KEY_VAR))
-    }
-
-    /// The credential Claude Code starts with now, and why when it is not
-    /// the owner's first choice (see `choose_claude_auth`). Known unusable:
-    /// a setup token past its recorded end, or a credential the CLI refused
-    /// as invalid within the last hour. A usage limit is not detected.
-    pub fn claude_choice(&self) -> (ClaudeAuth, Option<String>) {
-        let (subscription, key) = self.claude_stored();
-        let now = std::time::SystemTime::now();
-        let memory = self.claude_memory();
-        let refused_at = |index: usize| {
-            memory.refused[index]
-                .filter(|at| now.duration_since(*at).is_ok_and(|age| age < CLAUDE_RETRY))
-        };
-        // The setup token's recorded end (only when it is the stored
-        // subscription; a claude.ai sign-in has no end lore knows).
-        let token_ends = self
+    async fn claude_status(&self) -> (bool, Option<String>, Option<String>, String) {
+        let stored = self
             .stored_vars()
             .iter()
-            .any(|(name, _)| name == CLAUDE_TOKEN_VAR)
-            .then(|| self.sign_in_meta())
-            .flatten()
-            .and_then(|meta| {
-                meta.get("ends")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .filter(|ends| ends.as_str() < add_days_iso(0).as_str());
-        let why_not = |index: usize| -> Option<String> {
-            let name = if index == 0 {
-                "the subscription"
-            } else {
-                "the API key"
-            };
-            if let Some(at) = refused_at(index) {
-                let at = iso_from_unix(
-                    at.duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0),
-                );
-                return Some(format!("{name} was refused as invalid at {at}"));
-            }
-            if index == 0
-                && let Some(ends) = &token_ends
-            {
-                return Some(format!(
-                    "{name}'s setup token ended on {}",
-                    &ends[..ends.len().min(10)]
-                ));
-            }
-            None
-        };
-        let state = |stored: bool, index: usize| CredentialState {
-            stored,
-            unusable: stored && why_not(index).is_some(),
-        };
-        let priority = if memory.key_first {
-            ClaudeAuth::ApiKey
-        } else {
-            ClaudeAuth::Subscription
-        };
-        let auth = choose_claude_auth(
-            state(subscription, 0),
-            state(key, 1),
-            priority,
-            memory.fallback,
-        );
-        let reason = match (auth, priority) {
-            (ClaudeAuth::None, _) => None,
-            (chosen, first) if chosen == first => None,
-            (_, first) => {
-                let (first_stored, index) = if first == ClaudeAuth::Subscription {
-                    (subscription, 0)
-                } else {
-                    (key, 1)
-                };
-                if !first_stored {
-                    Some(format!("only the {} is stored", auth.label()))
-                } else {
-                    why_not(index).map(|why| format!("{why}, and falling back is on"))
-                }
-            }
-        };
-        (auth, reason)
-    }
-
-    /// The credential Claude Code starts with now.
-    pub fn claude_auth(&self) -> ClaudeAuth {
-        self.claude_choice().0
-    }
-
-    /// Notes which credential a start of a run or a terminal used and why,
-    /// for the card (checks, versions and model lists do not count).
-    pub fn note_claude_start(&self, home: &CliHome) {
-        let Some((auth, reason)) = home.claude.clone() else {
-            return;
-        };
-        // Nothing stored: nothing to say about which credential it used.
-        if auth == ClaudeAuth::None {
-            return;
-        }
-        let at = add_days_iso(0);
-        let mut line = format!("the last start used the {} ({at})", auth.label());
-        if let Some(reason) = reason {
-            line.push_str(&format!(" because {reason}"));
-        }
-        self.claude_memory().last = Some((auth, line));
-    }
-
-    async fn claude_status(&self) -> (bool, Option<String>, Option<String>, String) {
-        let last = self
-            .claude_memory()
-            .last
-            .as_ref()
-            .map(|(_, line)| line.clone());
-        let (subscription, key) = self.claude_stored();
-        let auth = self.claude_auth();
-        let stored = auth == ClaudeAuth::Subscription
-            && self
-                .stored_vars()
-                .iter()
-                .any(|(name, _)| name == CLAUDE_TOKEN_VAR);
+            .any(|(name, _)| name == CLAUDE_TOKEN_VAR);
         let output = self.run(&["auth", "status", "--text"], None).await;
         let (success, text) = match output {
             Ok(output) => (output.success, output.text),
@@ -1630,32 +1291,16 @@ impl Driver {
         .any(|phrase| lower.contains(phrase));
         let signed_in = success && !refused;
         let meta = self.sign_in_meta();
-        let both = match (subscription && key, auth) {
-            (true, ClaudeAuth::ApiKey) => {
-                " (a subscription sign-in is stored too; the API key is used)".to_string()
-            }
-            (true, _) => " (an API key is stored too; the subscription is used)".to_string(),
-            _ => String::new(),
-        };
-        let last = last.map(|line| format!("; {line}")).unwrap_or_default();
-        let (method, ends) = if auth == ClaudeAuth::ApiKey {
-            (Some(format!("API key{both}")), None)
-        } else if stored {
+        let (method, ends) = if stored {
             let ends = meta
                 .as_ref()
                 .and_then(|meta| meta.get("ends").and_then(|v| v.as_str()))
                 .map(str::to_string);
-            (Some(format!("setup-token{both}")), ends)
+            (Some("setup-token".to_string()), ends)
         } else if signed_in {
-            (Some(format!("claude.ai sign-in{both}")), find_date(&text))
+            (Some("claude.ai sign-in".to_string()), find_date(&text))
         } else {
             (None, None)
-        };
-        // The card shows the last start's credential with the CLI's text.
-        let text = if last.is_empty() {
-            text
-        } else {
-            format!("{}\n{}", text.trim_end(), last.trim_start_matches("; "))
         };
         (signed_in, method, ends, text)
     }
@@ -1811,22 +1456,6 @@ impl Driver {
             CredentialKind::ApiKey => {
                 single_line("API key")?;
                 match self.kind() {
-                    Kind::Claude => {
-                        // Only the shape is checked; Anthropic's formats
-                        // may change, so another prefix is a warning.
-                        if value.chars().count() < 20 {
-                            bail!("that is too short for an Anthropic API key");
-                        }
-                        self.store_var(CLAUDE_KEY_VAR, value)?;
-                        let warning = if value.starts_with("sk-ant-") {
-                            ""
-                        } else {
-                            " (it does not start with sk-ant-, as Anthropic API keys do; check it)"
-                        };
-                        Ok(format!(
-                            "the Anthropic API key is stored in the agent's volume{warning}"
-                        ))
-                    }
                     Kind::Codex => {
                         let home = self.home()?;
                         let output = self
@@ -2927,71 +2556,36 @@ esac
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The credential choice: the first stored one in priority order; the
-    /// other only with the fallback on, when the first is known unusable;
-    /// never one that is not stored.
-    #[test]
-    fn the_claude_credential_choice_never_picks_what_is_not_stored() {
-        use ClaudeAuth::*;
-        let s = |stored, unusable| CredentialState { stored, unusable };
-        let none = s(false, false);
-        for priority in [Subscription, ApiKey] {
-            for fallback in [false, true] {
-                for unusable in [false, true] {
-                    assert_eq!(choose_claude_auth(none, none, priority, fallback), None);
-                    assert_eq!(
-                        choose_claude_auth(s(true, unusable), none, priority, fallback),
-                        Subscription
-                    );
-                    assert_eq!(
-                        choose_claude_auth(none, s(true, unusable), priority, fallback),
-                        ApiKey
-                    );
-                }
-            }
-        }
-        let ok = s(true, false);
-        let bad = s(true, true);
-        assert_eq!(
-            choose_claude_auth(ok, ok, Subscription, false),
-            Subscription
-        );
-        assert_eq!(choose_claude_auth(ok, ok, ApiKey, false), ApiKey);
-        // Without the fallback a failing first credential is just used.
-        assert_eq!(
-            choose_claude_auth(bad, ok, Subscription, false),
-            Subscription
-        );
-        assert_eq!(choose_claude_auth(bad, ok, Subscription, true), ApiKey);
-        assert_eq!(choose_claude_auth(ok, bad, ApiKey, true), Subscription);
-        // Both unusable: the first, as without a fallback.
-        assert_eq!(
-            choose_claude_auth(bad, bad, Subscription, true),
-            Subscription
-        );
-    }
-
-    /// Claude Code gets one credential, never both, for runs and questions
-    /// (`run_command`), checks (`command_for`) and terminals: with only the
-    /// API key, the key and no claude.ai credentials; with both, the
-    /// subscription and no key. Sign out removes the key too, and the key
-    /// is never in the CLI's status text or the stored-message.
+    /// Claude Code is signed in with the subscription only: no API key is
+    /// accepted, a key an earlier runner stored is removed from
+    /// `secrets.env` at start-up (the setup token beside it stays), and
+    /// ANTHROPIC_API_KEY never reaches `claude`: not in runs, checks or
+    /// terminals, not from the volume and not from the container's
+    /// environment.
     #[tokio::test]
-    async fn claude_gets_the_subscription_or_the_api_key_never_both() {
+    async fn claude_never_gets_an_api_key_and_a_stored_one_is_removed_at_start_up() {
         let dir = temp("claude-key");
-        let driver = fresh(
-            &dir,
-            Kind::Claude,
-            "#!/bin/sh\necho \"API key: ANTHROPIC_API_KEY\"\n",
-        );
-        let key = Secret::new("sk-ant-api03-test-key-0123456789abcdef"); // lore:allow-secret (fake test value)
-        let said = driver
-            .set_credential(CredentialKind::ApiKey, &key)
+        let driver = fresh(&dir, Kind::Claude, "#!/bin/sh\necho \"Logged in\"\n");
+        let key = "sk-ant-api03-test-key-0123456789abcdef"; // lore:allow-secret (fake test value)
+        let refused = driver
+            .set_credential(CredentialKind::ApiKey, &Secret::new(key))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("cannot sign claude in"), "{refused}");
+        let token = Secret::new("sk-ant-oat01-a-pasted-setup-token-0000"); // lore:allow-secret (fake test value)
+        driver
+            .set_credential(CredentialKind::SetupToken, &token)
             .await
             .unwrap();
-        assert!(!said.contains(key.expose()), "{said}");
-        assert_eq!(driver.claude_auth(), ClaudeAuth::ApiKey);
-        assert!(driver.secrets().iter().any(|secret| secret == key.expose()));
+        // What an earlier runner left: the key beside the token.
+        let secrets = dir.join("state/secrets.env");
+        let before = std::fs::read_to_string(&secrets).unwrap();
+        write_private(
+            &secrets,
+            format!("ANTHROPIC_API_KEY={key}\n{before}").as_bytes(),
+        )
+        .unwrap();
         let envs = |command: &Command| -> std::collections::HashMap<String, String> {
             command
                 .as_std()
@@ -3004,17 +2598,33 @@ esac
                 })
                 .collect()
         };
-        // Only the key: runs, questions and terminals get it alone.
+        // Unused even before the start-up removal.
         let home = driver.home().unwrap();
         let run = envs(&driver.run_command(Path::new("/bin/true"), &[], &dir, &home));
+        assert!(!run.contains_key("ANTHROPIC_API_KEY"));
         assert_eq!(
-            run.get("ANTHROPIC_API_KEY").map(String::as_str),
-            Some(key.expose())
+            run.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some(token.expose())
         );
-        assert!(!run.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
         drop(home);
-        // A terminal's home is made for it: the settings are written before
-        // it is handed over.
+        // Start-up removes the key and keeps the token.
+        driver.prepare().unwrap();
+        let after = std::fs::read_to_string(&secrets).unwrap();
+        assert!(!after.contains("ANTHROPIC_API_KEY"), "{after}");
+        assert!(!after.contains(key));
+        assert!(after.contains(token.expose()));
+        assert!(!driver.secrets().iter().any(|secret| secret == key));
+        // A file holding nothing else is removed; a second start-up is
+        // quiet.
+        write_private(&secrets, format!("ANTHROPIC_API_KEY={key}\n").as_bytes()).unwrap();
+        driver.prepare().unwrap();
+        assert!(!secrets.exists());
+        driver.prepare().unwrap();
+        // The container's environment is not passed on either, to a run or
+        // a terminal.
+        // SAFETY: this test's own variable, read only by this test's
+        // driver; no other test sets or reads it.
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", key) };
         let home = driver
             .home_for(HomePurpose::Terminal { cli: true })
             .unwrap();
@@ -3023,213 +2633,22 @@ esac
                 .terminal_command(TerminalMode::Cli, None, None, Path::new("/bin/sh"), &home)
                 .unwrap(),
         );
-        // A terminal gets it through `apiKeyHelper` (no prompt), not in
-        // ANTHROPIC_API_KEY, and the settings file names only the variable.
-        assert!(!terminal.contains_key("ANTHROPIC_API_KEY"));
-        assert_eq!(
-            terminal.get("LORE_CLAUDE_API_KEY").map(String::as_str),
-            Some(key.expose())
-        );
-        let settings = std::fs::read_to_string(home.claude_dir().join("settings.json")).unwrap();
-        assert!(
-            settings.contains("printenv LORE_CLAUDE_API_KEY"),
-            "{settings}"
-        );
-        assert!(!settings.contains(key.expose()));
-        assert!(!terminal.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
-        drop(home);
-        // The claude.ai sign-in stays out of the home while the key is used.
-        write_private(
-            &dir.join("state/claude-credentials.json"),
-            br#"{"claudeAiOauth":{}}"#,
-        )
-        .unwrap();
-        // Now both are stored: the subscription is used, without the key.
-        assert_eq!(driver.claude_auth(), ClaudeAuth::Subscription);
-        let token = Secret::new("sk-ant-oat01-a-pasted-setup-token-0000"); // lore:allow-secret (fake test value)
-        driver
-            .set_credential(CredentialKind::SetupToken, &token)
-            .await
-            .unwrap();
-        let home = driver.home().unwrap();
-        assert!(home.claude_dir().join(".credentials.json").is_file());
         let run = envs(&driver.run_command(Path::new("/bin/true"), &[], &dir, &home));
-        assert_eq!(
-            run.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
-            Some(token.expose())
-        );
-        assert!(!run.contains_key("ANTHROPIC_API_KEY"));
-        let terminal = envs(
-            &driver
-                .terminal_command(TerminalMode::Cli, None, None, Path::new("/bin/sh"), &home)
-                .unwrap(),
-        );
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
         assert!(!terminal.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!run.contains_key("ANTHROPIC_API_KEY"));
+        let settings = std::fs::read_to_string(home.claude_dir().join("settings.json")).unwrap();
+        assert!(!settings.contains("apiKeyHelper"), "{settings}");
         drop(home);
-        // Only the key again (the subscription removed by hand): no
-        // claude.ai credentials in the home.
-        std::fs::remove_file(dir.join("state/claude-credentials.json")).unwrap();
-        let lines: Vec<String> = std::fs::read_to_string(dir.join("state/secrets.env"))
-            .unwrap()
-            .lines()
-            .filter(|line| !line.starts_with(CLAUDE_TOKEN_VAR))
-            .map(str::to_string)
-            .collect();
-        write_private(
-            &dir.join("state/secrets.env"),
-            (lines.join("\n") + "\n").as_bytes(),
-        )
-        .unwrap();
-        assert_eq!(driver.claude_auth(), ClaudeAuth::ApiKey);
-        write_private(
-            &dir.join("state/claude-credentials.json"),
-            br#"{"claudeAiOauth":{}}"#,
-        )
-        .unwrap();
-        // (a claude.ai sign-in counts as the subscription, which comes first)
-        assert_eq!(driver.claude_auth(), ClaudeAuth::Subscription);
-        std::fs::remove_file(dir.join("state/claude-credentials.json")).unwrap();
-        let home = driver.home().unwrap();
-        assert!(!home.claude_dir().join(".credentials.json").exists());
-        drop(home);
-        // Sign out removes the key with everything else.
-        driver.logout().await.unwrap();
-        assert_eq!(driver.claude_auth(), ClaudeAuth::None);
-        assert!(!driver.secrets().iter().any(|secret| secret == key.expose()));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The owner's order and the fallback in the driver: the key first
-    /// when asked; with the fallback, the other credential while the first
-    /// was refused as invalid or its setup token ended, with the reason
-    /// noted for the card; Check tries the first again.
-    #[tokio::test]
-    async fn claude_follows_the_owner_s_order_and_falls_back_only_when_asked() {
-        let dir = temp("claude-order");
-        let driver = fresh(&dir, Kind::Claude, "#!/bin/sh\necho \"Logged in\"\n");
-        let token = Secret::new("sk-ant-oat01-a-pasted-setup-token-0000"); // lore:allow-secret (fake test value)
-        let key = Secret::new("sk-ant-api03-test-key-0123456789abcdef"); // lore:allow-secret (fake test value)
-        driver
-            .set_credential(CredentialKind::SetupToken, &token)
-            .await
-            .unwrap();
-        driver
-            .set_credential(CredentialKind::ApiKey, &key)
-            .await
-            .unwrap();
-        assert_eq!(driver.claude_choice(), (ClaudeAuth::Subscription, None));
-        driver.set_claude_prefs("api_key", false);
-        assert_eq!(driver.claude_choice(), (ClaudeAuth::ApiKey, None));
-        // Refused, without the fallback: still the first.
-        driver.claude_refused(ClaudeAuth::ApiKey);
-        assert_eq!(driver.claude_auth(), ClaudeAuth::ApiKey);
-        // With it: the other one, and why.
-        driver.set_claude_prefs("api_key", true);
-        let (auth, why) = driver.claude_choice();
-        assert_eq!(auth, ClaudeAuth::Subscription);
-        assert!(why.unwrap().contains("the API key was refused as invalid"));
-        // A start decides once, with the home: a change of preference
-        // in between does not change what this start gets.
-        let home = driver.home().unwrap();
-        assert_eq!(home.claude_auth(), ClaudeAuth::Subscription);
-        driver.set_claude_prefs("api_key", false);
-        let command = driver.run_command(Path::new("/bin/true"), &[], &dir, &home);
-        let env: Vec<String> = command
-            .as_std()
-            .get_envs()
-            .filter(|(_, v)| v.is_some())
-            .map(|(k, _)| k.to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            env.contains(&"CLAUDE_CODE_OAUTH_TOKEN".to_string()),
-            "{env:?}"
-        );
-        assert!(!env.contains(&"ANTHROPIC_API_KEY".to_string()), "{env:?}");
-        let terminal = driver
-            .terminal_command(TerminalMode::Cli, None, None, Path::new("/bin/sh"), &home)
-            .unwrap();
-        assert!(
-            terminal
-                .as_std()
-                .get_envs()
-                .all(|(k, _)| k != "LORE_CLAUDE_API_KEY" && k != "ANTHROPIC_API_KEY")
-        );
-        assert!(
-            !std::fs::read_to_string(home.claude_dir().join("settings.json"))
-                .unwrap()
-                .contains("apiKeyHelper")
-        );
-        driver.set_claude_prefs("api_key", true);
-        // The terminal's start was noted (a check is not).
-        assert_eq!(driver.claude_last(), Some(ClaudeAuth::Subscription));
-        drop(home);
-        let FromRunner::Status { detail, .. } = driver.status(None).await else {
-            panic!()
-        };
-        assert!(
-            detail.contains("the last start used the subscription"),
-            "{detail}"
-        );
-        // The automatic status call does not forget the refusal; Check does.
-        assert_eq!(driver.claude_auth(), ClaudeAuth::Subscription);
-        driver.clear_claude_refusals();
-        assert_eq!(driver.claude_auth(), ClaudeAuth::ApiKey);
-        // An ended setup token: with the subscription first and the
-        // fallback on, the key.
-        driver.set_claude_prefs("subscription", true);
-        write_private(
-            &dir.join("state/sign-in.json"),
-            br#"{"method":"setup-token","saved":"2020-01-01T00:00:00Z","ends":"2021-01-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-        let (auth, why) = driver.claude_choice();
-        assert_eq!(auth, ClaudeAuth::ApiKey);
-        assert!(why.unwrap().contains("setup token ended on 2021-01-01"));
-        driver.set_claude_prefs("subscription", false);
-        assert_eq!(driver.claude_auth(), ClaudeAuth::Subscription);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A refusal inside a run counts only when the runner's own clean
-    /// check confirms it.
-    #[tokio::test]
-    async fn a_run_s_refusal_counts_only_when_a_clean_check_confirms_it() {
-        let dir = temp("claude-confirm");
-        let driver = fresh(
-            &dir,
-            Kind::Claude,
-            "#!/bin/sh\nif [ -f \"$HOME/../../refuse\" ]; then echo '{\"type\":\"assistant\",\"error\":\"authentication_failed\",\"message\":{\"content\":[]}}'; fi\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n",
-        );
-        let token = Secret::new("sk-ant-oat01-a-pasted-setup-token-0000"); // lore:allow-secret (fake test value)
-        let key = Secret::new("sk-ant-api03-test-key-0123456789abcdef"); // lore:allow-secret (fake test value)
-        driver
-            .set_credential(CredentialKind::SetupToken, &token)
-            .await
-            .unwrap();
-        driver
-            .set_credential(CredentialKind::ApiKey, &key)
-            .await
-            .unwrap();
-        driver.set_claude_prefs("subscription", true);
-        // Not confirmed: still the subscription.
-        driver
-            .confirm_claude_refusal(ClaudeAuth::Subscription)
-            .await;
-        assert_eq!(driver.claude_auth(), ClaudeAuth::Subscription);
-        // Confirmed: the fallback takes the key.
-        std::fs::write(dir.join("work/refuse"), "").unwrap();
-        driver
-            .confirm_claude_refusal(ClaudeAuth::Subscription)
-            .await;
-        assert_eq!(driver.claude_auth(), ClaudeAuth::ApiKey);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Root without CAP_DAC_OVERRIDE (as in the agent container) and a
     /// separate agent user: a terminal's home is prepared without writing
     /// into the home after it was handed over: the MCP configuration lands
-    /// beside it, readable by the agent user, and Claude's apiKeyHelper
-    /// settings are in it before the hand-over. Runs' homes work too.
+    /// beside it, readable by the agent user, and Claude's settings are in
+    /// it before the hand-over; a leftover Anthropic API key is removed
+    /// from the volume at start-up. Runs' homes work too.
     #[test]
     #[ignore = "needs root: see the README, Development"]
     fn a_terminal_home_is_prepared_as_root_without_dac_override() {
@@ -3266,9 +2685,12 @@ esac
             );
             driver.prepare().unwrap();
             if kind == Kind::Claude {
-                driver
-                    .store_var(CLAUDE_KEY_VAR, "sk-ant-api03-test-key-0123456789abcdef")
-                    .unwrap(); // lore:allow-secret (fake test value)
+                // An API key an earlier runner stored: removed at start-up.
+                write_private(
+                    &base.join("state/secrets.env"),
+                    b"ANTHROPIC_API_KEY=sk-ant-api03-test-key-0123456789abcdef\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-a-pasted-setup-token-0000\n", // lore:allow-secret (fake test values)
+                )
+                .unwrap();
             }
             let mcp = TerminalMcp {
                 url: "http://lore:8081/mcp".into(),
@@ -3281,6 +2703,8 @@ esac
                 | CapabilitySet::FOWNER;
             set_capabilities(None, without).unwrap();
             let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Start-up again, as the runner does, without the capability.
+                driver.prepare().unwrap();
                 let mut home = driver
                     .home_for(HomePurpose::Terminal { cli: true })
                     .unwrap();
@@ -3320,16 +2744,15 @@ esac
                 if kind == Kind::Claude {
                     let settings = home.claude_dir().join("settings.json");
                     assert_eq!(std::fs::metadata(&settings).unwrap().uid(), user.uid);
-                    assert!(
-                        std::fs::read_to_string(&settings)
-                            .unwrap()
-                            .contains("apiKeyHelper")
-                    );
+                    let secrets =
+                        std::fs::read_to_string(base.join("state/secrets.env")).unwrap();
+                    assert!(!secrets.contains("ANTHROPIC_API_KEY"), "{secrets}");
+                    assert!(secrets.contains("CLAUDE_CODE_OAUTH_TOKEN"));
                     assert!(
                         command
                             .as_std()
                             .get_envs()
-                            .any(|(k, _)| k == "LORE_CLAUDE_API_KEY")
+                            .all(|(k, _)| k != "ANTHROPIC_API_KEY")
                     );
                 }
                 set_capabilities(None, without).unwrap();

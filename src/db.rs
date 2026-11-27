@@ -380,7 +380,8 @@ const OPS_LOG_KEPT: i64 = 5000;
 /// agent's display name (`agent_registry.display_name`), and per built-in
 /// agent the services of its terminals and the order and fallback of
 /// Claude's credentials (`builtin_agents.terminal_services`,
-/// `claude_priority`, `claude_fallback`), a task's manual flag
+/// `claude_priority`, `claude_fallback`; the last two unused since Claude
+/// Code is signed in with the subscription only), a task's manual flag
 /// (`tasks.manual`, `tasks.manual_by`) and the owner's notes on tasks
 /// (`task_notes`, each bound to its task's `created_at`); the
 /// columns nullable, NULL being the behaviour before them.
@@ -473,7 +474,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // Built-in agents (schema 9): what a terminal's CLI may do with the
     // services (NULL: what the agent may; `read`; `off`), and which Claude
     // credential comes first (NULL: the subscription; `api_key`) and
-    // whether to fall back to the other (NULL or 0: no).
+    // whether to fall back to the other (NULL or 0: no). The last two are
+    // no longer read (Claude Code is signed in with the subscription only)
+    // but stay: columns are never dropped.
     ("builtin_agents", "terminal_services", "TEXT"),
     ("builtin_agents", "claude_priority", "TEXT"),
     ("builtin_agents", "claude_fallback", "INTEGER"),

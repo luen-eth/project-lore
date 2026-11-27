@@ -625,11 +625,8 @@ fn agent_view(
         // What the CLI said may name the account (an e-mail address).
         "status_detail": if manage { Some(&stored.status_detail) } else { None },
         "read_other_services": stored.read_other_services,
-        // NULL in the database: what the agent may; the subscription
-        // first; no fallback.
+        // NULL in the database: what the agent may.
         "terminal_services": stored.terminal_services.as_deref().unwrap_or("same"),
-        "claude_priority": stored.claude_priority.as_deref().unwrap_or("subscription"),
-        "claude_fallback": stored.claude_fallback.unwrap_or(false),
         "second_runner": if manage { hub.intrusion(name) } else { None },
         "status_at": stored.status_at,
         "updated_at": stored.updated_at,
@@ -695,11 +692,6 @@ struct SettingsForm {
     /// `same`, `read` or `off`.
     #[serde(default)]
     terminal_services: Option<String>,
-    /// Claude: `subscription` or `api_key`.
-    #[serde(default)]
-    claude_priority: Option<String>,
-    #[serde(default)]
-    claude_fallback: Option<bool>,
 }
 
 /// A model name: an alias or an id, no spaces, not starting with `-` (it
@@ -783,17 +775,7 @@ async fn update(
         Some(value @ ("read" | "off")) => Some(Some(value.to_string())),
         Some(_) => return bad_request("the terminal's services are same, read or off"),
     };
-    let claude_priority = match form.claude_priority.as_deref().map(str::trim) {
-        None => None,
-        Some("subscription") => Some(None),
-        Some("api_key") => Some(Some("api_key".to_string())),
-        Some(_) => return bad_request("Claude's first credential is subscription or api_key"),
-    };
-    let claude_fallback = form.claude_fallback;
-    let prefs_hub = hub.clone();
-    let prefs_agent = name.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-        let mut prefs_changed = false;
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let before = state.db.builtin_agent(&agent)?;
         let mut after = state.db.update_builtin_settings(&agent, &settings, &who)?;
         if let Some(on) = read_other_services
@@ -809,23 +791,6 @@ async fn update(
                 .db
                 .set_builtin_terminal_services(&agent, services.as_deref(), &who)?;
             after.terminal_services = services;
-        }
-        if claude_priority.is_some() || claude_fallback.is_some() {
-            let priority = claude_priority.unwrap_or_else(|| after.claude_priority.clone());
-            let fallback = claude_fallback.unwrap_or(after.claude_fallback.unwrap_or(false));
-            if priority != after.claude_priority
-                || fallback != after.claude_fallback.unwrap_or(false)
-            {
-                state.db.set_builtin_claude_credentials(
-                    &agent,
-                    priority.as_deref(),
-                    fallback,
-                    &who,
-                )?;
-                after.claude_priority = priority;
-                after.claude_fallback = fallback.then_some(true);
-                prefs_changed = true;
-            }
         }
         if before.as_ref() != Some(&after) {
             let mut changes = Vec::new();
@@ -874,27 +839,6 @@ async fn update(
                         }
                     ));
                 }
-                if before.claude_priority != after.claude_priority {
-                    changes.push(format!(
-                        "uses first: {}",
-                        if after.claude_priority.is_some() {
-                            "API key"
-                        } else {
-                            "subscription"
-                        }
-                    ));
-                }
-                if before.claude_fallback.unwrap_or(false) != after.claude_fallback.unwrap_or(false)
-                {
-                    changes.push(
-                        if after.claude_fallback.unwrap_or(false) {
-                            "falls back to the other credential"
-                        } else {
-                            "does not fall back"
-                        }
-                        .to_string(),
-                    );
-                }
                 if before.active_hours != after.active_hours {
                     let hours = if after.active_hours.is_empty() {
                         "always"
@@ -912,16 +856,11 @@ async fn update(
                 );
             }
         }
-        Ok(prefs_changed)
+        Ok(())
     })
     .await;
     match result {
-        Ok(Ok(prefs_changed)) => {
-            if prefs_changed {
-                prefs_hub.send_claude_prefs(&prefs_agent).await;
-            }
-            one(&admin, hub, name).await
-        }
+        Ok(Ok(())) => one(&admin, hub, name).await,
         Ok(Err(error)) => bad_request(&error.to_string()),
         Err(error) => {
             tracing::error!(%error, "saving a built-in agent failed");
@@ -940,7 +879,7 @@ async fn refresh(State(admin): State<Arc<Admin>>, Path(name): Path<String>) -> R
     let (status, models) = tokio::join!(
         hub.request(
             &name,
-            |id| ToRunner::Status { id, check: true },
+            |id| ToRunner::Status { id },
             STATUS_WAIT
         ),
         hub.request(&name, |id| ToRunner::ListModels { id }, MODELS_WAIT),
@@ -1125,7 +1064,7 @@ async fn credential(
             let _ = hub
                 .request(
                     &name,
-                    |id| ToRunner::Status { id, check: false },
+                    |id| ToRunner::Status { id },
                     STATUS_WAIT,
                 )
                 .await;
@@ -1169,7 +1108,7 @@ async fn logout(
             let _ = hub
                 .request(
                     &name,
-                    |id| ToRunner::Status { id, check: false },
+                    |id| ToRunner::Status { id },
                     STATUS_WAIT,
                 )
                 .await;

@@ -1536,8 +1536,8 @@ its own.
   `claude setup-token`, follow the browser sign-in it opens, and copy the token it
   prints. In the admin page press **Paste setup token** on `claude-builtin`, paste
   it, press **Store**. The runner keeps it as `CLAUDE_CODE_OAUTH_TOKEN` in
-  `/var/lib/lore-runner/secrets.env` and passes it only to `claude` (never to git)
-  (`ANTHROPIC_API_KEY` is then not set, so the subscription is used). The page shows
+  `/var/lib/lore-runner/secrets.env` and passes it only to `claude` (never to git).
+  The page shows
   *signed in with setup-token* and the end date, a year from when you stored it.
 - *Sign in with claude.ai*: press **Sign in with claude.ai**. The runner starts
   `claude auth login --claudeai` and the page shows its URL. Open it, sign in with
@@ -1545,58 +1545,18 @@ its own.
   under the URL and press **Send code**; the runner types it into the CLI. The
   runner keeps the credentials the CLI wrote (`.credentials.json`) as
   `/var/lib/lore-runner/claude-credentials.json`.
-- *Paste API key*: an Anthropic API key (from the Anthropic console). The runner
-  checks only its shape (one line, at least 20 characters; a key that does not start
-  with `sk-ant-` is stored with a warning) and keeps it as `ANTHROPIC_API_KEY` in
-  `secrets.env`, like the token: never in lore's database, logs or API answers, and
-  the page shows only *signed in with API key*. **Check** runs `claude auth status`,
-  which reports that a key is configured but does not test it against the API: a
-  wrong key shows up at the first run ("Invalid API key", HTTP 401).
 
-**Which one Claude uses.** A Claude Code process gets exactly one credential, never
-both: with the subscription (setup token or claude.ai sign-in) it gets no
-`ANTHROPIC_API_KEY`; with the API key it gets no `CLAUDE_CODE_OAUTH_TOKEN` and its
-fresh home no claude.ai credentials. When only one is stored, that one is used for
-runs, questions (`ask`), checks and terminals. When both are stored, the card's **Use
-first** (*subscription*, the default, or *API key*) decides. The checkbox **If the
-first one cannot be used, fall back to the other** (off by default) makes a start use
-the other credential while the first is known unusable: a setup token past its
-recorded end, or a credential Claude Code refused as invalid (its
-`authentication_failed` error) in the last hour. A refusal reported inside a run or a
-terminal counts only after the runner confirms it with its own clean check: the stored
-credential alone in a fresh home, no task text, no MCP server, one short prompt (so the
-confirmation itself uses a little of the subscription or a few tokens of the key);
-what ran in the run could have spoilt its own copy of a claude.ai sign-in, and that
-alone never moves you onto the API key. **Falling back from the
-subscription to the API key starts per-token billing without you watching.** A usage
-limit is not detected (its signal could not be established without real
-credentials), so it is not a reason to fall back. The credential is decided once per
-start, before the home is filled, and that one decision gives the home's contents,
-the environment, a terminal's settings, the log line and the refusal bookkeeping;
-nothing switches inside a running process. The first credential is tried again after
-an hour, or at once when you press **Check** (the automatic status checks on
-connecting do not reset it). The card's status text says which credential the last
-start of a run or a terminal used and why (checks, versions and model lists do not
-count), a run's log says it in its first line, and the activity feed notes it per run
-(the kind of credential, never the value). The owner's order reaches the runner when it
-connects and whenever it changes (lore waits for room on the link rather than drop
-it). What lore remembers about refusals is kept in the runner's memory and forgotten
-when it restarts.
-**Sign out** removes every stored Claude credential, the API key included; there is
-no removal of one credential alone (no other card has one either). In a terminal the
-API key reaches Claude Code through its documented `apiKeyHelper` setting
-(`printenv LORE_CLAUDE_API_KEY`, written into the terminal's fresh home; the key itself
-is only in the CLI's environment), so the interface does not ask whether to use a key
-it found in the environment.
-
-**Billing with an API key.** With an API key, runs, questions and terminal sessions
-are billed per token to the Anthropic API account instead of drawing on a
-subscription. The only spending limits lore applies are the daily cap of board tasks
-and the per-hour limits on `ask` and `delegate`; set a spend limit on the key in the
-Anthropic console. The egress allowlist already holds `api.anthropic.com`, the host
-Claude Code sent its requests to with a key in a local test; whether it contacts
-anything else with a key was not observed beyond that
-(`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set in the containers).
+Claude Code is signed in with the **subscription only**: there is no API-key mode.
+`ANTHROPIC_API_KEY` is never given to `claude` (not in runs, questions, checks or
+terminals, whether from the agent's volume or the container's environment). An
+Anthropic API key an earlier version stored in the agent's `secrets.env` is not
+used, and the runner removes it from the volume when it starts (its log says so in
+one line naming the variable, never the value). To use Claude models with an API
+key, give the key to an opencode agent instead. **Sign
+out** removes every stored Claude credential. The card's former *Use first* and
+fallback settings are gone; their columns (`builtin_agents.claude_priority`,
+`claude_fallback`, schema 9) stay in the database unused, and values in them are
+ignored.
 
 **Codex** (`agent-codex`), one of:
 

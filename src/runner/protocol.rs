@@ -73,7 +73,8 @@ impl Kind {
     /// Which credentials the owner may paste for this kind.
     pub fn credentials(self) -> &'static [CredentialKind] {
         match self {
-            Kind::Claude => &[CredentialKind::SetupToken, CredentialKind::ApiKey],
+            // Claude Code is signed in with the subscription only.
+            Kind::Claude => &[CredentialKind::SetupToken],
             Kind::Codex => &[CredentialKind::AuthJson, CredentialKind::ApiKey],
             Kind::Opencode => &[CredentialKind::ApiKey],
         }
@@ -131,8 +132,8 @@ pub enum CredentialKind {
     /// The contents of a Codex `auth.json` made elsewhere.
     AuthJson,
     /// A provider API key: `codex login --with-api-key`, or the key of an
-    /// opencode provider (`DEEPSEEK_API_KEY` for DeepSeek), or Anthropic's
-    /// for Claude Code (`ANTHROPIC_API_KEY`).
+    /// opencode provider (`DEEPSEEK_API_KEY` for DeepSeek). Never Claude
+    /// Code's: it is signed in with the subscription only.
     ApiKey,
 }
 
@@ -222,13 +223,7 @@ pub enum ToRunner {
     /// The hello was refused; lore closes the link after this.
     Refused { reason: String },
     /// Report the sign-in state (answered with `Status`).
-    Status {
-        id: u64,
-        /// The owner pressed Check: forget what was refused lately and try
-        /// the first credential again.
-        #[serde(default)]
-        check: bool,
-    },
+    Status { id: u64 },
     /// List the models the CLI offers (answered with `Models`).
     ListModels { id: u64 },
     /// Start an interactive sign-in (answered with `LoginPrompt`, later
@@ -295,10 +290,6 @@ pub enum ToRunner {
     },
     /// Close a terminal: its whole session is killed.
     TerminalClose { term_id: String },
-    /// Claude's credentials: which comes first when both are stored
-    /// (`subscription` or `api_key`) and whether to fall back to the other.
-    /// Sent after the welcome and whenever the owner changes them.
-    ClaudeCredentials { priority: String, fallback: bool },
 }
 
 /// The resources an agent container uses, as the runner reads them.
@@ -432,10 +423,6 @@ pub enum FromRunner {
         /// made, so lore can tell later whether the run moved it.
         #[serde(default)]
         base: Option<String>,
-        /// Which kind of credential the CLI was started with (`API key`,
-        /// `subscription`), never the credential itself.
-        #[serde(default)]
-        credential: Option<String>,
     },
     /// Part 6b: one line of a run's output, parsed from the CLI's JSON
     /// stream (`text`, `tool`, `result`, `error` or `raw`).
@@ -534,7 +521,7 @@ mod tests {
         let to: Vec<ToRunner> = vec![
             ToRunner::Welcome { protocol: 1 },
             ToRunner::Refused { reason: "x".into() },
-            ToRunner::Status { id: 1, check: true },
+            ToRunner::Status { id: 1 },
             ToRunner::ListModels { id: 2 },
             ToRunner::LoginStart {
                 id: 3,
@@ -647,7 +634,6 @@ mod tests {
                 run_id: "r1".into(),
                 session_id: None,
                 base: Some("abc".into()),
-                credential: Some("API key".into()),
             },
             FromRunner::RunOutput {
                 run_id: "r1".into(),

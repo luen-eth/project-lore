@@ -680,34 +680,6 @@ impl Hub {
         }
     }
 
-    /// The message that tells a Claude runner the owner's order and
-    /// fallback of its credentials (NULL: the subscription first, no
-    /// fallback).
-    fn claude_prefs(&self, agent: &str) -> Option<ToRunner> {
-        let stored = self.db.builtin_agent(agent).ok().flatten()?;
-        Some(ToRunner::ClaudeCredentials {
-            priority: stored
-                .claude_priority
-                .unwrap_or_else(|| "subscription".into()),
-            fallback: stored.claude_fallback.unwrap_or(false),
-        })
-    }
-
-    /// Sends the agent's runner its Claude credential choice again, after
-    /// the owner changed it: waits for room on the link rather than drop
-    /// it (a runner that is not connected gets it when it connects).
-    pub async fn send_claude_prefs(&self, agent: &str) {
-        let Some(prefs) = self.claude_prefs(agent) else {
-            return;
-        };
-        let link = self.inner().links.get(agent).map(|link| link.tx.clone());
-        if let Some(link) = link
-            && link.send(prefs).await.is_err()
-        {
-            tracing::warn!(%agent, "the runner's link closed before it heard the credential order");
-        }
-    }
-
     /// Gives the terminals' CLIs lore's MCP server at `url` (lore's
     /// internal address, `LORE_RUNNER_LORE_URL` + `/mcp`).
     pub fn with_mcp_url(mut self, url: String) -> Self {
@@ -1432,19 +1404,12 @@ impl Hub {
                 agent.clone(),
                 Link {
                     generation,
-                    tx: tx.clone(),
+                    tx,
                     kind,
                     provider: provider.clone(),
                     address: address.parse().ok().map(plain_ip),
                 },
             );
-            // The owner's choice of Claude's credentials, before anything
-            // else the runner hears.
-            if kind == Kind::Claude
-                && let Some(prefs) = self.claude_prefs(&agent)
-            {
-                let _ = tx.try_send(prefs);
-            }
         }
         if let Err(error) = self.db.builtin_connected(
             &agent,
@@ -1792,7 +1757,7 @@ esac
             .hub
             .request(
                 "claude-builtin",
-                |id| ToRunner::Status { id, check: false },
+                |id| ToRunner::Status { id },
                 WAIT,
             )
             .await
@@ -1835,7 +1800,7 @@ esac
             .hub
             .request(
                 "claude-builtin",
-                |id| ToRunner::Status { id, check: false },
+                |id| ToRunner::Status { id },
                 WAIT,
             )
             .await
@@ -2182,7 +2147,7 @@ esac
             pair.hub
                 .request(
                     "claude-builtin",
-                    |id| ToRunner::Status { id, check: false },
+                    |id| ToRunner::Status { id },
                     WAIT
                 )
                 .await,
@@ -2425,11 +2390,12 @@ esac
         );
     }
 
-    /// The terminal's services and Claude's credential order are set on
-    /// the card with the `agents` permission only, validated, stored as
-    /// NULL for the defaults, and the order reaches the runner.
+    /// The terminal's services are set on the card with the `agents`
+    /// permission only, validated and stored as NULL for the default.
+    /// Claude's card offers only the subscription's credentials, and the
+    /// old order and fallback columns are ignored whatever they hold.
     #[tokio::test]
-    async fn the_terminal_and_credential_settings_need_the_agents_permission() {
+    async fn the_terminal_settings_need_the_agents_permission() {
         let pair = listen().await;
         let base = admin_server(&pair).await;
         pair.db
@@ -2468,14 +2434,6 @@ esac
             400
         );
         assert_eq!(
-            put(&admin, serde_json::json!({"claude_priority": "both"}))
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            400
-        );
-        assert_eq!(
             put(&admin, serde_json::json!({"terminal_services": "read"}))
                 .send()
                 .await
@@ -2484,20 +2442,10 @@ esac
             200
         );
         assert_eq!(row().terminal_services.as_deref(), Some("read"));
-        assert_eq!(
-            put(
-                &admin,
-                serde_json::json!({"claude_priority": "api_key", "claude_fallback": true})
-            )
-            .send()
-            .await
-            .unwrap()
-            .status(),
-            200
-        );
-        assert_eq!(
-            (row().claude_priority.as_deref(), row().claude_fallback),
-            (Some("api_key"), Some(true))
+        // What an earlier version stored in the old columns is ignored.
+        pair.db.execute_for_test(
+            "UPDATE builtin_agents SET claude_priority = 'api_key', claude_fallback = 1
+             WHERE name = 'claude-builtin'",
         );
         let shown: serde_json::Value = http
             .get(format!("{base}/admin/api/builtin"))
@@ -2514,27 +2462,19 @@ esac
             .iter()
             .find(|a| a["name"] == "claude-builtin")
             .unwrap();
+        assert_eq!(claude["terminal_services"].as_str(), Some("read"));
+        assert!(claude.get("claude_priority").is_none(), "{claude}");
+        assert!(claude.get("claude_fallback").is_none(), "{claude}");
         assert_eq!(
-            (
-                claude["terminal_services"].as_str(),
-                claude["claude_priority"].as_str()
-            ),
-            (Some("read"), Some("api_key"))
+            claude["credentials"],
+            serde_json::json!([{"id": "setup_token", "label": "setup token"}])
         );
-        assert_eq!(claude["claude_fallback"], true);
-        // Back to the defaults: NULL again.
-        put(&admin, serde_json::json!({"terminal_services": "same", "claude_priority": "subscription", "claude_fallback": false}))
+        // Back to the default: NULL again.
+        put(&admin, serde_json::json!({"terminal_services": "same"}))
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            (
-                row().terminal_services,
-                row().claude_priority,
-                row().claude_fallback
-            ),
-            (None, None, None)
-        );
+        assert_eq!(row().terminal_services, None);
     }
 
     #[tokio::test]

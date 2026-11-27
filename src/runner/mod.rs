@@ -473,17 +473,8 @@ fn handle(command: ToRunner, driver: &Arc<Driver>, out: &mpsc::Sender<FromRunner
     tokio::spawn(async move {
         let answer = match command {
             ToRunner::Welcome { .. } | ToRunner::Refused { .. } => return,
-            ToRunner::ClaudeCredentials { priority, fallback } => {
-                driver.set_claude_prefs(&priority, fallback);
-                return;
-            }
             ToRunner::Ping { id } => FromRunner::Pong { id },
-            ToRunner::Status { id, check } => {
-                if check {
-                    driver.clear_claude_refusals();
-                }
-                driver.status(Some(id)).await
-            }
+            ToRunner::Status { id } => driver.status(Some(id)).await,
             ToRunner::ListModels { id } => {
                 let (models, source) = driver.models().await;
                 FromRunner::Models {
@@ -671,10 +662,7 @@ mod tests {
         ));
         // A CLI that cannot be started is reported, not fatal.
         handle(
-            ToRunner::Status {
-                id: 4,
-                check: false,
-            },
+            ToRunner::Status { id: 4 },
             &driver,
             &tx,
         );

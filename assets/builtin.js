@@ -399,10 +399,7 @@
     field.autocomplete = "off";
     field.spellcheck = false;
     label.append(el("span", "", (credential ? credential.label : kind) + " for " + agent.name), field);
-    const help = agent.kind === "claude" && kind === "api_key"
-      ? "Paste an Anthropic API key from the Anthropic console. With a key, Claude is billed per token to that account instead of the subscription: set a spend limit on the key there."
-      : CREDENTIAL_HELP[kind];
-    form.append(label, el("p", "muted small-text", help + " It is stored only in the agent's own volume, never in lore."));
+    form.append(label, el("p", "muted small-text", CREDENTIAL_HELP[kind] + " It is stored only in the agent's own volume, never in lore."));
     const actions = el("div", "board-actions");
     actions.append(button("Cancel", "", () => { ui.credential[agent.name] = undefined; render(); }));
     const save = el("button", "ghost small", "Store");
@@ -519,19 +516,6 @@
     terminalField.append(el("span", "", "Services in the terminal"), terminalServices);
     const terminalNote = el("p", "muted small-text builtin-help-note",
       "Caps what the CLI in this agent's terminals may do through lore (GitHub, GitLab, Dokploy, Cloudflare, mail, the repository tools). Runs are not affected.");
-    let claudePriority = null;
-    let claudeFallback = null;
-    const claudeParts = [];
-    if (agent.kind === "claude") {
-      claudePriority = select("claude_priority",
-        [["subscription", "subscription"], ["api_key", "API key"]], value("claude_priority") || "subscription");
-      const priorityField = el("label", "board-field");
-      priorityField.append(el("span", "", "Use first (when both are stored)"), claudePriority);
-      claudeFallback = check("claude_fallback",
-        "If the first one cannot be used, fall back to the other (from the subscription to the API key this starts per-token billing)");
-      claudeParts.push(priorityField, claudeFallback, el("p", "muted small-text builtin-help-note",
-        "Falls back when the first is missing, expired, or was refused as invalid; a usage limit is not detected. Check tries the first one again."));
-    }
 
     const actions = el("div", "board-actions");
     const save = el("button", "ghost small", "Save settings");
@@ -541,7 +525,7 @@
       "Available to help: while it is idle, your other agents may hand it a task (delegate) or ask it a question (ask, read-only) through lore. Off: it only works on board tasks.");
     form.append(modelField, checks, helpNote);
     if (readsBox) form.append(readsBox, readsNote);
-    form.append(row, terminalField, terminalNote, ...claudeParts, actions);
+    form.append(row, terminalField, terminalNote, actions);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const payload = {
@@ -553,8 +537,6 @@
       };
       if (readsBox) payload.read_other_services = readsBox.querySelector("input").checked;
       payload.terminal_services = terminalServices.value;
-      if (claudePriority) payload.claude_priority = claudePriority.value;
-      if (claudeFallback) payload.claude_fallback = claudeFallback.querySelector("input").checked;
       save.disabled = true;
       const result = await call(url(agent.name), {
         method: "PUT",
