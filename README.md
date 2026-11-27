@@ -2178,7 +2178,9 @@ added; tools lore gained since (for example `assistants`, `delegate` and `ask` o
 built-in agents are enabled) stay invisible to it, and asking the chat to "refresh"
 does nothing. Refresh or reconnect the connector in the app's settings. lore cannot
 see the app's copy, so every `hello` briefing ends with one line naming the tools lore
-offers this caller right now (the same list `tools/list` answers) and their count,
+offers this caller right now (the same list `tools/list` answers, less `assistants`,
+`delegate` and `ask` for a built-in agent's terminal, which may not use them; a run's
+briefing has no such line) and their count,
 and tells the model to name what it is missing and to ask the user to refresh the
 connector. A client that passes the optional `hello` argument `tools` (the names it
 can call) is told exactly which ones are missing, or that its list is current. lore

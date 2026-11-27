@@ -3947,7 +3947,13 @@ impl Lore {
             &[],
             &clip(&session.title, 90),
         );
-        let tools_line = self.tools_line(client_tools);
+        // A built-in agent (a terminal's CLI, or a session of its name) is
+        // refused the help tools: they are not offered to it.
+        let builtin = self
+            .assist
+            .as_ref()
+            .is_some_and(|runner| runner.is_builtin(actor) || runner.is_builtin(feed_agent));
+        let tools_line = self.tools_line(client_tools, builtin);
         Ok(briefing(
             session,
             &address,
@@ -3973,15 +3979,18 @@ impl Lore {
     }
 
     /// The briefing's last line: every tool this server offers this caller
-    /// (the list tools/list answers), and what to do when the app's copy is
+    /// (the list tools/list answers, less the help tools for a built-in
+    /// agent, which may not use them; a run's briefing has no such line),
+    /// and what to do when the app's copy is
     /// older. With the names the client says it can call (`client_tools`),
     /// exactly which are missing; names lore does not have are ignored.
-    fn tools_line(&self, client_tools: Option<&[String]>) -> String {
+    fn tools_line(&self, client_tools: Option<&[String]>, builtin: bool) -> String {
         let mut names: Vec<String> = self
             .tool_router
             .list_all()
             .into_iter()
             .map(|tool| tool.name.to_string())
+            .filter(|name| !(builtin && HELP_TOOLS.contains(&name.as_str())))
             .collect();
         names.sort();
         let mut line = format!(
@@ -7175,6 +7184,37 @@ mod tests {
             );
         }
         assert!(names(&helping_lore).contains(&"delegate".to_string()));
+        // A built-in agent's terminal is not offered the help tools it is
+        // refused.
+        let Extension(mut parts) = as_agent(Some(BUILTIN));
+        parts.extensions.insert(TerminalCaller);
+        let terminal = helping_lore
+            .hello(
+                args(json!({
+                    "project": "shop", "path": "/work", "repo": "none",
+                    "commit": "none", "title": "terminal"
+                })),
+                Extension(parts),
+            )
+            .await
+            .unwrap();
+        let line = terminal
+            .lines()
+            .find(|line| line.starts_with("Tools lore offers you now"))
+            .unwrap();
+        for tool in HELP_TOOLS {
+            assert!(
+                !line.contains(&format!(" {tool},")) && !line.contains(&format!(" {tool}.")),
+                "{line}"
+            );
+        }
+        assert!(
+            line.contains(&format!(
+                "({})",
+                names(&helping_lore).len() - HELP_TOOLS.len()
+            )),
+            "{line}"
+        );
         assert!(!names(&plain).contains(&"delegate".to_string()));
         // The client says what it has: an old list (no help tools, no
         // `hello`), plus a name lore does not know.
