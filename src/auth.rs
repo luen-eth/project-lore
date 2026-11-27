@@ -35,6 +35,12 @@ pub struct Agent(pub String);
 #[derive(Clone, Copy, Debug)]
 pub struct InternalListener;
 
+/// Marks a request made with a built-in agent's terminal token
+/// (`Authenticated::Terminal`): the CLI in a terminal the owner opened, a
+/// caller of its own kind, neither a run nor an ordinary agent.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalCaller;
+
 /// A bearer token and the agent it was issued to.
 pub struct Token {
     pub agent: String,
@@ -929,6 +935,9 @@ pub async fn require_token(
     });
 
     request.extensions_mut().insert(Agent(agent));
+    if terminal {
+        request.extensions_mut().insert(TerminalCaller);
+    }
     // A run token's scope travels with the request to the tools, which
     // check every provider call against it.
     if let Some(scope) = scope {

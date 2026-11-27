@@ -533,7 +533,10 @@ impl TaskRunner {
                     .into(),
             ));
         }
-        if author.starts_with("run:") || self.hub.is_builtin(&author) {
+        if author.starts_with("run:")
+            || author.starts_with("terminal:")
+            || self.hub.is_builtin(&author)
+        {
             return Err(Skip::Note(
                 "a built-in agent added it, and tasks built-in agents add are never run \
                  automatically"

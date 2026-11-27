@@ -12,7 +12,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::{
-    auth::{Agent, SHARED_AGENT},
+    auth::{Agent, SHARED_AGENT, TerminalCaller},
     db::{
         self, BODY_MAX_CHARS, Db, Entry, FileInfo, Implicit, KINDS, Message, NOTE_MAX_CHARS,
         NewEntry, NewFile, NewMessage, NewSession, NewTask, Patch, Rule, Session, TASK_ACTIONS,
@@ -92,6 +92,31 @@ them, and the `hello` briefing names them.";
 const LEGACY_TOOLS: [&str; 7] = [
     "recall", "log", "recent", "projects", "get", "amend", "forget",
 ];
+
+/// What lore writes on a task a built-in agent's terminal claimed: only
+/// such a task may be released or finished from a terminal.
+const TERMINAL_CLAIM: &str = "[claimed in a lore terminal]";
+
+/// The prefix of a task note, and the tag of an entry, written from a
+/// built-in agent's terminal (its token), so other agents and the page can
+/// tell it from a run's work.
+const TERMINAL_MARK: &str = "[lore terminal]";
+const TERMINAL_TAG: &str = "terminal";
+
+/// Whether the call came with a built-in agent's terminal token.
+fn from_terminal(parts: &Parts) -> bool {
+    parts.extensions.get::<TerminalCaller>().is_some()
+}
+
+/// The tags of an entry, with `terminal` added for one written from a
+/// terminal.
+fn tags_for(tags: Option<Vec<String>>, terminal: bool) -> String {
+    let mut tags = tags.unwrap_or_default();
+    if terminal && !tags.iter().any(|tag| tag.trim() == TERMINAL_TAG) {
+        tags.push(TERMINAL_TAG.into());
+    }
+    join_list((!tags.is_empty()).then_some(tags))
+}
 
 /// The title of a session lore opens itself for such a client.
 const IMPLICIT_TITLE: &str = "Implicit session (client with an outdated tool list)";
@@ -1124,6 +1149,7 @@ impl Lore {
             Some(Agent(name)) if name != SHARED_AGENT => name.clone(),
             _ => args.agent.unwrap_or_default().trim().to_lowercase(),
         };
+        let terminal = from_terminal(&parts);
         let scope = parts.extensions.get::<RunScope>().cloned();
         let this = self.clone();
         blocking(move || {
@@ -1148,7 +1174,7 @@ impl Lore {
                     kind: normalize_kind(&args.kind)?,
                     title: required("title", &args.title)?,
                     body: required("body", &args.body)?,
-                    tags: join_list(args.tags),
+                    tags: tags_for(args.tags, terminal),
                     files: join_list(args.files),
                     agent,
                     path: required("path", &args.path)?,
@@ -1747,6 +1773,7 @@ impl Lore {
         let actor = agent_of(&parts);
         let shared = actor == SHARED_AGENT;
         let session_id = args.session_id.trim().to_string();
+        let terminal = from_terminal(&parts);
         let this = self.clone();
         blocking(move || {
             let session = this.require_session(&session_id, &actor, shared)?;
@@ -1762,7 +1789,7 @@ impl Lore {
                     kind: "note".into(),
                     title: required("title", &args.title)?,
                     body: required("body", &args.body)?,
-                    tags: join_list(args.tags),
+                    tags: tags_for(args.tags, terminal),
                     files: String::new(),
                     agent: writer.clone(),
                     path: String::new(),
@@ -2049,6 +2076,7 @@ impl Lore {
                 .assist
                 .as_ref()
                 .is_some_and(|runner| runner.is_builtin(&agent));
+        let terminal = from_terminal(&parts);
         let assist = self.assist.clone();
         let this = self.clone();
         blocking(move || {
@@ -2125,7 +2153,9 @@ impl Lore {
             let task = this.db.add_task(&new).map_err(internal)?;
             // The identity lore verified: the token's agent (a built-in
             // agent's is marked, so its tasks are never run).
-            let author = if builtin {
+            let author = if terminal {
+                format!("terminal:{agent}")
+            } else if builtin {
                 format!("run:{agent}")
             } else {
                 agent.clone()
@@ -2167,6 +2197,7 @@ impl Lore {
         let shared = agent == SHARED_AGENT;
         let session_id = args.session_id.trim().to_string();
         let run = parts.extensions.get::<RunScope>().is_some();
+        let terminal = from_terminal(&parts);
         let assist = self.assist.clone();
         let this = self.clone();
         blocking(move || {
@@ -2212,6 +2243,43 @@ impl Lore {
                     args.id
                 ));
             }
+            // A terminal's CLI claims open tasks like anyone; it releases or
+            // finishes only a task it claimed in a terminal, and never moves
+            // a task the task runner took or will take (lore finishes those
+            // on its own commit proof).
+            let mut note = note;
+            if terminal {
+                let task = this
+                    .db
+                    .task(args.id)
+                    .map_err(internal)?
+                    .ok_or_else(|| format!("No task with id {}.", args.id))?;
+                let runs_own = this.db.task_belongs_to_runs(task.id).map_err(internal)?;
+                let claimed_here = task.status == "claimed"
+                    && task.claimed_by == actor
+                    && task.note.contains(TERMINAL_CLAIM);
+                if action != "claim" && (runs_own || (task.claimed_by == actor && !claimed_here)) {
+                    return Err(format!(
+                        "task #{} belongs to {actor}'s runs: from a terminal it may not be \
+                         `{action}`; lore finishes it on the run's commit, or the owner moves it \
+                         on the admin page",
+                        task.id
+                    ));
+                }
+                if (action == "done" || action == "release") && !claimed_here {
+                    return Err(format!(
+                        "from a terminal only a task claimed in a terminal may be `{action}`: \
+                         claim task #{} first",
+                        task.id
+                    ));
+                }
+                let text = note.take().unwrap_or_default();
+                note = Some(if action == "claim" {
+                    format!("{TERMINAL_CLAIM} {text}").trim_end().to_string()
+                } else {
+                    format!("{TERMINAL_MARK} {text}").trim_end().to_string()
+                });
+            }
             let task = match this.db.update_task(
                 args.id,
                 &action,
@@ -2243,7 +2311,10 @@ impl Lore {
             };
             // The task's author (the verified token agent, never a run)
             // re-queues it for the task runner by touching it.
-            if !run && this.db.task_author(task.id).map_err(internal)? == agent && !agent.is_empty()
+            if !run
+                && !terminal
+                && this.db.task_author(task.id).map_err(internal)? == agent
+                && !agent.is_empty()
             {
                 this.db.requeue_task(task.id, false).map_err(internal)?;
             }
@@ -6746,6 +6817,138 @@ mod tests {
             .await
             .unwrap();
         (text.split_whitespace().nth(1).unwrap().to_string(), text)
+    }
+
+    /// A terminal's CLI is a caller of its own: it claims and finishes
+    /// only what it claimed in a terminal, never moves a task the runs own,
+    /// and what it writes is marked.
+    #[tokio::test]
+    async fn a_terminal_acts_on_the_board_only_within_its_own_claims() {
+        let (lore, world) = helping("terminal-board", |_| {}).await;
+        let terminal = || {
+            let Extension(mut parts) = as_agent(Some(BUILTIN));
+            parts.extensions.insert(TerminalCaller);
+            Extension(parts)
+        };
+        let (session, _) = hello_as(&lore, BUILTIN).await;
+        let new_task = |title: &str| {
+            world
+                .db
+                .add_task(&crate::db::NewTask {
+                    project: "shop".into(),
+                    title: title.into(),
+                    body: String::new(),
+                    assignee: String::new(),
+                    created_by: "codex".into(),
+                    session_id: None,
+                    targets: Default::default(),
+                })
+                .unwrap()
+        };
+        let update = |id: i64, action: &str| {
+            args::<TaskUpdateArgs>(json!({"session_id": session, "id": id, "action": action}))
+        };
+        // Claimed by a run (no terminal mark): not done, released or
+        // cancelled from a terminal.
+        let by_run = new_task("run work");
+        world
+            .db
+            .update_task(by_run.id, "claim", BUILTIN, None, None)
+            .unwrap();
+        for action in ["done", "release", "cancel"] {
+            let refused = lore
+                .task_update(update(by_run.id, action), terminal())
+                .await
+                .unwrap_err();
+            assert!(refused.contains("belongs to"), "{action}: {refused}");
+        }
+        let refused = lore
+            .todo_done(
+                args(json!({"session_id": session, "id": by_run.id})),
+                terminal(),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("belongs to"), "{refused}");
+        // Delegated to the agent (the runner will take it): not cancelled.
+        let delegated = new_task("delegated");
+        world
+            .db
+            .add_delegation(delegated.id, BUILTIN, "codex", "codex")
+            .unwrap();
+        let refused = lore
+            .task_update(update(delegated.id, "cancel"), terminal())
+            .await
+            .unwrap_err();
+        assert!(refused.contains("belongs to"), "{refused}");
+        // Another agent's claim: not finished from a terminal.
+        let theirs = new_task("theirs");
+        world
+            .db
+            .update_task(theirs.id, "claim", "codex", None, None)
+            .unwrap();
+        let refused = lore
+            .task_update(update(theirs.id, "done"), terminal())
+            .await
+            .unwrap_err();
+        assert!(refused.contains("claimed in a terminal"), "{refused}");
+        // Its own claim in a terminal: claimed (marked), then done (marked).
+        let own = new_task("own");
+        lore.task_update(update(own.id, "claim"), terminal())
+            .await
+            .unwrap();
+        assert!(
+            world
+                .db
+                .task(own.id)
+                .unwrap()
+                .unwrap()
+                .note
+                .contains(TERMINAL_CLAIM)
+        );
+        let done = lore
+            .task_update(update(own.id, "done"), terminal())
+            .await
+            .unwrap();
+        assert!(done.contains("marked done"), "{done}");
+        let own = world.db.task(own.id).unwrap().unwrap();
+        assert_eq!(own.status, "done");
+        assert!(own.note.starts_with(TERMINAL_MARK), "{}", own.note);
+        // What it logs and adds is marked.
+        lore.log(
+            args(json!({
+                "session_id": session, "project": "shop", "kind": "note", "title": "t",
+                "body": "b", "path": "/w", "repo": "none", "commit": "none"
+            })),
+            terminal(),
+        )
+        .await
+        .unwrap();
+        let entry = &world.db.recent(Some("shop"), None, 1).unwrap()[0];
+        assert!(
+            entry.tags.split(',').any(|tag| tag.trim() == "terminal"),
+            "{}",
+            entry.tags
+        );
+        let added = lore
+            .task_add(
+                args(json!({"session_id": session, "project": "shop", "title": "from a terminal"})),
+                terminal(),
+            )
+            .await
+            .unwrap();
+        let id: i64 = added
+            .strip_prefix("Task #")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            world.db.task_author(id).unwrap(),
+            format!("terminal:{BUILTIN}")
+        );
     }
 
     #[tokio::test]

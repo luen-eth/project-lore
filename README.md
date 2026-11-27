@@ -1489,6 +1489,16 @@ limited to a task's scope**: there is no task, the person at the terminal acts w
 the agent's full authority, which is one more reason only the `agents` permission can
 open a terminal.
 
+On the board a terminal's CLI is a caller of its own, neither a run nor an ordinary
+agent: it may add tasks, to-dos and notes, log entries, and claim open tasks; it
+releases or finishes only a task it claimed in a terminal (lore writes `[claimed in a
+lore terminal]` on it), and it never marks done, releases, cancels or reopens a task
+the task runner took, was delegated, or that the agent's run claimed: those are
+finished on lore's own commit proof (or moved by the owner on the page). What it
+writes is marked: entries get the tag `terminal`, task notes start with `[lore
+terminal]`, and tasks it adds are recorded as `terminal:<agent>` and never run
+automatically.
+
 **Whoever can open the terminal has a shell in that agent's container, with its
 credentials** (the CLI's sign-in, the stored token or key). That is why only the
 `agents` permission can open it. The bytes are relayed as they are, both ways: a

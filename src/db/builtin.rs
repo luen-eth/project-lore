@@ -999,6 +999,18 @@ impl Db {
         Ok(())
     }
 
+    /// Whether the task runner ever started a run for a task, or a
+    /// delegation hands it to a built-in agent: such a task is finished
+    /// only on lore's own commit proof, never from a terminal.
+    pub fn task_belongs_to_runs(&self, task_id: i64) -> Result<bool> {
+        Ok(self.lock().query_row(
+            "SELECT EXISTS (SELECT 1 FROM agent_runs WHERE task_id = ?1)
+                 OR EXISTS (SELECT 1 FROM delegations WHERE task_id = ?1)",
+            params![task_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// The delegation of a task, when it was delegated.
     pub fn delegation(&self, task_id: i64) -> Result<Option<Delegation>> {
         Ok(self
