@@ -1366,7 +1366,9 @@ that re-forks into every pid freed, at the pids limit.
 pasting a credential and signing out are refused with a message on the page ("a run
 is going in this agent's container: wait until it ends (or stop it), then try
 again"), and no terminal opens; while a sign-in, a credential change or a terminal is
-going, a run is refused with `busy: …`, which lore takes as "try again later". So no
+going, a run is refused with `busy: …`, which lore takes as "try again later" (and
+while lore knows a terminal session is open it does not even try: the task runner
+waits and says why). So no
 process of a run is ever alive while a fresh sign-in or a pasted key is in the
 container, and none can plant a credential in a sign-in's home. All of this is held
 for the whole runner process, not per link: after a reconnect, nothing new starts
@@ -1513,7 +1515,8 @@ the built-in list).
 
 Signing in, pasting a credential and signing out are refused while a run goes in
 that agent's container (the page says so: wait until it ends, or stop it), and a run
-does not start while a sign-in is in progress or a terminal is open.
+does not start while a sign-in is in progress or a terminal session is open (shown in
+a window or not).
 
 **How long a sign-in lasts unattended.** A setup token (Claude, a year) and API keys
 (Codex, DeepSeek) never change and are what to use for agents that run on their own.
@@ -1634,12 +1637,14 @@ With the `agents` permission, a connected built-in agent's card has **Open
 terminal**, which shows the CLI's own interactive interface (Claude Code, Codex or
 opencode, signed in with the agent's stored credentials and started with the model
 chosen below), and, under **More**, **Shell**: `bash` as the agent user, in a fresh
-home of its own that is deleted when the terminal closes. A terminal does not open
-while a run or a sign-in goes (and a run waits while a terminal is open); before the
-first terminal opens, and when the last one closes, every process of the agent user
-ends. A sign-in you make in a terminal (`claude auth login`, `codex login`) is kept,
-as the credential file only, once the last terminal has closed and nothing of the
-agent user is left.
+home of its own that is deleted when the terminal's session ends. A terminal does not
+open while a run or a sign-in goes, and a run waits while a terminal session is open,
+shown in a window or not: the agent's card and the `assistants` tool then say
+*busy: a terminal session is open (since 10:42 UTC)*, and the task runner's queue
+says so on the tasks that wait. Before the first session starts, and when the last
+one ends, every process of the agent user ends. A sign-in you make in a terminal
+(`claude auth login`, `codex login`) is kept, as the credential file only, once the
+last session has ended and nothing of the agent user is left.
 It can also be opened from the **terminal icon** in the head of the Live activity
 column, and from the same icon beside **Hide activity** (so it is there when Live
 activity is hidden, and on medium widths in that button's place). The icons show only
@@ -1647,9 +1652,10 @@ to users with the `agents` permission, and only when the server has built-in age
 (`LORE_RUNNER_TOKENS`). With one built-in agent the icon opens its terminal; with
 several it shows a small menu of the connected ones (avatar, name, signed in or not);
 the last one picked comes first and is remembered per browser
-(`lore.terminal.agent`). While a terminal is open the icon brings it forward and
-focuses it. The menu works from the keyboard (Enter or Space, the arrow keys, Escape
-closes it).
+(`lore.terminal.agent`). While a terminal window is open the icon brings it forward
+and focuses it. While an agent has a session running, the menu says so under its name
+(*session running since 10:42, last output 2 min ago*) and offers **Resume**. The
+menu works from the keyboard (Enter or Space, the arrow keys, Escape closes it).
 
 The terminal opens as a **floating window** over the page, by default at the bottom
 right of the graph, clear of the Live activity column (which keeps its full height).
@@ -1662,8 +1668,61 @@ it and **Restore** returns it to its own size and place. Under 700px wide it tak
 whole width at the bottom and only its height changes (drag its top edge). The
 terminal follows every size change (during a drag it redraws as it goes and tells the
 CLI the new rows and columns once, when the drag ends), says clearly when it is
-disconnected or has ended, and closes only with its **Close** button: every key,
-Escape included, goes to the terminal.
+disconnected, shown elsewhere or ended, and closes only with its own buttons: every
+key, Escape included, goes to the terminal. **Hide** closes the window and leaves the
+session running; **End session** (it asks first) ends it.
+
+**A terminal session outlives its window.** Hide, closing the browser tab, reloading
+or leaving the page, and a dropped connection only *detach* the window: the CLI (or
+the shell) and whatever it is doing go on in the container. Opening the same agent's
+terminal of the same kind again (any signed-in user with the `agents` permission, from
+the card, the icon or its menu, where the button now reads **Resume**) *attaches* to
+that session instead of starting another: the window first shows the recent screen,
+then lore resizes the session to the window (one column off and back, so the program
+draws its whole screen again even at an unchanged size), and live output and typing
+follow. One window shows a session at a time: opening it in a second tab or by another
+administrator moves it there, and the first window says *Opened in another window*
+with **Take it back**; there is no shared viewing. The agent's card lists each running
+session (*Terminal session running since 10:42 · last output 2 min ago*, and whose
+window shows it) and how the last one of each kind ended. A new session is offered
+only by ending the running one.
+
+The recent screen is kept by lore, in memory, per session: the last 512 KiB of what
+the terminal printed, never written to the database, a file or the log, and dropped
+when the session ends. lore keeps it rather than the runner because every byte
+already passes through lore and the attach is then one step under one lock (the
+replay and the switch of the window happen together, so nothing is lost or shown
+twice), and the runner, which runs in the agent's container, needs no new state or
+protocol for it. A replay starts at a whole character outside any escape sequence and
+first sets the terminal modes that were on there (the alternate screen, cursor keys
+and visibility, mouse reporting, focus events, bracketed paste), so a full-screen
+program replays on the right screen and the keys and the mouse keep working; the
+redraw that follows fixes the rest.
+
+**A session ends only** when:
+- someone presses **End session** in its window;
+- its program exits by itself (`exit` in the shell, quitting the CLI);
+- it printed nothing for the idle limit while no window looked at it:
+  `LORE_TERMINAL_IDLE_MINUTES` on lore, 30 by default (1 to 1440). It never ends
+  while output keeps coming, and never while a window shows it and the page says it
+  is visible (every minute, and when it comes back into view); a hidden tab that has
+  not said so for two and a half minutes counts as nobody looking;
+- the user who opened it may no longer have it: lore checks every 30 seconds, for
+  every session, shown or not, that this user still exists, is not disabled and still
+  has the `agents` permission (the built-in `admin` always may). Deleting or
+  disabling the user, or taking `agents` away, ends the session within 30 seconds;
+  signing out, a session that expires or is ended by an administrator, or another
+  browser closing does **not**: that only detaches the window that was signed in
+  with it;
+- the agent's runner link is replaced or drops (its container restarted or lost the
+  connection), or lore stops: the runner kills its terminals with the link.
+
+When it ends while a window shows it, the window says why. When it ended while no
+window showed it, the next window opened for it says so instead of starting a new one
+(*The session ended at 11:20: it printed nothing for 30 minutes while nobody was
+looking*), once, with **New session**; a new session starts only with that button. The
+activity feed notes who opened, resumed, took over and left a session running, and
+how each one ended, with the user's name and never anything shown or typed.
 
 **The CLI in a terminal comes with lore's MCP server**, as a run's does: Claude Code
 with `--strict-mcp-config --mcp-config` (so only lore is loaded, never the claude.ai
@@ -1675,9 +1734,10 @@ memory, and sends it over the runner link; the runner gives it to the CLI alone,
 `LORE_AGENT_TOKEN` (the configuration files in the terminal's fresh home name the
 variable, never the value). lore accepts it only on the internal listener's `/mcp`
 (not on the public one, not on `/git`), only from the address that agent's runner is
-connected from, and only while that terminal is open: closing it for any reason (Close,
-the page going, the link dropping, the idle limit, the session check failing, lore
-stopping) forgets it. A **Shell** gets no token. A call made with it acts as that
+connected from, and only while that terminal's session lives, shown in a window or
+not (a long task keeps its MCP access when the tab is closed): when the session ends
+for any reason (End session, the CLI exiting, the idle limit, the opener check, the
+link being replaced or dropping, lore stopping) lore forgets it. A **Shell** gets no token. A call made with it acts as that
 built-in agent (for example `claude-builtin`) with the levels the administrator gave
 it on the Agents page, through every gate other calls pass (kill switch, levels, leak
 scan, protected Dokploy services, redaction, the operations log, the activity feed;
@@ -1720,22 +1780,28 @@ automatically.
 credentials** (the CLI's sign-in, the stored token or key). That is why only the
 `agents` permission can open it. The bytes are relayed as they are, both ways: a
 terminal cannot be redacted reliably, so what it shows is not filtered. Nothing from
-a terminal is stored in the database or written to the log; the activity feed notes
-only who opened which kind of terminal in which agent.
+a terminal is stored in the database or written to the log (the recent screen above
+lives in lore's memory only); the activity feed notes only who did what with which
+kind of terminal in which agent.
 
-How it works: the page opens a WebSocket to `/admin/api/builtin/{name}/terminal`
+How it works: each window opens a WebSocket to `/admin/api/builtin/{name}/terminal`
 (the session cookie and the `agents` permission are checked on the upgrade request,
 and its `Origin` must be the request's own origin, so another site cannot open one
-with your cookie). While it is open lore checks both again every 30 seconds: when
-the session has ended (signed out, expired, ended by an administrator) or the
-`agents` permission was taken away, it closes the terminal with a message saying
-why. lore relays it over the runner link to a PTY the runner opens in
-the container, with the same cleared environment as every other CLI command (the
-runner's link secret never reaches it) and `TERM=xterm-256color`. Each terminal runs
-in a session of its own; closing it, the page going away, or the runner's link
-dropping kills that whole session, background jobs included. A runner keeps at most
-two terminals open, and closes one after 15 minutes without input while nobody looks
-(the page says every minute that it is shown).
+with your cookie); attaching to a running session passes exactly these checks. While
+a window shows a session lore checks both again every 30 seconds: when the sign-in
+has ended (signed out, expired, ended by an administrator) or the `agents` permission
+was taken away, it detaches that window with a message saying why (the session's own
+fate is the opener check above). The window's first frame says which kind it wants
+and whether it may start a new one (`{"type":"open","mode":"cli","cols":…,"rows":…,
+"fresh":false}`); lore answers `opened` (a new session), `attached` followed by the
+replay and `replayed`, or `ended` (it ended while nobody looked); later `taken`,
+`detached` or `exit`. The window sends `resize`, `alive`, `hide` and `end`. lore relays
+a session over the runner link to a PTY the runner opens in the container, with the
+same cleared environment as every other CLI command (the runner's link secret never
+reaches it) and `TERM=xterm-256color`. Each runs in a Unix session of its own; ending
+it, or the runner's link dropping, kills that whole session, background jobs
+included. One session per agent and kind (the CLI, the shell), so a runner keeps at
+most two open; the runner itself has no idle limit any more, lore's applies.
 
 The terminal is drawn with [xterm.js](https://github.com/xtermjs/xterm.js) and its
 fit addon, vendored from npm (`@xterm/xterm` 6.0.0 and `@xterm/addon-fit` 0.11.0,
@@ -2421,6 +2487,7 @@ has no channel to push that notification.
 | `LORE_ASK_RESUME_MINUTES` | `60` | How long after its last turn a conversation can be resumed in the CLI's own session. |
 | `LORE_ASK_PER_HOUR` | `6` | Questions one calling agent may ask the built-in agents per hour. |
 | `LORE_DELEGATE_PER_HOUR` | `3` | Tasks one calling agent may delegate to the built-in agents per hour. |
+| `LORE_TERMINAL_IDLE_MINUTES` | `30` | A built-in agent's terminal session that no window shows ends after this many minutes without output (whole number, 1 to 1440); see [Terminal](#terminal). |
 | `LORE_RUNNER_LORE_URL` | `http://lore:<port of LORE_RUNNER_BIND>` (8081) | lore as the agents' containers reach it: their clone URL and MCP endpoint. |
 | `LORE_RUNNER_BIND` | `0.0.0.0:8081`; compose: lore's address on each agent network | Where lore listens for the built-in agents' runners (only with `LORE_RUNNER_TOKENS`): one address, or several, comma separated. Internal networks only: never publish this port. Must use another port than `LORE_BIND`. |
 | `LORE_AGENT_SUBNET_*`, `LORE_AGENT_RANGE_*`, `LORE_AGENT_IP_*` (`CLAUDE`, `CODEX`, `DEEPSEEK`) | `172.31.250.0/28`, `.8/29`, `.2`; `.16/28`, `.24/29`, `.18`; `.32/28`, `.40/29`, `.34` | `docker-compose.agents.yml` only: each agent network's subnet, the range everything but lore gets addresses from, and lore's fixed address (the runner listener binds there). Check for overlaps first (*Network*). |
@@ -2604,7 +2671,7 @@ an interruption left behind is swept away later:
 - **In a built-in agent's container**, a run's checkout (`/work/<run>`) and every
   CLI home (`/work/.homes/<random>`) are deleted when the run, terminal, sign-in or
   command ends. A janitor runs when the runner starts, after every run, after the
-  last terminal closes, after every sign-in, and every ten minutes while the
+  last terminal session ends, after every sign-in, and every ten minutes while the
   container is idle: it removes every entry under `/work` that no run, terminal,
   sign-in or command is using, whatever its age or owner (a directory the agent
   locked with mode 000 included; a symbolic link is unlinked, never followed), and

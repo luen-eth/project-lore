@@ -207,7 +207,9 @@ async fn run() -> Result<()> {
         // The terminals' CLIs reach lore's MCP endpoint where runs do.
         let mcp_url = format!("{}/mcp", taskrunner::lore_url_from_env()?);
         Some(Arc::new(
-            builtin::Hub::new(db.clone(), runner_tokens).with_mcp_url(mcp_url),
+            builtin::Hub::new(db.clone(), runner_tokens)
+                .with_mcp_url(mcp_url)
+                .with_terminal_idle(terminal_idle()?),
         ))
     };
     let mut auth = McpAuth::new(tokens, db.clone(), trust_proxy);
@@ -683,6 +685,22 @@ fn healthcheck() -> Result<()> {
             "unhealthy: {}",
             response.lines().next().unwrap_or("no response")
         )
+    }
+}
+
+/// How long a terminal session nobody looks at may print nothing before
+/// it ends: `LORE_TERMINAL_IDLE_MINUTES`, 30 by default, 1 to 1440.
+fn terminal_idle() -> Result<std::time::Duration> {
+    let value = env_or("LORE_TERMINAL_IDLE_MINUTES", "");
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(builtin::TERMINAL_IDLE);
+    }
+    match value.parse::<u64>() {
+        Ok(minutes) if (1..=1440).contains(&minutes) => {
+            Ok(std::time::Duration::from_secs(minutes * 60))
+        }
+        _ => bail!("LORE_TERMINAL_IDLE_MINUTES must be a whole number of minutes from 1 to 1440"),
     }
 }
 

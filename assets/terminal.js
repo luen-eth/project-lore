@@ -1,13 +1,20 @@
 /* The terminal window's document. It opens one WebSocket to lore, which
-   relays it to one PTY in a built-in agent's container: typed bytes go out
-   as binary frames, the terminal's bytes come back as binary frames, and
-   open, resize, keep-alive, close and the end travel as small JSON text
-   frames. Closing the socket (Close, or the frame being removed) closes the
-   terminal and kills what runs in it.
+   relays it to one terminal session in a built-in agent's container: typed
+   bytes go out as binary frames, the terminal's bytes come back as binary
+   frames, and open, resize, keep-alive, hide, end and what happened travel
+   as small JSON text frames.
+
+   A session outlives its window: closing the socket (Hide, a reload, the
+   frame being removed, a dropped connection) only detaches this window,
+   and the next window for the same agent and kind resumes the session,
+   with its recent screen first. The session ends only with End session,
+   when its program exits, or by lore (its idle limit, its runner's link,
+   the opener's permission). A session that ended while no window showed
+   it is reported once ("ended at 11:20: …"); a new one starts only with
+   New session.
 
    Every key goes to the terminal, Escape included, so the window closes
-   only with its Close button, which asks the admin page around it to
-   remove the frame. */
+   only with the admin page's buttons around it. */
 (() => {
   "use strict";
 
@@ -17,8 +24,10 @@
   const mode = params.get("mode") === "shell" ? "shell" : "cli";
   const avatar = params.get("avatar");
 
-  /* The page shown says someone is looking, so the terminal is not idle. */
+  /* The page shown says someone is looking, so the session is not idle. */
   const ALIVE_EVERY = 60 * 1000;
+  /* How long End session waits for a second click. */
+  const CONFIRM_FOR = 4000;
 
   $("name").textContent = agent || "Terminal";
   $("what").textContent = mode === "shell" ? "Shell as the agent user" : "The CLI's own interface";
@@ -46,6 +55,8 @@
   fit.fit();
 
   let socket = null;
+  /* connecting, open, ended (the session is over), taken (another window
+     shows it), detached (this window lost it; the session goes on). */
   let state = "connecting";
   /* Shown in the admin page's window; a drag in progress; the size the
      server was last told (see the message handler below). */
@@ -54,30 +65,55 @@
   let told = null;
   const encoder = new TextEncoder();
 
+  /* What the one action button does in each state. */
+  const ACTIONS = {
+    ended: ["New session", () => connect(true)],
+    taken: ["Take it back", () => connect(false)],
+    detached: ["Reconnect", () => connect(false)],
+  };
+
+  function clock(unix) {
+    const date = new Date((Number(unix) || 0) * 1000);
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
   function setState(name, text) {
     state = name;
     const node = $("state");
     node.className = "state " + name;
     node.textContent = text;
     node.title = text;
-    $("reconnect").hidden = name !== "closed";
-    $("screen").classList.toggle("ended", name === "closed");
-    tellParent({ type: "lore-terminal-state", state: name, text });
+    const action = ACTIONS[name];
+    $("action").hidden = !action;
+    if (action) $("action").textContent = action[0];
+    $("end").hidden = name !== "open";
+    $("screen").classList.toggle("ended", name !== "open" && name !== "connecting");
+    tellParent({ type: "lore-terminal-state", state: name, text, action: action ? action[0] : "" });
+  }
+
+  /* A line in the terminal itself, not only in the state's tooltip. */
+  function say(text, colour) {
+    term.write(`\r\n\x1b[${colour || 31}m${String(text).replace(/[\x00-\x1f]/g, " ")}\x1b[0m\r\n`);
   }
 
   function send(frame) {
     if (socket && socket.readyState === WebSocket.OPEN) socket.send(frame);
   }
 
-  function connect() {
-    setState("connecting", "Connecting…");
+  function connect(fresh) {
+    if (socket) {
+      const old = socket;
+      socket = null;
+      old.close();
+    }
+    setState("connecting", fresh ? "Starting a new session…" : "Connecting…");
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${scheme}//${location.host}/admin/api/builtin/${encodeURIComponent(agent)}/terminal`);
     ws.binaryType = "arraybuffer";
     socket = ws;
     ws.addEventListener("open", () => {
       told = `${term.cols}x${term.rows}`;
-      ws.send(JSON.stringify({ type: "open", mode, cols: term.cols, rows: term.rows }));
+      ws.send(JSON.stringify({ type: "open", mode, cols: term.cols, rows: term.rows, fresh: Boolean(fresh) }));
     });
     ws.addEventListener("message", (event) => {
       if (ws !== socket) return;
@@ -88,29 +124,53 @@
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
       if (message.type === "opened") {
-        setState("open", "Connected");
+        term.reset();
+        setState("open", `New session · since ${clock(message.since)}`);
+        catchUpSize();
         term.focus();
-      } else if (message.type === "exit") {
+      } else if (message.type === "attached") {
+        // The recent screen follows; the program then draws its screen
+        // again for this window's size.
+        term.reset();
+        const from = message.taken_from ? ` (taken from ${message.taken_from}'s window)` : "";
+        setState("open", `Resumed · running since ${clock(message.since)}${from}`);
+        catchUpSize();
+      } else if (message.type === "replayed") {
+        term.scrollToBottom();
+        term.focus();
+      } else if (message.type === "exit" || message.type === "ended") {
         const code = message.code === null || message.code === undefined ? "" : ` (exit ${message.code})`;
-        const text = `Ended${code}${message.message ? ": " + message.message : ""}`;
-        setState("closed", text);
-        // Said in the terminal too, not only in the state dot's tooltip.
-        if (message.message) term.write(`\r\n\x1b[31m${text.replace(/[\x00-\x1f]/g, " ")}\x1b[0m\r\n`);
+        const at = message.at ? ` at ${clock(message.at)}` : "";
+        const text = `The session ended${at}${code}${message.message ? ": " + message.message : ""}`;
+        setState("ended", text);
+        say(text);
+        if (message.type === "ended") say("Press New session to start another.", 90);
+      } else if (message.type === "taken") {
+        const text = `Opened in another window${message.by ? " (" + message.by + ")" : ""}; the session goes on there`;
+        setState("taken", text);
+        say(text, 33);
+      } else if (message.type === "detached") {
+        const text = message.message || "This window was detached; the session goes on";
+        setState("detached", text);
+        say(text, 33);
       } else if (message.type === "error") {
         const text = message.message || "The terminal could not be opened";
-        setState("closed", text);
-        term.write(`\r\n\x1b[31m${text.replace(/[\x00-\x1f]/g, " ")}\x1b[0m\r\n`);
+        setState("detached", text);
+        say(text);
       }
     });
     ws.addEventListener("close", () => {
       if (ws !== socket) return;
+      socket = null;
       // Refused before it opened: signed out, no `agents` permission, or
       // another origin. The server says which only to a fetch, not here.
       if (state === "connecting") {
-        setState("closed", "Disconnected: sign in again, or check the agents permission");
-        term.write("\r\n\x1b[31mDisconnected: sign in again, or check the agents permission\x1b[0m\r\n");
+        setState("detached", "Disconnected: sign in again, or check the agents permission");
+        say("Disconnected: sign in again, or check the agents permission");
+      } else if (state === "open") {
+        setState("detached", "Disconnected; the session goes on in the agent's container");
+        say("Disconnected; the session goes on in the agent's container. Reconnect to see it again.", 33);
       }
-      else if (state !== "closed") setState("closed", "Disconnected");
     });
   }
 
@@ -130,29 +190,74 @@
     pending = requestAnimationFrame(refit);
   }).observe($("screen"));
 
-  setInterval(() => {
+  function alive() {
     if (state === "open" && document.visibilityState === "visible") send(JSON.stringify({ type: "alive" }));
-  }, ALIVE_EVERY);
+  }
+  setInterval(alive, ALIVE_EVERY);
+  document.addEventListener("visibilitychange", alive);
 
-  $("reconnect").addEventListener("click", () => {
-    if (socket) socket.close();
-    term.reset();
-    connect();
+  $("action").addEventListener("click", () => {
+    const action = ACTIONS[state];
+    if (action) action[1]();
   });
 
+  /* Hide: this window lets go; the session goes on. */
+  function hide() {
+    send(JSON.stringify({ type: "hide" }));
+    if (socket) {
+      const old = socket;
+      socket = null;
+      old.close();
+    }
+    setState("detached", "Hidden; the session goes on");
+  }
+
+  /* End session: the program and everything started in it stop. */
+  function end() {
+    if (state !== "open") return;
+    send(JSON.stringify({ type: "end" }));
+  }
+
+  /* On the page of its own, End session asks for a second click. */
+  let confirming = 0;
+  $("end").addEventListener("click", () => {
+    if (!confirming) {
+      $("end").textContent = "Click again to end";
+      $("end").classList.add("danger");
+      confirming = setTimeout(resetEnd, CONFIRM_FOR);
+      return;
+    }
+    resetEnd();
+    end();
+  });
+  function resetEnd() {
+    clearTimeout(confirming);
+    confirming = 0;
+    $("end").textContent = "End session";
+    $("end").classList.remove("danger");
+  }
+
   /* In the admin page the window around the frame draws the bar (the
-     agent, the state, Reconnect, Expand, Close) and moves and resizes the
-     frame; this document then shows only the terminal, tells the page its
-     state and does what the page's buttons ask. While the owner drags an
-     edge the terminal still refits every frame, but the server hears the
-     new size only once, when the drag ends. */
+     agent, the state, the action, Expand, Hide, End session) and moves and
+     resizes the frame; this document then shows only the terminal, tells
+     the page its state and does what the page's buttons ask. While the
+     owner drags an edge the terminal still refits every frame, but the
+     server hears the new size only once, when the drag ends. */
   function tellParent(message) {
     if (embedded) window.parent.postMessage(message, location.origin);
   }
   function refit() { try { fit.fit(); } catch { /* not laid out yet */ } }
+  /* The size goes to the server only once the session is shown: the
+     first frame on a socket must be the `open`, which carries it. */
   function sendSize(cols, rows) {
+    if (state !== "open") return;
     told = `${cols}x${rows}`;
     send(JSON.stringify({ type: "resize", cols, rows }));
+  }
+  /* A size that changed while the socket opened. */
+  function catchUpSize() {
+    refit();
+    if (told !== `${term.cols}x${term.rows}`) sendSize(term.cols, term.rows);
   }
   if (embedded) document.body.classList.add("embedded");
   window.addEventListener("message", (event) => {
@@ -165,20 +270,13 @@
         if (told !== `${term.cols}x${term.rows}`) sendSize(term.cols, term.rows);
       }
     } else if (data.type === "lore-terminal-command") {
-      if (data.command === "close") $("close").click();
-      else if (data.command === "reconnect") $("reconnect").click();
+      if (data.command === "hide") { hide(); tellParent({ type: "lore-terminal-close" }); }
+      else if (data.command === "end") end();
+      else if (data.command === "action") $("action").click();
       else if (data.command === "focus") term.focus();
     }
   });
 
-  $("close").addEventListener("click", () => {
-    send(JSON.stringify({ type: "close" }));
-    if (socket) socket.close();
-    socket = null;
-    setState("closed", "Closed");
-    tellParent({ type: "lore-terminal-close" });
-  });
-
-  connect();
+  connect(false);
   tellParent({ type: "lore-terminal-ready", state, text: $("state").textContent });
 })();

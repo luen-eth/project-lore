@@ -167,7 +167,7 @@ pub enum RunKind {
 }
 
 /// What a terminal shows (used from part 6d on).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalMode {
     /// The CLI's own interactive interface.
@@ -279,13 +279,12 @@ pub enum ToRunner {
         model: Option<String>,
         /// lore's MCP server for the CLI's interface (never for a shell):
         /// where it is and the terminal's own token, valid while this
-        /// terminal is open. Missing from an older lore.
+        /// terminal's session lives. Missing from an older lore.
         #[serde(default)]
         mcp: Option<TerminalMcp>,
     },
-    /// Bytes typed into a terminal, base64. Empty data types nothing: it
-    /// says someone is still looking, which keeps the terminal from being
-    /// closed as idle.
+    /// Bytes typed into a terminal, base64. Empty data types nothing (an
+    /// older lore sent it as a keep-alive; the idle limit is lore's now).
     TerminalInput { term_id: String, data: String },
     /// The terminal's size changed.
     TerminalResize {

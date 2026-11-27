@@ -6,20 +6,24 @@
 //! runners report (connection, CLI version, sign-in state) in
 //! `builtin_agents`. It never stores or logs a credential: a pasted token
 //! passes through it to the runner and is dropped. Terminal bytes (part
-//! 6d) pass through it between a runner and one admin page, and are never
-//! stored or logged either.
+//! 6d) pass through it between a runner and the one admin window that
+//! shows a session, and are never stored or logged either: the recent
+//! screen of each running session is kept in memory only (`replay`), for
+//! the next window that attaches, and dropped when the session ends.
 //!
 //! Without `LORE_RUNNER_TOKENS` there is no hub, no listener and no route:
 //! lore behaves as it did before built-in agents existed.
+
+mod replay;
 
 use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, bail};
@@ -76,8 +80,27 @@ const LIVE_PROBE: Duration = Duration::from_secs(3);
 pub const MAX_TERMINALS: usize = crate::runner::terminal::MAX_TERMINALS;
 
 /// Output frames waiting for a page that does not read them; a page that
-/// falls this far behind loses its terminal.
+/// falls this far behind is detached (the session goes on).
 const TERMINAL_BACKLOG: usize = 1024;
+
+/// A terminal session nobody looks at ends after this long without output
+/// (`LORE_TERMINAL_IDLE_MINUTES`).
+pub const TERMINAL_IDLE: Duration = Duration::from_secs(30 * 60);
+
+/// How often lore looks at every terminal session: the idle limit, and
+/// whether the user who opened it may still have it.
+const TERMINAL_WATCH: Duration = Duration::from_secs(30);
+
+/// A page says every minute that it is shown; a viewer silent this long is
+/// taken as not looking (a hidden tab, a sleeping laptop).
+const TERMINAL_LOOKING: Duration = Duration::from_secs(150);
+
+/// Between the two resizes that make a program draw its screen again
+/// after a page attached: long enough for it to read the first size.
+const TERMINAL_REDRAW_PAUSE: Duration = Duration::from_millis(400);
+
+/// What the activity feed names lore's own notes by (as the admin page's).
+const ACTIVITY_ACTOR: &str = "admin";
 
 /// A runner secret, the built-in agent it belongs to, and what that agent
 /// is: its CLI and provider are fixed here, never taken from the runner.
@@ -502,6 +525,9 @@ pub enum HubError {
     Closed,
     /// The agent already has as many terminals open as it may.
     TooManyTerminals,
+    /// The session the page meant to resume has ended (and no new one is
+    /// started without the owner asking).
+    Ended(EndedSession),
 }
 
 impl std::fmt::Display for HubError {
@@ -514,8 +540,9 @@ impl std::fmt::Display for HubError {
             HubError::Timeout => "the agent's container did not answer in time",
             HubError::Closed => "the link to the agent's container closed",
             HubError::TooManyTerminals => {
-                "this agent already has two terminals open; close one first"
+                "this agent already has two terminals open; end one first"
             }
+            HubError::Ended(ended) => return write!(f, "the session ended: {}", ended.message),
         })
     }
 }
@@ -545,23 +572,175 @@ pub struct ModelList {
     pub source: String,
 }
 
-/// What a terminal's page hears from the runner.
+/// What a terminal's page hears.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TerminalEvent {
     Output(Vec<u8>),
+    /// The session ended.
     Exit {
         code: Option<i32>,
         message: Option<String>,
     },
+    /// Another window attached to the session: this one no longer shows
+    /// it.
+    TakenOver {
+        by: String,
+    },
 }
 
-/// An open terminal: the agent it runs in and the page that shows it, and
-/// for the CLI's interface the hash of its lore token (see
-/// `terminal_token_agent`). Forgetting the terminal revokes the token.
+/// Who opened a terminal session. While it lives lore checks that this
+/// user still exists, still has the `agents` permission and is not
+/// disabled; the built-in `admin` always may.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opener {
+    pub username: String,
+    /// The stored user's id; `None` for the built-in `admin`.
+    pub user_id: Option<i64>,
+}
+
+/// The one page that shows a session now.
+struct Viewer {
+    id: u64,
+    user: String,
+    tx: mpsc::Sender<TerminalEvent>,
+    /// When the page last said it is shown (or typed, or attached).
+    alive: Instant,
+}
+
+/// A terminal session: a PTY in an agent's container that lives on while
+/// no page shows it. For the CLI's interface it holds the hash of its lore
+/// token (see `terminal_token_agent`); forgetting the session revokes the
+/// token.
 struct Terminal {
     agent: String,
-    tx: mpsc::Sender<TerminalEvent>,
+    mode: TerminalMode,
     token_hash: Option<String>,
+    opener: Opener,
+    /// Unix seconds.
+    started_at: i64,
+    last_output_at: i64,
+    /// The last output, or the last moment someone looked: the idle limit
+    /// counts from here.
+    quiet_since: Instant,
+    /// The recent screen, in memory only.
+    replay: replay::Replay,
+    viewer: Option<Viewer>,
+}
+
+/// How a session ended, kept (in memory) until a new one of the same kind
+/// starts, so the owner who comes back sees why and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EndedSession {
+    pub mode: TerminalMode,
+    /// Unix seconds.
+    pub at: i64,
+    pub message: String,
+    /// A page has been told (it was attached then, or asked since).
+    #[serde(skip)]
+    seen: bool,
+}
+
+/// A running session as the page and the task runner see it.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionView {
+    pub mode: TerminalMode,
+    pub started_at: i64,
+    pub last_output_at: i64,
+    pub opened_by: String,
+    /// Who shows it in a window now, if anyone.
+    pub viewer: Option<String>,
+}
+
+/// What a page asks for when it opens a terminal window.
+pub struct AttachRequest {
+    pub agent: String,
+    pub mode: TerminalMode,
+    pub cols: u16,
+    pub rows: u16,
+    pub model: Option<String>,
+    pub opener: Opener,
+    /// Start a new session when none runs, even right after one ended.
+    pub fresh: bool,
+}
+
+/// A page attached to a session.
+pub struct Attached {
+    pub term_id: String,
+    pub viewer: u64,
+    pub events: mpsc::Receiver<TerminalEvent>,
+    /// A new session was started for this page.
+    pub started: bool,
+    /// For a session that was running: its recent screen.
+    pub replay: Vec<u8>,
+    pub started_at: i64,
+    pub opened_by: String,
+    /// The window it was taken from, by user name.
+    pub taken_from: Option<String>,
+}
+
+/// Where a page stands after its events stopped.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ViewerState {
+    /// It still shows the session.
+    Current,
+    /// The session runs; another window shows it (by this user), or none
+    /// does (the page fell behind and was detached).
+    Elsewhere(Option<String>),
+    /// The session ended.
+    Ended(Option<EndedSession>),
+}
+
+/// What lore calls each kind of terminal in the activity feed.
+fn what(mode: TerminalMode) -> &'static str {
+    match mode {
+        TerminalMode::Cli => "the CLI's terminal",
+        TerminalMode::Shell => "a shell",
+    }
+}
+
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `10:42 UTC`.
+pub fn clock(unix: i64) -> String {
+    let minute = unix.rem_euclid(86_400) / 60;
+    format!("{:02}:{:02} UTC", minute / 60, minute % 60)
+}
+
+fn minutes(duration: Duration) -> String {
+    let minutes = duration.as_secs() / 60;
+    match minutes {
+        0 => format!("{} seconds", duration.as_secs()),
+        1 => "1 minute".into(),
+        _ => format!("{minutes} minutes"),
+    }
+}
+
+/// Why the user who opened a session may no longer have it, or `None`.
+fn opener_gone(db: &Db, opener: &Opener) -> Option<String> {
+    let Some(id) = opener.user_id else {
+        return (opener.username != crate::users::ADMIN_USER)
+            .then(|| format!("{} is not a user who may open a terminal", opener.username));
+    };
+    match db.user(id) {
+        Ok(None) => Some(format!("{}, who opened it, was deleted", opener.username)),
+        Ok(Some(user)) if user.disabled => {
+            Some(format!("{}, who opened it, was disabled", opener.username))
+        }
+        Ok(Some(user)) if !user.perms().contains(crate::users::Perm::Agents) => Some(format!(
+            "{}, who opened it, no longer has the agents permission",
+            opener.username
+        )),
+        Ok(Some(_)) => None,
+        Err(error) => {
+            tracing::warn!(%error, "checking who opened a terminal failed; checked again later");
+            None
+        }
+    }
 }
 
 /// A connected runner, and the address it connected from (the agent's
@@ -617,6 +796,8 @@ struct Inner {
     models: HashMap<String, ModelList>,
     resources: HashMap<String, Resources>,
     terminals: HashMap<String, Terminal>,
+    /// The last ended session per agent and kind.
+    ended: HashMap<(String, TerminalMode), EndedSession>,
     intrusions: HashMap<String, Intrusion>,
     /// Output lines left out per run (the queue was full): how many, and
     /// the first one's sequence number, which the summary line takes.
@@ -652,6 +833,14 @@ pub struct Hub {
     /// lore's MCP endpoint as the agents reach it, for the terminals'
     /// CLIs (`with_mcp_url`); without it a terminal gets no MCP server.
     mcp_url: Option<String>,
+    /// A session nobody looks at ends after this long without output.
+    terminal_idle: Duration,
+    /// How often the sessions are looked at.
+    terminal_watch: Duration,
+    /// Set once the watch over the sessions runs.
+    watching: AtomicBool,
+    /// Where the activity feed's notes are published (the admin page's).
+    events: OnceLock<crate::events::Events>,
 }
 
 impl Hub {
@@ -677,6 +866,44 @@ impl Hub {
             run_tx,
             run_rx: Mutex::new(Some(run_rx)),
             mcp_url: None,
+            terminal_idle: TERMINAL_IDLE,
+            terminal_watch: TERMINAL_WATCH,
+            watching: AtomicBool::new(false),
+            events: OnceLock::new(),
+        }
+    }
+
+    /// The idle limit of a terminal session nobody looks at.
+    pub fn with_terminal_idle(mut self, idle: Duration) -> Self {
+        self.terminal_idle = idle;
+        self
+    }
+
+    /// A shorter look at the sessions, for the tests.
+    #[cfg(test)]
+    pub fn with_terminal_watch(mut self, every: Duration) -> Self {
+        self.terminal_watch = every;
+        self
+    }
+
+    /// Publishes the activity feed's notes about terminals here.
+    pub fn set_events(&self, events: crate::events::Events) {
+        let _ = self.events.set(events);
+    }
+
+    /// One line in the activity feed. Never terminal content: who, which
+    /// agent, which kind, what happened.
+    fn note(&self, summary: &str) {
+        match self
+            .db
+            .record_activity(ACTIVITY_ACTOR, "builtin", "", None, None, &[], summary)
+        {
+            Ok(activity) => {
+                if let Some(events) = self.events.get() {
+                    events.publish(activity);
+                }
+            }
+            Err(error) => tracing::warn!(%error, "noting a terminal in the activity feed failed"),
         }
     }
 
@@ -837,25 +1064,164 @@ impl Hub {
         }
     }
 
-    /// Opens a terminal in an agent's container for one page: answers the
-    /// terminal's id and where its output and its end arrive. The channel
-    /// closes without an `Exit` when the agent's container disconnects.
-    pub async fn terminal_open(
-        &self,
-        agent: &str,
-        mode: TerminalMode,
-        cols: u16,
-        rows: u16,
-        model: Option<String>,
-    ) -> Result<(String, mpsc::Receiver<TerminalEvent>), HubError> {
-        let term_id = format!("t{}", self.next_id());
-        let (tx, rx) = mpsc::channel(TERMINAL_BACKLOG);
-        let link = {
+    /// Starts the watch over the terminal sessions once: every
+    /// `terminal_watch` it ends a session nobody looks at that printed
+    /// nothing for `terminal_idle`, and one whose opener may no longer
+    /// have it. It stops when the hub goes.
+    fn watch_terminals(self: &Arc<Self>) {
+        if self.watching.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let hub = Arc::downgrade(self);
+        let every = self.terminal_watch;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let Some(hub) = hub.upgrade() else {
+                    return;
+                };
+                hub.check_terminals().await;
+            }
+        });
+    }
+
+    /// One look at every session: the idle limit, then the openers.
+    async fn check_terminals(&self) {
+        let now = Instant::now();
+        let mut idle = Vec::new();
+        let mut openers = Vec::new();
+        {
             let mut inner = self.inner();
-            let Some(link) = inner.links.get(agent) else {
+            for (id, terminal) in inner.terminals.iter_mut() {
+                let looking = terminal
+                    .viewer
+                    .as_ref()
+                    .is_some_and(|viewer| now.duration_since(viewer.alive) < TERMINAL_LOOKING);
+                if looking {
+                    terminal.quiet_since = now;
+                } else if now.duration_since(terminal.quiet_since) >= self.terminal_idle {
+                    idle.push(id.clone());
+                }
+                openers.push((id.clone(), terminal.opener.clone()));
+            }
+        }
+        for id in idle {
+            self.end_terminal(
+                &id,
+                None,
+                format!(
+                    "it printed nothing for {} while nobody was looking",
+                    minutes(self.terminal_idle)
+                ),
+            );
+        }
+        if openers.is_empty() {
+            return;
+        }
+        let db = self.db.clone();
+        let gone = tokio::task::spawn_blocking(move || {
+            let mut checked: HashMap<(String, Option<i64>), Option<String>> = HashMap::new();
+            openers
+                .into_iter()
+                .filter_map(|(id, opener)| {
+                    checked
+                        .entry((opener.username.clone(), opener.user_id))
+                        .or_insert_with(|| opener_gone(&db, &opener))
+                        .clone()
+                        .map(|why| (id, why))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (id, why) in gone {
+            self.end_terminal(&id, None, why);
+        }
+    }
+
+    /// Opens a terminal window for one page: attaches it to the agent's
+    /// running session of that kind (taking it from another window), or
+    /// starts one. A page that meant to resume (`fresh` false) a session
+    /// that has ended since hears why and when, once, instead of getting a
+    /// new one.
+    pub async fn terminal_attach(
+        self: &Arc<Self>,
+        request: AttachRequest,
+    ) -> Result<Attached, HubError> {
+        self.watch_terminals();
+        let AttachRequest {
+            agent,
+            mode,
+            cols,
+            rows,
+            model,
+            opener,
+            fresh,
+        } = request;
+        let viewer_id = self.next_id();
+        let (tx, rx) = mpsc::channel(TERMINAL_BACKLOG);
+        let now = Instant::now();
+        let viewer = Viewer {
+            id: viewer_id,
+            user: opener.username.clone(),
+            tx,
+            alive: now,
+        };
+        let (link, term_id, open, started_at) = {
+            let mut inner = self.inner();
+            let Some(link) = inner.links.get(&agent) else {
                 return Err(HubError::NotConnected);
             };
             let link = link.tx.clone();
+            if let Some((id, terminal)) = inner
+                .terminals
+                .iter_mut()
+                .find(|(_, terminal)| terminal.agent == agent && terminal.mode == mode)
+            {
+                let taken_from = terminal.viewer.replace(viewer).map(|previous| {
+                    let _ = previous.tx.try_send(TerminalEvent::TakenOver {
+                        by: opener.username.clone(),
+                    });
+                    previous.user
+                });
+                terminal.quiet_since = now;
+                let attached = Attached {
+                    term_id: id.clone(),
+                    viewer: viewer_id,
+                    events: rx,
+                    started: false,
+                    replay: terminal.replay.snapshot(),
+                    started_at: terminal.started_at,
+                    opened_by: terminal.opener.username.clone(),
+                    taken_from,
+                };
+                drop(inner);
+                self.note(&match &attached.taken_from {
+                    Some(from) if *from != opener.username => format!(
+                        "{} took over {} in {agent} from {from}",
+                        opener.username,
+                        what(mode)
+                    ),
+                    Some(_) => format!(
+                        "{} moved {} in {agent} to another window",
+                        opener.username,
+                        what(mode)
+                    ),
+                    None => format!("{} resumed {} in {agent}", opener.username, what(mode)),
+                });
+                return Ok(attached);
+            }
+            let key = (agent.clone(), mode);
+            if !fresh
+                && let Some(ended) = inner.ended.get_mut(&key)
+                && !ended.seen
+            {
+                ended.seen = true;
+                return Err(HubError::Ended(ended.clone()));
+            }
             let open = inner
                 .terminals
                 .values()
@@ -876,70 +1242,295 @@ impl Hub {
                 },
                 _ => None,
             };
+            let term_id = format!("t{}", self.next_id());
+            let started_at = unix_now();
+            inner.ended.remove(&key);
             inner.terminals.insert(
                 term_id.clone(),
                 Terminal {
-                    agent: agent.to_string(),
-                    tx,
+                    agent: agent.clone(),
+                    mode,
                     token_hash: token
                         .as_ref()
                         .map(|(_, token)| crate::oauth::token_hash(token)),
+                    opener: opener.clone(),
+                    started_at,
+                    last_output_at: started_at,
+                    quiet_since: now,
+                    replay: replay::Replay::default(),
+                    viewer: Some(viewer),
                 },
             );
-            (link, token)
-        };
-        let (link, token) = link;
-        let open = ToRunner::TerminalOpen {
-            term_id: term_id.clone(),
-            mode,
-            cols,
-            rows,
-            model,
-            mcp: token.map(|(url, token)| protocol::TerminalMcp {
-                url,
-                token: protocol::Secret::new(token),
-            }),
+            let open = ToRunner::TerminalOpen {
+                term_id: term_id.clone(),
+                mode,
+                cols,
+                rows,
+                model,
+                mcp: token.map(|(url, token)| protocol::TerminalMcp {
+                    url,
+                    token: protocol::Secret::new(token),
+                }),
+            };
+            (link, term_id, open, started_at)
         };
         if link.send(open).await.is_err() {
             self.inner().terminals.remove(&term_id);
             return Err(HubError::Closed);
         }
-        Ok((term_id, rx))
+        self.note(&format!(
+            "{} opened {} in {agent}",
+            opener.username,
+            what(mode)
+        ));
+        Ok(Attached {
+            term_id,
+            viewer: viewer_id,
+            events: rx,
+            started: true,
+            replay: Vec::new(),
+            started_at,
+            opened_by: opener.username,
+            taken_from: None,
+        })
     }
 
-    /// Sends a terminal command (input, resize) to the runner of the agent
-    /// the terminal runs in.
-    pub async fn terminal_send(&self, term_id: &str, command: ToRunner) -> Result<(), HubError> {
-        let link = {
-            let inner = self.inner();
-            let Some(terminal) = inner.terminals.get(term_id) else {
-                return Err(HubError::Closed);
-            };
-            let Some(link) = inner.links.get(&terminal.agent) else {
-                return Err(HubError::NotConnected);
-            };
-            link.tx.clone()
+    /// The link of the session `term_id` when `viewer` is the page that
+    /// shows it; `touch` marks that page as looking.
+    fn viewer_link(
+        &self,
+        term_id: &str,
+        viewer: u64,
+        touch: bool,
+    ) -> Result<mpsc::Sender<ToRunner>, HubError> {
+        let mut inner = self.inner();
+        let Some(terminal) = inner.terminals.get_mut(term_id) else {
+            return Err(HubError::Closed);
         };
+        let agent = terminal.agent.clone();
+        match terminal.viewer.as_mut() {
+            Some(current) if current.id == viewer => {
+                if touch {
+                    current.alive = Instant::now();
+                    terminal.quiet_since = current.alive;
+                }
+            }
+            _ => return Err(HubError::Closed),
+        }
+        inner
+            .links
+            .get(&agent)
+            .map(|link| link.tx.clone())
+            .ok_or(HubError::NotConnected)
+    }
+
+    /// Sends what the page showing a session typed or its new size to the
+    /// runner. Only the page that shows the session now may.
+    pub async fn terminal_send(
+        &self,
+        term_id: &str,
+        viewer: u64,
+        command: ToRunner,
+    ) -> Result<(), HubError> {
+        let link = self.viewer_link(term_id, viewer, true)?;
         link.send(command).await.map_err(|_| HubError::Closed)
     }
 
-    /// The page went: the terminal is forgotten and its runner told to
-    /// close it.
-    pub async fn terminal_close(&self, term_id: &str) {
-        let link = {
+    /// The page showing a session says it is shown.
+    pub fn terminal_alive(&self, term_id: &str, viewer: u64) {
+        let _ = self.viewer_link(term_id, viewer, true);
+    }
+
+    /// Makes a program draw its whole screen again for a page that just
+    /// attached: the size goes one column off and back, so the program
+    /// gets a window change it cannot ignore even when the size is the
+    /// one it had.
+    pub async fn terminal_redraw(
+        &self,
+        term_id: &str,
+        viewer: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), HubError> {
+        let nudge = if cols > 20 { cols - 1 } else { cols + 1 };
+        let resize = |cols| ToRunner::TerminalResize {
+            term_id: term_id.to_string(),
+            cols,
+            rows,
+        };
+        self.terminal_send(term_id, viewer, resize(nudge)).await?;
+        tokio::time::sleep(TERMINAL_REDRAW_PAUSE).await;
+        self.terminal_send(term_id, viewer, resize(cols)).await
+    }
+
+    /// The page went (hidden, closed, reloaded, its connection dropped):
+    /// the session goes on without it. Answers whether it was the page
+    /// showing the session.
+    pub fn terminal_detach(&self, term_id: &str, viewer: u64, why: &str) -> bool {
+        let note = {
             let mut inner = self.inner();
-            let Some(terminal) = inner.terminals.remove(term_id) else {
-                return;
+            let Some(terminal) = inner.terminals.get_mut(term_id) else {
+                return false;
             };
-            inner.links.get(&terminal.agent).map(|link| link.tx.clone())
+            if terminal
+                .viewer
+                .as_ref()
+                .is_none_or(|current| current.id != viewer)
+            {
+                return false;
+            }
+            let gone = terminal.viewer.take();
+            terminal.quiet_since = Instant::now();
+            format!(
+                "{} left {} in {} running{why}",
+                gone.map(|viewer| viewer.user).unwrap_or_default(),
+                what(terminal.mode),
+                terminal.agent
+            )
+        };
+        self.note(&note);
+        true
+    }
+
+    /// Ends a session: forgets it (which revokes its token), keeps how it
+    /// ended, tells its page and has the runner kill its whole session.
+    /// With `viewer`, only the page that shows it may.
+    pub fn end_terminal(&self, term_id: &str, viewer: Option<u64>, message: String) -> bool {
+        let (link, note) = {
+            let mut inner = self.inner();
+            let Some(terminal) = inner.terminals.get(term_id) else {
+                return false;
+            };
+            if let Some(viewer) = viewer
+                && terminal
+                    .viewer
+                    .as_ref()
+                    .is_none_or(|current| current.id != viewer)
+            {
+                return false;
+            }
+            let Some(terminal) = inner.terminals.remove(term_id) else {
+                return false;
+            };
+            let link = inner.links.get(&terminal.agent).map(|link| link.tx.clone());
+            let note = self.ended_locked(&mut inner, terminal, None, message);
+            (link, note)
         };
         if let Some(link) = link {
-            let _ = link
-                .send(ToRunner::TerminalClose {
-                    term_id: term_id.to_string(),
-                })
-                .await;
+            let close = ToRunner::TerminalClose {
+                term_id: term_id.to_string(),
+            };
+            if let Err(mpsc::error::TrySendError::Full(close)) = link.try_send(close) {
+                tokio::spawn(async move {
+                    let _ = link.send(close).await;
+                });
+            }
         }
+        self.note(&note);
+        true
+    }
+
+    /// Keeps how a session that was just taken out of the map ended and
+    /// tells its page; answers the activity note.
+    fn ended_locked(
+        &self,
+        inner: &mut Inner,
+        terminal: Terminal,
+        code: Option<i32>,
+        message: String,
+    ) -> String {
+        let at = unix_now();
+        let seen = terminal.viewer.as_ref().is_some_and(|viewer| {
+            viewer
+                .tx
+                .try_send(TerminalEvent::Exit {
+                    code,
+                    message: Some(message.clone()),
+                })
+                .is_ok()
+        });
+        let note = format!(
+            "{} in {} ended: {message}",
+            what(terminal.mode),
+            terminal.agent
+        );
+        inner.ended.insert(
+            (terminal.agent, terminal.mode),
+            EndedSession {
+                mode: terminal.mode,
+                at,
+                message,
+                seen,
+            },
+        );
+        let mut note = note;
+        if let Some(first) = note.get(..1) {
+            note = first.to_uppercase() + &note[1..];
+        }
+        note
+    }
+
+    /// Where a page stands whose events stopped coming.
+    pub fn terminal_viewer_state(
+        &self,
+        term_id: &str,
+        viewer: u64,
+        agent: &str,
+        mode: TerminalMode,
+    ) -> ViewerState {
+        let inner = self.inner();
+        match inner.terminals.get(term_id) {
+            Some(terminal) => match &terminal.viewer {
+                Some(current) if current.id == viewer => ViewerState::Current,
+                Some(other) => ViewerState::Elsewhere(Some(other.user.clone())),
+                None => ViewerState::Elsewhere(None),
+            },
+            None => ViewerState::Ended(inner.ended.get(&(agent.to_string(), mode)).cloned()),
+        }
+    }
+
+    /// The agent's running sessions.
+    pub fn terminal_sessions(&self, agent: &str) -> Vec<SessionView> {
+        let inner = self.inner();
+        let mut sessions: Vec<SessionView> = inner
+            .terminals
+            .values()
+            .filter(|terminal| terminal.agent == agent)
+            .map(|terminal| SessionView {
+                mode: terminal.mode,
+                started_at: terminal.started_at,
+                last_output_at: terminal.last_output_at,
+                opened_by: terminal.opener.username.clone(),
+                viewer: terminal.viewer.as_ref().map(|viewer| viewer.user.clone()),
+            })
+            .collect();
+        sessions.sort_by_key(|session| session.started_at);
+        sessions
+    }
+
+    /// How the agent's last sessions of each kind ended, while no new one
+    /// of that kind runs.
+    pub fn terminal_ended(&self, agent: &str) -> Vec<EndedSession> {
+        let inner = self.inner();
+        let mut ended: Vec<EndedSession> = inner
+            .ended
+            .iter()
+            .filter(|((name, _), _)| name == agent)
+            .map(|(_, ended)| ended.clone())
+            .collect();
+        ended.sort_by_key(|ended| ended.at);
+        ended
+    }
+
+    /// Since when a terminal session holds the agent's container (the
+    /// oldest one), or `None`: a run does not start while one is open.
+    pub fn terminal_busy(&self, agent: &str) -> Option<i64> {
+        self.inner()
+            .terminals
+            .values()
+            .filter(|terminal| terminal.agent == agent)
+            .map(|terminal| terminal.started_at)
+            .min()
     }
 
     /// How many terminals are open, in every agent.
@@ -949,9 +1540,10 @@ impl Hub {
     }
 
     /// The built-in agent a terminal token speaks for: the token belongs
-    /// to a terminal open right now, and the request comes from the
-    /// address that agent's runner is connected from (its container). A
-    /// closed terminal, a dropped link or another address: none.
+    /// to a session running right now (shown in a window or not), and the
+    /// request comes from the address that agent's runner is connected
+    /// from (its container). An ended session, a dropped link or another
+    /// address: none.
     pub fn terminal_token_agent(&self, presented: &str, peer: std::net::IpAddr) -> Option<String> {
         if !looks_like_terminal_token(presented) {
             return None;
@@ -966,34 +1558,46 @@ impl Hub {
         (link.address == Some(plain_ip(peer))).then(|| terminal.agent.clone())
     }
 
-    /// Terminal bytes from a runner, for the page that shows them. Only
-    /// the runner the terminal was opened in may write to it.
+    /// Terminal bytes from a runner: kept for the next page that attaches
+    /// and passed to the page showing the session, if any. Only the runner
+    /// the session was opened in may write to it.
     fn on_terminal_output(&self, agent: &str, term_id: &str, data: &str) {
         let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) else {
             return;
         };
-        let mut inner = self.inner();
-        let Some(terminal) = inner.terminals.get(term_id) else {
-            return;
-        };
-        if terminal.agent != agent {
-            return;
-        }
-        if terminal.tx.try_send(TerminalEvent::Output(bytes)).is_err() {
-            // The page does not keep up (or went): it loses the terminal
-            // rather than holding up the agent's whole link.
-            inner.terminals.remove(term_id);
-            let link = inner.links.get(agent).map(|link| link.tx.clone());
-            drop(inner);
-            tracing::warn!(%agent, %term_id, "a terminal's page fell behind; closing it");
-            if let Some(link) = link {
-                let _ = link.try_send(ToRunner::TerminalClose {
-                    term_id: term_id.to_string(),
-                });
+        let note = {
+            let mut inner = self.inner();
+            let Some(terminal) = inner.terminals.get_mut(term_id) else {
+                return;
+            };
+            if terminal.agent != agent {
+                return;
             }
-        }
+            terminal.replay.push(&bytes);
+            terminal.last_output_at = unix_now();
+            terminal.quiet_since = Instant::now();
+            let behind = terminal
+                .viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.tx.try_send(TerminalEvent::Output(bytes)).is_err());
+            if !behind {
+                return;
+            }
+            // The page does not keep up (or went): it is detached rather
+            // than holding up the agent's whole link; the session goes on.
+            let gone = terminal.viewer.take();
+            tracing::info!(%agent, %term_id, "a terminal's page fell behind; detached it");
+            format!(
+                "{} left {} in {agent} running (the window fell behind)",
+                gone.map(|viewer| viewer.user).unwrap_or_default(),
+                what(terminal.mode)
+            )
+        };
+        self.note(&note);
     }
 
+    /// A session ended in the container: the program exited, or it could
+    /// not be started.
     fn on_terminal_exit(
         &self,
         agent: &str,
@@ -1001,15 +1605,50 @@ impl Hub {
         code: Option<i32>,
         message: Option<String>,
     ) {
-        let mut inner = self.inner();
-        if inner
+        let note = {
+            let mut inner = self.inner();
+            if !inner
+                .terminals
+                .get(term_id)
+                .is_some_and(|terminal| terminal.agent == agent)
+            {
+                return;
+            }
+            let Some(terminal) = inner.terminals.remove(term_id) else {
+                return;
+            };
+            let message = message.unwrap_or_else(|| {
+                let program = match terminal.mode {
+                    TerminalMode::Cli => "the CLI",
+                    TerminalMode::Shell => "the shell",
+                };
+                match code {
+                    Some(code) => format!("{program} exited (exit code {code})"),
+                    None => format!("{program} exited"),
+                }
+            });
+            self.ended_locked(&mut inner, terminal, code, message)
+        };
+        self.note(&note);
+    }
+
+    /// Ends every session of an agent whose link went (replaced, or
+    /// closed): their PTYs died with the runner's session, and their tokens
+    /// must not outlive it.
+    fn end_link_terminals(&self, inner: &mut Inner, agent: &str, message: &str) -> Vec<String> {
+        let gone: Vec<String> = inner
             .terminals
-            .get(term_id)
-            .is_some_and(|terminal| terminal.agent == agent)
-            && let Some(terminal) = inner.terminals.remove(term_id)
-        {
-            let _ = terminal.tx.try_send(TerminalEvent::Exit { code, message });
+            .iter()
+            .filter(|(_, terminal)| terminal.agent == agent)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut notes = Vec::new();
+        for id in gone {
+            if let Some(terminal) = inner.terminals.remove(&id) {
+                notes.push(self.ended_locked(inner, terminal, None, message.to_string()));
+            }
         }
+        notes
     }
 
     /// Notes a sign-in the page started, before its prompt arrives.
@@ -1405,29 +2044,16 @@ impl Hub {
         }
         let (tx, mut rx) = mpsc::channel::<ToRunner>(64);
         let generation = self.next_id();
-        {
+        let ended = {
             let mut inner = self.inner();
-            // A replaced link takes its terminals with it: their PTYs died
-            // with the old runner session, and their tokens must not
-            // outlive it. Their pages hear why.
-            if inner.links.contains_key(&agent) {
-                let gone: Vec<String> = inner
-                    .terminals
-                    .iter()
-                    .filter(|(_, terminal)| terminal.agent == agent)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                for id in gone {
-                    if let Some(terminal) = inner.terminals.remove(&id) {
-                        let _ = terminal.tx.try_send(TerminalEvent::Exit {
-                            code: None,
-                            message: Some(
-                                "the agent's runner reconnected; open the terminal again".into(),
-                            ),
-                        });
-                    }
-                }
-            }
+            // A replaced link takes its terminal sessions with it: their
+            // PTYs died with the old runner session, and their tokens must
+            // not outlive it. Their pages hear why.
+            let ended = if inner.links.contains_key(&agent) {
+                self.end_link_terminals(&mut inner, &agent, "the agent's runner reconnected")
+            } else {
+                Vec::new()
+            };
             inner.links.insert(
                 agent.clone(),
                 Link {
@@ -1445,6 +2071,10 @@ impl Hub {
             {
                 let _ = tx.try_send(prefs);
             }
+            ended
+        };
+        for note in ended {
+            self.note(&note);
         }
         if let Err(error) = self.db.builtin_connected(
             &agent,
@@ -1466,19 +2096,22 @@ impl Hub {
         {
             self.pump(&agent, &mut socket, &mut rx).await;
         }
-        let current = {
+        let (current, ended) = {
             let mut inner = self.inner();
             let current = inner
                 .links
                 .get(&agent)
                 .is_some_and(|link| link.generation == generation);
+            let mut ended = Vec::new();
             if current {
                 inner.links.remove(&agent);
                 inner.resources.remove(&agent);
-                // Its terminals' pages see their channel close.
-                inner
-                    .terminals
-                    .retain(|_, terminal| terminal.agent != agent);
+                // Its terminal sessions died with the runner's session.
+                ended = self.end_link_terminals(
+                    &mut inner,
+                    &agent,
+                    "the agent's container disconnected",
+                );
                 // Whoever waits on this runner hears that it went.
                 inner.pending.retain(|_, (owner, _)| owner != &agent);
                 if let Some(login) = inner.logins.get_mut(&agent)
@@ -1491,8 +2124,11 @@ impl Hub {
                     login.message = "the agent's container disconnected".into();
                 }
             }
-            current
+            (current, ended)
         };
+        for note in ended {
+            self.note(&note);
+        }
         if current {
             let _ = self
                 .run_tx
@@ -1711,6 +2347,11 @@ esac
 
     /// lore's runner listener on a free port, with two built-in agents.
     async fn listen() -> Pair {
+        listen_tuned(None).await
+    }
+
+    /// The same, with a short terminal idle limit and a quick watch.
+    async fn listen_tuned(idle: Option<Duration>) -> Pair {
         let dir = temp_dir("pair");
         let db = Db::open(&dir.join("lore.db")).unwrap();
         let tokens = parse_runner_tokens(&format!(
@@ -1725,8 +2366,13 @@ esac
             })
             .collect();
         db.register_builtin_agents(&named).unwrap();
-        let hub =
-            Arc::new(Hub::new(db.clone(), tokens).with_mcp_url("http://127.0.0.1:9/mcp".into()));
+        let mut hub = Hub::new(db.clone(), tokens).with_mcp_url("http://127.0.0.1:9/mcp".into());
+        if let Some(idle) = idle {
+            hub = hub
+                .with_terminal_idle(idle)
+                .with_terminal_watch(Duration::from_millis(100));
+        }
+        let hub = Arc::new(hub);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/runner/ws", listener.local_addr().unwrap());
         let router = hub.clone().router();
@@ -1776,6 +2422,30 @@ esac
     }
 
     const WAIT: Duration = Duration::from_secs(20);
+
+    /// The built-in admin, as the one who opens a session.
+    fn owner() -> Opener {
+        Opener {
+            username: "admin".into(),
+            user_id: None,
+        }
+    }
+
+    /// A new session straight through the hub, as the owner's page would
+    /// open it.
+    async fn open_session(hub: &Arc<Hub>, agent: &str, mode: TerminalMode) -> Attached {
+        hub.terminal_attach(AttachRequest {
+            agent: agent.into(),
+            mode,
+            cols: 80,
+            rows: 24,
+            model: None,
+            opener: owner(),
+            fresh: true,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
 
     #[tokio::test]
     async fn a_runner_signs_in_with_a_pasted_token_that_lore_never_keeps() {
@@ -2217,8 +2887,19 @@ esac
                 "t-old".into(),
                 Terminal {
                     agent: "claude-builtin".into(),
-                    tx: page_tx,
+                    mode: TerminalMode::Cli,
                     token_hash: Some(crate::oauth::token_hash(&token)),
+                    opener: owner(),
+                    started_at: unix_now(),
+                    last_output_at: unix_now(),
+                    quiet_since: Instant::now(),
+                    replay: replay::Replay::default(),
+                    viewer: Some(Viewer {
+                        id: 1,
+                        user: "admin".into(),
+                        tx: page_tx,
+                        alive: Instant::now(),
+                    }),
                 },
             );
         }
@@ -2237,6 +2918,10 @@ esac
         );
         assert_eq!(pair.hub.terminal_count(), 0);
         assert_eq!(
+            pair.hub.terminal_ended("claude-builtin")[0].message,
+            "the agent's runner reconnected"
+        );
+        assert_eq!(
             auth.authenticate_terminal(&token, true, Some(local)).await,
             Err(Refused::Invalid)
         );
@@ -2247,7 +2932,24 @@ esac
         let pair = listen().await;
         let first = start(config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET));
         connected(&pair.hub, "claude-builtin").await;
+        // A terminal session dies with the link.
+        let mut session = open_session(&pair.hub, "claude-builtin", TerminalMode::Shell).await;
         first.abort();
+        let exit = tokio::time::timeout(WAIT, async {
+            loop {
+                match session.events.recv().await {
+                    Some(TerminalEvent::Output(_)) => continue,
+                    other => return other,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(&exit, Some(TerminalEvent::Exit { message: Some(why), .. }) if why == "the agent's container disconnected"),
+            "{exit:?}"
+        );
+        assert_eq!(pair.hub.terminal_count(), 0);
         for _ in 0..200 {
             if pair.hub.link("claude-builtin").is_none() {
                 break;
@@ -2754,14 +3456,24 @@ esac
         connected(&pair.hub, "claude-builtin").await;
         connected(&pair.hub, "codex-builtin").await;
 
-        async fn token_of(hub: &Hub, agent: &str, mode: TerminalMode) -> (String, String) {
-            let (term_id, mut rx) = hub.terminal_open(agent, mode, 80, 24, None).await.unwrap();
+        async fn token_of(
+            hub: &Arc<Hub>,
+            agent: &str,
+            mode: TerminalMode,
+        ) -> (String, u64, String) {
+            let Attached {
+                term_id,
+                viewer,
+                events: mut rx,
+                ..
+            } = open_session(hub, agent, mode).await;
             if mode == TerminalMode::Shell {
                 // The shell prints it when asked (split, so the echoed
                 // command line does not match).
                 let typed = "printf 'to%s\\n' \"k:${LORE_AGENT_TOKEN:-none}:\"\r";
                 hub.terminal_send(
                     &term_id,
+                    viewer,
                     ToRunner::TerminalInput {
                         term_id: term_id.clone(),
                         data: base64::engine::general_purpose::STANDARD.encode(typed),
@@ -2784,13 +3496,18 @@ esac
                 {
                     // Keep the receiver alive: the terminal stays open.
                     std::mem::forget(rx);
-                    return (term_id, text[start + 4..start + 4 + end].to_string());
+                    return (
+                        term_id,
+                        viewer,
+                        text[start + 4..start + 4 + end].to_string(),
+                    );
                 }
             }
         }
-        let (claude_term, token) = token_of(&pair.hub, "claude-builtin", TerminalMode::Cli).await;
+        let (claude_term, claude_viewer, token) =
+            token_of(&pair.hub, "claude-builtin", TerminalMode::Cli).await;
         assert!(looks_like_terminal_token(&token), "{token}");
-        let (codex_term, codex_token) =
+        let (codex_term, _, codex_token) =
             token_of(&pair.hub, "codex-builtin", TerminalMode::Cli).await;
         assert_ne!(token, codex_token);
 
@@ -2843,13 +3560,38 @@ esac
             Err(Refused::Invalid)
         );
         // A shell gets no token.
-        let (shell_term, shell_token) =
+        let (shell_term, _, shell_token) =
             token_of(&pair.hub, "claude-builtin", TerminalMode::Shell).await;
         assert_eq!(shell_token, "none");
-        pair.hub.terminal_close(&shell_term).await;
+        pair.hub
+            .end_terminal(&shell_term, None, "ended by the test".into());
 
-        // Closed: the token is gone; the other agent's still works.
-        pair.hub.terminal_close(&claude_term).await;
+        // The CLI exits by itself (its `read` gets a line): the session
+        // ends and its token is gone; the other agent's still works.
+        pair.hub
+            .terminal_send(
+                &claude_term,
+                claude_viewer,
+                ToRunner::TerminalInput {
+                    term_id: claude_term.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode("\r"),
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..250 {
+            if pair.hub.terminal_sessions("claude-builtin").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(pair.hub.terminal_sessions("claude-builtin").is_empty());
+        let ended = pair.hub.terminal_ended("claude-builtin");
+        assert!(
+            ended.iter().any(|ended| ended.mode == TerminalMode::Cli
+                && ended.message == "the CLI exited (exit code 0)"),
+            "{ended:?}"
+        );
         assert_eq!(
             auth.authenticate_terminal(&token, true, Some(runner)).await,
             Err(Refused::Invalid)
@@ -2859,7 +3601,8 @@ esac
                 .await,
             Ok(Authenticated::Terminal("codex-builtin".into()))
         );
-        pair.hub.terminal_close(&codex_term).await;
+        pair.hub
+            .end_terminal(&codex_term, None, "ended by the test".into());
         assert_eq!(
             auth.authenticate_terminal(&codex_token, true, Some(runner))
                 .await,
@@ -3008,51 +3751,6 @@ esac
         assert_eq!(exit["code"], 5);
         assert_eq!(pair.hub.terminal_count(), 0);
 
-        // A page that goes closes its terminal; two at most per agent.
-        let mut first = terminal_socket(&base, Some(&admin), Some(&origin))
-            .await
-            .unwrap();
-        let mut second = terminal_socket(&base, Some(&admin), Some(&origin))
-            .await
-            .unwrap();
-        let mut third = terminal_socket(&base, Some(&admin), Some(&origin))
-            .await
-            .unwrap();
-        for socket in [&mut first, &mut second] {
-            socket
-                .send(Ws::text(
-                    r#"{"type":"open","mode":"cli","cols":80,"rows":24}"#,
-                ))
-                .await
-                .unwrap();
-            let mut text = String::new();
-            until(socket, &mut text, "24 80").await;
-        }
-        third
-            .send(Ws::text(
-                r#"{"type":"open","mode":"cli","cols":80,"rows":24}"#,
-            ))
-            .await
-            .unwrap();
-        let refused = until(&mut third, &mut String::new(), "").await.unwrap();
-        assert_eq!(refused["type"], "error");
-        assert!(
-            refused["message"]
-                .as_str()
-                .unwrap()
-                .contains("two terminals")
-        );
-        assert_eq!(pair.hub.terminal_count(), 2);
-        drop(first);
-        second.close(None).await.unwrap();
-        for _ in 0..250 {
-            if pair.hub.terminal_count() == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(pair.hub.terminal_count(), 0);
-
         // Who opened it is noted; what was typed or shown is not kept.
         let feed = format!("{:?}", pair.db.activity(20).unwrap());
         assert!(
@@ -3065,111 +3763,421 @@ esac
         }
     }
 
-    /// An open terminal does not outlive the sign-in or the permission it
-    /// was opened with: lore looks again while it is open and closes it
-    /// with a sentence saying why.
-    #[tokio::test]
-    async fn an_open_terminal_closes_when_the_session_or_the_permission_goes() {
-        use futures_util::{SinkExt, StreamExt};
+    type PageSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Reads a terminal page's socket: terminal bytes go into `text`
+    /// until it holds `wanted` (answers `None`); a JSON frame whose type
+    /// is in `stop` is answered (`closed` stands for the socket's end);
+    /// other JSON frames are passed over.
+    async fn page_read(
+        socket: &mut PageSocket,
+        text: &mut String,
+        wanted: &str,
+        stop: &[&str],
+    ) -> Option<serde_json::Value> {
+        use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message as Ws;
-        let pair = listen().await;
-        let base = admin_server_with(&pair, Some(Duration::from_millis(150))).await;
-        let mut config = config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET);
-        let program = pair.dir.join("claude-waits");
-        std::fs::write(
-            &program,
-            "#!/bin/sh\ncase \"$1\" in --version) echo \"2.1.328 (Claude Code)\"; exit 0;; \
-             auth) echo \"Not logged in\"; exit 1;; esac\necho ready; read line; exit 0\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let frame = tokio::time::timeout_at(deadline, socket.next())
+                .await
+                .unwrap_or_else(|_| panic!("waited for {wanted:?} or {stop:?}; got {text:?}"));
+            match frame {
+                Some(Ok(Ws::Binary(bytes))) => {
+                    text.push_str(&String::from_utf8_lossy(&bytes));
+                    if !wanted.is_empty() && text.contains(wanted) {
+                        return None;
+                    }
+                }
+                Some(Ok(Ws::Text(json))) => {
+                    let value: serde_json::Value = serde_json::from_str(json.as_str()).unwrap();
+                    if stop.contains(&value["type"].as_str().unwrap_or("")) {
+                        return Some(value);
+                    }
+                }
+                Some(Ok(Ws::Close(_))) | Some(Err(_)) | None => {
+                    if stop.contains(&"closed") {
+                        return Some(serde_json::json!({ "type": "closed" }));
+                    }
+                    panic!(
+                        "the socket closed while waiting for {wanted:?} or {stop:?}; got {text:?}"
+                    );
+                }
+                Some(Ok(_)) => {}
+            }
         }
-        config.settings.program = program;
-        start(config);
-        connected(&pair.hub, "claude-builtin").await;
-        let operator = pair
+    }
+
+    /// A page's `open` frame.
+    fn open_frame(mode: &str, cols: u16, rows: u16, fresh: bool) -> String {
+        serde_json::json!({ "type": "open", "mode": mode, "cols": cols, "rows": rows, "fresh": fresh })
+            .to_string()
+    }
+
+    async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("waited in vain for {what}");
+    }
+
+    /// A user with these permissions, signed in.
+    async fn user(
+        pair: &Pair,
+        http: &reqwest::Client,
+        base: &str,
+        name: &str,
+        permissions: &[&str],
+    ) -> (i64, String) {
+        let password = format!("{name}-password");
+        let added = pair
             .db
             .add_user(&crate::db::NewUser {
-                username: "operator".into(),
+                username: name.into(),
                 email: None,
-                password_hash: crate::users::hash_password("operator-password").unwrap(),
-                permissions: crate::users::Perms::parse(&["agents", "users"]).unwrap(),
+                password_hash: crate::users::hash_password(&password).unwrap(),
+                permissions: crate::users::Perms::parse(permissions).unwrap(),
                 created_by: "admin".into(),
             })
             .unwrap();
+        (added.id, sign_in(http, base, name, &password).await)
+    }
+
+    /// The owner's request: a session goes on when its window goes, and
+    /// the next window resumes it (the recent screen first, then live
+    /// output, redrawn at its size) instead of starting another. A second
+    /// window takes it over; End session ends it. The feed says who did
+    /// what, never what was shown or typed.
+    #[tokio::test]
+    async fn a_session_outlives_its_window_and_the_next_window_resumes_it() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as Ws;
+        let pair = listen().await;
+        let base = admin_server(&pair).await;
+        start(config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET));
+        connected(&pair.hub, "claude-builtin").await;
         let http = reqwest::Client::new();
+        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let (_, operator) = user(&pair, &http, &base, "operator", &["agents"]).await;
         let origin = base.clone();
 
-        /// Opens a terminal and waits until the program in it has printed.
-        async fn open(
-            base: &str,
-            cookie: &str,
-            origin: &str,
-        ) -> tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        > {
-            let mut socket = terminal_socket(base, Some(cookie), Some(origin))
-                .await
-                .unwrap();
-            socket
-                .send(Ws::text(
-                    r#"{"type":"open","mode":"cli","cols":80,"rows":24}"#,
-                ))
-                .await
-                .unwrap();
-            let mut text = String::new();
-            while !text.contains("ready") {
-                let frame = tokio::time::timeout(Duration::from_secs(15), socket.next())
-                    .await
-                    .expect("the terminal never printed")
-                    .unwrap()
-                    .unwrap();
-                if let Ws::Binary(bytes) = frame {
-                    text.push_str(&String::from_utf8_lossy(&bytes));
-                }
-            }
-            socket
-        }
-        /// The `exit` frame lore sends, then the socket's end.
-        async fn closed(
-            socket: &mut tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-        ) -> serde_json::Value {
-            let mut exit = None;
-            loop {
-                let frame = tokio::time::timeout(Duration::from_secs(15), socket.next())
-                    .await
-                    .expect("the terminal stayed open");
-                match frame {
-                    Some(Ok(Ws::Text(json))) => {
-                        exit = Some(serde_json::from_str(json.as_str()).unwrap());
-                    }
-                    Some(Ok(Ws::Close(_))) | Some(Err(_)) | None => {
-                        return exit.expect("the socket closed without a reason");
-                    }
-                    Some(Ok(_)) => {}
-                }
-            }
-        }
-        async fn none_left(hub: &Hub) {
-            for _ in 0..250 {
-                if hub.terminal_count() == 0 {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            panic!("the terminal was not closed in the container");
-        }
-
-        // Still signed in, still allowed: several checks pass, it stays.
-        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
-        let mut socket = open(&base, &admin, &origin).await;
+        let mut first = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        first
+            .send(Ws::text(open_frame("shell", 80, 24, false)))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        let opened = page_read(&mut first, &mut text, "", &["opened"])
+            .await
+            .unwrap();
+        assert_eq!(opened["opened_by"], "admin");
+        first
+            .send(Ws::binary(
+                // In the foreground job (which a window change signals),
+                // waiting so the trap runs at once.
+                b"sh -c 'trap \"echo winch:\\$(stty size):\" WINCH; i=0; while :; do \
+                  i=$((i+1)); echo \"count-$i.\"; sleep 0.2 & wait $!; done'\r"
+                    .to_vec(),
+            ))
+            .await
+            .unwrap();
+        page_read(&mut first, &mut text, "count-3.", &[]).await;
+        // The window goes: the session does not.
+        drop(first);
+        wait_for("the window to be detached", || {
+            pair.hub
+                .terminal_sessions("claude-builtin")
+                .first()
+                .is_some_and(|session| session.viewer.is_none())
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(600)).await;
+        let sessions = pair.hub.terminal_sessions("claude-builtin");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].opened_by, "admin");
+        assert_eq!(sessions[0].mode, TerminalMode::Shell);
+
+        // The next window resumes it at its own size.
+        let mut second = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        second
+            .send(Ws::text(open_frame("shell", 100, 30, false)))
+            .await
+            .unwrap();
+        let mut replayed = String::new();
+        let attached = page_read(&mut second, &mut replayed, "", &["attached", "opened"])
+            .await
+            .unwrap();
+        assert_eq!(attached["type"], "attached", "{attached}");
+        assert_eq!(attached["opened_by"], "admin");
+        page_read(&mut second, &mut replayed, "", &["replayed"]).await;
+        assert!(replayed.contains("count-1."), "{replayed}");
+        let last = replayed
+            .split("count-")
+            .filter_map(|part| part.split('.').next()?.parse::<u32>().ok())
+            .max()
+            .unwrap();
+        // Output went on while no window showed it: it is in the replay.
+        assert!(last >= 6, "{replayed}");
+        let mut live = String::new();
+        // The program is made to redraw: one column off, then the size.
+        page_read(&mut second, &mut live, "winch:30 100:", &[]).await;
+        assert!(live.contains("winch:30 99:"), "{live}");
+        page_read(&mut second, &mut live, &format!("count-{}.", last + 3), &[]).await;
+        assert!(!live.contains("count-1."), "{live}");
+        // Typing reaches it.
+        second.send(Ws::binary(b"\x03".to_vec())).await.unwrap();
+        second
+            .send(Ws::binary(b"echo typed-$((6*7))\r".to_vec()))
+            .await
+            .unwrap();
+        page_read(&mut second, &mut live, "typed-42", &[]).await;
+
+        // Another window, another user with `agents`, takes it over.
+        let mut third = terminal_socket(&base, Some(&operator), Some(&origin))
+            .await
+            .unwrap();
+        third
+            .send(Ws::text(open_frame("shell", 100, 30, false)))
+            .await
+            .unwrap();
+        let mut seen = String::new();
+        page_read(&mut third, &mut seen, "", &["attached"]).await;
+        let taken = page_read(&mut second, &mut String::new(), "", &["taken"])
+            .await
+            .unwrap();
+        assert_eq!(taken["by"], "operator");
+        assert_eq!(
+            page_read(&mut second, &mut String::new(), "", &["closed"])
+                .await
+                .unwrap()["type"],
+            "closed"
+        );
+        // The window that lost it cannot type into it.
+        assert_eq!(
+            pair.hub.terminal_sessions("claude-builtin")[0]
+                .viewer
+                .as_deref(),
+            Some("operator")
+        );
+        page_read(&mut third, &mut seen, "", &["replayed"]).await;
+        assert!(seen.contains("typed-42"), "{seen}");
+
+        // End session: it ends, the window says why, nothing is left.
+        third.send(Ws::text(r#"{"type":"end"}"#)).await.unwrap();
+        let exit = page_read(&mut third, &mut String::new(), "", &["exit"])
+            .await
+            .unwrap();
+        assert_eq!(exit["message"], "operator ended it with End session");
+        assert!(exit["at"].as_i64().unwrap() > 0);
+        assert_eq!(pair.hub.terminal_count(), 0);
+        // The window saw it end: opening again starts a new one.
+        let mut fourth = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        fourth
+            .send(Ws::text(open_frame("shell", 80, 24, false)))
+            .await
+            .unwrap();
+        page_read(&mut fourth, &mut String::new(), "", &["opened"]).await;
+        fourth.send(Ws::text(r#"{"type":"end"}"#)).await.unwrap();
+        page_read(&mut fourth, &mut String::new(), "", &["exit"]).await;
+
+        let feed: Vec<String> = pair
+            .db
+            .activity(40)
+            .unwrap()
+            .into_iter()
+            .map(|activity| activity.summary)
+            .collect();
+        for line in [
+            "admin opened a shell in claude-builtin",
+            "admin left a shell in claude-builtin running",
+            "admin resumed a shell in claude-builtin",
+            "operator took over a shell in claude-builtin from admin",
+            "A shell in claude-builtin ended: operator ended it with End session",
+        ] {
+            assert!(
+                feed.iter().any(|summary| summary == line),
+                "{line} in {feed:?}"
+            );
+        }
+        for file in ["lore.db", "lore.db-wal"] {
+            let bytes = std::fs::read(pair.dir.join(file)).unwrap_or_default();
+            let bytes = String::from_utf8_lossy(&bytes);
+            assert!(!bytes.contains("count-1.") && !bytes.contains("typed-42"));
+        }
+    }
+
+    /// A fake CLI that prints its lore token, then a line every 200 ms
+    /// for 1.6 s, then waits for input.
+    fn chatty_cli(pair: &Pair) -> std::path::PathBuf {
+        let program = pair.dir.join("claude-chatty");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ncase \"$1\" in --version) echo \"2.1.328 (Claude Code)\"; exit 0;; \
+             auth) echo \"Not logged in\"; exit 1;; esac\n\
+             echo \"tok:${LORE_AGENT_TOKEN:-none}:\"\n\
+             for i in 1 2 3 4 5 6 7 8; do sleep 0.2; echo \"out-$i\"; done\n\
+             echo ready; read line\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    fn token_in(text: &str) -> String {
+        let start = text.find("tok:").unwrap() + 4;
+        let end = text[start..].find(':').unwrap();
+        text[start..start + end].to_string()
+    }
+
+    /// A session nobody looks at ends after the idle limit without
+    /// output, never while output keeps coming nor while a window shows
+    /// it. The owner who comes back hears why and when, and a new session
+    /// starts only when asked.
+    #[tokio::test]
+    async fn an_idle_session_ends_and_the_window_says_why_instead_of_starting_another() {
+        use crate::auth::{Authenticated, McpAuth, Refused};
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as Ws;
+        let pair = listen_tuned(Some(Duration::from_millis(800))).await;
+        let base = admin_server(&pair).await;
+        let mut config = config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET);
+        config.settings.program = chatty_cli(&pair);
+        start(config);
+        connected(&pair.hub, "claude-builtin").await;
+        let http = reqwest::Client::new();
+        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let origin = base.clone();
+        let mut auth = McpAuth::new(Vec::new(), pair.db.clone(), false);
+        auth.terminals = Some(pair.hub.clone());
+        let runner: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        let mut socket = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        socket
+            .send(Ws::text(open_frame("cli", 80, 24, false)))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        page_read(&mut socket, &mut text, "out-1", &[]).await;
+        let token = token_in(&text);
+        drop(socket);
+        // Detached and printing: it lives, and so does its token.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(pair.hub.terminal_count(), 1);
-        // Signing out ends the session: the terminal goes with it.
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, Some(runner)).await,
+            Ok(Authenticated::Terminal("claude-builtin".into()))
+        );
+        // Silent and unseen past the limit: it ends, with its token.
+        wait_for("the idle limit", || pair.hub.terminal_count() == 0).await;
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, Some(runner)).await,
+            Err(Refused::Invalid)
+        );
+        let ended = pair.hub.terminal_ended("claude-builtin");
+        assert!(
+            ended[0].message.contains("printed nothing") && ended[0].message.contains("nobody"),
+            "{ended:?}"
+        );
+
+        // The owner comes back: the window says why and when; nothing new
+        // starts.
+        let mut socket = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        socket
+            .send(Ws::text(open_frame("cli", 80, 24, false)))
+            .await
+            .unwrap();
+        let said = page_read(
+            &mut socket,
+            &mut String::new(),
+            "",
+            &["ended", "opened", "attached"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(said["type"], "ended", "{said}");
+        assert!(
+            said["message"]
+                .as_str()
+                .unwrap()
+                .contains("printed nothing")
+        );
+        assert_eq!(said["at"].as_i64(), Some(ended[0].at));
+        assert_eq!(pair.hub.terminal_count(), 0);
+
+        // "New session" starts one; a window that shows it keeps it,
+        // silent or not.
+        let mut socket = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        socket
+            .send(Ws::text(open_frame("cli", 80, 24, true)))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        page_read(&mut socket, &mut text, "ready", &[]).await;
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert_eq!(pair.hub.terminal_count(), 1);
+        // Hidden or closed: the limit counts again.
+        socket.send(Ws::text(r#"{"type":"hide"}"#)).await.unwrap();
+        wait_for("the idle limit after hiding", || {
+            pair.hub.terminal_count() == 0
+        })
+        .await;
+        let feed = format!("{:?}", pair.db.activity(40).unwrap());
+        assert!(
+            feed.contains("The CLI's terminal in claude-builtin ended: it printed nothing"),
+            "{feed}"
+        );
+    }
+
+    /// Signing out of one browser detaches that window and leaves the
+    /// session; the session itself ends when the user who opened it loses
+    /// the `agents` permission (or is deleted or disabled), shown in a
+    /// window or not, and its token goes with it.
+    #[tokio::test]
+    async fn a_session_ends_when_its_opener_may_no_longer_have_it() {
+        use crate::auth::{Authenticated, McpAuth, Refused};
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as Ws;
+        let pair = listen_tuned(Some(Duration::from_secs(3600))).await;
+        let base = admin_server_with(&pair, Some(Duration::from_millis(150))).await;
+        let mut config = config(&pair, "claude-builtin", Kind::Claude, CLAUDE_SECRET);
+        config.settings.program = chatty_cli(&pair);
+        start(config);
+        connected(&pair.hub, "claude-builtin").await;
+        let http = reqwest::Client::new();
+        let origin = base.clone();
+        let mut auth = McpAuth::new(Vec::new(), pair.db.clone(), false);
+        auth.terminals = Some(pair.hub.clone());
+        let runner: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        // The admin signs out: the window is detached, the session stays.
+        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let mut socket = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        socket
+            .send(Ws::text(open_frame("cli", 80, 24, false)))
+            .await
+            .unwrap();
+        page_read(&mut socket, &mut String::new(), "ready", &[]).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let out = http
             .post(format!("{base}/admin/api/logout"))
             .header(header::COOKIE, &admin)
@@ -3177,44 +4185,139 @@ esac
             .await
             .unwrap();
         assert_eq!(out.status(), 200);
-        let exit = closed(&mut socket).await;
-        assert_eq!(exit["type"], "exit");
+        let detached = page_read(&mut socket, &mut String::new(), "", &["detached"])
+            .await
+            .unwrap();
         assert!(
-            exit["message"]
+            detached["message"]
                 .as_str()
                 .unwrap()
-                .contains("your session has ended"),
-            "{exit}"
+                .contains("your sign-in has ended"),
+            "{detached}"
         );
-        none_left(&pair.hub).await;
-
-        // The permission is removed while the session stays.
-        let cookie = sign_in(&http, &base, "operator", "operator-password").await;
-        let mut socket = open(&base, &cookie, &origin).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(pair.hub.terminal_count(), 1);
+        // Signed in again, the admin resumes it, then ends it.
+        let admin = sign_in(&http, &base, "admin", "admin-password-long").await;
+        let mut socket = terminal_socket(&base, Some(&admin), Some(&origin))
+            .await
+            .unwrap();
+        socket
+            .send(Ws::text(open_frame("cli", 80, 24, false)))
+            .await
+            .unwrap();
+        let mut replayed = String::new();
+        page_read(&mut socket, &mut replayed, "", &["replayed"]).await;
+        assert!(replayed.contains("ready"), "{replayed}");
+        socket.send(Ws::text(r#"{"type":"end"}"#)).await.unwrap();
+        page_read(&mut socket, &mut String::new(), "", &["exit"]).await;
+        assert_eq!(pair.hub.terminal_count(), 0);
+
+        // An operator opens one and closes the window; then loses `agents`.
+        let (operator_id, operator) =
+            user(&pair, &http, &base, "operator", &["agents", "users"]).await;
+        let mut socket = terminal_socket(&base, Some(&operator), Some(&origin))
+            .await
+            .unwrap();
+        socket
+            .send(Ws::text(open_frame("cli", 80, 24, true)))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        page_read(&mut socket, &mut text, "out-1", &[]).await;
+        let token = token_in(&text);
+        drop(socket);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(pair.hub.terminal_count(), 1);
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, Some(runner)).await,
+            Ok(Authenticated::Terminal("claude-builtin".into()))
+        );
         let changed = http
-            .put(format!("{base}/admin/api/users/{}", operator.id))
-            .header(header::COOKIE, &cookie)
+            .put(format!("{base}/admin/api/users/{operator_id}"))
+            .header(header::COOKIE, &operator)
             .json(&serde_json::json!({ "permissions": ["users"] }))
             .send()
             .await
             .unwrap();
         assert_eq!(changed.status(), 200, "{}", changed.text().await.unwrap());
-        let exit = closed(&mut socket).await;
-        assert!(
-            exit["message"]
-                .as_str()
-                .unwrap()
-                .contains("no longer has the agents permission"),
-            "{exit}"
+        wait_for("the opener check", || pair.hub.terminal_count() == 0).await;
+        assert_eq!(
+            auth.authenticate_terminal(&token, true, Some(runner)).await,
+            Err(Refused::Invalid)
         );
-        none_left(&pair.hub).await;
+        assert_eq!(
+            pair.hub.terminal_ended("claude-builtin")[0].message,
+            "operator, who opened it, no longer has the agents permission"
+        );
         // And it cannot be opened again.
         assert_eq!(
-            terminal_socket(&base, Some(&cookie), Some(&origin))
+            terminal_socket(&base, Some(&operator), Some(&origin))
                 .await
                 .err(),
             Some(403)
+        );
+    }
+
+    /// Deleted, disabled, without `agents`, or not a user at all: the
+    /// opener check says why; the built-in admin always may.
+    #[test]
+    fn the_opener_check_names_every_reason() {
+        let dir = temp_dir("opener");
+        let db = Db::open(&dir.join("lore.db")).unwrap();
+        let add = |name: &str, perms: &[&str]| {
+            db.add_user(&crate::db::NewUser {
+                username: name.into(),
+                email: None,
+                password_hash: "x".into(),
+                permissions: crate::users::Perms::parse(perms).unwrap(),
+                created_by: "admin".into(),
+            })
+            .unwrap()
+        };
+        let opener = |user: &crate::db::User| Opener {
+            username: user.username.clone(),
+            user_id: Some(user.id),
+        };
+        assert_eq!(opener_gone(&db, &owner()), None);
+        assert!(
+            opener_gone(
+                &db,
+                &Opener {
+                    username: "viewer".into(),
+                    user_id: None
+                }
+            )
+            .is_some()
+        );
+        let keeper = add("keeper", &["agents"]);
+        assert_eq!(opener_gone(&db, &opener(&keeper)), None);
+        let writer = add("writer", &["write"]);
+        assert!(
+            opener_gone(&db, &opener(&writer))
+                .unwrap()
+                .contains("no longer has the agents permission")
+        );
+        let disabled = add("sleeper", &["agents"]);
+        db.update_user(
+            disabled.id,
+            &crate::db::UserPatch {
+                disabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            opener_gone(&db, &opener(&disabled))
+                .unwrap()
+                .contains("was disabled")
+        );
+        let gone = add("leaver", &["agents"]);
+        db.delete_user(gone.id).unwrap();
+        assert!(
+            opener_gone(&db, &opener(&gone))
+                .unwrap()
+                .contains("was deleted")
         );
     }
 
