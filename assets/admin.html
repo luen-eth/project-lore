@@ -243,9 +243,9 @@
     <button id="backup-import" class="ghost" type="button"><b>Import and merge</b><span>Add the entries, sessions and rules from a backup that are not here yet. Nothing is removed.</span></button>
     <button id="backup-restore" class="ghost danger" type="button"><b>Restore from backup</b><span>Replace everything here with the contents of a backup file.</span></button>
     <h4>Full database (.sqlite)</h4>
-    <button id="full-download" class="ghost" type="button"><b>Download</b><span>The whole database exactly as stored: memories, sessions, activity, board, every file version, profile, rules, the encrypted credentials, service levels, the operations log and the users with their password hashes. Keep it private.</span></button>
+    <button id="full-download" class="ghost" type="button"><b>Download</b><span>The whole database exactly as stored: memories, sessions, activity, board, every file version, profile, rules, the encrypted credentials, service levels, the operations log, the users with their password hashes, passkeys (public keys only), the authenticator-app secrets (encrypted with LORE_VAULT_KEY), recovery-code hashes and the sign-in log. Keep it private.</span></button>
     <div id="full-restore-box" class="full-restore">
-      <p class="small-text">Restoring replaces everything here with the uploaded database, its users, passwords, permissions and agent tokens included, so it is only for users who hold every permission. Restoring an older backup brings back deleted users and old passwords. A safety copy of the current database is kept on the server first.</p>
+      <p class="small-text">Restoring replaces everything here with the uploaded database, its users, passwords, permissions and agent tokens included, so it is only for users who hold every permission. Restoring an older backup brings back deleted users and old passwords; its passkeys, authenticator apps and recovery codes replace today's, and a backup from before these existed removes every second step and lets the built-in users in with the environment passwords again. A safety copy of the current database is kept on the server first.</p>
       <label class="board-field"><span>Type RESTORE to enable it</span>
         <input id="full-confirm" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="RESTORE">
       </label>

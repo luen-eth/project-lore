@@ -937,14 +937,43 @@ stored users.
 ### Users and permissions
 
 Sign-in asks for a user name and a password and is protected by invisible
-reCAPTCHA v3. A stored user may also type their e-mail address as the user name.
-Two users are built in and come from the environment; they are never stored and
-cannot be changed in the page:
+reCAPTCHA v3; when the account has a second step (a passkey, an authenticator app
+or a recovery code) that follows, and a passkey can also sign in alone (see
+[Passkeys and two-step sign-in](#passkeys-and-two-step-sign-in)). A stored user may
+also type their e-mail address as the user name. When Google's verification service
+cannot be reached, lore tries once more and then answers *"The sign-in check could
+not reach Google's reCAPTCHA service; try again"* (`503`); *"The request looked
+automated"* is kept for tokens Google refuses.
+
+Two users are built in. Whether they exist is decided by the environment; their
+password starts as the environment value and can then be changed on the page:
 
 | User | Password | Can do |
 |---|---|---|
-| `admin` | `LORE_ADMIN_PASSWORD` | every permission |
-| `viewer` | `LORE_VIEWER_PASSWORD` (only when set) | read only: the graph, the sessions and the live activity, entries, the profile, the board, the integrations, and reading and downloading files |
+| `admin` | `LORE_ADMIN_PASSWORD`, or the one set on the page | every permission |
+| `viewer` | `LORE_VIEWER_PASSWORD` (only when set), or the one set on the page | read only: the graph, the sessions and the live activity, entries, the profile, the board, the integrations, and reading and downloading files |
+
+**Passwords.** Every signed-in user changes their own password under
+**Profile → Security**, with the current one. A password set on the page for a
+built-in user is stored as an Argon2id hash (table `builtin_passwords`) and from
+then on **replaces** the environment value, which no longer signs in; *Use the
+environment password again* (a fresh sign-in needed) drops it. The rules for a new
+password: 10 to 256 characters for stored users, **12** for `admin` and `viewer`;
+not containing the user name (names of three or more characters; an equal password
+always), not the e-mail address or its part before `@` (case and surrounding spaces
+ignored), not the current password, and the two built-in passwords never the same
+(an empty user name tries `admin` first). Who sets whose password: a stored user's
+by anyone who may manage them (below); the viewer's by a user holding `users`;
+**admin's only by the built-in admin itself**. A password change ends the account's
+other sessions and moves the current one to a new token.
+
+**Break-glass** (when admin's password or second step is lost): in Dokploy add
+`LORE_ADMIN_BREAK_GLASS=on` to lore's environment and redeploy; sign in as `admin`
+with `LORE_ADMIN_PASSWORD` (it works even after a page password was set, and asks
+for no second step; the page shows a red banner, lore warns at start-up and logs
+`signin.break_glass` with the address); change the password and/or reset admin's
+second steps under **Profile → Security**; remove the variable and redeploy.
+There is no break-glass for the viewer: admin resets it.
 
 A sign-in without a user name (an old cached page) is tried as `admin` and then as
 `viewer`, as before user names existed.
@@ -965,7 +994,10 @@ can read everything the viewer reads.
 | `agents` | manage agents (display name, avatar, note, disable, revoke, delete an authorization) and approve new ones on the OAuth consent page; sign the built-in agents in and out and set their model, switches, daily cap and active hours. Approving gives the agent the shared memory, the board and the files; service access only when the approver also holds `integrations` (see *Without a token*) |
 | `users` | add, change and delete users, within the limits below |
 
-A user can be edited (e-mail, permissions, disabled, a new password) or deleted;
+A user can be edited (e-mail, permissions, disabled, a new password; setting a
+password needs a fresh sign-in) or deleted, and their second steps reset (*Reset
+second steps*, a fresh sign-in needed; not for yourself, use your own Security
+section; their sessions end);
 nobody can remove `users` from themselves, nor disable or delete themselves.
 **Nobody grants what they do not hold:** a user with `users` can give a new or an
 existing user (themselves included) only permissions they hold themselves, and
@@ -974,7 +1006,8 @@ permission they lack. The built-in `admin` holds every permission. The page disa
 the checkboxes the signed-in user cannot grant and hides Edit and Delete for stronger
 users; the server refuses the same with `403`. A new
 password, other permissions, disabling or deleting a user ends that user's sessions.
-Stored users change their own password, with the current one, under **Profile**.
+The viewer's password and second steps are set and reset in the built-in section
+of the panel with `users`; admin's only by admin.
 The page shows each control only with its permission and the server checks the same
 permission on every route, so hiding a button is not what keeps the data in.
 
@@ -987,7 +1020,22 @@ Every admin route is mapped to exactly one access level in a table in
 | `GET` | `/admin/api/session` | nothing |
 | `POST` | `/admin/api/login`, `/admin/api/logout` | nothing |
 | `GET` | `/admin/api/brain`, `/pulse`, `/events`, `/entries/{id}`, `/profile`, `/sessions`, `/sessions/{id}`, `/board`, `/files`, `/files/{id}`, `/files/{id}/download`, `/integrations` | signed in |
-| `PUT` | `/admin/api/password` (own password, stored users) | signed in |
+| `PUT` | `/admin/api/password` (own password, every user) | signed in |
+| `DELETE` | `/admin/api/password` (built-in users: back to the environment password) (fresh) | signed in |
+| `PUT` | `/admin/api/builtin-users/{name}/password` (fresh) | signed in; viewer: `users`; admin: only admin |
+| `DELETE` | `/admin/api/builtin-users/{name}/second-factors` (fresh) | signed in; viewer: `users`; admin: only admin |
+| `GET` | `/admin/signin.js` | nothing |
+| `POST` | `/admin/api/login/second-factor/passkey-options`, `/admin/api/login/second-factor` (need the `lore_pending` cookie), `/admin/api/login/cancel`, `/admin/api/login/passkey/options`, `/admin/api/login/passkey` | nothing |
+| `GET` | `/admin/api/security` | signed in |
+| `POST` | `/admin/api/security/reauth/options`, `/admin/api/security/reauth` | signed in |
+| `POST` | `/admin/api/security/passkeys/options`, `/admin/api/security/passkeys` (fresh) | signed in |
+| `PUT` | `/admin/api/security/passkeys/{id}` (rename) | signed in |
+| `DELETE` | `/admin/api/security/passkeys/{id}` (fresh) | signed in |
+| `POST` | `/admin/api/security/totp/setup`, `/admin/api/security/totp/confirm` (fresh) | signed in |
+| `DELETE` | `/admin/api/security/totp` (fresh) | signed in |
+| `POST` | `/admin/api/security/recovery-codes` (fresh) | signed in |
+| `DELETE` | `/admin/api/users/{id}/second-factors` (fresh) | `users` |
+| `GET` | `/admin/api/auth-events?account=…&limit=…` (the sign-in log, at most 200 rows) | `users` |
 | `GET` | `/admin/api/agents` | signed in |
 | `GET` | `/admin/api/oauth/requests/{id}` (the consent page; says so when `agents` is missing) | signed in |
 | `POST` | `/admin/api/oauth/requests/{id}/deny` | signed in |
@@ -1011,7 +1059,7 @@ Every admin route is mapped to exactly one access level in a table in
 | `GET` | `/admin/api/export` | `backup` |
 | `GET` | `/admin/api/backup/full` | `backup` |
 | `POST` | `/admin/api/import` (merge and replace) | `restore` |
-| `POST` | `/admin/api/restore/full` | every permission (the built-in `admin`, or a stored user holding all seven) |
+| `POST` | `/admin/api/restore/full` (fresh) | every permission (the built-in `admin`, or a stored user holding all seven) |
 | `PUT` | `/admin/api/profile` | `settings` |
 | `POST` | `/admin/api/rules` | `settings` |
 | `PUT`, `DELETE` | `/admin/api/rules/{id}` | `settings` |
@@ -1023,8 +1071,86 @@ Every admin route is mapped to exactly one access level in a table in
 | `GET`, `POST` | `/admin/api/users` | `users` |
 | `PUT`, `DELETE` | `/admin/api/users/{id}` | `users` |
 
+*(fresh)* means the route also needs a sign-in or confirmation from the last ten
+minutes (table `FRESH_ROUTES` in `src/admin.rs`, checked after the access level);
+otherwise it answers `403 {"error": "Confirm it is you first.", "reauth": true}` and
+the page asks the user to confirm.
+
 `GET /admin/api/session` returns `username`, `permissions` and, for older pages,
-`role` (`admin` when the user holds every permission, else `viewer`).
+`role` (`admin` when the user holds every permission, else `viewer`); also
+`second_factor_pending` (`{methods, username}` while a right password waits for its
+second step), `passkey_sign_in` (whether passkeys work at this address),
+`break_glass`, `methods` (how this session signed in) and `fresh_for` (seconds).
+
+### Passkeys and two-step sign-in
+
+Every user may add, under **Profile → Security**:
+
+- **Passkeys** (WebAuthn: platform passkeys such as Windows Hello, iCloud Keychain,
+  Google Password Manager, or a security key). A passkey the device keeps
+  (*password-free sign-in*) signs in alone with **Sign in with a passkey**: the
+  device must verify the user (PIN, fingerprint, face), which makes it two factors
+  in one. Every passkey also serves as the second step after the password, where
+  touching it is enough. Registration asks for a discoverable credential
+  (`residentKey: preferred`, `credProps`), attestation `none`, and the algorithms
+  EdDSA, ES256 and RS256 (RS256 for Windows Hello). At most 20 per user.
+- **An authenticator app** (TOTP: Google Authenticator, Aegis, 1Password …; SHA-1,
+  6 digits, 30 seconds). Set it up by scanning the QR code or typing the key, then
+  confirm with a code. The secret is stored encrypted with `LORE_VAULT_KEY`;
+  **without that key the app cannot be set up** (passkeys work without it). A code,
+  and every earlier one, is accepted once. If `LORE_VAULT_KEY` changes, the app can
+  no longer be checked: sign in with a passkey or a recovery code and set it up
+  again.
+- **Recovery codes**: ten codes of 80 bits, made with the first passkey or app,
+  shown once (download them), each usable once instead of the second step (never
+  alone). *Make new codes* replaces them all; removing the last passkey and app
+  removes them too. The page warns at three or fewer.
+
+Once a user has any of these, a right password no longer enters: the second-step
+card asks for the passkey, the code or a recovery code (five minutes; a reload
+resumes it). A user whose only second step cannot be checked at this address gets
+the card with nothing to offer and must ask an administrator to reset it.
+
+Limits: five wrong attempts per pending sign-in (then the password again), and
+**ten wrong second steps per account per 15 minutes from any address** (then `429`
+with `Retry-After`); the passkey sign-in and the re-authentication count on the
+per-address sign-in limit (5 per 15 minutes); passwordless options 30 per address
+per 10 minutes. reCAPTCHA guards the password step only. Failures of the passkey
+steps all get one message; the reason goes to the sign-in log.
+
+**Re-authentication.** Adding or removing a passkey or the app, new recovery codes,
+setting someone's password, resetting second steps, going back to the environment
+password and a full restore need a sign-in or a confirmation from the **last 10
+minutes**. *Confirm it is you* takes the password plus an app code or a recovery
+code (the password alone for an account without a second step), or a passkey with
+user verification. A change of how an account signs in ends its other sessions and
+moves this one to a new token. `Admin::require_fresh` is the one check, for later
+features too.
+
+**Per host.** A passkey is bound to the host name lore was reached at when it was
+made (the relying-party id, e.g. `data.luen.casa`); it is offered and accepted only
+there, and the Security list marks others *for another host*. Passkeys need a host
+the request names acceptably (`LORE_ALLOWED_HOSTS` when set) and, behind a proxy,
+`LORE_TRUST_PROXY` for `X-Forwarded-Proto: https`. Set `LORE_WEBAUTHN_RP_ID` to a
+parent domain only to share passkeys across subdomains. A signature counter that
+goes backwards (a cloned security key) is refused and logged; synced passkeys
+report 0 and pass.
+
+**What an administrator can do**: reset another user's second steps (within *may
+manage*; the user then signs in with the password alone until they set one up
+again), see each user's second steps in the Users panel, and read the sign-in log
+(`GET /admin/api/auth-events`, `users`). Nobody can read anyone's codes or keys.
+
+**Downgrade caveat.** The second steps and the page passwords live in tables an
+older lore (schema 9 or earlier) does not know. An older image started on this
+database ignores them: it signs in with the password alone and lets
+`LORE_ADMIN_PASSWORD`/`LORE_VIEWER_PASSWORD` in again. Going forward again brings
+them back unchanged.
+
+The sign-in log (`auth_events`, newest 5000 rows, full backup only) records every
+sign-in, refusal, limit, re-authentication and change of a password or second step,
+with the address; never a password, code or key. Changes also appear in the
+activity feed.
 
 ![The sign-in screen](docs/login.jpg)
 
@@ -1114,7 +1240,11 @@ codex mcp add lore --url https://lore.example.com/mcp
 The client finds out how to sign in by itself (a `401` from `/mcp` names the
 protected resource metadata), registers, and opens lore's consent page in the
 browser. There you sign in with a user name and password (the user needs the
-`agents` permission), see the name the application **claims** to have and the exact
+`agents` permission) and, when the account has one, the second step, or with a
+passkey alone: the consent page uses the same sign-in endpoints and rules as the
+admin view (see [Passkeys and two-step sign-in](#passkeys-and-two-step-sign-in)).
+Agent tokens are not affected: bearer tokens and OAuth access and refresh tokens
+never meet the second step. Then you see the name the application **claims** to have and the exact
 address the answer goes back to, name the agent (`[a-z0-9][a-z0-9_-]{1,31}`;
 `admin`, `viewer`, `shared` and the names of env-token agents are refused), or pick
 an existing OAuth agent to re-authorize, choose an avatar, and approve. The client
@@ -2668,18 +2798,21 @@ only ask less, never more, than before.
 |---|---|---|
 | `LORE_TOKENS` | | `agent:secret` pairs, comma separated. Entries are attributed to the agent, and one agent's access can be revoked without touching the others. |
 | `LORE_TOKEN` | | One secret shared by all agents. Can be combined with `LORE_TOKENS`. |
-| `LORE_ADMIN_PASSWORD` | | Password of the built-in user `admin` at `/admin` (12 characters or more). Unset disables the admin view. |
+| `LORE_ADMIN_PASSWORD` | | Password of the built-in user `admin` at `/admin` (12 characters or more), until a password is set on the page (which then replaces it). Unset disables the admin view. |
+| `LORE_ADMIN_BREAK_GLASS` | `off` | While `on`, `LORE_ADMIN_PASSWORD` signs in as `admin` even after the password was changed on the page, and without admin's second step; warned at start-up, logged, shown as a red banner. Turn it off after recovering (see *Users and permissions*). |
+| `LORE_WEBAUTHN_RP_ID` | the request's host | Passkey relying-party id. Set it to a parent domain only to share passkeys across subdomains; it must be the host or a parent domain of every `LORE_ALLOWED_HOSTS` entry (else lore refuses to start). |
+| `LORE_TOTP_ISSUER` | `lore (<host>)` | The name authenticator apps show for lore. |
 | `LORE_VIEWER_PASSWORD` | | Optional password of the built-in watch-only user `viewer`: graph, activity and entries, but no backup menu. Must differ from the admin password. |
 | `LORE_RECAPTCHA_SITE_KEY`, `LORE_RECAPTCHA_SECRET_KEY` | | reCAPTCHA v3 keys for the admin sign-in. Unset skips the check. |
 | `LORE_RECAPTCHA_MIN_SCORE` | `0.5` | Lowest reCAPTCHA score accepted. |
-| `LORE_VAULT_KEY` | | Key the service credentials are encrypted with: exactly 64 hex characters (`openssl rand -hex 32`). Unset disables the credential vault: no credential can be stored and the provider tools refuse. Losing it means entering the credentials again. |
+| `LORE_VAULT_KEY` | | Key the service credentials and the authenticator-app secrets are encrypted with: exactly 64 hex characters (`openssl rand -hex 32`). Unset disables the credential vault: no credential can be stored and the provider tools refuse. Losing it means entering the credentials again. |
 | `LORE_DOKPLOY_PROTECTED` | | Comma-separated Dokploy ids of lore's own deployment (each at least 8 characters of `A-Z a-z 0-9 _ -`). Agents may read them but no non-GET `dokploy` call naming one is sent. Anything else refuses to start. |
 | `LORE_EMBEDDING_MODEL` | `bge-m3` | `bge-m3`, `e5-large`, `e5-base` or `e5-small`. Changing it re-embeds every entry. |
 | `LORE_EMBEDDINGS` | `on` | `off` gives keyword-only search with no model download. |
 | `LORE_MIN_SIMILARITY` | per model | Similarity below which a meaning-only match is dropped. |
 | `LORE_TOOL_STATUS_LANG` | `tr` | Language of the status texts ChatGPT shows while a tool runs (see *Connecting a chat web app*): `tr`, `en` or `off`. Anything else logs a warning and uses `tr`. Read at start-up. |
 | `LORE_SESSION_IDLE_HOURS` | `12` | Hours without activity after which an open session is closed. Whole number between 1 and 720. |
-| `LORE_ALLOWED_HOSTS` | any | Hostnames accepted in the `Host` header. |
+| `LORE_ALLOWED_HOSTS` | any | Hostnames accepted in the `Host` header. Passkeys are bound to the host they were made at. |
 | `LORE_TRUST_PROXY` | `on` in Docker | Read the client address from `X-Forwarded-For`. Turn off if the port is exposed directly. |
 | `LORE_TRUSTED_PROXIES` | | With `LORE_TRUST_PROXY=on`: the peers whose `X-Forwarded-For` is believed, as address ranges, comma separated (`10.0.1.7/32`, `127.0.0.1`): your reverse proxy's own address. On Dokploy prefer `LORE_TRUSTED_PROXY_HOSTS`: Traefik's address on `dokploy-network` changes when its container restarts, and a fixed `/32` then either locks every client into one rate-limit counter or, once another container gets the old address, believes that container (see *Moving a single-container install to compose*, step 6). Never the subnet of `dokploy-network`, which every Dokploy application shares. Without this and `LORE_TRUSTED_PROXY_HOSTS`: any peer, as before; with built-in agents, any private or loopback peer (and a warning at start-up). Never the agent networks, and never on the runner listener. |
 | `LORE_TRUSTED_PROXY_HOSTS` | | With `LORE_TRUST_PROXY=on`: host names of your reverse proxy, comma separated (on Dokploy `dokploy-traefik`). Resolved through the system resolver at start-up and every 30 seconds; the addresses they resolve to now are trusted in addition to `LORE_TRUSTED_PROXIES`. A name must resolve to one address per family: an answer with two (another container added the name as a network alias) never adds an address, keeps the one already trusted only while it is still answered, and else trusts nothing for the name. A new single address replaces the old one at once; a name that stops resolving keeps its last address for 90 seconds; one that does not resolve at start-up is a warning. Changes are logged at info level. Never the agent networks, and never on the runner listener. |
@@ -2780,6 +2913,18 @@ much lighter, and accept weaker matching on meaning, or `LORE_EMBEDDINGS=off` fo
   restore's upload) and those without a body (revoking an agent). Requests without
   either header, from scripts and `curl`, carry no victim's cookie and go on to the
   usual checks.
+- **Sign-in**: passwords are Argon2id hashes (stored users and page passwords of
+  the built-in users). Passkeys are phishing-resistant: the browser binds the
+  signature to lore's origin and host, and lore checks both (attestation `none`,
+  EdDSA/ES256/RS256, verified with `ring`; checked against the WebAuthn Level 3 test
+  vectors). The authenticator app is not phishing-resistant (a real-time proxy page
+  can relay a code) but stops password reuse; its secrets are encrypted with
+  `LORE_VAULT_KEY`, each code works once. Recovery codes are stored as SHA-256 of
+  account and code (80 bits each). Security changes need a sign-in from the last ten
+  minutes; a password or second-step change ends the account's other sessions and
+  rotates the current session token. Every sign-in outcome and credential change is
+  in the sign-in log (`auth_events`), never a secret. Whoever can set lore's
+  environment can always get in (`LORE_ADMIN_BREAK_GLASS`); that is intended.
 - **A built-in agent's terminal** is a shell in its container with its
   credentials, relayed unfiltered: only the `agents` permission opens one, from this
   lore's own origin, and nothing it shows or receives is stored or logged (see
@@ -2921,8 +3066,11 @@ The admin view offers two kinds of backup (permission `backup` to download,
   profile and rules, the vault (still encrypted with `LORE_VAULT_KEY`), the service
   levels, the operations log, the users with their password hashes, the agent
   registry and the OAuth clients and authorizations (codes and tokens only as
-  hashes), the built-in agents' settings and last reported state, and every other
-  table. **The file hands out every user's password hash
+  hashes), the built-in agents' settings and last reported state, the passwords set
+  on the page for the built-in users (hashes), passkeys (public keys only), the
+  authenticator-app secrets (encrypted with `LORE_VAULT_KEY`), recovery-code hashes
+  and the sign-in log with its addresses, and every other table. The JSON backup
+  holds none of these. **The file hands out every user's password hash
   and every encrypted credential: keep it private.** Whoever holds it and
   `LORE_VAULT_KEY` holds the credentials.
 
@@ -2955,7 +3103,20 @@ load fails (bringing the loaded database up to date), the answer says that the
 database was replaced and names the safety copy that holds the previous one. Uploads
 are capped at 2 GiB, and an upload the client abandons leaves no temporary file
 behind. Signed-in users stay signed in, except stored users the restored database no
-longer has (or has disabled, or with other permissions).
+longer has (or has disabled, or with other permissions). A full restore needs a
+sign-in from the last ten minutes.
+
+A full restore also replaces every password set on the page, passkey,
+authenticator app and recovery code with the backup's:
+
+- A backup from before schema 10 has none of them: **every second step is gone and
+  the built-in users sign in with the environment passwords again.**
+- Passkeys removed since the backup come back; ones added since are gone (the
+  authenticator still holds them; remove them there).
+- Authenticator-app secrets restored under a different `LORE_VAULT_KEY` cannot be
+  read: those users sign in with a passkey or a recovery code, or an administrator
+  resets their second steps.
+- Sign-ins waiting for their second step and pending passkey prompts are cleared.
 
 Neither kind of backup holds a built-in agent's sign-in: the Claude token, the
 Codex `auth.json` and the DeepSeek key live only in each agent's own volume
@@ -3004,6 +3165,16 @@ a_terminal_home_is_prepared`). It needs the default temporary directory (`/tmp`,
 `TMPDIR` pointing into a home): root without `CAP_DAC_READ_SEARCH` cannot enter a
 0700 home directory such as `/home/<you>`.
 
+**Sign-in tests.** `cargo test webauthn` runs the WebAuthn verifier against the
+WebAuthn Level 3 test vectors (`src/testdata/webauthn-l3-vectors.json`, copied from
+section 16 of the Recommendation) and a software authenticator built on `ring`
+(`webauthn::soft`), which the HTTP tests of the admin view also use; `cargo test
+totp` checks the RFC 4226 and RFC 6238 vectors. To try passkeys in a browser, run
+lore locally and open `http://localhost:<port>/admin` (browsers treat `localhost` as
+a secure context; the relying-party id is then `localhost`); Chrome's DevTools
+(*WebAuthn* panel) or the CDP `WebAuthn.addVirtualAuthenticator` command gives a
+virtual authenticator. The authenticator app needs `LORE_VAULT_KEY` locally too.
+
 Run with `--ignored` but without root, they fail with "needs root"
 instead of skipping. The fork-bomb test (`kill_all_ends_a_fork_bomb_that_holds_every_pid`)
 also needs `LORE_TEST_PID_BOMB=1` and a cgroup pids limit of at most 4096, so it
@@ -3033,6 +3204,11 @@ Rust 1.85 or newer. The source is small:
 | `src/embed.rs` | Local embedding models |
 | `src/admin.rs` | Admin sign-in, the route permission table, users, the graph API, live events, backup and restore |
 | `src/admin/agents.rs` | The agents panel's API, the consent page's approve and deny, the avatar files |
+| `src/admin/security.rs` | Password changes, the second step of a sign-in, passkey sign-in, the WebAuthn challenges |
+| `src/admin/factors.rs` | Profile → Security: re-authentication, passkeys, the authenticator app, recovery codes, resets, the sign-in log |
+| `src/webauthn.rs` | The WebAuthn relying-party verifier (registration and assertion) |
+| `src/totp.rs` | The authenticator app (TOTP), recovery codes, the setup QR code |
+| `src/db/signin.rs` | The sign-in tables: page passwords, passkeys, TOTP secrets, recovery codes, the sign-in log |
 | `src/users.rs` | Permissions, user name and password rules, Argon2id hashing |
 | `src/events.rs` | Fan-out of agent activity to open admin pages |
 | `assets/` | The admin page (plain HTML, CSS and canvas JavaScript, no build step) |
