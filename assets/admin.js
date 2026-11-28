@@ -2023,7 +2023,19 @@ $("backup-file").addEventListener("change", async (event) => {
 
 /* The full database: a .sqlite download, and a restore that replaces
    everything after the word RESTORE is typed. */
-$("full-download").addEventListener("click", () => {
+$("full-download").addEventListener("click", async () => {
+  // The download needs a recent sign-in (it holds every password hash):
+  // confirm first when the session is older than ten minutes.
+  try {
+    const session = await (await fetch("/admin/api/session", { credentials: "same-origin" })).json();
+    if (!(session.fresh_for > 5) && !(await askReauth())) {
+      backupStatus("The download needs you to confirm it is you first.", "bad");
+      return;
+    }
+  } catch (_) {
+    backupStatus("Lore cannot be reached.", "bad");
+    return;
+  }
   const link = document.createElement("a");
   link.href = "/admin/api/backup/full";
   link.download = "";
@@ -4115,12 +4127,8 @@ $("own-password").addEventListener("submit", async (event) => {
   }
   $("own-submit").disabled = true;
   try {
-    const response = await api("/admin/api/password", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ current, password }),
-    });
-    const result = await response.json().catch(() => ({}));
+    // With a second step, a password change needs a recent sign-in.
+    const { response, body: result } = await sendFresh("/admin/api/password", { current, password }, "PUT");
     if (!response.ok) {
       profileStatus(result.error || "The password could not be changed.", "bad");
       return;
@@ -4446,8 +4454,7 @@ async function deleteUser(user) {
   const sure = window.confirm(`Delete the user ${user.username}?\n\nThey are signed out and can no longer sign in. This cannot be undone.`);
   if (!sure) return;
   try {
-    const response = await api("/admin/api/users/" + user.id, { method: "DELETE" });
-    const result = await response.json().catch(() => ({}));
+    const { response, body: result } = await sendFresh("/admin/api/users/" + user.id, undefined, "DELETE");
     if (!response.ok) {
       usersStatus(result.error || "The user could not be deleted.", "bad");
       return;
@@ -4474,12 +4481,8 @@ $("user-form").addEventListener("submit", async (event) => {
   };
   $("user-submit").disabled = true;
   try {
-    const response = await api("/admin/api/users", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const result = await response.json().catch(() => ({}));
+    // Adding a user needs a recent sign-in; sendFresh asks for it.
+    const { response, body: result } = await sendFresh("/admin/api/users", payload);
     if (!response.ok) {
       usersStatus(result.error || "The user could not be added.", "bad");
       return;

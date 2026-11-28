@@ -103,6 +103,28 @@ pub(super) async fn change_own_password(
     {
         return bad_request(&message);
     }
+    // An account with a second step needs a fresh session: the current
+    // password alone must not stand in for the second step.
+    let state = admin.clone();
+    let account = me.account();
+    let has_factor =
+        tokio::task::spawn_blocking(move || state.db.second_factor_summary(&account)).await;
+    match has_factor {
+        Ok(Ok(summary)) if summary.any() => {
+            if let Err(refusal) = admin.require_fresh(&headers) {
+                return refusal.into_response();
+            }
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::error!(%error, "reading the second factors failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "the second-factor task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
     // Like a sign-in: the attempt counts before the current password is
     // checked, and the check needs a free Argon2 slot.
     if let Some(retry_after) = admin.logins.hit(&ip) {
@@ -163,7 +185,8 @@ pub(super) async fn change_own_password(
                 }
             }
             state.end_sessions_of_account(&account, keep.as_deref(), None);
-            let rotated = keep.and_then(|keep| state.rotate_session(&keep, true));
+            // A new token, but not a fresh one: a password is one factor.
+            let rotated = keep.and_then(|keep| state.rotate_session(&keep, false));
             auth_event(
                 &state,
                 &account,
@@ -378,17 +401,19 @@ pub(super) const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(300);
 pub(super) const PASSKEY_REFUSED: &str = "This passkey is not known here or could not be verified.";
 
 /// Which second factors a pending sign-in may use.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct SecondFactors {
     /// The account has a second factor at all (even an unusable one).
     pub(super) any: bool,
     pub(super) passkey: bool,
     pub(super) totp: bool,
     pub(super) recovery: bool,
+    /// Hosts the account's passkeys were made for, other than this one.
+    pub(super) other_hosts: Vec<String>,
 }
 
 impl SecondFactors {
-    fn methods(self) -> Vec<&'static str> {
+    fn methods(&self) -> Vec<&'static str> {
         let mut methods = Vec::new();
         if self.passkey {
             methods.push("passkey");
@@ -443,18 +468,19 @@ pub(super) struct Ceremony {
 
 /// Which second factors the account has, and which of them work at this
 /// address: passkeys made for this relying party, an authenticator app
-/// the vault can read, unused recovery codes. An account with a factor
-/// none of which works still gets the second step (fail closed).
+/// the vault can read, unused recovery codes. `any` counts every factor,
+/// passkeys of other hosts and unreadable apps included: a password alone
+/// never signs in an account that has one.
 pub(super) fn second_factors(
     admin: &Admin,
     account: &str,
     rp: Option<&RelyingParty>,
 ) -> anyhow::Result<SecondFactors> {
+    let credentials = admin.db.credentials(account)?;
     let passkey = rp.is_some_and(|rp| {
-        admin
-            .db
-            .credentials(account)
-            .is_ok_and(|list| list.iter().any(|credential| credential.rp_id == rp.id))
+        credentials
+            .iter()
+            .any(|credential| credential.rp_id == rp.id)
     });
     let totp_row = admin.db.totp(account)?;
     let totp = totp_row
@@ -462,10 +488,17 @@ pub(super) fn second_factors(
         .is_some_and(|row| totp_key(admin, account, row).is_some());
     let recovery = admin.db.recovery_remaining(account)?.0 > 0;
     Ok(SecondFactors {
-        any: passkey || totp_row.is_some() || recovery,
+        any: !credentials.is_empty() || totp_row.is_some() || recovery,
         passkey,
         totp,
         recovery,
+        other_hosts: credentials
+            .iter()
+            .map(|credential| credential.rp_id.clone())
+            .filter(|id| rp.is_none_or(|rp| &rp.id != id))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -500,6 +533,32 @@ pub(super) fn start_pending(
     };
     let account = user.account();
     let username = user.username.clone();
+    let methods = factors.methods();
+    // The account has a second step, but none of it can be checked here:
+    // the password alone never signs in.
+    if methods.is_empty() {
+        let hosts = factors.other_hosts.join(", ");
+        auth_event(
+            admin,
+            &account,
+            &username,
+            "signin.fail.second_factor",
+            ip,
+            "no second step usable at this address",
+        );
+        tracing::warn!(%ip, user = %username, "password right, but no second step works at this address");
+        let mut message = String::from("Your second step cannot be checked at this address. ");
+        if !hosts.is_empty() {
+            message.push_str(&format!(
+                "Your passkeys were made for {hosts}: sign in there. "
+            ));
+        }
+        message.push_str(
+            "No recovery code is left either; an administrator can reset your second steps \
+             (for admin: LORE_ADMIN_BREAK_GLASS).",
+        );
+        return forbidden(&message);
+    }
     {
         let mut pending = admin.pending_map();
         let now = Instant::now();
@@ -523,7 +582,6 @@ pub(super) fn start_pending(
             },
         );
     }
-    let methods = factors.methods();
     auth_event(
         admin,
         &account,
@@ -904,31 +962,41 @@ pub(super) async fn second_factor(
     let Some(token) = cookie(&headers, PENDING_COOKIE) else {
         return restart("The sign-in expired. Enter the password again.");
     };
-    let (user, account, factors) = {
+    // The attempt is reserved before anything is checked, under the
+    // pending lock: it counts on this pending sign-in (at most five) and on
+    // the account's limit (ten per window, from any address), so parallel
+    // guesses cannot all be verified before the first failure is counted.
+    let reserved = {
         let mut pending = admin.pending_map();
         let now = Instant::now();
         pending.retain(|_, entry| entry.expires > now);
-        match pending.get(&token) {
-            Some(entry) => (entry.user.clone(), entry.account.clone(), entry.factors),
-            None => return restart("The sign-in expired. Enter the password again."),
+        let Some(entry) = pending.get_mut(&token) else {
+            return restart("The sign-in expired. Enter the password again.");
+        };
+        if entry.failures >= PENDING_FAILURES {
+            pending.remove(&token);
+            return restart("Too many wrong attempts. Enter the password again.");
+        }
+        let method: &'static str = match form.method.as_str() {
+            "totp" if entry.factors.totp => "totp",
+            "recovery" if entry.factors.recovery => "recovery",
+            "passkey" if entry.factors.passkey => "passkey",
+            _ => return bad_request("this way of confirming is not available for this sign-in"),
+        };
+        match admin.second_factor_failures.hit(&entry.account) {
+            Some(retry_after) => Err((entry.user.clone(), entry.account.clone(), retry_after)),
+            None => {
+                entry.failures += 1;
+                Ok((entry.user.clone(), entry.account.clone(), method))
+            }
         }
     };
-    if let Some(retry_after) = admin.second_factor_failures.blocked(&account) {
-        auth_event(
-            &admin,
-            &account,
-            &user.username,
-            "signin.limited",
-            &ip,
-            "second factor",
-        );
-        return too_many_requests(retry_after);
-    }
-    let method: &'static str = match form.method.as_str() {
-        "totp" if factors.totp => "totp",
-        "recovery" if factors.recovery => "recovery",
-        "passkey" if factors.passkey => "passkey",
-        _ => return bad_request("this way of confirming is not available for this sign-in"),
+    let (user, account, method) = match reserved {
+        Ok(reserved) => reserved,
+        Err((user, account, retry_after)) => {
+            limited_event(&admin, &account, &user.username, &ip, "second factor");
+            return too_many_requests(retry_after);
+        }
     };
     let state = admin.clone();
     let check_account = account.clone();
@@ -977,18 +1045,14 @@ pub(super) async fn second_factor(
                 &ip,
                 &format!("{method}: {reason}"),
             );
-            admin.second_factor_failures.hit(&account);
+            // The attempt was counted when it was reserved.
             let gone = {
                 let mut pending = admin.pending_map();
-                match pending.get_mut(&pending_token) {
-                    Some(entry) => {
-                        entry.failures += 1;
-                        if entry.failures >= PENDING_FAILURES {
-                            pending.remove(&pending_token);
-                            true
-                        } else {
-                            false
-                        }
+                match pending.get(&pending_token) {
+                    Some(entry) if entry.failures < PENDING_FAILURES => false,
+                    Some(_) => {
+                        pending.remove(&pending_token);
+                        true
                     }
                     None => true,
                 }
@@ -1134,7 +1198,7 @@ pub(super) async fn passkey_sign_in(
 ) -> Response {
     let ip = client_ip(&headers, Some(peer), admin.trust_proxy);
     if let Some(retry_after) = admin.logins.hit(&ip) {
-        auth_event(&admin, "", "", "signin.limited", &ip, "passkey");
+        limited_event(&admin, "", "", &ip, "passkey");
         return too_many_requests(retry_after);
     }
     let binding = cookie(&headers, WEBAUTHN_COOKIE);

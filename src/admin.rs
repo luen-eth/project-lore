@@ -431,7 +431,9 @@ const ROUTES: &[(&str, &str, Access)] = &[
 /// Routes that also need a fresh authentication (`FRESH_FOR`): a session
 /// left open must not silently change how its account signs in. The guard
 /// answers `403 {"reauth": true}` otherwise. `PUT /admin/api/users/{id}`
-/// needs one only when it sets a password; its handler checks.
+/// needs one when it sets a password, permissions or the disabled flag
+/// (its handler checks); `PUT /admin/api/password` when the account has a
+/// second step (its handler checks too).
 const FRESH_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/admin/api/password"),
     ("PUT", "/admin/api/builtin-users/{name}/password"),
@@ -445,6 +447,12 @@ const FRESH_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/admin/api/security/totp"),
     ("POST", "/admin/api/security/recovery-codes"),
     ("POST", "/admin/api/restore/full"),
+    // The full database holds every password hash and the encrypted
+    // credentials; with every permission it is as much as being admin.
+    ("GET", "/admin/api/backup/full"),
+    // Adding or deleting a user changes who can sign in.
+    ("POST", "/admin/api/users"),
+    ("DELETE", "/admin/api/users/{id}"),
 ];
 
 /// Whether a passkey relying-party id may be used on `host`: equal to it,
@@ -526,6 +534,9 @@ pub struct Admin {
     second_factor_failures: RateLimiter,
     /// Passwordless passkey options per address.
     passkey_options: RateLimiter,
+    /// When a limit's refusal was last written to the sign-in log, per
+    /// account, address and kind.
+    limits_noted: Mutex<HashMap<String, Instant>>,
     logins: RateLimiter,
     /// Argon2 verifications running at once, at most `ARGON_PERMITS`: each
     /// takes 19 MiB and a core, so a flood of sign-ins is answered 429
@@ -607,6 +618,7 @@ impl Admin {
             // minutes, whatever address they come from.
             second_factor_failures: RateLimiter::new(10, Duration::from_secs(15 * 60)),
             passkey_options: RateLimiter::new(30, Duration::from_secs(10 * 60)),
+            limits_noted: Mutex::new(HashMap::new()),
             // Five wrong attempts lock the address out for fifteen minutes.
             logins: RateLimiter::new(5, Duration::from_secs(15 * 60)),
             argon: Arc::new(tokio::sync::Semaphore::new(ARGON_PERMITS)),
@@ -1590,6 +1602,26 @@ fn auth_event(admin: &Admin, account: &str, actor: &str, event: &str, ip: &str, 
     }
 }
 
+/// Notes that a limit refused an attempt, once per window for each
+/// address or account, so a flood of refused requests cannot fill the
+/// sign-in log.
+fn limited_event(admin: &Admin, account: &str, actor: &str, ip: &str, detail: &str) {
+    let key = format!("{account}\n{ip}\n{detail}");
+    {
+        let mut noted = admin.limits_noted.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        noted.retain(|_, at| now.duration_since(*at) < LIMIT_NOTE_WINDOW);
+        if noted.contains_key(&key) || noted.len() >= 10_000 {
+            return;
+        }
+        noted.insert(key, now);
+    }
+    auth_event(admin, account, actor, "signin.limited", ip, detail);
+}
+
+/// How long one limit's refusals are noted only once.
+const LIMIT_NOTE_WINDOW: Duration = Duration::from_secs(15 * 60);
+
 /// Starts the session of a completed sign-in, whichever way it went, and
 /// answers like a successful `/login`: a new token, the session cookie.
 async fn finish_sign_in(
@@ -1938,14 +1970,17 @@ async fn update_user(
     }
     patch.disabled = form.disabled;
     let password = form.password.filter(|password| !password.is_empty());
-    if let Some(password) = &password {
-        if let Err(message) = users::check_password(password) {
-            return bad_request(&message);
-        }
-        // Setting a password changes how the account signs in.
-        if let Err(refusal) = admin.require_fresh(&headers) {
-            return refusal.into_response();
-        }
+    if let Some(password) = &password
+        && let Err(message) = users::check_password(password)
+    {
+        return bad_request(&message);
+    }
+    // A password, permissions or the disabled flag change who can sign in
+    // and what they may do: that needs a recent sign-in.
+    if (password.is_some() || patch.permissions.is_some() || patch.disabled.is_some())
+        && let Err(refusal) = admin.require_fresh(&headers)
+    {
+        return refusal.into_response();
     }
     let keep = cookie(&headers, COOKIE);
     let state = admin.clone();
@@ -8725,7 +8760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreadable_app_still_asks_for_the_second_step() {
+    async fn an_unreadable_app_refuses_the_password_alone() {
         // The secret was stored under another vault key: sign-in fails
         // closed, offering nothing it can check.
         let (base, admin) = serve().await;
@@ -8739,8 +8774,17 @@ mod tests {
             json!({ "username": "luis", "password": "a-long-password" }),
         )
         .await;
+        // Nothing usable here: refused, never a session or a pending step.
+        assert_eq!(response.status(), 403);
+        assert!(session_token_of(&response).is_none());
+        assert!(cookie_of(&response, "lore_pending").is_none());
         let body: serde_json::Value = response.json().await.unwrap();
-        assert_eq!(body["second_factor"]["methods"], json!([]));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be checked at this address")
+        );
     }
 
     #[tokio::test]
@@ -9538,5 +9582,265 @@ mod tests {
         assert_eq!(response.status(), 403);
         let body: serde_json::Value = response.json().await.unwrap();
         assert_eq!(body["error"], "The request looked automated. Try again.");
+    }
+    // Attack tests of the security review of 2026-11-28, turned around:
+    // each asserts that the attack now fails.
+
+    /// Sends `count` wrong app codes at once with one pending cookie.
+    async fn parallel_wrong_codes(base: &str, pending: &str, count: u32, offset: u32) -> Vec<u16> {
+        let client = reqwest::Client::new();
+        let mut handles = Vec::new();
+        for i in 0..count {
+            let client = client.clone();
+            let url = format!("{base}/admin/api/login/second-factor");
+            let pending = pending.to_string();
+            handles.push(tokio::spawn(async move {
+                client
+                    .post(url)
+                    .header(header::COOKIE, pending)
+                    .json(
+                        &json!({ "method": "totp", "code": format!("{:06}", 100000 + offset + i) }),
+                    )
+                    .send()
+                    .await
+                    .map(|r| r.status().as_u16())
+                    .unwrap_or(0)
+            }));
+        }
+        let mut statuses = Vec::new();
+        for handle in handles {
+            statuses.push(handle.await.unwrap());
+        }
+        statuses
+    }
+
+    fn codes_checked(admin: &Admin, account: &str) -> usize {
+        admin
+            .db
+            .auth_events(Some(account), 5000)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event == "signin.fail.second_factor")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn parallel_code_guesses_are_counted_before_they_are_checked() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "unused");
+        let account = db::user_account(user.id);
+        give_totp(&admin, &account);
+        // 400 wrong codes at once on one pending sign-in: at most five are
+        // checked.
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        let statuses = parallel_wrong_codes(&base, &pending, 400, 0).await;
+        assert!(
+            statuses
+                .iter()
+                .all(|status| *status == 401 || *status == 429),
+            "{statuses:?}"
+        );
+        let checked = codes_checked(&admin, &account);
+        assert!(
+            checked <= 5,
+            "{checked} codes checked on one pending sign-in"
+        );
+        // More pending sign-ins at once: at most ten per account and window.
+        let mut pendings = Vec::new();
+        for _ in 0..3 {
+            pendings.push(pending_for(&base, "luis", "a-long-password").await);
+        }
+        let mut attacks = Vec::new();
+        for (n, pending) in pendings.iter().enumerate() {
+            let (base, pending) = (base.clone(), pending.clone());
+            attacks.push(tokio::spawn(async move {
+                parallel_wrong_codes(&base, &pending, 100, 1000 * (n as u32 + 1)).await
+            }));
+        }
+        for attack in attacks {
+            attack.await.unwrap();
+        }
+        let checked = codes_checked(&admin, &account);
+        assert!(
+            checked <= 10,
+            "{checked} codes checked for one account in one window"
+        );
+    }
+
+    #[tokio::test]
+    async fn reauth_codes_count_on_the_account_limit() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "luis-token");
+        let account = db::user_account(user.id);
+        let key = give_totp(&admin, &account);
+        // Ten wrong confirmations (the address limit cleared in between, as
+        // an attacker with many addresses would) use up the account's limit.
+        for n in 0..10 {
+            admin.logins.reset("127.0.0.1");
+            let response = send_as(
+                reqwest::Method::POST,
+                &base,
+                "/admin/api/security/reauth",
+                "luis-token",
+                json!({ "password": "a-long-password", "code": format!("{:06}", 200000 + n) }),
+            )
+            .await;
+            assert_eq!(response.status(), 400);
+        }
+        admin.logins.reset("127.0.0.1");
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            "luis-token",
+            json!({ "password": "a-long-password", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 429);
+    }
+
+    #[tokio::test]
+    async fn a_passkey_for_another_host_still_asks_for_a_second_step() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "unused");
+        // A passkey made at 127.0.0.1, no recovery code.
+        give_passkey(&admin, &db::user_account(user.id));
+        // The same server under another host name: refused, not a session.
+        let other = base.replace("127.0.0.1", "localhost");
+        let response = login(
+            &other,
+            json!({ "username": "luis", "password": "a-long-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        assert!(session_token_of(&response).is_none());
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("127.0.0.1"),
+            "{body}"
+        );
+        // At the passkey's own host it asks for the second step.
+        let response = login(
+            &base,
+            json!({ "username": "luis", "password": "a-long-password" }),
+        )
+        .await;
+        assert!(session_token_of(&response).is_none());
+        assert!(cookie_of(&response, "lore_pending").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_stale_session_cannot_add_change_or_delete_users() {
+        let (base, admin) = serve().await;
+        give_totp(&admin, "admin");
+        let victim = stored_user(&admin, "victim", &["write"], "victim-token");
+        make_stale(&admin, "admin-token");
+        let response = send_as(reqwest::Method::POST, &base, "/admin/api/users", "admin-token",
+            json!({ "username": "mallory", "email": "", "password": "mallory-password-1",
+                "permissions": ["write","backup","restore","settings","integrations","agents","users"] })).await;
+        assert_eq!(response.status(), 403);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["reauth"], true);
+        let response = login(
+            &base,
+            json!({ "username": "mallory", "password": "mallory-password-1" }),
+        )
+        .await;
+        assert!(session_token_of(&response).is_none());
+        let path = format!("/admin/api/users/{}", victim.id);
+        for body in [
+            json!({ "permissions": ["write", "users"] }),
+            json!({ "disabled": true }),
+        ] {
+            let response = put_json(&base, &path, "admin-token", body.clone()).await;
+            assert_eq!(response.status(), 403, "{body}");
+        }
+        let response = send_as(
+            reqwest::Method::DELETE,
+            &base,
+            &path,
+            "admin-token",
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        // The full backup download too.
+        let response = get_as(&base, "/admin/api/backup/full", "admin-token").await;
+        assert_eq!(response.status(), 403);
+        assert!(
+            admin
+                .db
+                .user(victim.id)
+                .unwrap()
+                .is_some_and(|user| !user.disabled)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_password_change_does_not_make_a_session_fresh() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &["users"], "luis-token");
+        let account = db::user_account(user.id);
+        give_totp(&admin, &account);
+        make_stale(&admin, "luis-token");
+        // With a second step, changing the password needs a fresh session.
+        let response = put_json(
+            &base,
+            "/admin/api/password",
+            "luis-token",
+            json!({ "current": "a-long-password", "password": "another-long-password-9" }),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        // Without one (an account with no second step) it works, and the
+        // new token is not fresh.
+        stored_user(&admin, "plain", &[], "plain-token");
+        make_stale(&admin, "plain-token");
+        let response = put_json(
+            &base,
+            "/admin/api/password",
+            "plain-token",
+            json!({ "current": "a-long-password", "password": "another-long-password-9" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        assert_eq!(admin.sessions()[&token].fresh_for(), 0);
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/totp/setup",
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        assert!(admin.db.totp(&account).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn refused_passkey_attempts_cannot_flush_the_sign_in_log() {
+        let (base, admin) = serve().await;
+        admin
+            .db
+            .record_auth_event("admin", "", "signin.break_glass", "1.2.3.4", "")
+            .unwrap();
+        let client = reqwest::Client::new();
+        for _ in 0..5100 {
+            client
+                .post(format!("{base}/admin/api/login/passkey"))
+                .json(&json!({ "ceremony": "x" }))
+                .send()
+                .await
+                .unwrap();
+        }
+        let kept = admin.db.auth_events(None, 20_000).unwrap();
+        assert!(kept.iter().any(|event| event.event == "signin.break_glass"));
+        // One address's refusals are logged once per window.
+        let limited = kept
+            .iter()
+            .filter(|event| event.event == "signin.limited")
+            .count();
+        assert_eq!(limited, 1);
     }
 }

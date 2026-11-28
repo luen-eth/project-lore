@@ -87,8 +87,20 @@ CREATE TABLE IF NOT EXISTS auth_events (
 CREATE INDEX IF NOT EXISTS auth_events_account ON auth_events (account, id DESC);
 "#;
 
-/// Sign-in log rows kept; older ones are dropped.
+/// Sign-in log rows kept of each kind (noise, and the rest); older ones
+/// are dropped.
 const AUTH_EVENTS_KEPT: i64 = 5000;
+
+/// Events anyone can cause without an account or a right password: they
+/// have their own budget, so a flood of them never erases the others.
+const NOISE_EVENTS: &[&str] = &[
+    "signin.fail.password",
+    "signin.fail.passkey",
+    "signin.fail.second_factor",
+    "signin.limited",
+    "signin.pending",
+    "reauth.fail",
+];
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')";
 
@@ -652,10 +664,24 @@ impl Db {
             ),
             params![account, actor, event, ip, detail],
         )?;
-        let id = conn.last_insert_rowid();
+        // Two budgets: what anyone can cause without an account (refused
+        // attempts, limits, pending sign-ins) never pushes out what only a
+        // signed-in or right-password action writes (sign-ins, break-glass,
+        // password and second-step changes, resets).
+        let noise = NOISE_EVENTS.contains(&event);
+        let placeholders = NOISE_EVENTS
+            .iter()
+            .map(|kind| format!("'{kind}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = if noise { "IN" } else { "NOT IN" };
         conn.execute(
-            "DELETE FROM auth_events WHERE id <= ?1",
-            params![id - AUTH_EVENTS_KEPT],
+            &format!(
+                "DELETE FROM auth_events WHERE event {filter} ({placeholders}) AND id < (
+                     SELECT id FROM auth_events WHERE event {filter} ({placeholders})
+                     ORDER BY id DESC LIMIT 1 OFFSET ?1)"
+            ),
+            params![AUTH_EVENTS_KEPT - 1],
         )?;
         Ok(())
     }
@@ -824,6 +850,25 @@ mod tests {
             .unwrap();
         assert!(db.credential_by_id(&[3; 16]).unwrap().is_none());
         assert!(db.credential_id_taken(&[3; 16]).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn noise_never_pushes_out_the_events_that_matter() {
+        let (dir, db) = temp_db("noise");
+        db.record_auth_event("admin", "admin", "signin.break_glass", "1.2.3.4", "")
+            .unwrap();
+        for _ in 0..(AUTH_EVENTS_KEPT + 50) {
+            db.record_auth_event("", "", "signin.fail.passkey", "5.6.7.8", "x")
+                .unwrap();
+        }
+        let all = db.auth_events(None, 20_000).unwrap();
+        assert!(all.iter().any(|event| event.event == "signin.break_glass"));
+        let noise = all
+            .iter()
+            .filter(|e| e.event == "signin.fail.passkey")
+            .count();
+        assert_eq!(noise as i64, AUTH_EVENTS_KEPT);
         let _ = std::fs::remove_dir_all(dir);
     }
 

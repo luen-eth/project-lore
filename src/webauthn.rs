@@ -1149,4 +1149,107 @@ mod tests {
             let _ = parse_auth_data(&mutated, RP_ID);
         }
     }
+
+    #[test]
+    fn deep_and_huge_cbor_never_panics() {
+        let rp = "example.org";
+        let mut base = Sha256::digest(rp.as_bytes()).to_vec();
+        base.push(FLAG_UP | FLAG_ED);
+        base.extend_from_slice(&[0, 0, 0, 1]);
+        for (name, ext) in [
+            ("arrays", {
+                let mut v = vec![0x81u8; 1000];
+                v.push(0);
+                v
+            }),
+            ("tags", {
+                let mut v = vec![0xc6u8; 1000];
+                v.push(0);
+                v
+            }),
+            ("maps", {
+                let mut v = Vec::new();
+                for _ in 0..500 {
+                    v.extend_from_slice(&[0xa1, 0x00]);
+                }
+                v.push(0);
+                v
+            }),
+            (
+                "hugebytes",
+                vec![0x5b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
+            (
+                "hugearray",
+                vec![0x9b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
+            (
+                "hugemap",
+                vec![0xbb, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
+            ("indef", {
+                let mut v = vec![0x9fu8; 1000];
+                v.push(0xff);
+                v
+            }),
+            (
+                "bigtag",
+                vec![
+                    0xc2, 0x51, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                ],
+            ),
+        ] {
+            let mut data = base.clone();
+            data.extend_from_slice(&ext);
+            let result = parse_auth_data(&data, rp);
+            assert!(result.is_err(), "{name}");
+            // registration-sized nesting too
+            let mut big = vec![0xc6u8; 16000];
+            big.push(0);
+            let _ = one_cbor_item(&big);
+            let mut big = vec![0x81u8; 16000];
+            big.push(0);
+            let _ = one_cbor_item(&big);
+        }
+        // COSE keys: duplicate labels, wrong curves, tiny RSA.
+        let int = |n: i64| Value::Integer(n.into());
+        let enc = |v: Value| {
+            let mut o = Vec::new();
+            ciborium::ser::into_writer(&v, &mut o).unwrap();
+            o
+        };
+        let rsa_tiny = enc(Value::Map(vec![
+            (int(1), int(3)),
+            (int(3), int(-257)),
+            (int(-1), Value::Bytes(vec![0; 256])),
+            (int(-2), Value::Bytes(vec![1])),
+        ]));
+        let (_, key) = parse_cose_key(&rsa_tiny).unwrap();
+        assert!(verify_signature(&key, b"m", &[0u8; 256]).is_err());
+        let rsa_e = enc(Value::Map(vec![
+            (int(1), int(3)),
+            (int(3), int(-257)),
+            (int(-1), Value::Bytes(vec![0xff; 1024])),
+            (int(-2), Value::Bytes(vec![0xff; 8])),
+        ]));
+        let (_, key) = parse_cose_key(&rsa_e).unwrap();
+        assert!(verify_signature(&key, b"m", &[0u8; 1024]).is_err());
+        let ec_bad = enc(Value::Map(vec![
+            (int(1), int(2)),
+            (int(3), int(-7)),
+            (int(-1), int(1)),
+            (int(-2), Value::Bytes(vec![0; 32])),
+            (int(-3), Value::Bytes(vec![0; 32])),
+        ]));
+        let (_, key) = parse_cose_key(&ec_bad).unwrap();
+        assert!(verify_signature(&key, b"m", &[0x30, 0x06, 2, 1, 1, 2, 1, 1]).is_err());
+        let ec_p384 = enc(Value::Map(vec![
+            (int(1), int(2)),
+            (int(3), int(-7)),
+            (int(-1), int(2)),
+            (int(-2), Value::Bytes(vec![0; 32])),
+            (int(-3), Value::Bytes(vec![0; 32])),
+        ]));
+        assert!(parse_cose_key(&ec_p384).is_err());
+    }
 }
