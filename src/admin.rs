@@ -535,6 +535,8 @@ pub struct Admin {
     /// one at a time.
     busy: AtomicBool,
     http: reqwest::Client,
+    /// Where reCAPTCHA tokens are verified: Google, except in the tests.
+    recaptcha_verify_url: String,
     /// The client provider calls go through: no redirects, 60 s timeout.
     ops_http: reqwest::Client,
     /// The OAuth authorization server, whose consent requests the page
@@ -613,6 +615,7 @@ impl Admin {
                 .timeout(Duration::from_secs(8))
                 .build()
                 .expect("building the HTTP client"),
+            recaptcha_verify_url: RECAPTCHA_VERIFY_URL.into(),
             ops_http: ops::client(),
             oauth: None,
             builtin: None,
@@ -637,6 +640,13 @@ impl Admin {
             None => name,
         };
         Some(RelyingParty { id, origin })
+    }
+
+    /// Verifies reCAPTCHA tokens at `url`, for the tests.
+    #[cfg(test)]
+    fn with_recaptcha_verify_url(mut self, url: &str) -> Self {
+        self.recaptcha_verify_url = url.into();
+        self
     }
 
     /// Sets the sign-in options read from the environment.
@@ -1452,15 +1462,36 @@ async fn login(
         return too_many_requests(retry_after);
     }
 
-    if let Some(recaptcha) = &admin.recaptcha
-        && let Err(reason) = verify_captcha(&admin.http, recaptcha, &form.captcha, &ip).await
-    {
-        tracing::warn!(%ip, %reason, "admin login rejected by reCAPTCHA");
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "The request looked automated. Try again." })),
+    if let Some(recaptcha) = &admin.recaptcha {
+        let verdict = verify_captcha(
+            &admin.http,
+            &admin.recaptcha_verify_url,
+            recaptcha,
+            &form.captcha,
+            &ip,
         )
-            .into_response();
+        .await;
+        match verdict {
+            Ok(()) => {}
+            Err(CaptchaError::Unreachable(reason)) => {
+                tracing::warn!(%ip, %reason, "admin login refused: reCAPTCHA could not be reached");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "The sign-in check could not reach Google's reCAPTCHA service; try again."
+                    })),
+                )
+                    .into_response();
+            }
+            Err(CaptchaError::Rejected(reason)) => {
+                tracing::warn!(%ip, %reason, "admin login rejected by reCAPTCHA");
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "The request looked automated. Try again." })),
+                )
+                    .into_response();
+            }
+        }
     }
 
     let username = form.username.trim().to_lowercase();
@@ -4432,19 +4463,68 @@ struct CaptchaVerdict {
     action: String,
 }
 
-/// Checks a reCAPTCHA v3 token with Google. Fails closed: if Google cannot be
-/// reached, the login is refused.
+/// Google's reCAPTCHA verification endpoint.
+const RECAPTCHA_VERIFY_URL: &str = "https://www.google.com/recaptcha/api/siteverify";
+
+/// Why a reCAPTCHA check did not pass.
+#[derive(Debug)]
+enum CaptchaError {
+    /// Google could not be asked (network, timeout, an error page): not
+    /// the user's fault, and said so.
+    Unreachable(String),
+    /// Google answered, and the answer was no.
+    Rejected(String),
+}
+
+/// Checks a reCAPTCHA v3 token with Google. Fails closed: if Google cannot
+/// be reached, the login is refused, after one more try.
 async fn verify_captcha(
     http: &reqwest::Client,
+    url: &str,
     recaptcha: &Recaptcha,
     token: &str,
     ip: &str,
-) -> Result<(), String> {
+) -> Result<(), CaptchaError> {
     if token.is_empty() {
-        return Err("no token".into());
+        return Err(CaptchaError::Rejected("no token".into()));
     }
-    let verdict: CaptchaVerdict = http
-        .post("https://www.google.com/recaptcha/api/siteverify")
+    let verdict = match ask_recaptcha(http, url, recaptcha, token, ip).await {
+        Ok(verdict) => verdict,
+        Err(first) => {
+            tracing::warn!(reason = %first, "reCAPTCHA could not be reached; trying once more");
+            ask_recaptcha(http, url, recaptcha, token, ip)
+                .await
+                .map_err(CaptchaError::Unreachable)?
+        }
+    };
+    if !verdict.success {
+        return Err(CaptchaError::Rejected("token rejected".into()));
+    }
+    if verdict.action != RECAPTCHA_ACTION {
+        return Err(CaptchaError::Rejected(format!(
+            "unexpected action \"{}\"",
+            verdict.action
+        )));
+    }
+    if verdict.score < recaptcha.min_score {
+        return Err(CaptchaError::Rejected(format!(
+            "score {:.1} below threshold",
+            verdict.score
+        )));
+    }
+    Ok(())
+}
+
+/// One request to the verification endpoint; `Err` when no verdict came
+/// back.
+async fn ask_recaptcha(
+    http: &reqwest::Client,
+    url: &str,
+    recaptcha: &Recaptcha,
+    token: &str,
+    ip: &str,
+) -> Result<CaptchaVerdict, String> {
+    http.post(url)
         .form(&[
             ("secret", recaptcha.secret.as_str()),
             ("response", token),
@@ -4453,19 +4533,11 @@ async fn verify_captcha(
         .send()
         .await
         .map_err(|e| format!("verification request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("verification service answered {e}"))?
         .json()
         .await
-        .map_err(|e| format!("unreadable verification response: {e}"))?;
-    if !verdict.success {
-        return Err("token rejected".into());
-    }
-    if verdict.action != RECAPTCHA_ACTION {
-        return Err(format!("unexpected action \"{}\"", verdict.action));
-    }
-    if verdict.score < recaptcha.min_score {
-        return Err(format!("score {:.1} below threshold", verdict.score));
-    }
-    Ok(())
+        .map_err(|e| format!("unreadable verification response: {e}"))
 }
 
 fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -9359,5 +9431,112 @@ mod tests {
         for script in [SCRIPT, SIGNIN_SCRIPT, CONSENT_SCRIPT] {
             assert!(!script.contains("innerHTML") && !script.contains("insertAdjacentHTML"));
         }
+    }
+    /// The admin router with reCAPTCHA on, verified at `verify_url`.
+    async fn serve_with_captcha(verify_url: &str) -> String {
+        static SERVERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lore-captcha-test-{}-{}",
+            std::process::id(),
+            SERVERS.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let admin = Arc::new(
+            Admin::new(
+                Db::open(&dir.join("lore.db")).unwrap(),
+                "admin-password".into(),
+                None,
+                Some(Recaptcha {
+                    site_key: "site".into(),
+                    secret: "secret".into(),
+                    min_score: 0.5,
+                }),
+                false,
+                vec![],
+                None,
+                0.8,
+                Events::new(),
+                Embedder::disabled(),
+                12,
+                None,
+                ops::Guard::default(),
+            )
+            .with_recaptcha_verify_url(verify_url),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(admin);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_recaptcha_is_named_and_tried_twice() {
+        // Nothing listens on port 1: both tries fail, and the answer says
+        // what happened instead of blaming the user.
+        let base = serve_with_captcha("http://127.0.0.1:1/siteverify").await;
+        let response = login(
+            &base,
+            json!({ "username": "admin", "password": "admin-password", "captcha": "t" }),
+        )
+        .await;
+        assert_eq!(response.status(), 503);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["error"],
+            "The sign-in check could not reach Google's reCAPTCHA service; try again."
+        );
+        // A verifier that fails once, then answers: the second try passes.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let verifier = Router::new().route(
+            "/siteverify",
+            post(move || {
+                let counted = counted.clone();
+                async move {
+                    if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::BAD_GATEWAY.into_response()
+                    } else {
+                        Json(json!({ "success": true, "score": 0.9, "action": "login" }))
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/siteverify", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, verifier).await.unwrap() });
+        let base = serve_with_captcha(&url).await;
+        let response = login(
+            &base,
+            json!({ "username": "admin", "password": "admin-password", "captcha": "t" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A token Google refuses is still "looked automated".
+        let refusing = Router::new().route(
+            "/siteverify",
+            post(|| async { Json(json!({ "success": false })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/siteverify", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, refusing).await.unwrap() });
+        let base = serve_with_captcha(&url).await;
+        let response = login(
+            &base,
+            json!({ "username": "admin", "password": "admin-password", "captcha": "t" }),
+        )
+        .await;
+        assert_eq!(response.status(), 403);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "The request looked automated. Try again.");
     }
 }
