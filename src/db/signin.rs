@@ -930,7 +930,10 @@ mod tests {
         drop(db);
         let db = Db::open(&dir.join("lore.db")).unwrap();
         let conn = db.lock();
-        assert_eq!(super::super::schema_version(&conn).unwrap(), 10);
+        assert_eq!(
+            super::super::schema_version(&conn).unwrap(),
+            super::super::SCHEMA_VERSION
+        );
         let after = super::super::table_counts(&conn).unwrap();
         for (table, count) in &before {
             assert!(after.contains(&(table.clone(), *count)), "{table} changed");
