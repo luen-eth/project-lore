@@ -965,7 +965,9 @@ ignored), not the current password, and the two built-in passwords never the sam
 (an empty user name tries `admin` first). Who sets whose password: a stored user's
 by anyone who may manage them (below); the viewer's by a user holding `users`;
 **admin's only by the built-in admin itself**. A password change ends the account's
-other sessions and moves the current one to a new token.
+other sessions and moves the current one to a new token (which does not count as a
+fresh sign-in: the password is one factor). For an account with a second step,
+changing the own password needs a sign-in or confirmation from the last ten minutes.
 
 **Break-glass** (when admin's password or second step is lost): in Dokploy add
 `LORE_ADMIN_BREAK_GLASS=on` to lore's environment and redeploy; sign in as `admin`
@@ -1057,7 +1059,7 @@ Every admin route is mapped to exactly one access level in a table in
 | `POST` | `/admin/api/files` | `write` |
 | `DELETE` | `/admin/api/files/{id}` | `write` |
 | `GET` | `/admin/api/export` | `backup` |
-| `GET` | `/admin/api/backup/full` | `backup` |
+| `GET` | `/admin/api/backup/full` (fresh) | `backup` |
 | `POST` | `/admin/api/import` (merge and replace) | `restore` |
 | `POST` | `/admin/api/restore/full` (fresh) | every permission (the built-in `admin`, or a stored user holding all seven) |
 | `PUT` | `/admin/api/profile` | `settings` |
@@ -1068,8 +1070,10 @@ Every admin route is mapped to exactly one access level in a table in
 | `PUT` | `/admin/api/integrations/permissions` | `integrations` |
 | `PUT` | `/admin/api/integrations/enabled` | `integrations` |
 | `PUT` | `/admin/api/integrations/leakscan` | `integrations` |
-| `GET`, `POST` | `/admin/api/users` | `users` |
-| `PUT`, `DELETE` | `/admin/api/users/{id}` | `users` |
+| `GET` | `/admin/api/users` | `users` |
+| `POST` | `/admin/api/users` (fresh) | `users` |
+| `PUT` | `/admin/api/users/{id}` (fresh when it sets a password, permissions or the disabled flag) | `users` |
+| `DELETE` | `/admin/api/users/{id}` (fresh) | `users` |
 
 *(fresh)* means the route also needs a sign-in or confirmation from the last ten
 minutes (table `FRESH_ROUTES` in `src/admin.rs`, checked after the access level);
@@ -1108,19 +1112,26 @@ Every user may add, under **Profile → Security**:
 
 Once a user has any of these, a right password no longer enters: the second-step
 card asks for the passkey, the code or a recovery code (five minutes; a reload
-resumes it). A user whose only second step cannot be checked at this address gets
-the card with nothing to offer and must ask an administrator to reset it.
+resumes it). Passkeys made for another host count as a second step too: a user
+none of whose second steps can be checked at this address (passkeys of another
+host only, an app the vault cannot read, no recovery code left) is refused with a
+message naming the host the passkeys belong to; the password alone never signs in.
+An administrator can reset the second steps (admin: `LORE_ADMIN_BREAK_GLASS`).
 
-Limits: five wrong attempts per pending sign-in (then the password again), and
-**ten wrong second steps per account per 15 minutes from any address** (then `429`
-with `Retry-After`); the passkey sign-in and the re-authentication count on the
-per-address sign-in limit (5 per 15 minutes); passwordless options 30 per address
-per 10 minutes. reCAPTCHA guards the password step only. Failures of the passkey
+Limits: five attempts per pending sign-in (then the password again), and **ten
+second-step attempts per account per 15 minutes from any address** (then `429` with
+`Retry-After`; a successful one clears it). Every attempt is counted **before** it
+is checked, so parallel guesses gain nothing. The passkey sign-in and the
+re-authentication count on the per-address sign-in limit (5 per 15 minutes) and
+re-authentication also on the account's second-step limit; passwordless options 30
+per address per 10 minutes. reCAPTCHA guards the password step only. Failures of the passkey
 steps all get one message; the reason goes to the sign-in log.
 
 **Re-authentication.** Adding or removing a passkey or the app, new recovery codes,
-setting someone's password, resetting second steps, going back to the environment
-password and a full restore need a sign-in or a confirmation from the **last 10
+setting someone's password, adding or deleting a user, changing a user's
+permissions or disabled flag, resetting second steps, going back to the environment
+password, changing the own password when the account has a second step, downloading
+the full database and a full restore need a sign-in or a confirmation from the **last 10
 minutes**. *Confirm it is you* takes the password plus an app code or a recovery
 code (the password alone for an account without a second step), or a passkey with
 user verification. A change of how an account signs in ends its other sessions and
@@ -1147,9 +1158,14 @@ database ignores them: it signs in with the password alone and lets
 `LORE_ADMIN_PASSWORD`/`LORE_VIEWER_PASSWORD` in again. Going forward again brings
 them back unchanged.
 
-The sign-in log (`auth_events`, newest 5000 rows, full backup only) records every
-sign-in, refusal, limit, re-authentication and change of a password or second step,
-with the address; never a password, code or key. Changes also appear in the
+The sign-in log (`auth_events`, full backup only) records every sign-in, refusal,
+limit, re-authentication and change of a password or second step, with the address;
+never a password, code or key. It keeps two budgets of 5000 rows each: what anyone
+can cause without an account (refused passwords, passkeys and codes, limits, pending
+sign-ins) and everything else (sign-ins, break-glass, password and second-step
+changes, resets), so a flood of refused requests cannot erase the record of a
+break-glass sign-in. A limit's refusals are logged once per 15 minutes per address
+and account. Changes also appear in the
 activity feed.
 
 ![The sign-in screen](docs/login.jpg)
@@ -3083,6 +3099,12 @@ or a stored user holding all seven), not just `restore`, and the page shows the
 control only to such users. Restoring an older backup also brings back the users
 deleted since and the passwords they had then, and the agents and authorizations
 revoked since.
+
+**Every permission is admin-equivalent.** A stored user holding all seven
+permissions can download the full database, edit it (for example the built-in
+admin's page password or second steps) and restore it, and so take over the
+built-in `admin`. Give all seven only to someone you would give admin's password.
+Both the download and the restore need a sign-in from the last ten minutes.
 
 Restoring a full backup (**Full database → Restore**, after typing `RESTORE`)
 first checks the upload without changing anything: the SQLite header, that it opens
