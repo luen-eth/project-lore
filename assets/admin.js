@@ -2056,12 +2056,19 @@ $("full-file").addEventListener("change", async (event) => {
   $("full-result").hidden = true;
   backupStatus("Uploading and checking the database…");
   try {
-    const response = await api("/admin/api/restore/full", {
+    const upload = () => api("/admin/api/restore/full", {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: file,
     });
-    const result = await response.json().catch(() => ({}));
+    let response = await upload();
+    let result = await response.json().catch(() => ({}));
+    // A full restore replaces every credential: it needs a recent sign-in.
+    if (response.status === 403 && result.reauth && await askReauth()) {
+      backupStatus("Uploading and checking the database…");
+      response = await upload();
+      result = await response.json().catch(() => ({}));
+    }
     if (!response.ok) {
       const reason = response.status === 413
         ? "The file is larger than 2 GiB."
@@ -3783,6 +3790,7 @@ async function sendFresh(path, payload, method) {
 /* The re-authentication dialog: resolves true once confirmed, false when
    cancelled. */
 let reauthWaiting = null;
+let reauthOpenedProfile = false;
 
 async function askReauth() {
   closeReauth(false);
@@ -3806,8 +3814,10 @@ async function askReauth() {
     $("reauth-recovery-field").hidden = true;
     $("reauth-use-recovery").hidden = true;
   }
-  // The dialog lives in the profile panel; open it if another panel asked.
-  if ($("profile").hidden) $("profile-toggle").click();
+  // The dialog lives in the profile panel; when another panel asked, the
+  // profile shows over it for the moment, without closing that panel.
+  reauthOpenedProfile = $("profile").hidden;
+  if (reauthOpenedProfile) $("profile").hidden = false;
   $("reauth").hidden = false;
   $("reauth").scrollIntoView({ block: "nearest" });
   $("reauth-password").focus();
@@ -3816,6 +3826,7 @@ async function askReauth() {
 
 function closeReauth(confirmed) {
   $("reauth").hidden = true;
+  if (reauthOpenedProfile) { $("profile").hidden = true; reauthOpenedProfile = false; }
   for (const id of ["reauth-password", "reauth-code", "reauth-recovery"]) $(id).value = "";
   if (reauthWaiting) { const done = reauthWaiting; reauthWaiting = null; done(confirmed); }
 }
