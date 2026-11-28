@@ -534,6 +534,8 @@ pub struct Admin {
     second_factor_failures: RateLimiter,
     /// Passwordless passkey options per address.
     passkey_options: RateLimiter,
+    /// Re-authentication attempts per session.
+    reauth_attempts: RateLimiter,
     /// When a limit's refusal was last written to the sign-in log, per
     /// account, address and kind.
     limits_noted: Mutex<HashMap<String, Instant>>,
@@ -618,6 +620,7 @@ impl Admin {
             // minutes, whatever address they come from.
             second_factor_failures: RateLimiter::new(10, Duration::from_secs(15 * 60)),
             passkey_options: RateLimiter::new(30, Duration::from_secs(10 * 60)),
+            reauth_attempts: RateLimiter::new(5, Duration::from_secs(15 * 60)),
             limits_noted: Mutex::new(HashMap::new()),
             // Five wrong attempts lock the address out for fifteen minutes.
             logins: RateLimiter::new(5, Duration::from_secs(15 * 60)),
@@ -1611,8 +1614,37 @@ fn limited_event(admin: &Admin, account: &str, actor: &str, ip: &str, detail: &s
         let mut noted = admin.limits_noted.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         noted.retain(|_, at| now.duration_since(*at) < LIMIT_NOTE_WINDOW);
-        if noted.contains_key(&key) || noted.len() >= 10_000 {
+        if noted.contains_key(&key) {
             return;
+        }
+        if noted.len() >= LIMIT_NOTES_KEPT {
+            // Full: an account's refusal displaces an anonymous one (their
+            // keys start with the empty account); otherwise one marker says
+            // that refusals went unlogged this window.
+            let anonymous = (!account.is_empty())
+                .then(|| noted.keys().find(|k| k.starts_with('\n')).cloned())
+                .flatten();
+            match anonymous {
+                Some(old) => {
+                    noted.remove(&old);
+                }
+                None => {
+                    if noted.contains_key(LIMIT_SUPPRESSED) {
+                        return;
+                    }
+                    noted.insert(LIMIT_SUPPRESSED.into(), now);
+                    drop(noted);
+                    auth_event(
+                        admin,
+                        "",
+                        "",
+                        "signin.limited",
+                        "",
+                        "suppressed: more refusals this window than the log notes",
+                    );
+                    return;
+                }
+            }
         }
         noted.insert(key, now);
     }
@@ -1621,6 +1653,10 @@ fn limited_event(admin: &Admin, account: &str, actor: &str, ip: &str, detail: &s
 
 /// How long one limit's refusals are noted only once.
 const LIMIT_NOTE_WINDOW: Duration = Duration::from_secs(15 * 60);
+/// Distinct refusals noted per window; past it, one marker.
+const LIMIT_NOTES_KEPT: usize = 10_000;
+/// The key of the marker that refusals went unlogged.
+const LIMIT_SUPPRESSED: &str = "suppressed";
 
 /// Starts the session of a completed sign-in, whichever way it went, and
 /// answers like a successful `/login`: a new token, the session cookie.
@@ -9668,14 +9704,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reauth_codes_count_on_the_account_limit() {
+    async fn reauth_attempts_count_on_the_session() {
         let (base, admin) = serve().await;
         let user = stored_user(&admin, "luis", &[], "luis-token");
         let account = db::user_account(user.id);
         let key = give_totp(&admin, &account);
-        // Ten wrong confirmations (the address limit cleared in between, as
-        // an attacker with many addresses would) use up the account's limit.
-        for n in 0..10 {
+        // Five wrong confirmations (the address limit cleared in between, as
+        // with many addresses) use up this session's limit.
+        for n in 0..5 {
             admin.logins.reset("127.0.0.1");
             let response = send_as(
                 reqwest::Method::POST,
@@ -9842,5 +9878,198 @@ mod tests {
             .filter(|event| event.event == "signin.limited")
             .count();
         assert_eq!(limited, 1);
+    }
+    /// Signs in with a password and sends five wrong app codes to that
+    /// pending sign-in, three times: the account's second-step limit (ten)
+    /// is used up, as a stranger who knows the password could do.
+    async fn exhaust_account_limit(base: &str, admin: &Admin, username: &str) {
+        for round in 0..3 {
+            admin.logins.reset("127.0.0.1");
+            let pending = pending_for(base, username, "a-long-password").await;
+            for n in 0..5 {
+                post_with(
+                    base,
+                    "/admin/api/login/second-factor",
+                    &pending,
+                    json!({ "method": "totp", "code": format!("{:06}", 300000 + round * 10 + n) }),
+                )
+                .await;
+            }
+        }
+        // The owner comes from another address.
+        admin.logins.reset("127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn a_stranger_with_the_password_cannot_lock_the_owner_out() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "luis", &[], "luis-token");
+        let account = db::user_account(user.id);
+        let key = give_totp(&admin, &account);
+        let mut device = give_passkey(&admin, &account);
+        exhaust_account_limit(&base, &admin, "luis").await;
+        // The account limit is used up for codes...
+        let pending = pending_for(&base, "luis", "a-long-password").await;
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 429);
+        // ...but a passkey still finishes a new sign-in.
+        let options: serde_json::Value = post_with(
+            &base,
+            "/admin/api/login/second-factor/passkey-options",
+            &pending,
+            json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let answer = device.assert(
+            &challenge_of(&options),
+            &base,
+            "127.0.0.1",
+            crate::webauthn::soft::Flags::UP,
+        );
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "passkey", "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        // The owner's existing session re-authenticates with a passkey...
+        exhaust_account_limit(&base, &admin, "luis").await;
+        make_stale(&admin, "luis-token");
+        let options: serde_json::Value = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth/options",
+            "luis-token",
+            json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let answer = device.assert(
+            &challenge_of(&options),
+            &base,
+            "127.0.0.1",
+            crate::webauthn::soft::Flags::UP_UV,
+        );
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            "luis-token",
+            json!({ "ceremony": options["ceremony"], "credential": answer }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        // ...and with the password and the right code.
+        make_stale(&admin, &token);
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            &token,
+            json!({ "password": "a-long-password", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn an_app_only_owner_keeps_his_session_and_can_change_the_password() {
+        let (base, admin) = serve().await;
+        let user = stored_user(&admin, "tina", &[], "tina-token");
+        let account = db::user_account(user.id);
+        let key = give_totp(&admin, &account);
+        exhaust_account_limit(&base, &admin, "tina").await;
+        // A new sign-in with the right code waits out the window: that is
+        // the rate limit doing its job.
+        let pending = pending_for(&base, "tina", "a-long-password").await;
+        let response = post_with(
+            &base,
+            "/admin/api/login/second-factor",
+            &pending,
+            json!({ "method": "totp", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 429);
+        // Her existing session confirms and rotates the leaked password.
+        admin.logins.reset("127.0.0.1");
+        make_stale(&admin, "tina-token");
+        let response = send_as(
+            reqwest::Method::POST,
+            &base,
+            "/admin/api/security/reauth",
+            "tina-token",
+            json!({ "password": "a-long-password", "code": code_now(&key) }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let token = session_token_of(&response).unwrap();
+        let response = put_json(
+            &base,
+            "/admin/api/password",
+            &token,
+            json!({ "current": "a-long-password", "password": "a-fresh-new-password-7" }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let response = login(
+            &base,
+            json!({ "username": "tina", "password": "a-long-password" }),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+    }
+
+    #[test]
+    fn a_full_limit_log_keeps_accounts_and_marks_what_it_drops() {
+        let dir = std::env::temp_dir().join(format!("lore-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let admin = Admin::new(
+            Db::open(&dir.join("lore.db")).unwrap(),
+            "admin-password".into(),
+            None,
+            None,
+            false,
+            vec![],
+            None,
+            0.8,
+            Events::new(),
+            Embedder::disabled(),
+            12,
+            None,
+            ops::Guard::default(),
+        );
+        for n in 0..LIMIT_NOTES_KEPT {
+            admin.limits_noted.lock().unwrap().insert(
+                format!("\n10.0.{}.{}\npasskey", n / 256, n % 256),
+                Instant::now(),
+            );
+        }
+        // An account's refusal still gets in, displacing an anonymous one.
+        limited_event(&admin, "user:1", "luis", "10.9.9.9", "second factor");
+        // Anonymous ones past the cap leave one marker, once.
+        limited_event(&admin, "", "", "10.8.8.8", "passkey");
+        limited_event(&admin, "", "", "10.8.8.9", "passkey");
+        let events = admin.db.auth_events(None, 10).unwrap();
+        assert!(events.iter().any(|e| e.account == "user:1"));
+        let markers = events
+            .iter()
+            .filter(|e| e.detail.starts_with("suppressed"))
+            .count();
+        assert_eq!(markers, 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

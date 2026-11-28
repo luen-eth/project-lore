@@ -1119,12 +1119,16 @@ message naming the host the passkeys belong to; the password alone never signs i
 An administrator can reset the second steps (admin: `LORE_ADMIN_BREAK_GLASS`).
 
 Limits: five attempts per pending sign-in (then the password again), and **ten
-second-step attempts per account per 15 minutes from any address** (then `429` with
-`Retry-After`; a successful one clears it). Every attempt is counted **before** it
-is checked, so parallel guesses gain nothing. The passkey sign-in and the
-re-authentication count on the per-address sign-in limit (5 per 15 minutes) and
-re-authentication also on the account's second-step limit; passwordless options 30
-per address per 10 minutes. reCAPTCHA guards the password step only. Failures of the passkey
+app or recovery codes per account per 15 minutes from any address** (then `429` with
+`Retry-After`; a successful second step clears it). Every attempt is counted
+**before** it is checked, so parallel guesses gain nothing. Passkey answers do not
+count on the account limit (a signature cannot be guessed): someone who knows the
+password and sends wrong codes cannot keep the owner's passkey out. The passkey
+sign-in counts on the per-address sign-in limit (5 per 15 minutes); passwordless
+options 30 per address per 10 minutes. Re-authentication counts on the per-address
+limit and on a limit of its own session (5 per 15 minutes), never on the account
+limit: wrong codes sent to pending sign-ins never block a session that is already
+signed in, so the owner can still confirm and change a leaked password. reCAPTCHA guards the password step only. Failures of the passkey
 steps all get one message; the reason goes to the sign-in log.
 
 **Re-authentication.** Adding or removing a passkey or the app, new recovery codes,

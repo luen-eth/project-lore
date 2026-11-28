@@ -983,7 +983,15 @@ pub(super) async fn second_factor(
             "passkey" if entry.factors.passkey => "passkey",
             _ => return bad_request("this way of confirming is not available for this sign-in"),
         };
-        match admin.second_factor_failures.hit(&entry.account) {
+        // A passkey signature cannot be guessed: it counts on this pending
+        // sign-in only, so a stranger's wrong codes never lock the owner's
+        // passkey out. Codes count on the account's limit too.
+        let limited = if method == "passkey" {
+            None
+        } else {
+            admin.second_factor_failures.hit(&entry.account)
+        };
+        match limited {
             Some(retry_after) => Err((entry.user.clone(), entry.account.clone(), retry_after)),
             None => {
                 entry.failures += 1;

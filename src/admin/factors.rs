@@ -201,19 +201,21 @@ pub(super) async fn reauth(
         return StatusCode::UNAUTHORIZED.into_response();
     };
     // Reserved before anything is checked: the attempt counts on the
-    // address's sign-in limit and on the account's second-step limit (an
-    // app code or recovery code is guessed here as much as at sign-in).
+    // address's sign-in limit and on this session's own limit (five per
+    // 15 minutes). Not on the account's second-step limit: wrong codes a
+    // stranger sends to pending sign-ins must never block a session that
+    // is already signed in.
     if let Some(retry_after) = admin.logins.hit(&ip) {
         limited_event(&admin, &me.account(), &me.username, &ip, "reauth");
         return too_many_requests(retry_after);
     }
-    if let Some(retry_after) = admin.second_factor_failures.hit(&me.account()) {
+    if let Some(retry_after) = admin.reauth_attempts.hit(&token) {
         limited_event(
             &admin,
             &me.account(),
             &me.username,
             &ip,
-            "reauth, second step",
+            "reauth, this session",
         );
         return too_many_requests(retry_after);
     }
@@ -288,7 +290,7 @@ pub(super) async fn reauth(
     match checked {
         Ok(Ok(Ok(how))) => {
             admin.logins.reset(&ip);
-            admin.second_factor_failures.reset(&account);
+            admin.reauth_attempts.reset(&token);
             let Some(rotated) = admin.rotate_session(&token, true) else {
                 return StatusCode::UNAUTHORIZED.into_response();
             };
