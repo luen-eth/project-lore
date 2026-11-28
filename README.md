@@ -1022,7 +1022,7 @@ Every admin route is mapped to exactly one access level in a table in
 | `GET` | `/admin/api/session` | nothing |
 | `POST` | `/admin/api/login`, `/admin/api/logout` | nothing |
 | `GET` | `/admin/api/brain`, `/pulse`, `/events`, `/entries/{id}`, `/profile`, `/sessions`, `/sessions/{id}`, `/board`, `/files`, `/files/{id}`, `/files/{id}/download`, `/integrations` | signed in |
-| `PUT` | `/admin/api/password` (own password, every user) | signed in |
+| `PUT` | `/admin/api/password` (own password, every user; fresh when the account has a second step) | signed in |
 | `DELETE` | `/admin/api/password` (built-in users: back to the environment password) (fresh) | signed in |
 | `PUT` | `/admin/api/builtin-users/{name}/password` (fresh) | signed in; viewer: `users`; admin: only admin |
 | `DELETE` | `/admin/api/builtin-users/{name}/second-factors` (fresh) | signed in; viewer: `users`; admin: only admin |
